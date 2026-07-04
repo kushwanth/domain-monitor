@@ -1,0 +1,35 @@
+[Unit]
+Description=RDAP and DNS Security Monitor
+After=network-online.target
+
+[Container]
+# Replace with your actual GitHub username and repository name
+Image=ghcr.io/your-github-username/your-repo-name:latest
+
+# Add your auth tokens using Secrets here to avoid hardcoding them in config.jsonnet
+# Create them using: podman secret create <secret-name> <file-with-secret>
+# Secret=cloudflare-token,type=env,target=CLOUDFLARE_TOKEN
+# Secret=ntfy-auth,type=env,target=NTFY_AUTH
+# Secret=telegram-token,type=env,target=TELEGRAM_TOKEN
+# Environment=TELEGRAM_CHAT_ID=your_telegram_chat_id
+
+# Automatically pull the latest image on systemd daemon-reload or boot
+AutoUpdate=registry
+
+# Set the environment variable telling the Go app where to find the config
+Environment=CONFIG_PATH=/app/config.jsonnet
+
+# Expose the HTTP port for JSON State (/api/state) and Web Dashboard (/)
+# Ensure this matches the port defined in your config.jsonnet
+PublishPort=8080:8080
+
+# Mount your configuration file into the container as read-only
+Volume=/path/to/your/homelab/config.jsonnet:/app/config.jsonnet:ro
+
+[Service]
+# Automatically restart the container if it crashes or the system reboots
+Restart=always
+TimeoutStartSec=60
+
+[Install]
+WantedBy=default.target

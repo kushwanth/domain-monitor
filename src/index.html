@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Domain Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      /* Light Theme Variables */
+      --bg-main: #fafafa;
+      --bg-sidebar: #ffffff;
+      --bg-card: #ffffff;
+      --bg-hover: #f1f5f9;
+      --border: #eaeaea;
+      --text-main: #111827;
+      --text-muted: #6b7280;
+      --primary: #3b82f6;
+      --primary-hover: #eff6ff;
+      --success: #10b981;
+      --error: #ef4444;
+      --warning: #f59e0b;
+      --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+    }
+    
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .badge.success { background-color: rgba(16, 185, 129, 0.1); color: var(--success); }
+    .badge.warning { background-color: rgba(245, 158, 11, 0.1); color: var(--warning); }
+    .badge.error { background-color: rgba(239, 68, 68, 0.1); color: var(--error); }
+
+    [data-theme="dark"] {
+      /* OLED Dark Theme Variables */
+      --bg-main: #0a0a0a;
+      --bg-sidebar: #111111;
+      --bg-card: #171717;
+      --bg-hover: #262626;
+      --border: #262626;
+      --text-main: #f3f4f6;
+      --text-muted: #9ca3af;
+      --primary: #3b82f6;
+      --primary-hover: #1e3a8a;
+      --success: #10b981;
+      --error: #ef4444;
+      --warning: #f59e0b;
+      --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.8);
+    }
+
+    * {
+      box-sizing: border-box;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    body {
+      margin: 0;
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      display: flex;
+      height: 100vh;
+      line-height: 1.6;
+      overflow: hidden;
+      transition: background-color 0.3s, color 0.3s;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 260px;
+      background-color: var(--bg-sidebar);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      padding: 24px 16px;
+      transition: background-color 0.3s, border-color 0.3s;
+    }
+
+    .brand {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 40px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding-left: 12px;
+    }
+
+    .nav-items {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .nav-item {
+      padding: 12px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 500;
+      color: var(--text-muted);
+      transition: all 0.2s;
+    }
+
+    .nav-item:hover {
+      background-color: var(--bg-hover);
+      color: var(--text-main);
+    }
+
+    .nav-item.active {
+      background-color: var(--primary-hover);
+      color: var(--primary);
+    }
+
+    [data-theme="dark"] .nav-item.active {
+      background-color: rgba(59, 130, 246, 0.1);
+    }
+
+    .theme-toggle {
+      padding: 12px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+
+    /* Main Content */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+
+    .header {
+      padding: 32px 48px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      background-color: var(--bg-main);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+    }
+
+    .content {
+      padding: 32px 48px;
+      flex: 1;
+    }
+
+    /* Domains View */
+    .domain-list {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .domain-card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .domain-header {
+      padding: 20px 24px;
+      display: grid;
+      grid-template-columns: minmax(200px, 1fr) 2fr auto;
+      align-items: center;
+      gap: 16px;
+      cursor: pointer;
+      transition: background-color 0.2s;
+      list-style: none;
+      /* Remove native detail marker */
+    }
+
+    .domain-header::-webkit-details-marker {
+      display: none;
+    }
+
+    .domain-header:hover {
+      background-color: var(--bg-hover);
+    }
+
+    .domain-title {
+      font-weight: 600;
+      font-size: 1.1rem;
+      margin-right: 16px;
+    }
+
+    .domain-status {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+
+    .status-dot.ok {
+      background-color: var(--success);
+    }
+
+    .status-dot.error {
+      background-color: var(--error);
+    }
+
+    .status-dot.warning {
+      background-color: var(--warning);
+    }
+
+    .status-dot.unknown {
+      background-color: var(--text-muted);
+    }
+
+    .domain-chevron {
+      color: var(--text-muted);
+      transition: transform 0.3s;
+    }
+
+    details[open] .domain-chevron {
+      transform: rotate(180deg);
+    }
+
+    .domain-details {
+      padding: 0 24px 24px 24px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      border-top: 1px solid var(--border);
+      margin-top: 16px;
+      padding-top: 24px;
+    }
+
+    .detail-panel {
+      flex: 1;
+      background: transparent;
+      border: none;
+      padding: 0;
+    }
+
+    .detail-panel h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 16px;
+      color: var(--text-muted);
+    }
+
+    .detail-row {
+      display: flex;
+      margin-bottom: 12px;
+      font-size: 0.9rem;
+    }
+
+    .detail-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .detail-label {
+      width: 140px;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+
+    .detail-value {
+      flex: 1;
+      word-break: break-all;
+      font-weight: 500;
+    }
+
+    .data-list {
+      margin: 0;
+      padding-left: 0;
+      list-style-type: none;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .header-stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      padding: 24px 32px 0 32px;
+    }
+
+    .stat-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      padding: 8px 16px;
+      border-radius: 20px;
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .stat-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .stat-value {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    @media (max-width: 768px) {
+      .sidebar {
+        width: 60px;
+        padding: 16px 8px;
+      }
+
+      .sidebar .brand,
+      .sidebar .nav-item span,
+      .sidebar .theme-toggle span {
+        display: none;
+      }
+
+      .main {
+        margin-left: 0;
+      }
+
+      .domain-details {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <aside class="sidebar">
+    <div class="brand">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+      </svg>
+      DomainGuard
+    </div>
+    <div class="nav-items">
+      <div class="nav-item active" onclick="switchView('domains')" id="nav-domains">Domains</div>
+      <div class="nav-item" onclick="switchView('dns')" id="nav-dns">DNS Records</div>
+    </div>
+    <div id="last-updated"
+      style="margin-bottom: 16px; font-size: 0.75rem; color: var(--text-muted); text-align: center;"></div>
+    <div class="theme-toggle" onclick="toggleTheme()">
+      <span>Theme</span>
+      <svg id="theme-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="5"></circle>
+        <line x1="12" y1="1" x2="12" y2="3"></line>
+        <line x1="12" y1="21" x2="12" y2="23"></line>
+        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+        <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+        <line x1="1" y1="12" x2="3" y2="12"></line>
+        <line x1="21" y1="12" x2="23" y2="12"></line>
+        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+        <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+      </svg>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div id="view-stats" class="header-stats">
+      <!-- Rendered via JS -->
+    </div>
+
+    <div class="content">
+      <!-- Domains View -->
+      <div id="view-domains" class="domain-list">
+        <!-- Rendered via JS -->
+      </div>
+
+      <!-- DNS View -->
+      <div id="view-dns" class="domain-list hidden"></div>
+    </div>
+  </main>
+
+  <script>
+    let appState = { domains: {}, dns: {} };
+    let currentView = 'domains';
+
+    // Theme initialization
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+
+    function toggleTheme() {
+      const current = document.documentElement.getAttribute('data-theme');
+      document.documentElement.setAttribute('data-theme', current === 'dark' ? 'light' : 'dark');
+    }
+
+    function switchView(view) {
+      currentView = view;
+      document.getElementById('nav-domains').classList.toggle('active', view === 'domains');
+      document.getElementById('nav-dns').classList.toggle('active', view === 'dns');
+
+      document.getElementById('view-domains').classList.toggle('hidden', view !== 'domains');
+      document.getElementById('view-dns').classList.toggle('hidden', view !== 'dns');
+
+      // Update stats on view switch without requiring a full fetch
+      if (view === 'domains') {
+        renderDomains();
+      } else {
+        renderDNS();
+      }
+    }
+
+    function renderStats(total, healthy, issues, expiringDomains, expiringCerts) {
+      document.getElementById('view-stats').innerHTML = `
+        <div class="stat-box">
+          <span class="stat-label">Total</span>
+          <span class="stat-value">${total}</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-label">Healthy</span>
+          <span class="stat-value"><span class="status-dot ok"></span>${healthy}</span>
+        </div>
+        <div class="stat-box" style="${issues > 0 ? 'border-color: var(--error);' : ''}">
+          <span class="stat-label">Issues</span>
+          <span class="stat-value"><span class="status-dot error"></span>${issues}</span>
+        </div>
+        ${currentView === 'domains' ? `
+        <div class="stat-box" style="${expiringDomains > 0 ? 'border-color: var(--warning);' : ''}">
+          <span class="stat-label">Expiring Domains</span>
+          <span class="stat-value" style="${expiringDomains > 0 ? 'color: var(--warning);' : ''}">${expiringDomains}</span>
+        </div>` : ''}
+        ${currentView === 'dns' ? `
+        <div class="stat-box" style="${expiringCerts > 0 ? 'border-color: var(--warning);' : ''}">
+          <span class="stat-label">Expiring SSL</span>
+          <span class="stat-value" style="${expiringCerts > 0 ? 'color: var(--warning);' : ''}">${expiringCerts}</span>
+        </div>` : ''}
+      `;
+    }
+
+    async function fetchState() {
+      try {
+        const res = await fetch('/api/state');
+        const data = await res.json();
+        appState = data;
+
+        if (appState.last_updated) {
+          const updatedDate = new Date(appState.last_updated).toLocaleString();
+          document.getElementById('last-updated').innerText = `Last Updated: ${updatedDate}`;
+        }
+
+        renderDomains();
+        renderDNS();
+      } catch (e) {
+        console.error("Failed to fetch state", e);
+      }
+    }
+
+    function formatTitleCase(str) {
+      if (!str) return 'None';
+      return str.replace(/([a-z])([A-Z])/g, '$1 $2')
+        .replace(/[_-]/g, ' ')
+        .split(' ')
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+    }
+
+    function renderDomains() {
+      const container = document.getElementById('view-domains');
+      container.innerHTML = '';
+
+      const rdapChecks = appState.rdap_checks || {};
+      const emailChecks = appState.email_checks || {};
+      const allDomains = new Set([...Object.keys(rdapChecks), ...Object.keys(emailChecks)]);
+
+      let healthyCount = 0;
+      let issueCount = 0;
+      let expiringCount = 0;
+
+      for (const domain of allDomains) {
+        const rdapState = rdapChecks[domain] || {};
+        const emailState = emailChecks[domain] || {};
+
+        let statusClass = 'ok';
+
+        if (emailState.status === 'failed' || emailState.status === 'hijacked' || rdapState.status === 'failed') {
+          statusClass = 'error';
+        } else if (emailState.status === 'mismatch') {
+          statusClass = 'warning';
+        } else if (rdapState.status === 'pending') {
+          statusClass = 'unknown';
+        }
+
+        if (rdapState.domain_status && rdapState.domain_status.some(s => s.toLowerCase().includes('hold') || s.toLowerCase().includes('pendingdelete'))) {
+          statusClass = 'error';
+        }
+
+        if (statusClass === 'error' || statusClass === 'warning') {
+          issueCount++;
+        } else if (statusClass === 'ok') {
+          healthyCount++;
+        }
+
+        let emailHtml = `<div class="detail-panel"><h3>Email</h3><p class="detail-value" style="color: var(--text-muted)">Not Configured</p></div>`;
+        if (emailState.type) {
+          const mxs = (emailState.mx && emailState.mx.length > 0) ? `<ul class="data-list"><li>${emailState.mx.join('</li><li>')}</li></ul>` : 'None';
+          const isDkimValid = (emailState.dkim_valid && emailState.dkim_valid.length > 0);
+          emailHtml = `
+            <div class="detail-panel">
+              <h3>Email Security</h3>
+              <div class="detail-row"><div class="detail-label">Provider:</div><div class="detail-value" style="text-transform: capitalize;">${formatTitleCase(emailState.provider) || 'Custom/Basic'}</div></div>
+              <div class="detail-row"><div class="detail-label">SPF:</div><div class="detail-value">${emailState.spf ? 'Valid' : 'Missing'}</div></div>
+              <div class="detail-row"><div class="detail-label">DMARC:</div><div class="detail-value">${emailState.dmarc ? 'Valid' : 'Missing'}</div></div>
+              <div class="detail-row"><div class="detail-label">DKIM:</div><div class="detail-value">${isDkimValid ? 'Valid' : 'Missing'}</div></div>
+              <div class="detail-row"><div class="detail-label">MX Records:</div><div class="detail-value" style="text-transform: lowercase;">${mxs}</div></div>
+            </div>`;
+        }
+
+        let rdapHtml = `
+        <div class="detail-panel">
+          <h3>Domain Information</h3>
+          <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="color: var(--text-muted)">Not Configured</div></div>
+        </div>`;
+
+        let badgeHtml = '';
+        let expText = 'Unknown';
+        if (rdapState.status && rdapState.status !== "pending") {
+          expText = rdapState.expiration ? new Date(rdapState.expiration).toLocaleString() : 'Unknown';
+          
+          if (rdapState.expiration) {
+            const expDate = new Date(rdapState.expiration);
+            const daysLeft = Math.ceil((expDate - new Date()) / (1000 * 60 * 60 * 24));
+            if (daysLeft < 0) {
+               badgeHtml = `<span class="badge error">Expired</span>`;
+               expiringCount++;
+            } else if (daysLeft <= 30) {
+               badgeHtml = `<span class="badge warning">${daysLeft}d left</span>`;
+               expiringCount++;
+            } else {
+               badgeHtml = `<span class="badge success">${daysLeft}d left</span>`;
+            }
+          }
+          
+          const ns = (rdapState.nameservers && rdapState.nameservers.length > 0) ? `<ul class="data-list"><li>${rdapState.nameservers.join('</li><li>')}</li></ul>` : 'None';
+          const statuses = (rdapState.domain_status && rdapState.domain_status.length > 0) ? `<ul class="data-list"><li>${rdapState.domain_status.map(formatTitleCase).join('</li><li>')}</li></ul>` : 'Active';
+          rdapHtml = `
+            <div class="detail-panel">
+              <h3>Domain Information</h3>
+              <div class="detail-row"><div class="detail-label">Registrar:</div><div class="detail-value">${rdapState.registrar || 'Unknown'}</div></div>
+              <div class="detail-row"><div class="detail-label">Expiration:</div><div class="detail-value">${expText}</div></div>
+              <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value" style="text-transform: lowercase;">${ns}</div></div>
+              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="text-transform: capitalize;">${statuses}</div></div>
+              <div class="detail-row"><div class="detail-label">DNSSEC:</div><div class="detail-value">${rdapState.dnssec ? 'Enabled' : 'Disabled'}</div></div>
+            </div>`;
+        }
+
+        const isRDAPFailed = (rdapState.status === 'failed');
+
+        const card = document.createElement('details');
+        card.className = 'domain-card';
+        card.setAttribute('data-search', domain.toLowerCase());
+        
+        let chevronHtml = `<svg class="domain-chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
+        
+        if (isRDAPFailed) {
+          card.onclick = (e) => e.preventDefault();
+          chevronHtml = '';
+        }
+        
+        card.innerHTML = `
+          <summary class="domain-header">
+            <div class="domain-title" style="text-transform: lowercase;">${domain}</div>
+            <div class="domain-status">
+              ${badgeHtml ? badgeHtml : `<span>${expText}</span>`}
+              <span class="status-dot ${statusClass}"></span>
+            </div>
+            ${chevronHtml}
+          </summary>
+          <div class="domain-details">
+            ${rdapHtml}
+            ${emailHtml}
+          </div>
+        `;
+        container.appendChild(card);
+      } // end of for loop
+      
+      if (currentView === 'domains') {
+        renderStats(allDomains.size, healthyCount, issueCount, expiringCount, 0);
+      }
+    }
+
+
+    function renderDNS() {
+      const container = document.getElementById('view-dns');
+      container.innerHTML = '';
+
+      const dnsChecks = appState.dns_checks || {};
+      let healthyCount = 0;
+      let issueCount = 0;
+      let expiringCertCount = 0;
+
+      for (const [key, state] of Object.entries(dnsChecks)) {
+        if (state.status === 'failed' || state.status === 'api_error' || state.status === 'mismatch') {
+          issueCount++;
+        } else if (state.status === 'ok' || state.status === 'ok_flattened') {
+          healthyCount++;
+        }
+      }
+
+      for (const [key, state] of Object.entries(dnsChecks)) {
+
+        let statusClass = 'ok';
+        let statusText = 'Healthy';
+
+        if (state.status === 'failed' || state.status === 'api_error') {
+          statusClass = 'error';
+          statusText = 'Issue Detected';
+        } else if (state.status === 'mismatch') {
+          statusClass = 'warning';
+          statusText = 'Mismatch';
+        } else if (state.status === 'proxied_unverified') {
+          statusClass = 'unknown';
+          statusText = 'Proxied / Unverified';
+        } else if (state.status === 'ok_flattened') {
+          statusClass = 'ok';
+          statusText = 'Healthy (Flattened)';
+        }
+
+        const name = formatTitleCase(state.name || state.hostname || 'Unknown');
+        const hostname = state.hostname || 'Unknown';
+        const type = (state.type || 'Unknown').toUpperCase();
+        const expectedUl = state.expected ? `<ul class="data-list"><li>${state.expected.join('</li><li>')}</li></ul>` : 'N/A';
+        const foundInline = state.found ? state.found.join(', ') : 'None';
+        const found = state.found ? `<ul class="data-list"><li>${state.found.join('</li><li>')}</li></ul>` : 'None';
+
+        let sslRow = '';
+        let badgeHtml = '';
+        if (state.ssl_days !== undefined) {
+          if (state.ssl_days === -1) {
+             sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value" style="color: var(--warning);">No Cert / Error</div></div>`;
+             badgeHtml = `<span class="badge error">No Cert</span>`;
+          } else {
+             sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value">${state.ssl_days > 0 ? 'Valid (' + state.ssl_days + ' days)' : '<span style="color: var(--error);">Expired</span>'}</div></div>`;
+             
+             if (state.ssl_days < 0) {
+               badgeHtml = `<span class="badge error">Expired</span>`;
+               expiringCertCount++;
+             } else if (state.ssl_days <= 30) {
+               badgeHtml = `<span class="badge warning">${state.ssl_days}d left</span>`;
+               expiringCertCount++;
+             } else {
+               badgeHtml = `<span class="badge success">${state.ssl_days}d left</span>`;
+             }
+          }
+        }
+
+        const card = document.createElement('details');
+        card.className = 'domain-card';
+        card.setAttribute('data-search', key.toLowerCase());
+        card.innerHTML = `
+          <summary class="domain-header">
+            <div class="domain-title" style="text-transform: lowercase;">${hostname}</div>
+            <div class="domain-status">
+              ${badgeHtml}
+              <span style="text-transform: lowercase;">${foundInline}</span>
+              <span class="status-dot ${statusClass}"></span>
+            </div>
+            <svg class="domain-chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </summary>
+          <div class="domain-details">
+            <div class="detail-panel">
+              <h3>Configuration</h3>
+              <div class="detail-row"><div class="detail-label">Name:</div><div class="detail-value">${name}</div></div>
+              <div class="detail-row"><div class="detail-label">Hostname:</div><div class="detail-value" style="text-transform: lowercase;">${hostname}</div></div>
+              <div class="detail-row"><div class="detail-label">Type:</div><div class="detail-value">${type}</div></div>
+              <div class="detail-row"><div class="detail-label">Expected:</div><div class="detail-value" style="text-transform: lowercase;">${expectedUl}</div></div>
+            </div>
+            <div class="detail-panel">
+              <h3>Live Status</h3>
+              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value">${statusText}</div></div>
+              ${sslRow}
+              <div class="detail-row"><div class="detail-label">Found:</div><div class="detail-value" style="text-transform: lowercase;">${found}</div></div>
+              ${state.error ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value" style="color: var(--error);">${state.error}</div></div>` : ''}
+            </div>
+          </div>
+        `;
+        container.appendChild(card);
+      }
+
+      if (currentView === 'dns') {
+        renderStats(Object.keys(dnsChecks).length, healthyCount, issueCount, 0, expiringCertCount);
+      }
+    }
+
+    fetchState();
+  </script>
+</body>
+
+</html>
