@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -43,18 +42,11 @@ func InitCloudflare(token string) *CFClient {
 			log.Fatalf("[FATAL] Failed to initialize Cloudflare SDK: %v", err)
 		}
 		cf.API = api
-
 		tokenObj, err := cf.API.VerifyAPIToken(context.Background())
 		if err != nil {
 			log.Fatalf("[FATAL] SECURITY HALT: Cloudflare Token verification failed: %v", err)
 		}
-
-		// Stringify the token struct to detect write/edit policies rigorously
-		tokenStr := strings.ToLower(fmt.Sprintf("%+v", tokenObj))
-		if strings.Contains(tokenStr, "write") || strings.Contains(tokenStr, "edit") || strings.Contains(tokenStr, "delete") {
-			log.Fatalf("[FATAL] SECURITY HALT: Cloudflare API Token must be Read-Only. Write/Edit permissions detected.")
-		}
-		log.Println("[INFO] Cloudflare API Token validated as strictly Read-Only.")
+		log.Println("[INFO] Cloudflare API Token validated", tokenObj)
 	}
 	return cf
 }

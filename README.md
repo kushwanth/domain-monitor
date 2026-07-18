@@ -38,7 +38,7 @@ local TUNNEL = "TUNNEL";
   },
 
   providers: {
-    cloudflare_token: "YOUR_READ_ONLY_TOKEN", 
+    cloudflare_token: "YOUR_CLOUDFLARE_TOKEN", 
   },
   
   resolvers: ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"], 
