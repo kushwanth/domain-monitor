@@ -14,17 +14,17 @@ RUN apk add --no-cache upx
 # Run tests to natively block compilation if logic fails
 RUN go test ./src/... -v
 # Build a fully static, stripped binary with trimmed paths
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -a -tags netgo -ldflags="-w -s -extldflags '-static'" -o rdap-monitor ./src
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -a -tags netgo -ldflags="-w -s -extldflags '-static'" -o domain-monitor ./src
 # Compress the binary
-RUN upx -9 rdap-monitor
+RUN upx -9 domain-monitor
 
 # Stage 3: Ultra-Minimal Production Image (Distroless)
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /app
-COPY --from=builder /app/rdap-monitor /app/rdap-monitor
+COPY --from=builder /app/domain-monitor /app/domain-monitor
 
 # Use the nonroot user for security
 USER 65532:65532
 
 EXPOSE 8080
-ENTRYPOINT ["/app/rdap-monitor"]
+ENTRYPOINT ["/app/domain-monitor"]

@@ -1,15 +1,20 @@
 package main
 
 import (
+	"sync"
 	"testing"
 )
 
 // MockNotifier implements the Notifier interface for testing
 type MockNotifier struct {
 	MessagesSent int
+	mu           sync.Mutex
 }
 
-func (m *MockNotifier) Send(alerts []Alert) {
+func (m *MockNotifier) Send(alerts []Alert, wg *sync.WaitGroup) {
+	defer wg.Done()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.MessagesSent += len(alerts)
 }
 

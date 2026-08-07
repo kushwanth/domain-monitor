@@ -2,15 +2,18 @@ package main
 
 import (
 	_ "embed"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
+	"html/template"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,6 +23,9 @@ import (
 
 //go:embed index.html
 var indexHTML []byte
+
+var prerenderedHTML atomic.Value
+var prerenderedJSON atomic.Value
 
 func setupHTTPServer(port string, firstRunDone chan struct{}) *http.Server {
 	mux := http.NewServeMux()
@@ -32,10 +38,11 @@ func setupHTTPServer(port string, firstRunDone chan struct{}) *http.Server {
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "public, max-age=300")
-
-		LiveState.RLock()
-		defer LiveState.RUnlock()
-		json.NewEncoder(w).Encode(LiveState)
+		if b, ok := prerenderedJSON.Load().([]byte); ok {
+			w.Write(b)
+		} else {
+			w.Write([]byte("{}"))
+		}
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -44,12 +51,19 @@ func setupHTTPServer(port string, firstRunDone chan struct{}) *http.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(indexHTML)
+		if b, ok := prerenderedHTML.Load().([]byte); ok {
+			w.Write(b)
+		} else {
+			w.Write([]byte("Loading..."))
+		}
 	})
 
 	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	go func() {
@@ -73,7 +87,9 @@ func main() {
 		configPath = os.Getenv("CONFIG_PATH")
 	}
 
-	app, err := LoadConfig(configPath)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	app, err := LoadConfig(ctx, configPath)
 	if err != nil {
 		log.Fatalf("[FATAL] Configuration error: %v", err)
 	}
@@ -81,16 +97,12 @@ func main() {
 	rdapClient := &rdap.Client{}
 	log.Printf(MsgLogStartup, len(app.Config.Domains), len(app.Config.DNSRecords))
 
-	ctx, cancel := context.WithCancel(context.Background())
 
-	for _, dt := range app.Config.Domains {
-		UpdateRDAPState(dt.Domain, map[string]interface{}{"status": "pending"})
-	}
 
 	firstRunDone := make(chan struct{})
 	server := setupHTTPServer(app.Config.Port, firstRunDone)
 
-	// Unified Execution Engine
+	// Execute concurrent engine
 	go func() {
 		maxWorkers := runtime.NumCPU()
 		if maxWorkers < 2 {
@@ -101,43 +113,67 @@ func main() {
 
 		for {
 
-			// Phase 1: High-Speed Concurrent DNS & Email Security
+			loopState := &CheckState{
+				RDAP:  make(map[string]map[string]interface{}),
+				DNS:   make(map[string]map[string]interface{}),
+				Email: make(map[string]map[string]interface{}),
+			}
+
+			for _, dt := range app.Config.Domains {
+				loopState.UpdateState("rdap", dt.Domain, map[string]interface{}{"status": "pending"})
+			}
+
+			// Execute DNS & Email concurrently
 			g, _ := errgroup.WithContext(ctx)
 			g.SetLimit(maxWorkers)
 
-			// Dispatch DNS Records
+			// Dispatch DNS
 			for _, dnc := range app.Config.DNSRecords {
 				record := dnc
 				g.Go(func() error {
-					evaluateDNS(app, record)
+					evaluateDNS(app, record, loopState)
 					return nil
 				})
 			}
 
-			// Dispatch Email Security
+			// Dispatch Email
 			for _, dt := range app.Config.Domains {
 				domain := dt
 				g.Go(func() error {
-					evaluateEmailSecurity(app, domain)
+					evaluateEmailSecurity(app, domain, loopState)
 					return nil
 				})
 			}
 
-			g.Wait() // Wait for DNS & Email to finish
+			g.Wait()
 
-			// Phase 2: Sequential Rate-Limited RDAP Sweep
+			// Run RDAP sequentially with rate limits
 			for _, dt := range app.Config.Domains {
 				select {
 				case <-ctx.Done():
 					return
 				default:
-					evaluateRDAP(rdapClient, app, dt)
+					evaluateRDAP(rdapClient, app, dt, loopState)
 					time.Sleep(app.ReqDelay)
 				}
 			}
 
-			// Phase 3: Flush Consolidated Notifications
+			// Dispatch notifications
 			app.Notifier.Flush()
+
+			// Pre-render JSON and HTML
+			loopState.NextRefresh = time.Now().Add(app.LoopDuration).UTC().Format(time.RFC3339)
+			jsonBytes, _ := json.Marshal(loopState)
+			prerenderedJSON.Store(jsonBytes)
+			
+			tmpl, err := template.New("index").Parse(string(indexHTML))
+			if err == nil {
+				var buf bytes.Buffer
+				tmpl.Execute(&buf, map[string]interface{}{
+					"StateJSON": template.JS(jsonBytes),
+				})
+				prerenderedHTML.Store(buf.Bytes())
+			}
 
 			if isFirstRun {
 				close(firstRunDone)
@@ -168,40 +204,32 @@ func main() {
 	defer shutdownCancel()
 	server.Shutdown(shutdownCtx)
 
+	// Wait for notifications to complete
+	app.Notifier.Wait()
+
 	log.Println(MsgLogShutdownComplete)
 }
 
 type CheckState struct {
-	sync.RWMutex
+	sync.Mutex
 	RDAP        map[string]map[string]interface{} `json:"rdap_checks"`
 	DNS         map[string]map[string]interface{} `json:"dns_checks"`
 	Email       map[string]map[string]interface{} `json:"email_checks"`
 	LastUpdated string                            `json:"last_updated"`
+	NextRefresh string                            `json:"next_refresh"`
 }
 
-var LiveState = &CheckState{
-	RDAP:  make(map[string]map[string]interface{}),
-	DNS:   make(map[string]map[string]interface{}),
-	Email: make(map[string]map[string]interface{}),
-}
+func (c *CheckState) UpdateState(category, key string, data map[string]interface{}) {
+	c.Lock()
+	defer c.Unlock()
 
-func UpdateRDAPState(domain string, data map[string]interface{}) {
-	LiveState.Lock()
-	defer LiveState.Unlock()
-	LiveState.RDAP[domain] = data
-	LiveState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
-}
-
-func UpdateDNSState(record string, data map[string]interface{}) {
-	LiveState.Lock()
-	defer LiveState.Unlock()
-	LiveState.DNS[record] = data
-	LiveState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
-}
-
-func UpdateEmailState(domain string, data map[string]interface{}) {
-	LiveState.Lock()
-	defer LiveState.Unlock()
-	LiveState.Email[domain] = data
-	LiveState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+	switch category {
+	case "rdap":
+		c.RDAP[key] = data
+	case "dns":
+		c.DNS[key] = data
+	case "email":
+		c.Email[key] = data
+	}
+	c.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 }

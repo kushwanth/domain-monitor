@@ -1,35 +1,17 @@
 package main
 
 import (
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"testing"
 )
 
 func TestCloudflareCIDRLoading(t *testing.T) {
-	// Create a mock HTTP server that returns fake Cloudflare IPs
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("192.0.2.0/24\n2001:db8::/32\n"))
-	}))
-	defer mockServer.Close()
-
 	cf := &CFClient{}
-
-	// Temporarily override the hardcoded URLs in a real scenario you'd pass these as arguments,
-	// but for this test, we validate the parsing logic manually mimicking the LoadCIDRs function.
-	resp, err := http.Get(mockServer.URL)
-	if err != nil {
-		t.Fatalf("Failed to reach mock server: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// Mimic the internal parsing logic of LoadCIDRs
-	cf.CIDRs = cf.LoadCIDRsFromReader(resp.Body)
-
-	if len(cf.CIDRs) != 2 {
-		t.Fatalf("Expected 2 CIDR blocks, got %d", len(cf.CIDRs))
-	}
+	
+	// Manually populate CIDRs for testing IsCloudflareIP logic
+	_, ipnet1, _ := net.ParseCIDR("192.0.2.0/24")
+	_, ipnet2, _ := net.ParseCIDR("2001:db8::/32")
+	cf.CIDRs = []*net.IPNet{ipnet1, ipnet2}
 
 	tests := []struct {
 		name     string

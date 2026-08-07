@@ -23,7 +23,7 @@ type Alert struct {
 
 // Notifier interface allows easy expansion to Slack, Telegram, Discord, etc.
 type Notifier interface {
-	Send(alerts []Alert)
+	Send(alerts []Alert, wg *sync.WaitGroup)
 }
 
 // NotificationManager handles broadcasting to all configured providers
@@ -31,6 +31,7 @@ type NotificationManager struct {
 	Providers []Notifier
 	Buffer    []Alert
 	mu        sync.Mutex
+	wg        sync.WaitGroup
 }
 
 func (nm *NotificationManager) Dispatch(message, redacted, priority, tag, domain, name string) {
@@ -49,18 +50,27 @@ func (nm *NotificationManager) Dispatch(message, redacted, priority, tag, domain
 
 func (nm *NotificationManager) Flush() {
 	nm.mu.Lock()
-	alerts := nm.Buffer
-	nm.Buffer = nil
-	nm.mu.Unlock()
-
-	if len(alerts) == 0 {
+	if len(nm.Buffer) == 0 {
+		nm.mu.Unlock()
 		return
 	}
 
+	alerts := make([]Alert, len(nm.Buffer))
+	copy(alerts, nm.Buffer)
+	nm.Buffer = nm.Buffer[:0]
+	nm.mu.Unlock()
+
 	for _, provider := range nm.Providers {
-		provider.Send(alerts)
+		nm.wg.Add(1)
+		provider.Send(alerts, &nm.wg)
 	}
 }
+
+func (nm *NotificationManager) Wait() {
+	nm.wg.Wait()
+}
+
+
 
 // --- Ntfy Implementation ---
 
@@ -69,8 +79,9 @@ type NtfyProvider struct {
 	Auth string
 }
 
-func (n *NtfyProvider) Send(alerts []Alert) {
+func (n *NtfyProvider) Send(alerts []Alert, wg *sync.WaitGroup) {
 	go func() {
+		defer wg.Done()
 		var sb strings.Builder
 		highestPriority := "default"
 
@@ -111,8 +122,9 @@ type TelegramProvider struct {
 	ChatID string
 }
 
-func (t *TelegramProvider) Send(alerts []Alert) {
+func (t *TelegramProvider) Send(alerts []Alert, wg *sync.WaitGroup) {
 	go func() {
+		defer wg.Done()
 		var sb strings.Builder
 		sb.WriteString("⚠️ <b>Domain Monitor Alerts</b>\n\n")
 
@@ -168,7 +180,7 @@ const (
 	MsgAlertDNSMismatch = "[CRITICAL] Mismatch on %s (%s)! Missing expected: %s. Found: [%s]"
 
 	// DNS Info
-	MsgLogDNSSuccess    = "[INFO] ✓ DNS: %s (%s) -> [%s]"
+
 	MsgLogDNSCFDetect   = "[INFO] Auto-detected %s as Cloudflare Proxied. Pivoting to API SDK."
 	MsgLogDNSCFBypass   = "[WARN] %s requires Cloudflare API but token is missing. Skipping backend verification."
 	MsgLogDNSCustomFail = "[WARN] Custom resolver %s failed for %s. Falling back to global pool."
@@ -183,13 +195,7 @@ const (
 	MsgAlertEmailNoDKIM    = "[HIGH] No valid DKIM records found for %s (checked: %s)"
 
 	// Email Security Info
-	MsgLogEmailCustomMX     = "[INFO] ✓ Email Security (Custom MX): %s -> [%s]"
 	MsgLogEmailUnknownProv  = "[WARN] Unknown mail_provider '%s' for %s. Skipping MX hijack prevention."
-	MsgLogEmailSPFFail      = "[WARN] SPF lookup failed for %s: %v"
-	MsgLogEmailDMARCFail    = "[WARN] DMARC lookup failed for %s: %v"
-	MsgLogEmailDKIMFail     = "[WARN] DKIM lookup failed for %s: %v"
-	MsgLogEmailSuccess      = "[INFO] ✓ Email Security: %s | Provider: %s | SPF: %v | DMARC: %v | DKIM: %d valid"
-	MsgLogEmailBasicSuccess = "[INFO] ✓ Email Security (Basic MX): %s -> [%s]"
 
 	// RDAP Alerts
 	MsgAlertRDAPExpiry    = "%s expires in %.0f days"
@@ -201,11 +207,7 @@ const (
 
 	// RDAP Info
 	MsgLogRDAPFail    = "[ERROR] RDAP query failed for %s: %v"
-	MsgLogRDAPSuccess = "[INFO] ✓ RDAP: %s | DNSSEC: %s | Statuses: [%s]"
 
-	// Cloudflare Info
-	MsgLogCFValid = "[INFO] Cloudflare API Token validated as strictly Read-Only."
-	MsgLogCFCIDRs = "[INFO] Fetched %d Cloudflare CIDR blocks"
 
 	// System Info
 	MsgLogStartup          = "[INFO] Daemon initialized successfully. Domains: %d, DNS Records: %d"

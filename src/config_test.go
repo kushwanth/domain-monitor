@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -52,7 +53,7 @@ func TestLoadConfig(t *testing.T) {
 			cfgPath := tmpDir + "/config.json"
 			os.WriteFile(cfgPath, []byte(tt.configJSON), 0644)
 
-			app, err := LoadConfig(cfgPath)
+			app, err := LoadConfig(context.Background(), cfgPath)
 			if tt.expectErr {
 				if err == nil {
 					t.Fatalf("Expected error containing '%s', got nil", tt.errContains)

@@ -9,11 +9,11 @@ import (
 	"github.com/openrdap/rdap"
 )
 
-func evaluateRDAP(client *rdap.Client, app *AppState, target DomainConfig) {
+func evaluateRDAP(client *rdap.Client, app *AppState, target DomainConfig, state *CheckState) {
 	domainInfo, err := client.QueryDomain(target.Domain)
 	if err != nil {
 		log.Printf(MsgLogRDAPFail, target.Domain, err)
-		UpdateRDAPState(target.Domain, map[string]interface{}{
+		state.UpdateState("rdap", target.Domain, map[string]interface{}{
 			"status": "failed",
 			"error":  err.Error(),
 		})
@@ -137,7 +137,7 @@ func evaluateRDAP(client *rdap.Client, app *AppState, target DomainConfig) {
 		dnssec = true
 	}
 
-	UpdateRDAPState(target.Domain, map[string]interface{}{
+	state.UpdateState("rdap", target.Domain, map[string]interface{}{
 		"status":        "ok",
 		"expiration":    expirationDate,
 		"last_changed":  lastChangedDate,

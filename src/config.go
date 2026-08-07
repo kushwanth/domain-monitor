@@ -76,7 +76,7 @@ type AppState struct {
 	StateLastChanged map[string]string
 }
 
-func LoadConfig(path string) (*AppState, error) {
+func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	if path == "" {
 		path = "config.jsonnet"
 	}
@@ -222,15 +222,12 @@ func LoadConfig(path string) (*AppState, error) {
 			r.Expected[j] = cleanVal
 		}
 
-		if r.Type == "TUNNEL" && r.Provider != "cloudflare" {
-			log.Fatalf("[FATAL] Record %s uses type TUNNEL, which requires 'provider: \"cloudflare\"' to resolve tunnel names via API.", r.Hostname)
-		}
 	}
 
 	app := &AppState{
 		Config:           &rawCfg,
 		Notifier:         nm,
-		CF:               InitCloudflare(rawCfg.Providers.CloudflareToken),
+		CF:               InitCloudflare(ctx, rawCfg.Providers.CloudflareToken),
 		StateLastChanged: make(map[string]string),
 	}
 

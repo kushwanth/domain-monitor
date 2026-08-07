@@ -1,5 +1,5 @@
 [Unit]
-Description=RDAP and DNS Security Monitor
+Description=Domains and DNS Security Monitor
 After=network-online.target
 
 [Container]

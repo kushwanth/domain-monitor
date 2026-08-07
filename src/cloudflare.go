@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"io"
 	"log"
 	"net"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +19,7 @@ type CFClient struct {
 	CacheMutex sync.RWMutex
 }
 
-func InitCloudflare(token string) *CFClient {
+func InitCloudflare(ctx context.Context, token string) *CFClient {
 	cf := &CFClient{
 		ZoneCache: make(map[string]string),
 	}
@@ -31,51 +29,42 @@ func InitCloudflare(token string) *CFClient {
 	// Auto-refresh CF IPs every 24 hours
 	go func() {
 		for {
-			time.Sleep(24 * time.Hour)
-			cf.LoadCIDRs()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(24 * time.Hour):
+				cf.LoadCIDRs()
+			}
 		}
 	}()
 
 	if token != "" {
-		api, err := cloudflare.NewWithAPIToken(token)
+		cfApi, err := cloudflare.NewWithAPIToken(token)
 		if err != nil {
 			log.Fatalf("[FATAL] Failed to initialize Cloudflare SDK: %v", err)
 		}
-		cf.API = api
-		tokenObj, err := cf.API.VerifyAPIToken(context.Background())
-		if err != nil {
+		_, verificationErr := cfApi.VerifyAPIToken(context.Background())
+		if verificationErr != nil {
 			log.Fatalf("[FATAL] SECURITY HALT: Cloudflare Token verification failed: %v", err)
 		}
-		log.Println("[INFO] Cloudflare API Token validated", tokenObj)
+		cf.API = cfApi
 	}
 	return cf
 }
 
-func (cf *CFClient) LoadCIDRsFromReader(r io.Reader) []*net.IPNet {
+func (cf *CFClient) LoadCIDRs() {
+	ranges, err := cloudflare.IPs()
+	if err != nil {
+		log.Printf("[WARN] Failed to fetch Cloudflare IPs: %v", err)
+		return
+	}
+
 	var newCIDRs []*net.IPNet
-	body, _ := io.ReadAll(r)
-	for _, line := range strings.Split(string(body), "\n") {
-		if _, ipnet, err := net.ParseCIDR(strings.TrimSpace(line)); err == nil {
+	allCIDRs := append(ranges.IPv4CIDRs, ranges.IPv6CIDRs...)
+	for _, cidr := range allCIDRs {
+		if _, ipnet, err := net.ParseCIDR(cidr); err == nil {
 			newCIDRs = append(newCIDRs, ipnet)
 		}
-	}
-	return newCIDRs
-}
-
-func (cf *CFClient) LoadCIDRs() {
-	var newCIDRs []*net.IPNet
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	for _, u := range []string{"https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6"} {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
-		resp, err := client.Do(req)
-		if err == nil {
-			cidrs := cf.LoadCIDRsFromReader(resp.Body)
-			newCIDRs = append(newCIDRs, cidrs...)
-			resp.Body.Close()
-		}
-		cancel()
 	}
 
 	cf.CacheMutex.Lock()
@@ -131,8 +120,8 @@ func (cf *CFClient) FetchBackendRecords(hostname, recType string) ([]string, err
 	}
 
 	searchType := recType
-	if recType == "TUNNEL" {
-		searchType = "" // Fetch all, we'll manually filter if needed, as API behavior varies for tunnels
+	if recType == "IP" {
+		searchType = ""
 	}
 
 	records, _, err := cf.API.ListDNSRecords(context.Background(), cloudflare.ZoneIdentifier(zoneID), cloudflare.ListDNSRecordsParams{
@@ -145,13 +134,9 @@ func (cf *CFClient) FetchBackendRecords(hostname, recType string) ([]string, err
 
 	var backends []string
 	for _, r := range records {
-		if recType == "TUNNEL" {
-			// In overhauled Cloudflare API/UI, Tunnel records might show as type "tunnel" or just have the tunnel name in content.
-			// Or they might still be CNAMEs pointing to .cfargotunnel.com
-			if strings.ToLower(r.Type) == "tunnel" || strings.ToLower(r.Type) == "cname" {
-				// Strip .cfargotunnel.com just in case it's exposed as the full CNAME
-				content := strings.TrimSuffix(strings.ToLower(r.Content), ".cfargotunnel.com")
-				backends = append(backends, content)
+		if recType == "IP" {
+			if r.Type == "A" || r.Type == "AAAA" {
+				backends = append(backends, strings.ToLower(r.Content))
 			}
 		} else if searchType == "" || r.Type == searchType {
 			backends = append(backends, strings.ToLower(r.Content))

@@ -20,30 +20,42 @@ func checkSSL(hostname string, ips []string) (int, error) {
 		dialHost = strings.Replace(dialHost, "*.", "www.", 1)
 	}
 
-	targetAddr := dialHost + ":443"
+	var lastErr error
+	targets := []string{dialHost + ":443"}
 	if len(ips) > 0 {
-		if net.ParseIP(ips[0]) != nil {
-			ipStr := ips[0]
-			if strings.Contains(ipStr, ":") && !strings.HasPrefix(ipStr, "[") {
-				ipStr = "[" + ipStr + "]"
+		targets = []string{}
+		for _, ipStr := range ips {
+			if net.ParseIP(ipStr) != nil {
+				if strings.Contains(ipStr, ":") && !strings.HasPrefix(ipStr, "[") {
+					ipStr = "[" + ipStr + "]"
+				}
+				targets = append(targets, ipStr+":443")
 			}
-			targetAddr = ipStr + ":443"
 		}
 	}
-
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", targetAddr, &tls.Config{
-		ServerName:         dialHost,
-		InsecureSkipVerify: true,
-	})
-	if err != nil {
-		return -1, err
+	if len(targets) == 0 {
+		targets = []string{dialHost + ":443"}
 	}
-	defer conn.Close()
-	cert := conn.ConnectionState().PeerCertificates[0]
-	return int(time.Until(cert.NotAfter).Hours() / 24), nil
+
+	for _, targetAddr := range targets {
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", targetAddr, &tls.Config{
+			ServerName:         dialHost,
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		cert := conn.ConnectionState().PeerCertificates[0]
+		days := int(time.Until(cert.NotAfter).Hours() / 24)
+		conn.Close()
+		return days, nil
+	}
+
+	return -1, lastErr
 }
 
-func evaluateDNS(app *AppState, target DNSTask) {
+func evaluateDNS(app *AppState, target DNSTask, state *CheckState) {
 	var foundRecords []string
 	var err error
 
@@ -66,7 +78,9 @@ func evaluateDNS(app *AppState, target DNSTask) {
 			"TXT":   dns.TypeTXT,
 		}
 
-		if qType, ok := dnsTypeMap[target.Type]; ok {
+		if target.Type == "IP" {
+			foundRecords, err = queryIPRecords(target.Hostname, resolvers)
+		} else if qType, ok := dnsTypeMap[target.Type]; ok {
 			foundRecords, err = queryDNS(target.Hostname, qType, resolvers)
 			
 			// CNAME Flattening
@@ -105,15 +119,19 @@ func evaluateDNS(app *AppState, target DNSTask) {
 	// Resilient Fallback mechanism
 	if !isCF && err != nil && target.CustomResolver != "" {
 		log.Printf(MsgLogDNSCustomFail, target.CustomResolver, target.Hostname)
-		dnsTypeMap := map[string]uint16{
-			"A":     dns.TypeA,
-			"AAAA":  dns.TypeAAAA,
-			"CNAME": dns.TypeCNAME,
-			"MX":    dns.TypeMX,
-			"TXT":   dns.TypeTXT,
-		}
-		if qType, ok := dnsTypeMap[target.Type]; ok {
-			foundRecords, err = queryDNS(target.Hostname, qType, app.Config.Resolvers)
+		if target.Type == "IP" {
+			foundRecords, err = queryIPRecords(target.Hostname, app.Config.Resolvers)
+		} else {
+			dnsTypeMap := map[string]uint16{
+				"A":     dns.TypeA,
+				"AAAA":  dns.TypeAAAA,
+				"CNAME": dns.TypeCNAME,
+				"MX":    dns.TypeMX,
+				"TXT":   dns.TypeTXT,
+			}
+			if qType, ok := dnsTypeMap[target.Type]; ok {
+				foundRecords, err = queryDNS(target.Hostname, qType, app.Config.Resolvers)
+			}
 		}
 	}
 
@@ -122,7 +140,7 @@ func evaluateDNS(app *AppState, target DNSTask) {
 		redacted := fmt.Sprintf("DNS Resolution Failed for %s (%s).", target.Hostname, target.Type)
 		app.Notifier.Dispatch(msg, redacted, "urgent", "rotating_light", target.Hostname, target.Name)
 		recordKey := fmt.Sprintf("%s_%s", target.Hostname, target.Type)
-		UpdateDNSState(recordKey, map[string]interface{}{
+		state.UpdateState("dns", recordKey, map[string]interface{}{
 			"hostname": target.Hostname,
 			"name":     target.Name,
 			"type":     target.Type,
@@ -134,7 +152,7 @@ func evaluateDNS(app *AppState, target DNSTask) {
 	}
 
 	// Smart Auto-Detect Logic (Cloudflare)
-	if !isCF && app.CF.API != nil && (target.Type == "A" || target.Type == "AAAA") {
+	if !isCF && app.CF.API != nil && (target.Type == "A" || target.Type == "AAAA" || target.Type == "IP") {
 		isCF = true
 		for _, rec := range foundRecords {
 			if !app.CF.IsCloudflareIP(rec) {
@@ -144,15 +162,13 @@ func evaluateDNS(app *AppState, target DNSTask) {
 		}
 	}
 
-	if isCF && (len(foundRecords) > 0 || target.Type == "TUNNEL") {
-		if target.Type != "TUNNEL" {
-			log.Printf(MsgLogDNSCFDetect, target.Hostname)
-		}
+	if isCF && len(foundRecords) > 0 {
+		log.Printf(MsgLogDNSCFDetect, target.Hostname)
 
 		if app.CF.API == nil {
 			log.Printf(MsgLogDNSCFBypass, target.Hostname)
 			recordKey := fmt.Sprintf("%s_%s", target.Hostname, target.Type)
-			UpdateDNSState(recordKey, map[string]interface{}{
+			state.UpdateState("dns", recordKey, map[string]interface{}{
 				"hostname": target.Hostname,
 				"name":     target.Name,
 				"type":     target.Type,
@@ -165,7 +181,7 @@ func evaluateDNS(app *AppState, target DNSTask) {
 		foundRecords, err = app.CF.FetchBackendRecords(target.Hostname, target.Type)
 		if err != nil {
 			recordKey := fmt.Sprintf("%s_%s", target.Hostname, target.Type)
-			UpdateDNSState(recordKey, map[string]interface{}{
+			state.UpdateState("dns", recordKey, map[string]interface{}{
 				"hostname": target.Hostname,
 				"name":     target.Name,
 				"type":     target.Type,
@@ -195,14 +211,14 @@ func evaluateDNS(app *AppState, target DNSTask) {
 
 	// Check SSL concurrently while assembling state
 	sslDays := -1
-	if target.Type == "A" || target.Type == "AAAA" || target.Type == "CNAME" || target.Type == "TUNNEL" {
+	if target.Type == "A" || target.Type == "AAAA" || target.Type == "IP" || target.Type == "CNAME" {
 		if days, err := checkSSL(target.Hostname, foundRecords); err == nil {
 			sslDays = days
 		}
 	}
 
 	if allMatch {
-		UpdateDNSState(recordKey, map[string]interface{}{
+		state.UpdateState("dns", recordKey, map[string]interface{}{
 			"hostname": target.Hostname,
 			"name":     target.Name,
 			"type":     target.Type,
@@ -212,7 +228,7 @@ func evaluateDNS(app *AppState, target DNSTask) {
 			"ssl_days": sslDays,
 		})
 	} else {
-		UpdateDNSState(recordKey, map[string]interface{}{
+		state.UpdateState("dns", recordKey, map[string]interface{}{
 			"hostname": target.Hostname,
 			"name":     target.Name,
 			"type":     target.Type,
@@ -246,6 +262,7 @@ func queryDNS(hostname string, qtype uint16, resolvers []string) ([]string, erro
 	// Ensure the hostname ends with a dot for FQDN format required by miekg/dns
 	fqdn := dns.Fqdn(hostname)
 	m.SetQuestion(fqdn, qtype)
+	m.RecursionDesired = true
 
 	r, _, err := c.Exchange(m, ip)
 	if err != nil {
@@ -286,4 +303,21 @@ func queryDNS(hostname string, qtype uint16, resolvers []string) ([]string, erro
 	}
 
 	return results, nil
+}
+
+func queryIPRecords(hostname string, resolvers []string) ([]string, error) {
+	aRecords, aErr := queryDNS(hostname, dns.TypeA, resolvers)
+	aaaaRecords, aaaaErr := queryDNS(hostname, dns.TypeAAAA, resolvers)
+	
+	var found []string
+	if aErr == nil {
+		found = append(found, aRecords...)
+	}
+	if aaaaErr == nil {
+		found = append(found, aaaaRecords...)
+	}
+	if aErr != nil && aaaaErr != nil {
+		return found, fmt.Errorf("lookup failed for A and AAAA: %v, %v", aErr, aaaaErr)
+	}
+	return found, nil
 }

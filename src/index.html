@@ -412,8 +412,11 @@
     </div>
   </main>
 
+  <script type="application/json" id="app-state">
+    {{ .StateJSON }}
+  </script>
   <script>
-    let appState = { domains: {}, dns: {} };
+    let appState = JSON.parse(document.getElementById('app-state').textContent || '{}');
     let currentView = 'domains';
 
     // Theme initialization
@@ -469,22 +472,44 @@
       `;
     }
 
-    async function fetchState() {
+    function formatUserTzDate(isoString) {
+      if (!isoString) return '';
+      
+      let dateStr = '';
+      let tz = '';
       try {
-        const res = await fetch('/api/state');
-        const data = await res.json();
-        appState = data;
-
-        if (appState.last_updated) {
-          const updatedDate = new Date(appState.last_updated).toLocaleString();
-          document.getElementById('last-updated').innerText = `Last Updated: ${updatedDate}`;
+        tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+      } catch (e) {
+        tz = '';
+      }
+      const tzSuffix = tz ? ` (${tz})` : '';
+      
+      try {
+        if (window.Temporal && window.Temporal.Instant) {
+          dateStr = Temporal.Instant.from(isoString).toLocaleString(navigator.language);
+        } else {
+          dateStr = new Date(isoString).toLocaleString();
         }
+      } catch (e) {
+        dateStr = new Date(isoString).toLocaleString();
+      }
+      return dateStr + tzSuffix;
+    }
 
+    function initialize() {
+        if (appState.last_updated) {
+          const updatedDate = formatUserTzDate(appState.last_updated);
+          let txt = `Last Updated: ${updatedDate}`;
+          if (appState.next_refresh) {
+              const nextDate = formatUserTzDate(appState.next_refresh);
+              txt += `<br>Next Update: ${nextDate}`;
+          }
+          document.getElementById('last-updated').innerHTML = txt;
+        } else {
+          document.getElementById('last-updated').innerText = 'Initializing... (Please wait)';
+        }
         renderDomains();
         renderDNS();
-      } catch (e) {
-        console.error("Failed to fetch state", e);
-      }
     }
 
     function formatTitleCase(str) {
@@ -723,7 +748,7 @@
       }
     }
 
-    fetchState();
+    initialize();
   </script>
 </body>
 

@@ -31,7 +31,7 @@ var providerDKIMMap = map[string][]string{
 	"zoho":       {"zoho", "zmail"},
 }
 
-func evaluateEmailSecurity(app *AppState, target DomainConfig) {
+func evaluateEmailSecurity(app *AppState, target DomainConfig, state *CheckState) {
 	if !target.CheckEmailSecurity {
 		return
 	}
@@ -43,7 +43,7 @@ func evaluateEmailSecurity(app *AppState, target DomainConfig) {
 		if !target.SuppressAlerts {
 			app.Notifier.Dispatch(msg, redacted, "urgent", "envelope", target.Domain, target.Name)
 		}
-		UpdateEmailState(target.Domain, map[string]interface{}{"status": "failed", "error": "No MX records found"})
+		state.UpdateState("email", target.Domain, map[string]interface{}{"status": "failed", "error": "No MX records found"})
 		return
 	}
 
@@ -69,9 +69,9 @@ func evaluateEmailSecurity(app *AppState, target DomainConfig) {
 			}
 		}
 		if allMatch {
-			UpdateEmailState(target.Domain, map[string]interface{}{"status": "ok", "type": "custom_mx", "found": liveMXs})
+			state.UpdateState("email", target.Domain, map[string]interface{}{"status": "ok", "type": "custom_mx", "found": liveMXs})
 		} else {
-			UpdateEmailState(target.Domain, map[string]interface{}{"status": "mismatch", "type": "custom_mx", "found": liveMXs})
+			state.UpdateState("email", target.Domain, map[string]interface{}{"status": "mismatch", "type": "custom_mx", "found": liveMXs})
 		}
 		return
 	}
@@ -100,7 +100,7 @@ func evaluateEmailSecurity(app *AppState, target DomainConfig) {
 				if !target.SuppressAlerts {
 					app.Notifier.Dispatch(msg, redacted, "urgent", "rotating_light", target.Domain, target.Name)
 				}
-				UpdateEmailState(target.Domain, map[string]interface{}{"status": "hijacked", "found": liveMXs})
+				state.UpdateState("email", target.Domain, map[string]interface{}{"status": "hijacked", "found": liveMXs})
 				return
 			}
 		}
@@ -193,7 +193,7 @@ func evaluateEmailSecurity(app *AppState, target DomainConfig) {
 			}
 		}
 
-		UpdateEmailState(target.Domain, map[string]interface{}{
+		state.UpdateState("email", target.Domain, map[string]interface{}{
 			"status":     "ok",
 			"type":       "provider",
 			"provider":   target.MailProvider,
@@ -203,6 +203,6 @@ func evaluateEmailSecurity(app *AppState, target DomainConfig) {
 			"mx":         liveMXs,
 		})
 	} else {
-		UpdateEmailState(target.Domain, map[string]interface{}{"status": "ok", "type": "basic", "mx": liveMXs})
+		state.UpdateState("email", target.Domain, map[string]interface{}{"status": "ok", "type": "basic", "mx": liveMXs})
 	}
 }
