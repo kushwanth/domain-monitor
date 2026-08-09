@@ -20,6 +20,10 @@ type CFClient struct {
 }
 
 func InitCloudflare(ctx context.Context, token string) *CFClient {
+	if token == "" {
+		return nil
+	}
+
 	cf := &CFClient{
 		ZoneCache: make(map[string]string),
 	}
@@ -38,17 +42,16 @@ func InitCloudflare(ctx context.Context, token string) *CFClient {
 		}
 	}()
 
-	if token != "" {
-		cfApi, err := cloudflare.NewWithAPIToken(token)
-		if err != nil {
-			log.Fatalf("[FATAL] Failed to initialize Cloudflare SDK: %v", err)
-		}
-		_, verificationErr := cfApi.VerifyAPIToken(context.Background())
-		if verificationErr != nil {
-			log.Fatalf("[FATAL] SECURITY HALT: Cloudflare Token verification failed: %v", err)
-		}
-		cf.API = cfApi
+	cfApi, err := cloudflare.NewWithAPIToken(token)
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to initialize Cloudflare SDK: %v", err)
 	}
+	_, verificationErr := cfApi.VerifyAPIToken(context.Background())
+	if verificationErr != nil {
+		log.Fatalf("[FATAL] SECURITY HALT: Cloudflare Token verification failed: %s, %v", token, verificationErr)
+	}
+	cf.API = cfApi
+
 	return cf
 }
 

@@ -152,7 +152,7 @@ func evaluateDNS(app *AppState, target DNSTask, state *CheckState) {
 	}
 
 	// Smart Auto-Detect Logic (Cloudflare)
-	if !isCF && app.CF.API != nil && (target.Type == "A" || target.Type == "AAAA" || target.Type == "IP") {
+	if !isCF && app.CF != nil && app.CF.API != nil && (target.Type == "A" || target.Type == "AAAA" || target.Type == "IP") {
 		isCF = true
 		for _, rec := range foundRecords {
 			if !app.CF.IsCloudflareIP(rec) {
@@ -165,7 +165,7 @@ func evaluateDNS(app *AppState, target DNSTask, state *CheckState) {
 	if isCF && len(foundRecords) > 0 {
 		log.Printf(MsgLogDNSCFDetect, target.Hostname)
 
-		if app.CF.API == nil {
+		if app.CF == nil || app.CF.API == nil {
 			log.Printf(MsgLogDNSCFBypass, target.Hostname)
 			recordKey := fmt.Sprintf("%s_%s", target.Hostname, target.Type)
 			state.UpdateState("dns", recordKey, map[string]interface{}{
