@@ -2,7 +2,7 @@
 
 A robust, lightweight, and highly performant Go daemon designed for homelabs to continuously monitor domain registrations (RDAP), verify DNS record integrity, and detect nameserver hijacks. 
 
-Built specifically for low-resource environments, this monitor uses a completely decoupled architecture, advanced DNS load balancing, and smart Cloudflare API integration to ensure your infrastructure is safe without triggering false positives or getting IP-banned by registries.
+Built specifically for low-resource environments, this monitor uses a completely decoupled architecture and advanced DNS load balancing to ensure your infrastructure is safe without triggering false positives or getting IP-banned by registries.
 
 ---
 
@@ -10,8 +10,7 @@ Built specifically for low-resource environments, this monitor uses a completely
 
 *   **Decoupled Worker Engines:** RDAP checks, standard DNS lookups, and Provider APIs run in completely independent, concurrent Goroutine worker pools scaled to your CPU core count.
 *   **Consolidated Notification Engine:** Alerts are buffered during each sweep and fired sequentially to prevent alert fatigue and network throttling.
-*   **Smart Cloudflare Integration:** Uses the official Go SDK. Automatically fetches CF IP ranges daily. If a domain routes through Cloudflare, it dynamically pivots to the SDK to verify your unproxied backend origin.
-*   **Strict Fail-Fast Security:** At startup, the daemon validates notification reachability, DNS resolver health, enforces mandatory `name` identifiers for privacy, and forcefully crashes if the provided Cloudflare token has write/edit/delete permissions.
+*   **Strict Fail-Fast Security:** At startup, the daemon validates notification reachability, DNS resolver health, and enforces mandatory `name` identifiers for privacy.
 *   **Safe K8s Bootstrapping:** The core backend HTTP server boots instantly for Docker/K8s liveness probes (`/health`), but gracefully blocks the `/api/state` endpoint until the very first execution sweep successfully populates the memory cache, guaranteeing no zero-state flashes.
 *   **Advanced DNS Resolving:** Define up to 9 custom global DNS resolvers with round-robin load balancing. Override resolvers at the individual record level for internal/split-horizon DNS.
 *   **Resilient Infrastructure:** Includes full Git pre-commit hooks, CI/CD GitHub Action pipelines, and a Dockerfile that natively blocks compilation if unit tests fail.
@@ -37,10 +36,7 @@ local TUNNEL = "TUNNEL";
     telegram: { token: "YOUR_BOT_TOKEN", chat_id: "YOUR_CHAT_ID" }
   },
 
-  providers: {
-    cloudflare_token: "YOUR_CLOUDFLARE_TOKEN", 
-  },
-  
+
   resolvers: ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"], 
 
   domains: [
@@ -52,6 +48,10 @@ local TUNNEL = "TUNNEL";
       mail_provider: "google",
       // mx_records: ["mx.custom.com"], // Mutually exclusive with mail_provider
       dkim_selectors: ["custom1", "custom2"],
+      dnssec: true,
+      caa: {
+        issue: ["letsencrypt.org", "digicert.com"]
+      },
       suppress_alerts: true // Set to true to mute notifications for this domain
     }
   ],
@@ -59,12 +59,6 @@ local TUNNEL = "TUNNEL";
   dns_records: [
     // Standard Resolution
     { hostname: "mail.example.com", name: "Mail Server", type: A, expected: ["192.0.2.100"] },
-    
-    // Direct API Bypass (Skips DNS)
-    { hostname: "api.example.com", name: "API Backend", type: A, expected: ["192.0.2.200"], provider: "cloudflare" },
-    
-    // Cloudflare Tunnel Native Verification (requires provider: "cloudflare")
-    { hostname: "app.example.com", name: "App Tunnel", type: TUNNEL, expected: ["my-tunnel-name"], provider: "cloudflare" },
     
     // Custom Resolver Override
     { hostname: "internal.example.com", name: "Internal DNS", type: A, expected: ["10.0.0.5"], custom_resolver: "10.0.0.1" }
@@ -111,7 +105,6 @@ For Linux environments, you can use the included `domain-monitor.container` file
 2. To avoid hardcoding sensitive tokens in your `config.jsonnet`, you can inject them securely using Podman Secrets. Create the secrets:
    ```bash
    echo "your_token" | podman secret create telegram-token -
-   echo "your_token" | podman secret create cloudflare-token -
    ```
 3. Update `domain-monitor.container` to map these secrets, and map non-sensitive configuration (like `TELEGRAM_CHAT_ID`) using standard `Environment=` fields.
 4. Reload systemd and start the container:
@@ -139,4 +132,4 @@ This project maintains strict testing requirements.
 
 ## Disclaimer: LLM Contribution
 
-**Note:** This Project is refined with the assistance of a Large Language Model (LLM). All logic has been reviewed and tested to ensure it meets strict security and performance requirements.
+**Note:** This Project is implemented with the assistance of a Large Language Model (LLM).

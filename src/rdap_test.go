@@ -9,10 +9,10 @@ func TestRDAPValidation(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		targetNS    []string
-		liveNS      []string
-		expectUnauth bool
+		name          string
+		targetNS      []string
+		liveNS        []string
+		expectUnauth  bool
 		expectMissing bool
 	}{
 		{
@@ -128,5 +128,55 @@ func TestRDAPStatusLock(t *testing.T) {
 				t.Errorf("Expected Suspended: %v, got %v", tt.expectSusp, isSuspended)
 			}
 		})
+	}
+}
+
+func TestValidateRDAPStateAlertsAndStatus(t *testing.T) {
+	t.Parallel()
+
+	app := &AppState{
+		Notifier: &NotificationManager{},
+	}
+	state := &CheckState{
+		RDAP: make(map[string]*RDAPState),
+	}
+
+	target := DomainConfig{
+		Domain:         "example.com",
+		Name:           "Example Domain",
+		ExpectedNS:     []string{"ns1.example.com", "ns2.example.com"},
+		SuppressAlerts: false,
+	}
+
+	// Case 1: Active domain with matching NS and lock
+	parsed1 := &RDAPState{
+		Status:       StatusOk,
+		Nameservers:  []string{"ns1.example.com", "ns2.example.com"},
+		DomainStatus: []string{"clientTransferProhibited"},
+	}
+	validateRDAPState(app, target, state, parsed1)
+
+	state.Lock()
+	savedState1 := state.RDAP["example.com"]
+	state.Unlock()
+
+	if savedState1.Status != StatusOk {
+		t.Errorf("Expected StatusOk, got %s", savedState1.Status)
+	}
+
+	// Case 2: Suspended domain (serverHold) -> Status should be StatusFailed
+	parsed2 := &RDAPState{
+		Status:       StatusOk,
+		Nameservers:  []string{"ns1.example.com", "ns2.example.com"},
+		DomainStatus: []string{"serverHold"},
+	}
+	validateRDAPState(app, target, state, parsed2)
+
+	state.Lock()
+	savedState2 := state.RDAP["example.com"]
+	state.Unlock()
+
+	if savedState2.Status != StatusFailed {
+		t.Errorf("Expected StatusFailed for serverHold, got %s", savedState2.Status)
 	}
 }

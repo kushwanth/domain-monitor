@@ -1,19 +1,22 @@
 local default_ns = ["ns1.example.com", "ns2.example.com"];
 local A = "A";
-local TUNNEL = "TUNNEL";
+local AAAA = "AAAA";
+local CNAME = "CNAME";
+local MX = "MX";
+local TXT = "TXT";
 
 {
   port: "8080",
   loop_interval: "6h",
   request_delay: "5s",
+  whois_delay: "10s",
+
+  // Optional: ctlogs.dev API key for higher rate limits on CT log monitoring
+  // ctlogs_api_key: "",
 
   notifications: {
-    ntfy: { url: "https://ntfy.sh/my_secret_topic", auth: "" },
-    telegram: { token: "YOUR_BOT_TOKEN_HERE", chat_id: "YOUR_CHAT_ID_HERE" }
-  },
-
-  providers: {
-    cloudflare_token: "YOUR_CLOUDFLARE_TOKEN_HERE", 
+    // ntfy: { url: "https://ntfy.sh/my_secret_topic", auth: "" },
+    // telegram: { token: "YOUR_BOT_TOKEN", chat_id: "YOUR_CHAT_ID" }
   },
   
   resolvers: ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"], 
@@ -21,27 +24,73 @@ local TUNNEL = "TUNNEL";
   domains: [
     { 
       domain: "example.com", 
-      name: "Prod Domain", 
-      expected_ns: default_ns,
+      name: "Example Prod Domain", 
+      expected_ns: ["a.iana-servers.net", "b.iana-servers.net"],
+      check_email_security: false,
+      monitor_ct_logs: true,
+      dnssec: true,
+      caa: {
+        issue: ["letsencrypt.org", "digicert.com"]
+      },
+      suppress_alerts: true
+    },
+    {
+      domain: "api.example.com",
+      name: "Example API Zone",
+      is_delegated_zone: true,
+      root_zone: "example.com",
+      expected_ns: ["ns1.example.net", "ns2.example.net"],
+      check_email_security: false,
+      dnssec: true,
+      caa: { issue: ["letsencrypt.org"] },
+      suppress_alerts: true
+    },
+    { 
+      domain: "example.net", 
+      name: "Example Net Main", 
+      expected_ns: ["a.iana-servers.net", "b.iana-servers.net"],
       check_email_security: true,
       mail_provider: "google",
-      // mx_records: ["mx.custom.com"], // Mutually exclusive with mail_provider
-      dkim_selectors: ["custom1", "custom2"],
-      suppress_alerts: true // Set to true to mute notifications for this domain
+      monitor_ct_logs: true,
+      dnssec: true,
+      caa: {
+        issue: ["digicert.com", "letsencrypt.org"],
+        issuewild: ["digicert.com", "letsencrypt.org"]
+      },
+      suppress_alerts: true
+    },
+    { 
+      domain: "example.org", 
+      name: "Example Org Main", 
+      expected_ns: ["a.iana-servers.net", "b.iana-servers.net"],
+      check_email_security: true,
+      mx_records: ["mail.example.org"],
+      dkim_selectors: ["default"],
+      monitor_ct_logs: true,
+      dnssec: true,
+      caa: {
+        issue: ["letsencrypt.org"]
+      },
+      suppress_alerts: true
+    },
+    { 
+      domain: "example.edu", 
+      name: "Example Edu Fallback", 
+      expected_ns: ["a.iana-servers.net", "b.iana-servers.net"],
+      check_email_security: false,
+      dnssec: false,
+      suppress_alerts: true
     }
   ],
 
   dns_records: [
-    // Standard Resolution
-    { hostname: "mail.example.com", name: "Mail Server", type: A, expected: ["192.0.2.100"] },
-    
-    // Direct API Bypass (Skips DNS)
-    { hostname: "api.example.com", name: "API Backend", type: A, expected: ["192.0.2.200"], provider: "cloudflare" },
-    
-    // Cloudflare Tunnel Native Verification (requires provider: "cloudflare")
-    { hostname: "app.example.com", name: "App Tunnel", type: TUNNEL, expected: ["my-tunnel-name"], provider: "cloudflare" },
-    
-    // Custom Resolver Override
-    { hostname: "internal.example.com", name: "Internal DNS", type: A, expected: ["10.0.0.5"], custom_resolver: "10.0.0.1" }
+    { hostname: "example.com", name: "Example A", type: A, expected: ["93.184.215.14"] },
+    { hostname: "example.com", name: "Example AAAA", type: AAAA, expected: ["2606:2800:21f:cb07:6820:80da:af6b:8b2c"] },
+    { hostname: "www.example.com", name: "Example WWW", type: A, expected: ["93.184.215.14"] },
+    { hostname: "example.net", name: "Example Net A", type: A, expected: ["93.184.215.14"] },
+    { hostname: "example.net", name: "Example Net MX", type: MX, expected: ["smtp.example.net"] },
+    { hostname: "example.net", name: "Example Net TXT", type: TXT, expected: ["v=spf1 include:_spf.example.net ~all"] },
+    { hostname: "www.example.net", name: "Example Net WWW", type: A, expected: ["93.184.215.14"] },
+    { hostname: "api.example.com", name: "Example API", type: A, expected: ["93.184.215.14"] }
   ]
 }

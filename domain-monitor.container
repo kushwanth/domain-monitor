@@ -8,7 +8,6 @@ Image=ghcr.io/your-github-username/your-repo-name:latest
 
 # Add your auth tokens using Secrets here to avoid hardcoding them in config.jsonnet
 # Create them using: podman secret create <secret-name> <file-with-secret>
-# Secret=cloudflare-token,type=env,target=CLOUDFLARE_TOKEN
 # Secret=ntfy-auth,type=env,target=NTFY_AUTH
 # Secret=telegram-token,type=env,target=TELEGRAM_TOKEN
 # Environment=TELEGRAM_CHAT_ID=your_telegram_chat_id

@@ -183,13 +183,20 @@
     .domain-header {
       padding: 20px 24px;
       display: grid;
-      grid-template-columns: minmax(200px, 1fr) 2fr auto;
+      grid-template-columns: 250px 120px 1fr auto;
       align-items: center;
       gap: 16px;
       cursor: pointer;
       transition: background-color 0.2s;
       list-style: none;
       /* Remove native detail marker */
+    }
+
+    .domain-expiry {
+      display: flex;
+      align-items: center;
+      color: var(--text-muted);
+      font-size: 0.9rem;
     }
 
     .domain-header::-webkit-details-marker {
@@ -213,6 +220,15 @@
       gap: 8px;
       color: var(--text-muted);
       font-size: 0.9rem;
+      min-width: max-content;
+    }
+    
+    .truncate {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: inline-block;
+      max-width: 100%;
     }
 
     .status-dot {
@@ -235,6 +251,17 @@
 
     .status-dot.unknown {
       background-color: var(--text-muted);
+    }
+
+    .status-label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--text-muted);
     }
 
     .domain-chevron {
@@ -306,22 +333,39 @@
       display: none !important;
     }
 
+    /* Stats Header */
     .header-stats {
       display: flex;
-      flex-wrap: wrap;
       gap: 16px;
-      padding: 24px 32px 0 32px;
+      padding: 32px 48px;
+      border-bottom: 1px solid var(--border);
     }
 
     .stat-box {
-      background: var(--bg-card);
+      background-color: var(--bg-card);
       border: 1px solid var(--border);
-      padding: 8px 16px;
       border-radius: 20px;
+      padding: 8px 16px;
       display: flex;
-      flex-direction: row;
       align-items: center;
-      gap: 12px;
+      gap: 8px;
+      box-shadow: var(--shadow);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .stat-box:hover {
+      background-color: var(--bg-hover);
+    }
+
+    .stat-box.active {
+      background-color: var(--primary-hover);
+      border-color: var(--primary);
+    }
+
+    [data-theme="dark"] .stat-box.active {
+      background-color: rgba(59, 130, 246, 0.1);
+      border-color: var(--primary);
     }
 
     .stat-label {
@@ -376,6 +420,7 @@
     <div class="nav-items">
       <div class="nav-item active" onclick="switchView('domains')" id="nav-domains">Domains</div>
       <div class="nav-item" onclick="switchView('dns')" id="nav-dns">DNS Records</div>
+      <div class="nav-item" onclick="switchView('certs')" id="nav-certs">Certificates</div>
     </div>
     <div id="last-updated"
       style="margin-bottom: 16px; font-size: 0.75rem; color: var(--text-muted); text-align: center;"></div>
@@ -409,6 +454,13 @@
 
       <!-- DNS View -->
       <div id="view-dns" class="domain-list hidden"></div>
+
+      <!-- Certs View -->
+      <div id="view-certs" class="domain-list hidden">
+        <div class="domain-card" style="padding: 24px;">
+           <div id="certs-table-container">Select a domain to view certificate history.</div>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -418,6 +470,7 @@
   <script>
     let appState = JSON.parse(document.getElementById('app-state').textContent || '{}');
     let currentView = 'domains';
+    let currentFilter = 'all';
 
     // Theme initialization
     if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
@@ -430,15 +483,35 @@
     }
 
     function switchView(view) {
+      if (currentView !== view) {
+        currentFilter = 'all'; // reset filter on view switch
+      }
       currentView = view;
       document.getElementById('nav-domains').classList.toggle('active', view === 'domains');
       document.getElementById('nav-dns').classList.toggle('active', view === 'dns');
+      document.getElementById('nav-certs').classList.toggle('active', view === 'certs');
 
       document.getElementById('view-domains').classList.toggle('hidden', view !== 'domains');
       document.getElementById('view-dns').classList.toggle('hidden', view !== 'dns');
+      document.getElementById('view-certs').classList.toggle('hidden', view !== 'certs');
 
       // Update stats on view switch without requiring a full fetch
       if (view === 'domains') {
+        renderDomains();
+      } else if (view === 'dns') {
+        renderDNS();
+      } else if (view === 'certs') {
+        renderCertsInit();
+      }
+    }
+
+    function toggleFilter(filter) {
+      if (currentFilter === filter) {
+        currentFilter = 'all';
+      } else {
+        currentFilter = filter;
+      }
+      if (currentView === 'domains') {
         renderDomains();
       } else {
         renderDNS();
@@ -447,25 +520,25 @@
 
     function renderStats(total, healthy, issues, expiringDomains, expiringCerts) {
       document.getElementById('view-stats').innerHTML = `
-        <div class="stat-box">
+        <div class="stat-box ${currentFilter === 'all' ? 'active' : ''}" onclick="toggleFilter('all')">
           <span class="stat-label">Total</span>
           <span class="stat-value">${total}</span>
         </div>
-        <div class="stat-box">
+        <div class="stat-box ${currentFilter === 'healthy' ? 'active' : ''}" onclick="toggleFilter('healthy')">
           <span class="stat-label">Healthy</span>
           <span class="stat-value"><span class="status-dot ok"></span>${healthy}</span>
         </div>
-        <div class="stat-box" style="${issues > 0 ? 'border-color: var(--error);' : ''}">
+        <div class="stat-box ${currentFilter === 'issues' ? 'active' : ''}" style="${issues > 0 && currentFilter !== 'issues' ? 'border-color: var(--error);' : ''}" onclick="toggleFilter('issues')">
           <span class="stat-label">Issues</span>
           <span class="stat-value"><span class="status-dot error"></span>${issues}</span>
         </div>
         ${currentView === 'domains' ? `
-        <div class="stat-box" style="${expiringDomains > 0 ? 'border-color: var(--warning);' : ''}">
-          <span class="stat-label">Expiring Domains</span>
+        <div class="stat-box ${currentFilter === 'expiring' ? 'active' : ''}" style="${expiringDomains > 0 && currentFilter !== 'expiring' ? 'border-color: var(--warning);' : ''}" onclick="toggleFilter('expiring')">
+          <span class="stat-label">Expiring/Expired Domains</span>
           <span class="stat-value" style="${expiringDomains > 0 ? 'color: var(--warning);' : ''}">${expiringDomains}</span>
         </div>` : ''}
         ${currentView === 'dns' ? `
-        <div class="stat-box" style="${expiringCerts > 0 ? 'border-color: var(--warning);' : ''}">
+        <div class="stat-box ${currentFilter === 'expiring' ? 'active' : ''}" style="${expiringCerts > 0 && currentFilter !== 'expiring' ? 'border-color: var(--warning);' : ''}" onclick="toggleFilter('expiring')">
           <span class="stat-label">Expiring SSL</span>
           <span class="stat-value" style="${expiringCerts > 0 ? 'color: var(--warning);' : ''}">${expiringCerts}</span>
         </div>` : ''}
@@ -512,6 +585,19 @@
         renderDNS();
     }
 
+    function escapeHTML(str) {
+        if (!str) return '';
+        return String(str).replace(/[&<>'"]/g, 
+            tag => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                "'": '&#39;',
+                '"': '&quot;'
+            }[tag] || tag)
+        );
+    }
+
     function formatTitleCase(str) {
       if (!str) return 'None';
       return str.replace(/([a-z])([A-Z])/g, '$1 $2')
@@ -536,19 +622,76 @@
       for (const domain of allDomains) {
         const rdapState = rdapChecks[domain] || {};
         const emailState = emailChecks[domain] || {};
+        const dnssecState = (appState.dnssec_checks || {})[domain] || {};
+        const caaState = (appState.caa_checks || {})[domain] || {};
 
         let statusClass = 'ok';
+        let statusText = 'Healthy';
+        let isExpiring = false;
 
-        if (emailState.status === 'failed' || emailState.status === 'hijacked' || rdapState.status === 'failed') {
-          statusClass = 'error';
-        } else if (emailState.status === 'mismatch') {
-          statusClass = 'warning';
+        if (rdapState.status && rdapState.status !== "pending") {
+          if (rdapState.expiration) {
+            const expDate = new Date(rdapState.expiration);
+            const daysLeft = Math.ceil((expDate - new Date()) / (1000 * 60 * 60 * 24));
+            if (daysLeft <= 30) {
+               isExpiring = true;
+            }
+          }
+        }
+
+        let badges = [];
+
+        // RED (Critical Errors)
+        if (rdapState.status === 'failed') badges.push({label: 'rdap_lookup_failed', cls: 'error'});
+        if (rdapState.domain_status) {
+           if (rdapState.domain_status.some(s => s.toLowerCase().includes('clienthold'))) badges.push({label: 'epp_client_hold', cls: 'error'});
+           if (rdapState.domain_status.some(s => s.toLowerCase().includes('serverhold'))) badges.push({label: 'epp_server_hold', cls: 'error'});
+           if (rdapState.domain_status.some(s => s.toLowerCase().includes('pendingdelete'))) badges.push({label: 'epp_pending_delete', cls: 'error'});
+           if (rdapState.domain_status.some(s => s.toLowerCase().includes('redemptionperiod'))) badges.push({label: 'epp_redemption_period', cls: 'error'});
+        }
+        if (!rdapState.is_delegated_zone && (!rdapState.nameservers || rdapState.nameservers.length === 0)) badges.push({label: 'missing_nameservers', cls: 'error'});
+        
+        if (isExpiring) badges.push({label: 'expiring_domain', cls: 'error'});
+        
+        if (dnssecState.source && dnssecState.valid === false) {
+           if (!dnssecState.ds_matches_dnskey) badges.push({label: 'dnssec_ds_mismatch', cls: 'error'});
+           if (!dnssecState.rrsig_valid) badges.push({label: 'dnssec_rrsig_invalid', cls: 'error'});
+           if (!dnssecState.chain_intact && dnssecState.source !== 'local_only') badges.push({label: 'dnssec_chain_broken', cls: 'error'});
+           if (dnssecState.ds_matches_dnskey && dnssecState.rrsig_valid && dnssecState.chain_intact) badges.push({label: 'bad_dnssec', cls: 'error'}); // Fallback
+        }
+        
+        if (emailState.status === 'failed') badges.push({label: 'email_lookup_failed', cls: 'error'});
+        if (emailState.status === 'hijacked') badges.push({label: 'mx_hijacked', cls: 'error'});
+        
+        // YELLOW (Warnings)
+        if (emailState.status === 'mismatch') badges.push({label: 'mx_mismatch', cls: 'warning'});
+        if (emailState.status && emailState.status !== 'failed') {
+           if (!emailState.spf) badges.push({label: 'missing_spf', cls: 'warning'});
+           if (!emailState.dmarc) badges.push({label: 'missing_dmarc', cls: 'warning'});
+           if (!emailState.dkim_valid || emailState.dkim_valid.length === 0) badges.push({label: 'missing_dkim', cls: 'warning'});
+        }
+
+        if (caaState.error) badges.push({label: 'caa_lookup_error', cls: 'warning'});
+        if (caaState.valid === false) badges.push({label: 'caa_invalid', cls: 'warning'});
+        if (caaState.unknown_cas && caaState.unknown_cas.length > 0) badges.push({label: 'caa_unauthorized_ca', cls: 'warning'});
+
+        if (badges.length > 0) {
+          if (badges.some(b => b.cls === 'error')) {
+             statusClass = 'error';
+          } else {
+             statusClass = 'warning';
+          }
         } else if (rdapState.status === 'pending') {
           statusClass = 'unknown';
         }
 
-        if (rdapState.domain_status && rdapState.domain_status.some(s => s.toLowerCase().includes('hold') || s.toLowerCase().includes('pendingdelete'))) {
-          statusClass = 'error';
+        let labelsHtml = '';
+        if (badges.length > 0) {
+            labelsHtml = badges.map(b => `<span class="badge ${b.cls}">${b.label}</span>`).join('');
+        } else if (statusClass === 'unknown') {
+            labelsHtml = `<span class="badge" style="color: var(--text-muted); background: var(--border);">unknown</span>`;
+        } else {
+            labelsHtml = `<span class="badge success">healthy</span>`;
         }
 
         if (statusClass === 'error' || statusClass === 'warning') {
@@ -556,15 +699,23 @@
         } else if (statusClass === 'ok') {
           healthyCount++;
         }
+        if (isExpiring) {
+          expiringCount++;
+        }
+
+        // Apply filters
+        if (currentFilter === 'healthy' && statusClass !== 'ok') continue;
+        if (currentFilter === 'issues' && statusClass !== 'error' && statusClass !== 'warning') continue;
+        if (currentFilter === 'expiring' && !isExpiring) continue;
 
         let emailHtml = `<div class="detail-panel"><h3>Email</h3><p class="detail-value" style="color: var(--text-muted)">Not Configured</p></div>`;
-        if (emailState.type) {
-          const mxs = (emailState.mx && emailState.mx.length > 0) ? `<ul class="data-list"><li>${emailState.mx.join('</li><li>')}</li></ul>` : 'None';
+        if (emailState.status) {
+          const mxs = (emailState.mx && emailState.mx.length > 0) ? `<ul class="data-list"><li>${emailState.mx.map(escapeHTML).join('</li><li>')}</li></ul>` : 'None';
           const isDkimValid = (emailState.dkim_valid && emailState.dkim_valid.length > 0);
           emailHtml = `
             <div class="detail-panel">
               <h3>Email Security</h3>
-              <div class="detail-row"><div class="detail-label">Provider:</div><div class="detail-value" style="text-transform: capitalize;">${formatTitleCase(emailState.provider) || 'Custom/Basic'}</div></div>
+              <div class="detail-row"><div class="detail-label">Provider:</div><div class="detail-value" style="text-transform: capitalize;">${escapeHTML(formatTitleCase(emailState.provider)) || 'Custom/Basic'}</div></div>
               <div class="detail-row"><div class="detail-label">SPF:</div><div class="detail-value">${emailState.spf ? 'Valid' : 'Missing'}</div></div>
               <div class="detail-row"><div class="detail-label">DMARC:</div><div class="detail-value">${emailState.dmarc ? 'Valid' : 'Missing'}</div></div>
               <div class="detail-row"><div class="detail-label">DKIM:</div><div class="detail-value">${isDkimValid ? 'Valid' : 'Missing'}</div></div>
@@ -597,24 +748,62 @@
             }
           }
           
-          const ns = (rdapState.nameservers && rdapState.nameservers.length > 0) ? `<ul class="data-list"><li>${rdapState.nameservers.join('</li><li>')}</li></ul>` : 'None';
-          const statuses = (rdapState.domain_status && rdapState.domain_status.length > 0) ? `<ul class="data-list"><li>${rdapState.domain_status.map(formatTitleCase).join('</li><li>')}</li></ul>` : 'Active';
-          rdapHtml = `
+          const ns = (rdapState.nameservers && rdapState.nameservers.length > 0) ? `<ul class="data-list"><li>${rdapState.nameservers.map(escapeHTML).join('</li><li>')}</li></ul>` : 'None';
+          const statuses = (rdapState.domain_status && rdapState.domain_status.length > 0) ? `<ul class="data-list"><li>${rdapState.domain_status.map(formatTitleCase).map(escapeHTML).join('</li><li>')}</li></ul>` : 'Active';
+          
+          if (rdapState.is_delegated_zone) {
+            rdapHtml = `
+              <div class="detail-panel">
+                <h3>Delegated Zone</h3>
+                <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value" style="text-transform: lowercase;">${ns}</div></div>
+                <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value">Monitored</div></div>
+              </div>`;
+          } else {
+            rdapHtml = `
+              <div class="detail-panel">
+                <h3>Domain Information</h3>
+                <div class="detail-row"><div class="detail-label">Registrar:</div><div class="detail-value">${escapeHTML(rdapState.registrar) || 'Unknown'}</div></div>
+                <div class="detail-row"><div class="detail-label">Expiration:</div><div class="detail-value">${expText}</div></div>
+                <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value" style="text-transform: lowercase;">${ns}</div></div>
+                <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="text-transform: capitalize;">${statuses}</div></div>
+                <div class="detail-row"><div class="detail-label">DNSSEC:</div><div class="detail-value">${rdapState.dnssec ? 'Enabled' : 'Disabled'}</div></div>
+              </div>`;
+          }
+        }
+
+        let dnssecHtml = `<div class="detail-panel"><h3>DNSSEC</h3><p class="detail-value" style="color: var(--text-muted)">Not Configured</p></div>`;
+        if (dnssecState.source) {
+          dnssecHtml = `
             <div class="detail-panel">
-              <h3>Domain Information</h3>
-              <div class="detail-row"><div class="detail-label">Registrar:</div><div class="detail-value">${rdapState.registrar || 'Unknown'}</div></div>
-              <div class="detail-row"><div class="detail-label">Expiration:</div><div class="detail-value">${expText}</div></div>
-              <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value" style="text-transform: lowercase;">${ns}</div></div>
-              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="text-transform: capitalize;">${statuses}</div></div>
-              <div class="detail-row"><div class="detail-label">DNSSEC:</div><div class="detail-value">${rdapState.dnssec ? 'Enabled' : 'Disabled'}</div></div>
-            </div>`;
+              <h3>DNSSEC Validation</h3>
+              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="${dnssecState.valid ? 'color: var(--success)' : 'color: var(--error)'}">${dnssecState.valid ? 'Valid' : 'Invalid'}</div></div>
+              <div class="detail-row"><div class="detail-label">Tier 1 (Local):</div><div class="detail-value">${dnssecState.ds_matches_dnskey && dnssecState.rrsig_valid ? 'Pass' : 'Fail'}</div></div>
+              <div class="detail-row"><div class="detail-label">Tier 2 (DoH):</div><div class="detail-value">${dnssecState.chain_intact ? 'Pass' : (dnssecState.source === 'local_only' ? 'N/A' : 'Fail')}</div></div>
+              <div class="detail-row"><div class="detail-label">Algorithms:</div><div class="detail-value">${(dnssecState.algorithms || []).join(', ') || 'None'}</div></div>
+              ${dnssecState.error ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value" style="color: var(--error)">${escapeHTML(dnssecState.error)}</div></div>` : ''}
+            </div>
+          `;
+        }
+
+        let caaHtml = `<div class="detail-panel"><h3>CAA Records</h3><p class="detail-value" style="color: var(--text-muted)">Not Configured</p></div>`;
+        if (caaState.issue || caaState.issuewild || caaState.issuemail || caaState.error) {
+          caaHtml = `
+            <div class="detail-panel">
+              <h3>CAA Records</h3>
+              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="${caaState.valid ? 'color: var(--success)' : 'color: var(--error)'}">${caaState.valid ? 'Valid' : 'Invalid'}</div></div>
+              <div class="detail-row"><div class="detail-label">Issue:</div><div class="detail-value">${(caaState.issue || []).map(escapeHTML).join(', ') || 'None'}</div></div>
+              <div class="detail-row"><div class="detail-label">IssueWild:</div><div class="detail-value">${(caaState.issuewild || []).map(escapeHTML).join(', ') || 'None'}</div></div>
+              <div class="detail-row"><div class="detail-label">IssueMail:</div><div class="detail-value">${(caaState.issuemail || []).map(escapeHTML).join(', ') || 'None'}</div></div>
+              ${caaState.unknown_cas && caaState.unknown_cas.length > 0 ? `<div class="detail-row"><div class="detail-label">Unknown CAs:</div><div class="detail-value" style="color: var(--warning)">${caaState.unknown_cas.map(escapeHTML).join(', ')}</div></div>` : ''}
+            </div>
+          `;
         }
 
         const isRDAPFailed = (rdapState.status === 'failed');
 
         const card = document.createElement('details');
         card.className = 'domain-card';
-        card.setAttribute('data-search', domain.toLowerCase());
+        card.setAttribute('data-search', escapeHTML(domain.toLowerCase()));
         
         let chevronHtml = `<svg class="domain-chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
         
@@ -625,16 +814,22 @@
         
         card.innerHTML = `
           <summary class="domain-header">
-            <div class="domain-title" style="text-transform: lowercase;">${domain}</div>
+            <div class="domain-title" style="text-transform: lowercase;">${escapeHTML(domain)}</div>
+            <div class="domain-expiry">
+              ${badgeHtml ? badgeHtml : `<span style="opacity: 0.6;">${expText}</span>`}
+            </div>
             <div class="domain-status">
-              ${badgeHtml ? badgeHtml : `<span>${expText}</span>`}
-              <span class="status-dot ${statusClass}"></span>
+              <span class="status-label">
+                ${labelsHtml}
+              </span>
             </div>
             ${chevronHtml}
           </summary>
           <div class="domain-details">
             ${rdapHtml}
             ${emailHtml}
+            ${dnssecHtml}
+            ${caaHtml}
           </div>
         `;
         container.appendChild(card);
@@ -668,58 +863,82 @@
         let statusClass = 'ok';
         let statusText = 'Healthy';
 
+        let badges = [];
         if (state.status === 'failed' || state.status === 'api_error') {
-          statusClass = 'error';
-          statusText = 'Issue Detected';
+          badges.push({label: 'dns_failed', cls: 'error'});
         } else if (state.status === 'mismatch') {
-          statusClass = 'warning';
-          statusText = 'Mismatch';
-        } else if (state.status === 'proxied_unverified') {
-          statusClass = 'unknown';
-          statusText = 'Proxied / Unverified';
-        } else if (state.status === 'ok_flattened') {
-          statusClass = 'ok';
-          statusText = 'Healthy (Flattened)';
+          badges.push({label: 'dns_mismatch', cls: 'warning'});
         }
 
-        const name = formatTitleCase(state.name || state.hostname || 'Unknown');
-        const hostname = state.hostname || 'Unknown';
-        const type = (state.type || 'Unknown').toUpperCase();
-        const expectedUl = state.expected ? `<ul class="data-list"><li>${state.expected.join('</li><li>')}</li></ul>` : 'N/A';
-        const foundInline = state.found ? state.found.join(', ') : 'None';
-        const found = state.found ? `<ul class="data-list"><li>${state.found.join('</li><li>')}</li></ul>` : 'None';
+        const name = escapeHTML(formatTitleCase(state.name || state.hostname || 'Unknown'));
+        const hostname = escapeHTML(state.hostname || 'Unknown');
+        const type = escapeHTML((state.type || 'Unknown').toUpperCase());
+        const expectedUl = state.expected ? `<ul class="data-list"><li>${state.expected.map(escapeHTML).join('</li><li>')}</li></ul>` : 'N/A';
+        const foundInline = state.found ? state.found.map(escapeHTML).join(', ') : 'None';
+        const found = state.found ? `<ul class="data-list"><li>${state.found.map(escapeHTML).join('</li><li>')}</li></ul>` : 'None';
 
+        let isExpiringCert = false;
         let sslRow = '';
         let badgeHtml = '';
-        if (state.ssl_days !== undefined) {
+        if (state.ssl_days !== undefined && state.ssl_days !== -2) {
           if (state.ssl_days === -1) {
              sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value" style="color: var(--warning);">No Cert / Error</div></div>`;
              badgeHtml = `<span class="badge error">No Cert</span>`;
+             badges.push({label: 'ssl_missing', cls: 'error'});
           } else {
              sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value">${state.ssl_days > 0 ? 'Valid (' + state.ssl_days + ' days)' : '<span style="color: var(--error);">Expired</span>'}</div></div>`;
              
              if (state.ssl_days < 0) {
                badgeHtml = `<span class="badge error">Expired</span>`;
+               isExpiringCert = true;
                expiringCertCount++;
+               badges.push({label: 'ssl_expired', cls: 'error'});
              } else if (state.ssl_days <= 30) {
                badgeHtml = `<span class="badge warning">${state.ssl_days}d left</span>`;
+               isExpiringCert = true;
                expiringCertCount++;
+               badges.push({label: 'ssl_expiring', cls: 'warning'});
              } else {
                badgeHtml = `<span class="badge success">${state.ssl_days}d left</span>`;
              }
           }
         }
 
+        if (badges.length > 0) {
+           if (badges.some(b => b.cls === 'error')) {
+               statusClass = 'error';
+           } else {
+               statusClass = 'warning';
+           }
+        } else {
+           statusClass = 'ok';
+        }
+
+        let labelsHtml = '';
+        if (badges.length > 0) {
+            labelsHtml = badges.map(b => `<span class="badge ${b.cls}">${b.label}</span>`).join('');
+        } else {
+            labelsHtml = `<span class="badge success">healthy</span>`;
+        }
+
+        // Apply filters
+        if (currentFilter === 'healthy' && statusClass !== 'ok') continue;
+        if (currentFilter === 'issues' && statusClass !== 'error' && statusClass !== 'warning') continue;
+        if (currentFilter === 'expiring' && !isExpiringCert) continue;
+
         const card = document.createElement('details');
         card.className = 'domain-card';
-        card.setAttribute('data-search', key.toLowerCase());
+        card.setAttribute('data-search', escapeHTML(key.toLowerCase()));
         card.innerHTML = `
           <summary class="domain-header">
             <div class="domain-title" style="text-transform: lowercase;">${hostname}</div>
-            <div class="domain-status">
+            <div class="domain-expiry">
               ${badgeHtml}
-              <span style="text-transform: lowercase;">${foundInline}</span>
-              <span class="status-dot ${statusClass}"></span>
+            </div>
+            <div class="domain-status">
+              <span class="status-label">
+                ${labelsHtml}
+              </span>
             </div>
             <svg class="domain-chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
           </summary>
@@ -736,7 +955,7 @@
               <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value">${statusText}</div></div>
               ${sslRow}
               <div class="detail-row"><div class="detail-label">Found:</div><div class="detail-value" style="text-transform: lowercase;">${found}</div></div>
-              ${state.error ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value" style="color: var(--error);">${state.error}</div></div>` : ''}
+              ${state.error ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value" style="color: var(--error);">${escapeHTML(state.error)}</div></div>` : ''}
             </div>
           </div>
         `;
@@ -746,6 +965,97 @@
       if (currentView === 'dns') {
         renderStats(Object.keys(dnsChecks).length, healthyCount, issueCount, 0, expiringCertCount);
       }
+    }
+    function renderCertsInit() {
+      const rdapChecks = appState.rdap_checks || {};
+      const emailChecks = appState.email_checks || {};
+      const allDomains = Array.from(new Set([...Object.keys(rdapChecks), ...Object.keys(emailChecks)])).sort();
+      
+      let optionsHtml = '<option value="" style="background-color: var(--bg-card); color: var(--text-main);">Select a domain...</option>';
+      allDomains.forEach(d => {
+          optionsHtml += `<option value="${d}" style="background-color: var(--bg-card); color: var(--text-main);">${d}</option>`;
+      });
+
+      document.getElementById('view-stats').innerHTML = `
+        <div style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
+          <div class="stat-box active" style="position: relative; padding: 0; border-radius: 6px;">
+            <select id="cert-domain-select" onchange="fetchCerts()" style="appearance: none; -webkit-appearance: none; -moz-appearance: none; background: transparent; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; font-family: inherit; color: var(--text-main); cursor: pointer; outline: none; margin: 0; min-width: 260px; padding: 12px 48px 12px 20px; width: 100%;">
+               ${optionsHtml}
+            </select>
+            <svg style="position: absolute; right: 20px; top: 50%; transform: translateY(-50%); pointer-events: none; color: var(--text-main);" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+               <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </div>
+          <div id="selected-domain-display" style="font-weight: 600; font-size: 1.1rem; color: var(--text-main);"></div>
+        </div>
+      `;
+    }
+
+    async function fetchCerts() {
+       const domain = document.getElementById('cert-domain-select').value;
+       const container = document.getElementById('certs-table-container');
+       const display = document.getElementById('selected-domain-display');
+       if (!domain) {
+           container.innerHTML = 'Select a domain to view certificate history.';
+           if (display) display.textContent = '';
+           return;
+       }
+       
+       if (display) display.textContent = domain;
+       
+       container.innerHTML = 'Loading history...';
+       try {
+           const res = await fetch('/api/certs?domain=' + encodeURIComponent(domain));
+           const certs = await res.json();
+           
+           if (!certs || certs.length === 0) {
+               container.innerHTML = 'No certificates found for this domain yet.';
+               return;
+           }
+           
+           let html = `
+             <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem;">
+               <thead>
+                 <tr style="border-bottom: 1px solid var(--border); color: var(--text-muted);">
+                   <th style="padding: 12px 8px;">Issue Date</th>
+                   <th style="padding: 12px 8px;">Expiry Date</th>
+                   <th style="padding: 12px 8px;">Days Left</th>
+                   <th style="padding: 12px 8px;">Issuer</th>
+                   <th style="padding: 12px 8px;">Match</th>
+                   <th style="padding: 12px 8px;">Status</th>
+                 </tr>
+               </thead>
+               <tbody>
+           `;
+           
+           certs.forEach(c => {
+               const notAfter = new Date(c.not_after);
+               const daysLeft = Math.ceil((notAfter - new Date()) / (1000 * 60 * 60 * 24));
+               const isExpired = daysLeft < 0;
+               const status = isExpired ? '<span class="badge error">Expired</span>' : '<span class="badge success">Active</span>';
+               
+               let daysHtml = daysLeft < 0 ? '0' : daysLeft.toString();
+               if (daysLeft <= 30 && daysLeft >= 0) {
+                 daysHtml = `<span style="color: var(--warning); font-weight: 600;">${daysHtml}</span>`;
+               }
+               
+               html += `
+                 <tr style="border-bottom: 1px solid var(--border);">
+                   <td style="padding: 12px 8px;">${new Date(c.not_before).toLocaleDateString()}</td>
+                   <td style="padding: 12px 8px;">${notAfter.toLocaleDateString()}</td>
+                   <td style="padding: 12px 8px;">${daysHtml}</td>
+                   <td style="padding: 12px 8px;">${escapeHTML(c.issuer || 'Unknown')}</td>
+                   <td style="padding: 12px 8px; word-break: break-all;">${escapeHTML(c.match || '')}</td>
+                   <td style="padding: 12px 8px;">${status}</td>
+                 </tr>
+               `;
+           });
+           
+           html += '</tbody></table>';
+           container.innerHTML = html;
+       } catch (err) {
+           container.innerHTML = '<span style="color: var(--error)">Failed to load certificates.</span>';
+       }
     }
 
     initialize();

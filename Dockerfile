@@ -1,5 +1,5 @@
 # Stage 1: Base builder environment
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS base
+FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine AS base
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

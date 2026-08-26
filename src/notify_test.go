@@ -3,6 +3,7 @@ package main
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 // MockNotifier implements the Notifier interface for testing
@@ -29,15 +30,15 @@ func TestNotificationManager(t *testing.T) {
 		{
 			name: "Single Alert",
 			alerts: []Alert{
-				{Message: "Test Alert", Priority: "urgent", Domain: "example.com"},
+				{Message: "Test Alert", Redacted: "Test Alert 0", Priority: PriorityUrgent, Domain: "example.com"},
 			},
 			expectSent: 1,
 		},
 		{
 			name: "Multiple Alerts",
 			alerts: []Alert{
-				{Message: "Test Alert 1", Priority: "high", Domain: "example.com"},
-				{Message: "Test Alert 2", Priority: "urgent", Domain: "example.com"},
+				{Message: "Test Alert 1", Redacted: "Test Alert 1", Priority: PriorityHigh, Domain: "example.com"},
+				{Message: "Test Alert 2", Redacted: "Test Alert 2", Priority: PriorityUrgent, Domain: "example.com"},
 			},
 			expectSent: 2,
 		},
@@ -71,5 +72,88 @@ func TestNotificationManager(t *testing.T) {
 				t.Errorf("Mock2: expected %d, got %d", tt.expectSent, mock2.MessagesSent)
 			}
 		})
+	}
+}
+
+func TestNotificationDeduplication(t *testing.T) {
+	t.Parallel()
+
+	mock := &MockNotifier{}
+	nm := &NotificationManager{
+		Providers: []Notifier{mock},
+	}
+
+	// Cycle 1: First occurrence of alert
+	nm.StartCycle()
+	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
+	nm.Flush()
+	nm.EndCycle()
+
+	if mock.MessagesSent != 1 {
+		t.Fatalf("Cycle 1: expected 1 message sent, got %d", mock.MessagesSent)
+	}
+
+	// Cycle 2: Same alert within 24h should be deduplicated / suppressed
+	nm.StartCycle()
+	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
+	nm.Flush()
+	nm.EndCycle()
+
+	if mock.MessagesSent != 1 {
+		t.Fatalf("Cycle 2: expected 1 message sent (deduplicated), got %d", mock.MessagesSent)
+	}
+
+	// Cycle 3: Issue resolves, alert not dispatched
+	nm.StartCycle()
+	// No dispatch this cycle
+	nm.Flush()
+	nm.EndCycle()
+
+	if mock.MessagesSent != 1 {
+		t.Fatalf("Cycle 3: expected 1 message sent, got %d", mock.MessagesSent)
+	}
+
+	// Cycle 4: Issue re-occurs, should alert again since it was resolved in Cycle 3
+	nm.StartCycle()
+	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
+	nm.Flush()
+	nm.EndCycle()
+
+	if mock.MessagesSent != 2 {
+		t.Fatalf("Cycle 4: expected 2 messages sent after resolution, got %d", mock.MessagesSent)
+	}
+}
+
+func TestNotification24hExpiry(t *testing.T) {
+	t.Parallel()
+
+	mock := &MockNotifier{}
+	nm := &NotificationManager{
+		Providers: []Notifier{mock},
+	}
+
+	nm.StartCycle()
+	nm.Dispatch("Alert", "Redacted", PriorityHigh, "warning", "example.com", "Test")
+	nm.Flush()
+	nm.EndCycle()
+
+	if mock.MessagesSent != 1 {
+		t.Fatalf("Expected 1 message, got %d", mock.MessagesSent)
+	}
+
+	// Artificially age the sent state by 25 hours
+	key := "example.com|Redacted"
+	nm.mu.Lock()
+	nm.sentState[key] = time.Now().Add(-25 * time.Hour)
+	nm.mu.Unlock()
+
+	// Should alert again because > 24 hours passed
+	nm.StartCycle()
+	nm.Dispatch("Alert", "Redacted", PriorityHigh, "warning", "example.com", "Test")
+	nm.Flush()
+	nm.EndCycle()
+
+	if mock.MessagesSent != 2 {
+		t.Fatalf("Expected 2 messages after 25h expiry, got %d", mock.MessagesSent)
 	}
 }

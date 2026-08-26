@@ -4,19 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"os"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/go-jsonnet"
+	"github.com/miekg/dns"
 )
 
-type Providers struct {
-	CloudflareToken string `json:"cloudflare_token"`
+const (
+	DefaultDoHURL = "https://dns.google/resolve"
+)
+
+type CAAConfig struct {
+	Issue     []string `json:"issue"`
+	IssueWild []string `json:"issuewild"`
+	IssueMail []string `json:"issuemail"`
 }
 
 type NtfyConfig struct {
@@ -39,41 +48,52 @@ type AppConfig struct {
 	Port          string         `json:"port"`
 	LoopInterval  string         `json:"loop_interval"`
 	RequestDelay  string         `json:"request_delay"`
+	WhoisDelay    string         `json:"whois_delay"`
 	Notifications Notifications  `json:"notifications"`
-	Providers     Providers      `json:"providers"`
 	Resolvers     []string       `json:"resolvers"`
+	DoHURL        string         `json:"doh_url,omitempty"`
+	CTLogsAPIKey  string         `json:"ctlogs_api_key,omitempty"`
 	Domains       []DomainConfig `json:"domains"`
 	DNSRecords    []DNSTask      `json:"dns_records"`
 }
 
 type DomainConfig struct {
-	Domain             string   `json:"domain"`
-	Name               string   `json:"name"`
-	ExpectedNS         []string `json:"expected_ns"`
-	CheckEmailSecurity bool     `json:"check_email_security"`
-	MailProvider       string   `json:"mail_provider"`
-	MXRecords          []string `json:"mx_records"`
-	DKIMSelectors      []string `json:"dkim_selectors"`
-	SuppressAlerts     bool     `json:"suppress_alerts"`
+	Domain             string     `json:"domain"`
+	Name               string     `json:"name"`
+	IsDelegatedZone    bool       `json:"is_delegated_zone"`
+	RootZone           string     `json:"root_zone"`
+	ExpectedNS         []string   `json:"expected_ns"`
+	CheckEmailSecurity bool       `json:"check_email_security"`
+	MailProvider       string     `json:"mail_provider"`
+	MXRecords          []string   `json:"mx_records"`
+	DKIMSelectors      []string   `json:"dkim_selectors"`
+	DNSSEC             bool       `json:"dnssec"`
+	MonitorCTLogs      bool       `json:"monitor_ct_logs"`
+	CAA                *CAAConfig `json:"caa,omitempty"`
+	AcceptSelfSigned   bool       `json:"accept_self_signed"`
+	SuppressAlerts     bool       `json:"suppress_alerts"`
 }
 
 type DNSTask struct {
-	Hostname       string   `json:"hostname"`
-	Name           string   `json:"name"`
-	Type           string   `json:"type"`
-	Expected       []string `json:"expected"`
-	Provider       string   `json:"provider"`
-	CustomResolver string   `json:"custom_resolver"`
+	Hostname         string   `json:"hostname"`
+	Name             string   `json:"name"`
+	Type             string   `json:"type"`
+	Expected         []string `json:"expected"`
+	CustomResolver   string   `json:"custom_resolver"`
+	AcceptSelfSigned bool     `json:"accept_self_signed"`
 }
 
 type AppState struct {
-	Config           *AppConfig
-	CF               *CFClient
-	Notifier         *NotificationManager
-	LoopDuration     time.Duration
-	ReqDelay         time.Duration
-	StateMu          sync.Mutex
-	StateLastChanged map[string]string
+	Config              *AppConfig
+	Notifier            *NotificationManager
+	LoopDuration        time.Duration
+	ReqDelay            time.Duration
+	WhoisDelay          time.Duration
+	StateMu             sync.Mutex
+	StateLastChanged    map[string]string
+	PrerenderedHTML     atomic.Value
+	PrerenderedJSON     atomic.Value
+	GlobalResolverIndex atomic.Uint32
 }
 
 func LoadConfig(ctx context.Context, path string) (*AppState, error) {
@@ -93,8 +113,11 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	}
 
 	// Override with environment variables if provided
-	if t := strings.TrimSpace(os.Getenv("CLOUDFLARE_TOKEN")); t != "" {
-		rawCfg.Providers.CloudflareToken = t
+	if p := strings.TrimSpace(os.Getenv("PORT")); p != "" {
+		rawCfg.Port = p
+	}
+	if rawCfg.Port == "" {
+		rawCfg.Port = "8080"
 	}
 	if t := strings.TrimSpace(os.Getenv("NTFY_AUTH")); t != "" {
 		if rawCfg.Notifications.Ntfy == nil {
@@ -114,6 +137,12 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 		}
 		rawCfg.Notifications.Telegram.ChatID = id
 	}
+	if k := strings.TrimSpace(os.Getenv("CTLOGS_API_KEY")); k != "" {
+		rawCfg.CTLogsAPIKey = k
+	}
+	if u := strings.TrimSpace(os.Getenv("DOH_URL")); u != "" {
+		rawCfg.DoHURL = u
+	}
 
 	nm := &NotificationManager{}
 
@@ -124,15 +153,19 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 		}
 
 		client := &http.Client{Timeout: 5 * time.Second}
-		req, _ := http.NewRequest("POST", rawCfg.Notifications.Ntfy.URL, strings.NewReader("System Boot: Connectivity Test"))
+		req, err := http.NewRequestWithContext(ctx, "POST", rawCfg.Notifications.Ntfy.URL, strings.NewReader("System Boot: Connectivity Test"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create ntfy request: %w", err)
+		}
 		if rawCfg.Notifications.Ntfy.Auth != "" {
 			req.Header.Set("Authorization", rawCfg.Notifications.Ntfy.Auth)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Fatalf("[FATAL] Ntfy URL provided is unreachable: %v", err)
+			return nil, fmt.Errorf("ntfy URL provided is unreachable: %w", err)
 		}
-		resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 
 		nm.Providers = append(nm.Providers, &NtfyProvider{
 			URL:  rawCfg.Notifications.Ntfy.URL,
@@ -153,51 +186,62 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 		rawCfg.Resolvers = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 	}
 	if len(rawCfg.Resolvers) > 9 {
-		log.Fatalf("[FATAL] Configured resolvers exceed maximum limit of 9.")
+		return nil, fmt.Errorf("configured resolvers exceed maximum limit of 9")
 	}
 	for _, res := range rawCfg.Resolvers {
 		ip := res
-		if !strings.Contains(ip, ":") {
-			ip += ":53"
+		if _, _, err := net.SplitHostPort(ip); err != nil {
+			ip = net.JoinHostPort(ip, "53")
 		}
-		resolver := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				return net.Dial("udp", ip)
-			},
-		}
-		if _, err := resolver.LookupHost(context.Background(), "example.com"); err != nil {
-			log.Fatalf("[FATAL] Global resolver health check failed for %s: %v", res, err)
-		}
-	}
-
-	// 3. Provider Config Logic Validations
-	for _, rec := range rawCfg.DNSRecords {
-		if rec.Provider == "cloudflare" && rawCfg.Providers.CloudflareToken == "" {
-			log.Fatalf("[FATAL] Record %s requests Cloudflare API, but 'cloudflare_token' is missing.", rec.Hostname)
+		c := new(dns.Client)
+		c.Timeout = 5 * time.Second
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn("example.com"), dns.TypeA)
+		m.RecursionDesired = true
+		if _, _, err := c.ExchangeContext(ctx, m, ip); err != nil {
+			return nil, fmt.Errorf("global resolver health check failed for %s: %w", res, err)
 		}
 	}
 
-	// 4. Schema Normalization
+	// 3. Schema Normalization
 	for i := range rawCfg.Domains {
 		d := &rawCfg.Domains[i]
-		d.Domain = strings.ToLower(strings.TrimSpace(d.Domain))
+		d.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.Domain), "."))
 		for j := range d.ExpectedNS {
-			d.ExpectedNS[j] = strings.ToLower(strings.TrimSpace(d.ExpectedNS[j]))
+			d.ExpectedNS[j] = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.ExpectedNS[j]), "."))
 		}
 
 		// Enforce Name is mandatory for domains
 		if d.Name == "" {
-			log.Fatalf("[FATAL] Domain %s is missing a mandatory 'name' field.", d.Domain)
+			return nil, fmt.Errorf("domain %s is missing a mandatory 'name' field", d.Domain)
+		}
+
+		if d.IsDelegatedZone {
+			d.RootZone = strings.ToLower(strings.TrimSpace(d.RootZone))
+			if d.RootZone == "" {
+				return nil, fmt.Errorf("delegated domain %s is missing a mandatory 'root_zone' field", d.Domain)
+			}
+		}
+
+		if d.CAA != nil {
+			for j := range d.CAA.Issue {
+				d.CAA.Issue[j] = strings.ToLower(strings.TrimSpace(d.CAA.Issue[j]))
+			}
+			for j := range d.CAA.IssueWild {
+				d.CAA.IssueWild[j] = strings.ToLower(strings.TrimSpace(d.CAA.IssueWild[j]))
+			}
+			for j := range d.CAA.IssueMail {
+				d.CAA.IssueMail[j] = strings.ToLower(strings.TrimSpace(d.CAA.IssueMail[j]))
+			}
 		}
 
 		if d.CheckEmailSecurity {
 			if d.MailProvider != "" && len(d.MXRecords) > 0 {
-				log.Fatalf("[FATAL] Domain %s has both mail_provider and mx_records set. These are mutually exclusive.", d.Domain)
+				return nil, fmt.Errorf("domain %s has both mail_provider and mx_records set; these are mutually exclusive", d.Domain)
 			}
 			d.MailProvider = strings.ToLower(strings.TrimSpace(d.MailProvider))
 			for j := range d.MXRecords {
-				d.MXRecords[j] = strings.ToLower(strings.TrimSpace(d.MXRecords[j]))
+				d.MXRecords[j] = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.MXRecords[j]), "."))
 			}
 			for j := range d.DKIMSelectors {
 				d.DKIMSelectors[j] = strings.ToLower(strings.TrimSpace(d.DKIMSelectors[j]))
@@ -207,27 +251,41 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 
 	for i := range rawCfg.DNSRecords {
 		r := &rawCfg.DNSRecords[i]
-		r.Hostname = strings.ToLower(strings.TrimSpace(r.Hostname))
+		r.Hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(r.Hostname), "."))
 
 		if r.Name == "" {
-			log.Fatalf("[FATAL] DNS Record %s (%s) is missing a mandatory 'name' field.", r.Hostname, r.Type)
+			return nil, fmt.Errorf("dns record %s (%s) is missing a mandatory 'name' field", r.Hostname, r.Type)
 		}
 
 		r.Type = strings.ToUpper(strings.TrimSpace(r.Type))
 		if r.Type == "" {
-			log.Fatalf("[FATAL] DNS Record %s is missing a type (e.g. A, CNAME).", r.Hostname)
+			return nil, fmt.Errorf("dns record %s is missing a type (e.g. A, CNAME)", r.Hostname)
 		}
 		for j := range r.Expected {
-			cleanVal := strings.ToLower(strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(r.Expected[j]), "."), "alias:"))
+			cleanVal := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(r.Expected[j]), "."), "alias:")
+			if r.Type != "TXT" {
+				cleanVal = strings.ToLower(cleanVal)
+			}
+
+			// Normalize IPs for A, AAAA, IP types
+			if r.Type == "A" || r.Type == "AAAA" || r.Type == "IP" {
+				if ip := net.ParseIP(cleanVal); ip != nil {
+					cleanVal = ip.String()
+				}
+			}
+
 			r.Expected[j] = cleanVal
 		}
 
 	}
 
+	if rawCfg.DoHURL == "" {
+		rawCfg.DoHURL = DefaultDoHURL
+	}
+
 	app := &AppState{
 		Config:           &rawCfg,
 		Notifier:         nm,
-		CF:               InitCloudflare(ctx, rawCfg.Providers.CloudflareToken),
 		StateLastChanged: make(map[string]string),
 	}
 
@@ -238,6 +296,10 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	app.ReqDelay, _ = time.ParseDuration(rawCfg.RequestDelay)
 	if app.ReqDelay == 0 {
 		app.ReqDelay = 5 * time.Second
+	}
+	app.WhoisDelay, _ = time.ParseDuration(rawCfg.WhoisDelay)
+	if app.WhoisDelay == 0 {
+		app.WhoisDelay = 10 * time.Second
 	}
 
 	return app, nil
