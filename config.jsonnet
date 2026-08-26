@@ -11,6 +11,9 @@ local TXT = "TXT";
   request_delay: "5s",
   whois_delay: "10s",
 
+  // The directory where state files (ct_logs/ and ct_state.json) are persisted
+  data_dir: "./data",
+
   // Optional: ctlogs.dev API key for higher rate limits on CT log monitoring
   // ctlogs_api_key: "",
 

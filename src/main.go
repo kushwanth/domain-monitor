@@ -139,6 +139,15 @@ func main() {
 		log.Fatalf("[FATAL] Configuration error: %v", err)
 	}
 
+	if app.Config.DataDir != "" {
+		CTLogsPath = filepath.Join(app.Config.DataDir, "ct_logs")
+	}
+	
+	ctStatePath := "ct_state.json"
+	if app.Config.DataDir != "" {
+		ctStatePath = filepath.Join(app.Config.DataDir, "ct_state.json")
+	}
+
 	rdapClient := &rdap.Client{
 		HTTP: &http.Client{Timeout: 10 * time.Second},
 	}
@@ -158,7 +167,7 @@ func main() {
 		isFirstRun := true
 		ctLogPersist := make(map[string]*CTLogState)
 
-		if b, err := os.ReadFile("ct_state.json"); err == nil {
+		if b, err := os.ReadFile(ctStatePath); err == nil {
 			if jsonErr := json.Unmarshal(b, &ctLogPersist); jsonErr != nil {
 				log.Printf("[WARN] Failed to parse ct_state.json: %v", jsonErr)
 			}
@@ -272,7 +281,7 @@ func main() {
 			}
 
 			if b, err := json.Marshal(ctLogPersist); err == nil {
-				if writeErr := atomicWriteFile("ct_state.json", b, 0644); writeErr != nil {
+				if writeErr := atomicWriteFile(ctStatePath, b, 0644); writeErr != nil {
 					log.Printf("[WARN] Failed to write ct_state.json: %v", writeErr)
 				}
 			}

@@ -739,10 +739,8 @@
             const daysLeft = Math.ceil((expDate - new Date()) / (1000 * 60 * 60 * 24));
             if (daysLeft < 0) {
                badgeHtml = `<span class="badge error">Expired</span>`;
-               expiringCount++;
             } else if (daysLeft <= 30) {
                badgeHtml = `<span class="badge warning">${daysLeft}d left</span>`;
-               expiringCount++;
             } else {
                badgeHtml = `<span class="badge success">${daysLeft}d left</span>`;
             }

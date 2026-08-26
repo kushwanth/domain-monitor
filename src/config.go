@@ -53,6 +53,7 @@ type AppConfig struct {
 	Resolvers     []string       `json:"resolvers"`
 	DoHURL        string         `json:"doh_url,omitempty"`
 	CTLogsAPIKey  string         `json:"ctlogs_api_key,omitempty"`
+	DataDir       string         `json:"data_dir"`
 	Domains       []DomainConfig `json:"domains"`
 	DNSRecords    []DNSTask      `json:"dns_records"`
 }

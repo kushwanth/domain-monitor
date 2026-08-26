@@ -289,21 +289,18 @@ func fetchWhois(domain string) (*RDAPState, error) {
 		return nil, fmt.Errorf("whois query failed: %w", err)
 	}
 
-	parsed, err := whoisparser.Parse(result)
-	if err != nil {
-		return nil, fmt.Errorf("whois parsing failed: %w", err)
-	}
+	parsed, parseErr := whoisparser.Parse(result)
 
 	state := &RDAPState{
 		Status: StatusOk,
 		DNSSEC: false,
 	}
 
-	if parsed.Registrar != nil && parsed.Registrar.Name != "" {
+	if parseErr == nil && parsed.Registrar != nil && parsed.Registrar.Name != "" {
 		state.Registrar = parsed.Registrar.Name
 	}
 
-	if parsed.Domain != nil {
+	if parseErr == nil && parsed.Domain != nil {
 		if parsed.Domain.ExpirationDateInTime != nil {
 			state.Expiration = parsed.Domain.ExpirationDateInTime.UTC().Format(time.RFC3339)
 		} else if parsed.Domain.ExpirationDate != "" {
@@ -318,6 +315,32 @@ func fetchWhois(domain string) (*RDAPState, error) {
 				state.Nameservers = append(state.Nameservers, strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns), ".")))
 			}
 		}
+	}
+
+	// Fallback to manual parsing for critical fields from the raw string
+	// The likexian/whois result contains the registry WHOIS at the top, which usually
+	// contains the expiration date even if the registrar WHOIS rate limits or fails parsing.
+	if state.Expiration == "" || state.Registrar == "" {
+		lines := strings.Split(result, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if state.Expiration == "" && (strings.HasPrefix(line, "Registry Expiry Date:") || strings.HasPrefix(line, "Expiry date:")) {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					state.Expiration = strings.TrimSpace(parts[1])
+				}
+			}
+			if state.Registrar == "" && strings.HasPrefix(line, "Registrar:") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					state.Registrar = strings.TrimSpace(parts[1])
+				}
+			}
+		}
+	}
+
+	if state.Expiration == "" && parseErr != nil {
+		return nil, fmt.Errorf("whois parsing failed completely: %w", parseErr)
 	}
 
 	return state, nil

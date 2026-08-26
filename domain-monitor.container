@@ -25,6 +25,9 @@ PublishPort=8080:8080
 # Mount your configuration file into the container as read-only
 Volume=/path/to/your/homelab/config.jsonnet:/app/config.jsonnet:ro
 
+# Mount a directory to persist data (CT logs, state)
+Volume=/path/to/your/homelab/data:/app/data:rw
+
 [Service]
 # Automatically restart the container if it crashes or the system reboots
 Restart=always
