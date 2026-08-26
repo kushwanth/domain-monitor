@@ -19,8 +19,14 @@ func evaluateRDAP(ctx context.Context, client *rdap.Client, app *AppState, targe
 		whoisState, whoisErr := fetchWhois(target.Domain)
 		if whoisErr != nil {
 			log.Printf(MsgLogWHOISFail, target.Domain, whoisErr)
+			
+			status := StatusFailed
+			if strings.Contains(whoisErr.Error(), "connection refused") || strings.Contains(whoisErr.Error(), "i/o timeout") || strings.Contains(whoisErr.Error(), "no such host") {
+				status = StatusWarning
+			}
+
 			state.UpdateRDAP(target.Domain, &RDAPState{
-				Status: StatusFailed,
+				Status: status,
 				Error:  fmt.Sprintf("RDAP: %v | WHOIS: %v", err, whoisErr),
 			})
 			return

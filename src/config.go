@@ -53,7 +53,6 @@ type AppConfig struct {
 	Resolvers     []string       `json:"resolvers"`
 	DoHURL        string         `json:"doh_url,omitempty"`
 	CTLogsAPIKey  string         `json:"ctlogs_api_key,omitempty"`
-	DataDir       string         `json:"data_dir"`
 	Domains       []DomainConfig `json:"domains"`
 	DNSRecords    []DNSTask      `json:"dns_records"`
 }
@@ -226,13 +225,25 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 
 		if d.CAA != nil {
 			for j := range d.CAA.Issue {
-				d.CAA.Issue[j] = strings.ToLower(strings.TrimSpace(d.CAA.Issue[j]))
+				val := strings.ToLower(strings.TrimSpace(d.CAA.Issue[j]))
+				if val == ";" {
+					val = ""
+				}
+				d.CAA.Issue[j] = val
 			}
 			for j := range d.CAA.IssueWild {
-				d.CAA.IssueWild[j] = strings.ToLower(strings.TrimSpace(d.CAA.IssueWild[j]))
+				val := strings.ToLower(strings.TrimSpace(d.CAA.IssueWild[j]))
+				if val == ";" {
+					val = ""
+				}
+				d.CAA.IssueWild[j] = val
 			}
 			for j := range d.CAA.IssueMail {
-				d.CAA.IssueMail[j] = strings.ToLower(strings.TrimSpace(d.CAA.IssueMail[j]))
+				val := strings.ToLower(strings.TrimSpace(d.CAA.IssueMail[j]))
+				if val == ";" {
+					val = ""
+				}
+				d.CAA.IssueMail[j] = val
 			}
 		}
 

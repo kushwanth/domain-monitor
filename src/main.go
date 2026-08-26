@@ -139,14 +139,9 @@ func main() {
 		log.Fatalf("[FATAL] Configuration error: %v", err)
 	}
 
-	if app.Config.DataDir != "" {
-		CTLogsPath = filepath.Join(app.Config.DataDir, "ct_logs")
-	}
-	
-	ctStatePath := "ct_state.json"
-	if app.Config.DataDir != "" {
-		ctStatePath = filepath.Join(app.Config.DataDir, "ct_state.json")
-	}
+	defaultDataDir := "./data"
+	CTLogsPath = filepath.Join(defaultDataDir, "ct_logs")
+	ctStatePath := filepath.Join(defaultDataDir, "ct_state.json")
 
 	rdapClient := &rdap.Client{
 		HTTP: &http.Client{Timeout: 10 * time.Second},

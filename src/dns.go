@@ -442,10 +442,14 @@ func queryCAARecords(ctx context.Context, app *AppState, hostname string, resolv
 	var entries []CAAEntry
 	for _, ans := range r.Answer {
 		if caa, ok := ans.(*dns.CAA); ok {
+			val := strings.ToLower(strings.TrimSpace(caa.Value))
+			if val == ";" {
+				val = ""
+			}
 			entries = append(entries, CAAEntry{
 				Flag:  caa.Flag,
 				Tag:   strings.ToLower(caa.Tag),
-				Value: strings.ToLower(strings.TrimSpace(caa.Value)),
+				Value: val,
 			})
 		}
 	}
