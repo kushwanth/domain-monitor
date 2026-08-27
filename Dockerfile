@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -a -t
 RUN upx -9 domain-monitor
 
 # Create data directory with appropriate ownership for nonroot user (UID 65532)
-RUN mkdir -p /app/data && chown -R 65532:65532 /app/data
+RUN mkdir -p /app/data/ct_logs && chown -R 65532:65532 /app/data && chmod -R 775 /app/data
 
 # Stage 3: Ultra-Minimal Production Image (Distroless)
 FROM gcr.io/distroless/static:nonroot

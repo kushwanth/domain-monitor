@@ -607,6 +607,15 @@
         .join(' ');
     }
 
+    function formatCAAValue(val) {
+      if (!val) return 'None';
+      const trimmed = String(val).trim();
+      if (trimmed === ';' || trimmed === '""' || trimmed === "''") {
+        return 'Deny All';
+      }
+      return escapeHTML(val);
+    }
+
     function renderDomains() {
       const container = document.getElementById('view-domains');
       container.innerHTML = '';
@@ -790,10 +799,10 @@
             <div class="detail-panel">
               <h3>CAA Records</h3>
               <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="${caaState.valid ? 'color: var(--success)' : 'color: var(--error)'}">${caaState.valid ? 'Valid' : 'Invalid'}</div></div>
-              <div class="detail-row"><div class="detail-label">Issue:</div><div class="detail-value">${(caaState.issue || []).map(escapeHTML).join(', ') || 'None'}</div></div>
-              <div class="detail-row"><div class="detail-label">IssueWild:</div><div class="detail-value">${(caaState.issuewild || []).map(escapeHTML).join(', ') || 'None'}</div></div>
-              <div class="detail-row"><div class="detail-label">IssueMail:</div><div class="detail-value">${(caaState.issuemail || []).map(escapeHTML).join(', ') || 'None'}</div></div>
-              ${caaState.unknown_cas && caaState.unknown_cas.length > 0 ? `<div class="detail-row"><div class="detail-label">Unknown CAs:</div><div class="detail-value" style="color: var(--warning)">${caaState.unknown_cas.map(escapeHTML).join(', ')}</div></div>` : ''}
+              <div class="detail-row"><div class="detail-label">Issue:</div><div class="detail-value">${(caaState.issue || []).map(formatCAAValue).join(', ') || 'None'}</div></div>
+              <div class="detail-row"><div class="detail-label">IssueWild:</div><div class="detail-value">${(caaState.issuewild || []).map(formatCAAValue).join(', ') || 'None'}</div></div>
+              <div class="detail-row"><div class="detail-label">IssueMail:</div><div class="detail-value">${(caaState.issuemail || []).map(formatCAAValue).join(', ') || 'None'}</div></div>
+              ${caaState.unknown_cas && caaState.unknown_cas.length > 0 ? `<div class="detail-row"><div class="detail-label">Unknown CAs:</div><div class="detail-value" style="color: var(--warning)">${caaState.unknown_cas.map(formatCAAValue).join(', ')}</div></div>` : ''}
             </div>
           `;
         }

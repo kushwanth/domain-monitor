@@ -227,9 +227,10 @@ func queryCAARecords(ctx context.Context, app *AppState, hostname string, resolv
 	var entries []CAAEntry
 	for _, ans := range r.Answer {
 		if caa, ok := ans.(*dns.CAA); ok {
-			val := strings.ToLower(strings.TrimSpace(caa.Value))
-			if val == ";" {
-				val = ""
+			val := strings.Trim(strings.TrimSpace(caa.Value), "\"")
+			val = strings.TrimSpace(val)
+			if val == "" || val == ";" {
+				val = ";"
 			}
 			entries = append(entries, CAAEntry{
 				Flag:  caa.Flag,
@@ -239,6 +240,23 @@ func queryCAARecords(ctx context.Context, app *AppState, hostname string, resolv
 		}
 	}
 	return entries, nil
+}
+
+// parseCAAIssuer extracts the CA domain from a CAA value string.
+// Returns ";" if the record is an explicit deny-all (e.g. ";", "", "\";\"", or "; parameter=val").
+func parseCAAIssuer(rawVal string) string {
+	val := strings.Trim(strings.TrimSpace(rawVal), "\"")
+	val = strings.TrimSpace(val)
+	if val == "" || val == ";" {
+		return ";"
+	}
+	parts := strings.SplitN(val, ";", 2)
+	issuer := strings.Trim(strings.TrimSpace(parts[0]), "\"")
+	issuer = strings.TrimSpace(issuer)
+	if issuer == "" || issuer == ";" {
+		return ";"
+	}
+	return strings.ToLower(issuer)
 }
 
 func queryIPRecords(ctx context.Context, app *AppState, hostname string, resolvers []string) ([]string, error) {
@@ -285,30 +303,18 @@ func evaluateCAA(ctx context.Context, app *AppState, target DomainConfig, state 
 	liveIssueMail := make(map[string]bool)
 
 	for _, v := range res.Issue {
-		clean := strings.TrimSpace(strings.SplitN(v, ";", 2)[0])
-		if clean == "" && strings.Contains(v, ";") {
-			clean = ";"
-		}
-		if clean != "" {
-			liveIssue[clean] = true
+		if issuer := parseCAAIssuer(v); issuer != "" {
+			liveIssue[issuer] = true
 		}
 	}
 	for _, v := range res.IssueWild {
-		clean := strings.TrimSpace(strings.SplitN(v, ";", 2)[0])
-		if clean == "" && strings.Contains(v, ";") {
-			clean = ";"
-		}
-		if clean != "" {
-			liveIssueWild[clean] = true
+		if issuer := parseCAAIssuer(v); issuer != "" {
+			liveIssueWild[issuer] = true
 		}
 	}
 	for _, v := range res.IssueMail {
-		clean := strings.TrimSpace(strings.SplitN(v, ";", 2)[0])
-		if clean == "" && strings.Contains(v, ";") {
-			clean = ";"
-		}
-		if clean != "" {
-			liveIssueMail[clean] = true
+		if issuer := parseCAAIssuer(v); issuer != "" {
+			liveIssueMail[issuer] = true
 		}
 	}
 
@@ -355,6 +361,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 				if !target.SuppressAlerts {
 					app.Notifier.Dispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
 				}
+				res.UnknownCAs = append(res.UnknownCAs, liveCA)
 				res.Valid = false
 			}
 		}
@@ -397,6 +404,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 			if !target.SuppressAlerts {
 				app.Notifier.Dispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
 			}
+			res.UnknownCAs = append(res.UnknownCAs, liveCA)
 			res.Valid = false
 		}
 	}
@@ -715,20 +723,12 @@ func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string
 		resolvers = []string{target.CustomResolver}
 	}
 
-	dnsTypeMap := map[string]uint16{
-		"A":     dns.TypeA,
-		"AAAA":  dns.TypeAAAA,
-		"CNAME": dns.TypeCNAME,
-		"MX":    dns.TypeMX,
-		"TXT":   dns.TypeTXT,
-	}
-
 	var foundRecords []string
 	var err error
 
 	if target.Type == "IP" {
 		foundRecords, err = queryIPRecords(ctx, app, target.Hostname, resolvers)
-	} else if qType, ok := dnsTypeMap[target.Type]; ok {
+	} else if qType, ok := DNSTypeMap[target.Type]; ok {
 		foundRecords, err = queryDNS(ctx, app, target.Hostname, qType, resolvers)
 
 		// CNAME Flattening

@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"regexp"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 // System & Default Paths
 const (
-	DefaultDataDir = "/app/data"
-	DefaultDoHURL  = "https://dns.google/resolve"
+	DefaultDataDir             = "/app/data"
+	DefaultDoHURL              = "https://dns.google/resolve"
+	DefaultCTLogsSubdir        = "ct_logs"
+	MaxNotificationMessageLen  = 3500
 )
 
 // External API Endpoints
@@ -19,6 +23,28 @@ const (
 	BootstrapTTL        = 24 * time.Hour
 	CTLogsAPIEndpoint   = "https://api.ctlogs.dev/v1/subdomains/"
 	TelegramAPIEndpoint = "https://api.telegram.org/bot%s/sendMessage"
+)
+
+// CheckStatus represents lifecycle status of a check
+type CheckStatus string
+
+const (
+	StatusPending  CheckStatus = "pending"
+	StatusOk       CheckStatus = "ok"
+	StatusFailed   CheckStatus = "failed"
+	StatusMismatch CheckStatus = "mismatch"
+	StatusWarning  CheckStatus = "warning"
+	StatusHijacked CheckStatus = "hijacked"
+)
+
+// AlertPriority defines the urgency level of a notification alert
+type AlertPriority string
+
+const (
+	PriorityUrgent  AlertPriority = "urgent"
+	PriorityHigh    AlertPriority = "high"
+	PriorityWarning AlertPriority = "warning"
+	PriorityDefault AlertPriority = "default"
 )
 
 // System Errors
@@ -30,6 +56,145 @@ var (
 	ErrRDAPNotFound    = fmt.Errorf("RDAP domain not found (404)")
 	ErrRDAPRateLimited = fmt.Errorf("RDAP rate limited (429)")
 )
+
+// DNSTypeMap maps record type string names to miekg/dns uint16 type constants.
+var DNSTypeMap = map[string]uint16{
+	"A":     dns.TypeA,
+	"AAAA":  dns.TypeAAAA,
+	"CNAME": dns.TypeCNAME,
+	"MX":    dns.TypeMX,
+	"TXT":   dns.TypeTXT,
+	"CAA":   dns.TypeCAA,
+	"NS":    dns.TypeNS,
+}
+
+// EPPStatusMap maps raw or formatted EPP/RDAP tokens to canonical camelCase strings.
+var EPPStatusMap = map[string]string{
+	"clienttransferprohibited": "clientTransferProhibited",
+	"servertransferprohibited": "serverTransferProhibited",
+	"transferprohibited":       "transferProhibited",
+	"clientupdateprohibited":   "clientUpdateProhibited",
+	"serverupdateprohibited":   "serverUpdateProhibited",
+	"updateprohibited":         "updateProhibited",
+	"clientdeleteprohibited":   "clientDeleteProhibited",
+	"serverdeleteprohibited":   "serverDeleteProhibited",
+	"deleteprohibited":         "deleteProhibited",
+	"clientrenewprohibited":    "clientRenewProhibited",
+	"serverrenewprohibited":    "serverRenewProhibited",
+	"renewprohibited":          "renewProhibited",
+	"clienthold":               "clientHold",
+	"serverhold":               "serverHold",
+	"hold":                     "hold",
+	"pendingcreate":            "pendingCreate",
+	"pendingdelete":            "pendingDelete",
+	"pendingrenew":             "pendingRenew",
+	"pendingrestore":           "pendingRestore",
+	"pendingtransfer":          "pendingTransfer",
+	"pendingupdate":            "pendingUpdate",
+	"redemptionperiod":         "redemptionPeriod",
+	"autorenewperiod":          "autoRenewPeriod",
+	"renewperiod":              "renewPeriod",
+	"transferperiod":           "transferPeriod",
+	"inactive":                 "inactive",
+	"active":                   "active",
+	"ok":                       "ok",
+	"validated":                "validated",
+	"associated":               "associated",
+	"notassociated":            "notAssociated",
+}
+
+// TZReplacements provides standard timezone abbreviation offsets for flexible date parsing.
+var TZReplacements = map[string]string{
+	" UTC":  " +0000",
+	" GMT":  " +0000",
+	" Z":    " +0000",
+	" EDT":  " -0400",
+	" EST":  " -0500",
+	" CDT":  " -0500",
+	" CST":  " -0600",
+	" MDT":  " -0600",
+	" MST":  " -0700",
+	" PDT":  " -0700",
+	" PST":  " -0800",
+	" BST":  " +0100",
+	" CET":  " +0100",
+	" CEST": " +0200",
+	" JST":  " +0900",
+	" KST":  " +0900",
+	" AEST": " +1000",
+	" AEDT": " +1100",
+}
+
+// FlexibleDateFormats lists candidate layouts for parsing WHOIS and RDAP date strings.
+var FlexibleDateFormats = []string{
+	time.RFC3339,
+	time.RFC3339Nano,
+	time.RFC1123,
+	time.RFC1123Z,
+	time.RFC822,
+	time.RFC822Z,
+	time.RFC850,
+	time.ANSIC,
+	time.UnixDate,
+	time.RubyDate,
+	"2006-01-02T15:04:05Z",
+	"2006-01-02T15:04:05.000Z",
+	"2006-01-02T15:04:05-0700",
+	"2006-01-02T15:04:05+0700",
+	"2006-01-02T15:04:05-07:00",
+	"2006-01-02T15:04:05+07:00",
+	"2006-01-02 15:04:05 -0700",
+	"2006-01-02 15:04:05 +0700",
+	"2006-01-02 15:04:05-07:00",
+	"2006-01-02 15:04:05+07:00",
+	"2006-01-02 15:04:05 MST",
+	"2006-01-02 15:04:05 UTC",
+	"2006-01-02 15:04:05",
+	"2006-01-02",
+	"02-Jan-2006 15:04:05 -0700",
+	"02-Jan-2006 15:04:05 +0700",
+	"02-Jan-2006 15:04:05 MST",
+	"02-Jan-2006 15:04:05 UTC",
+	"02-Jan-2006 15:04:05",
+	"02-Jan-2006",
+	"02.01.2006 15:04:05",
+	"02.01.2006",
+	"2006.01.02 15:04:05",
+	"2006.01.02",
+	"2006/01/02 15:04:05",
+	"2006/01/02",
+	"02/01/2006 15:04:05",
+	"02/01/2006",
+	"01/02/2006 15:04:05",
+	"01/02/2006",
+	"Mon Jan 02 15:04:05 MST 2006",
+	"Mon Jan 02 15:04:05 2006",
+	"Mon Jan 2 15:04:05 MST 2006",
+	"20060102",
+	"20060102150405",
+	"02-01-2006",
+	"02-01-2006 15:04:05",
+}
+
+// WhoisNotFoundIndicators lists indicators across global registrars and registries denoting an unregistered domain.
+var WhoisNotFoundIndicators = []string{
+	"no match for",
+	"not found",
+	"status: free",
+	"status: available",
+	"domain not found",
+	"no data found",
+	"domain not registered",
+	"no entries found",
+	"the queried object does not exist",
+	"is available for registration",
+	"no matching record",
+	"domain unknown",
+	"nothing found",
+	"object does not exist",
+	"not registered",
+	"no information was found",
+}
 
 // Precompiled Regular Expressions
 var (

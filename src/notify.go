@@ -14,15 +14,6 @@ import (
 	"time"
 )
 
-type AlertPriority string
-
-const (
-	PriorityUrgent  AlertPriority = "urgent"
-	PriorityHigh    AlertPriority = "high"
-	PriorityWarning AlertPriority = "warning"
-	PriorityDefault AlertPriority = "default"
-)
-
 // Alert represents a single notification event
 type Alert struct {
 	Message  string
@@ -136,8 +127,6 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 			}
 		}()
 
-		const maxLen = 3500 // Safe limit for Ntfy
-
 		sendChunk := func(text string, highestPriority AlertPriority, tags []string) {
 			req, err := http.NewRequestWithContext(ctx, "POST", p.URL, strings.NewReader(strings.TrimSpace(text)))
 			if err != nil {
@@ -189,7 +178,7 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 		for _, alert := range alerts {
 			line := alert.Message + "\n\n"
 
-			if currentChunk.Len()+len(line) > maxLen {
+			if currentChunk.Len()+len(line) > MaxNotificationMessageLen {
 				sendChunk(currentChunk.String(), highestPriority, currentTags)
 				currentChunk.Reset()
 				highestPriority = PriorityDefault
@@ -230,8 +219,6 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 				slog.Error("Telegram provider panicked", "error", r)
 			}
 		}()
-
-		const maxLen = 3500 // Leave room for prefix, suffix, JSON overhead
 
 		sendChunk := func(text string) {
 			apiURL := fmt.Sprintf(TelegramAPIEndpoint, p.Token)
@@ -286,7 +273,7 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 
 			line := fmt.Sprintf("• %s%s\n", prefix, html.EscapeString(msg))
 
-			if currentChunk.Len()+len(line) > maxLen {
+			if currentChunk.Len()+len(line) > MaxNotificationMessageLen {
 				sendChunk(currentChunk.String())
 				currentChunk.Reset()
 				currentChunk.WriteString("⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n")

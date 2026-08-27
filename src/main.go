@@ -25,17 +25,6 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
-type CheckStatus string
-
-const (
-	StatusPending  CheckStatus = "pending"
-	StatusOk       CheckStatus = "ok"
-	StatusFailed   CheckStatus = "failed"
-	StatusMismatch CheckStatus = "mismatch"
-	StatusWarning  CheckStatus = "warning"
-	StatusHijacked CheckStatus = "hijacked"
-)
-
 func setupHTTPServer(app *AppState, port string, firstRunDone chan struct{}) *http.Server {
 	mux := http.NewServeMux()
 
@@ -158,6 +147,9 @@ func main() {
 	}
 
 	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" && app.Config.DataDir != "" {
+		dataDir = app.Config.DataDir
+	}
 	if dataDir == "" {
 		dataDir = DefaultDataDir
 		if _, err := os.Stat("/app"); os.IsNotExist(err) {
@@ -165,11 +157,11 @@ func main() {
 		}
 	}
 	if err := os.MkdirAll(dataDir, 0775); err != nil {
-		slog.Warn("Failed to ensure data directory exists", "path", dataDir, "error", err)
+		slog.Warn("Failed to ensure data directory exists (ensure directory is writable by UID 65532 or use :U volume mount)", "path", dataDir, "error", err)
 	}
 	CTLogsPath = filepath.Join(dataDir, "ct_logs")
 	if err := os.MkdirAll(CTLogsPath, 0775); err != nil {
-		slog.Warn("Failed to ensure ct_logs directory exists", "path", CTLogsPath, "error", err)
+		slog.Warn("Failed to ensure ct_logs directory exists (ensure directory is writable by UID 65532 or use :U volume mount)", "path", CTLogsPath, "error", err)
 	}
 	ctStatePath := filepath.Join(dataDir, "ct_state.json")
 

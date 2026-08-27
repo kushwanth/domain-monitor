@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-var CTLogsPath = "ct_logs"
+var CTLogsPath = DefaultCTLogsSubdir
 
 type CTCert struct {
 	ID        string `json:"id"`

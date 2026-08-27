@@ -8,14 +8,6 @@ import (
 func TestDNSCheck(t *testing.T) {
 	t.Parallel()
 
-	dnsTypeMap := map[string]uint16{
-		"A":     1,
-		"AAAA":  28,
-		"CNAME": 5,
-		"MX":    15,
-		"TXT":   16,
-	}
-
 	tests := []struct {
 		name       string
 		recordType string
@@ -33,7 +25,7 @@ func TestDNSCheck(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			_, ok := dnsTypeMap[tt.recordType]
+			_, ok := DNSTypeMap[tt.recordType]
 			if ok != tt.expectOK {
 				t.Errorf("Expected OK=%v for %s, got %v", tt.expectOK, tt.recordType, ok)
 			}
@@ -149,6 +141,7 @@ func TestValidateCAATag(t *testing.T) {
 		expected    []string
 		live        map[string]bool
 		expectValid bool
+		expectUnk   []string
 	}{
 		{
 			name: "Valid Exact Match",
@@ -234,6 +227,19 @@ func TestValidateCAATag(t *testing.T) {
 			live:        map[string]bool{"any-mail-ca.com": true},
 			expectValid: true,
 		},
+		{
+			name: "Deny All Unauthorized CA Populates UnknownCAs",
+			target: DomainConfig{
+				Domain:         "example.com",
+				Name:           "Example",
+				SuppressAlerts: true,
+			},
+			tag:         "issue",
+			expected:    []string{},
+			live:        map[string]bool{";": true, "unauth-ca.com": true},
+			expectValid: false,
+			expectUnk:   []string{"unauth-ca.com"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -245,6 +251,49 @@ func TestValidateCAATag(t *testing.T) {
 			if res.Valid != tt.expectValid {
 				t.Errorf("Expected Valid: %v, got %v", tt.expectValid, res.Valid)
 			}
+			if len(tt.expectUnk) > 0 {
+				for _, unk := range tt.expectUnk {
+					found := false
+					for _, u := range res.UnknownCAs {
+						if u == unk {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("Expected UnknownCA %s in %v", unk, res.UnknownCAs)
+					}
+				}
+			}
 		})
+	}
+}
+
+func TestParseCAAIssuer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{";", ";"},
+		{"", ";"},
+		{"\";\"", ";"},
+		{"\"\"", ";"},
+		{" ; ", ";"},
+		{"; policy=ev", ";"},
+		{"; accounturi=https://example.com/acct/123", ";"},
+		{"letsencrypt.org", "letsencrypt.org"},
+		{"\"letsencrypt.org\"", "letsencrypt.org"},
+		{"LETSENCRYPT.ORG", "letsencrypt.org"},
+		{"letsencrypt.org; accounturi=https://example.com", "letsencrypt.org"},
+		{"digicert.com; validationmethods=dns-01", "digicert.com"},
+	}
+
+	for _, tt := range tests {
+		actual := parseCAAIssuer(tt.input)
+		if actual != tt.expected {
+			t.Errorf("parseCAAIssuer(%q) = %q, expected %q", tt.input, actual, tt.expected)
+		}
 	}
 }

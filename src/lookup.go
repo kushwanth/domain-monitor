@@ -106,91 +106,21 @@ func parseFlexibleDate(dateStr string) (time.Time, string, error) {
 
 	// Clean known timezone abbreviations and normalize
 	cleanNormalized := clean
-	tzReplacements := map[string]string{
-		" UTC":  " +0000",
-		" GMT":  " +0000",
-		" Z":    " +0000",
-		" EDT":  " -0400",
-		" EST":  " -0500",
-		" CDT":  " -0500",
-		" CST":  " -0600",
-		" MDT":  " -0600",
-		" MST":  " -0700",
-		" PDT":  " -0700",
-		" PST":  " -0800",
-		" BST":  " +0100",
-		" CET":  " +0100",
-		" CEST": " +0200",
-		" JST":  " +0900",
-		" KST":  " +0900",
-		" AEST": " +1000",
-		" AEDT": " +1100",
-	}
-	for tz, repl := range tzReplacements {
+	for tz, repl := range TZReplacements {
 		if strings.HasSuffix(cleanNormalized, tz) {
 			cleanNormalized = strings.TrimSuffix(cleanNormalized, tz) + repl
 			break
 		}
 	}
 
-	formats := []string{
-		time.RFC3339,
-		time.RFC3339Nano,
-		time.RFC1123,
-		time.RFC1123Z,
-		time.RFC822,
-		time.RFC822Z,
-		time.RFC850,
-		time.ANSIC,
-		time.UnixDate,
-		time.RubyDate,
-		"2006-01-02T15:04:05Z",
-		"2006-01-02T15:04:05.000Z",
-		"2006-01-02T15:04:05-0700",
-		"2006-01-02T15:04:05+0700",
-		"2006-01-02T15:04:05-07:00",
-		"2006-01-02T15:04:05+07:00",
-		"2006-01-02 15:04:05 -0700",
-		"2006-01-02 15:04:05 +0700",
-		"2006-01-02 15:04:05-07:00",
-		"2006-01-02 15:04:05+07:00",
-		"2006-01-02 15:04:05 MST",
-		"2006-01-02 15:04:05 UTC",
-		"2006-01-02 15:04:05",
-		"2006-01-02",
-		"02-Jan-2006 15:04:05 -0700",
-		"02-Jan-2006 15:04:05 +0700",
-		"02-Jan-2006 15:04:05 MST",
-		"02-Jan-2006 15:04:05 UTC",
-		"02-Jan-2006 15:04:05",
-		"02-Jan-2006",
-		"02.01.2006 15:04:05",
-		"02.01.2006",
-		"2006.01.02 15:04:05",
-		"2006.01.02",
-		"2006/01/02 15:04:05",
-		"2006/01/02",
-		"02/01/2006 15:04:05",
-		"02/01/2006",
-		"01/02/2006 15:04:05",
-		"01/02/2006",
-		"Mon Jan 02 15:04:05 MST 2006",
-		"Mon Jan 02 15:04:05 2006",
-		"Mon Jan 2 15:04:05 MST 2006",
-		"20060102",
-		"20060102150405",
-		"02-01-2006",
-		"02-01-2006 15:04:05",
-	}
-
 	for _, target := range []string{cleanNormalized, clean} {
-		for _, format := range formats {
+		for _, format := range FlexibleDateFormats {
 			if t, err := time.Parse(format, target); err == nil {
 				utc := t.UTC()
 				return utc, utc.Format(time.RFC3339), nil
 			}
 		}
-		for _, format := range formats {
+		for _, format := range FlexibleDateFormats {
 			if t, err := time.ParseInLocation(format, target, time.UTC); err == nil {
 				utc := t.UTC()
 				return utc, utc.Format(time.RFC3339), nil
@@ -208,26 +138,46 @@ func normalizeEPPStatus(raw string) string {
 		return ""
 	}
 
-	// Remove ICANN schema URL anchors (e.g., "https://icann.org/epp#clientTransferProhibited" -> "clientTransferProhibited")
+	// 1. If raw contains a URL with an anchor (e.g., "https://icann.org/epp#clientTransferProhibited"
+	// or "clientTransferProhibited https://icann.org/epp#clientTransferProhibited"), extract the anchor token if valid.
 	if hashIdx := strings.Index(s, "#"); hashIdx != -1 {
 		token := strings.TrimSpace(s[hashIdx+1:])
-		if token != "" {
+		token = strings.TrimRight(token, ")/;, \t\r\n")
+		if token != "" && !strings.Contains(token, "/") && !strings.Contains(token, " ") {
+			cleanKey := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(token, " ", ""), "-", ""), "_", ""))
+			if canon, ok := EPPStatusMap[cleanKey]; ok {
+				return canon
+			}
 			return token
 		}
 	}
 
-	// Strip parenthesis notes like "(server-managed)"
+	// 2. Strip parenthesis notes like "(server-managed)"
 	if parenIdx := strings.Index(s, "("); parenIdx != -1 {
 		s = strings.TrimSpace(s[:parenIdx])
 	}
 
+	// 3. Strip any full URL tokens (e.g., "https://...", "http://...")
 	fields := strings.Fields(s)
-	if len(fields) > 0 {
-		first := fields[0]
-		if hashIdx := strings.Index(first, "#"); hashIdx != -1 {
-			return strings.TrimSpace(first[hashIdx+1:])
+	var nonURLFields []string
+	for _, f := range fields {
+		if !strings.HasPrefix(strings.ToLower(f), "http://") && !strings.HasPrefix(strings.ToLower(f), "https://") {
+			nonURLFields = append(nonURLFields, f)
 		}
-		return first
+	}
+	if len(nonURLFields) > 0 {
+		s = strings.Join(nonURLFields, " ")
+	}
+
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	// 4. Map known multi-word, hyphenated, or camelCase EPP / RDAP status strings to canonical format
+	cleanKey := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, " ", ""), "-", ""), "_", ""))
+	if canon, ok := EPPStatusMap[cleanKey]; ok {
+		return canon
 	}
 
 	return s
@@ -252,8 +202,8 @@ func cleanStatuses(statuses []string) []string {
 
 func isTransferLocked(statuses []string) bool {
 	for _, s := range statuses {
-		clean := strings.ToLower(strings.ReplaceAll(s, " ", ""))
-		if strings.Contains(clean, "transferprohibited") {
+		clean := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, " ", ""), "-", ""), "_", ""))
+		if strings.Contains(clean, "transferprohibited") || strings.Contains(clean, "prohibittransfer") || strings.Contains(clean, "transferlock") {
 			return true
 		}
 	}
@@ -262,7 +212,7 @@ func isTransferLocked(statuses []string) bool {
 
 func getSuspensionStatus(statuses []string) (bool, string) {
 	for _, s := range statuses {
-		clean := strings.ToLower(strings.ReplaceAll(s, " ", ""))
+		clean := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, " ", ""), "-", ""), "_", ""))
 		if clean == "serverhold" || clean == "clienthold" || clean == "pendingdelete" || clean == "redemptionperiod" || clean == "inactive" {
 			return true, s
 		}
@@ -273,25 +223,7 @@ func getSuspensionStatus(statuses []string) (bool, string) {
 // isDomainNotFoundInWhois checks for common registrar and registry not-found responses.
 func isDomainNotFoundInWhois(text string) bool {
 	lower := strings.ToLower(text)
-	indicators := []string{
-		"no match for",
-		"not found",
-		"status: free",
-		"status: available",
-		"domain not found",
-		"no data found",
-		"domain not registered",
-		"no entries found",
-		"the queried object does not exist",
-		"is available for registration",
-		"no matching record",
-		"domain unknown",
-		"nothing found",
-		"object does not exist",
-		"not registered",
-		"no information was found",
-	}
-	for _, ind := range indicators {
+	for _, ind := range WhoisNotFoundIndicators {
 		if strings.Contains(lower, ind) {
 			return true
 		}

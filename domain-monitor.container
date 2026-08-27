@@ -27,7 +27,8 @@ PublishPort=8080:8080
 Volume=/path/to/your/homelab/config.jsonnet:/app/config.jsonnet:ro
 
 # Mount a directory to persist data (CT logs, state)
-Volume=/path/to/your/homelab/data:/app/data:rw
+# Note: :U flag tells Podman to recursively map ownership to container UID 65532
+Volume=/path/to/your/homelab/data:/app/data:U
 
 [Service]
 # Automatically restart the container if it crashes or the system reboots

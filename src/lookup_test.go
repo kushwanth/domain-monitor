@@ -93,6 +93,48 @@ func TestRDAPStatusLock(t *testing.T) {
 		expectSusp bool
 	}{
 		{
+			name:       "Standard Locked (RDAP space-separated)",
+			statuses:   []string{"client transfer prohibited", "client update prohibited"},
+			expectLock: true,
+			expectSusp: false,
+		},
+		{
+			name:       "Server Transfer Prohibited (RDAP space-separated)",
+			statuses:   []string{"server transfer prohibited"},
+			expectLock: true,
+			expectSusp: false,
+		},
+		{
+			name:       "Transfer Prohibited (Hyphenated)",
+			statuses:   []string{"client-transfer-prohibited"},
+			expectLock: true,
+			expectSusp: false,
+		},
+		{
+			name:       "Suspended (RDAP client hold)",
+			statuses:   []string{"client hold"},
+			expectLock: false,
+			expectSusp: true,
+		},
+		{
+			name:       "Suspended (RDAP server hold)",
+			statuses:   []string{"server hold"},
+			expectLock: false,
+			expectSusp: true,
+		},
+		{
+			name:       "Suspended (RDAP pending delete)",
+			statuses:   []string{"pending delete"},
+			expectLock: false,
+			expectSusp: true,
+		},
+		{
+			name:       "Suspended (RDAP redemption period)",
+			statuses:   []string{"redemption period"},
+			expectLock: false,
+			expectSusp: true,
+		},
+		{
 			name:       "Standard Locked",
 			statuses:   []string{"clientTransferProhibited", "clientUpdateProhibited"},
 			expectLock: true,
@@ -325,9 +367,23 @@ func TestNormalizeEPPStatus(t *testing.T) {
 		expected string
 	}{
 		{"clientTransferProhibited https://icann.org/epp#clientTransferProhibited", "clientTransferProhibited"},
+		{"client transfer prohibited", "clientTransferProhibited"},
+		{"server transfer prohibited", "serverTransferProhibited"},
+		{"transfer prohibited", "transferProhibited"},
+		{"client update prohibited", "clientUpdateProhibited"},
+		{"client delete prohibited", "clientDeleteProhibited"},
+		{"client renew prohibited", "clientRenewProhibited"},
+		{"client hold", "clientHold"},
+		{"server hold", "serverHold"},
+		{"pending delete", "pendingDelete"},
+		{"pending transfer", "pendingTransfer"},
+		{"redemption period", "redemptionPeriod"},
+		{"auto renew period", "autoRenewPeriod"},
+		{"client-transfer-prohibited", "clientTransferProhibited"},
+		{"client_transfer_prohibited", "clientTransferProhibited"},
 		{"https://icann.org/epp#serverHold", "serverHold"},
 		{"ok", "ok"},
-		{"ACTIVE", "ACTIVE"},
+		{"ACTIVE", "active"},
 		{"clientTransferProhibited (server-managed)", "clientTransferProhibited"},
 		{"inactive", "inactive"},
 		{"redemptionPeriod", "redemptionPeriod"},

@@ -42,6 +42,7 @@ type Notifications struct {
 
 type AppConfig struct {
 	Port          string         `json:"port"`
+	DataDir       string         `json:"data_dir,omitempty"`
 	LoopInterval  string         `json:"loop_interval"`
 	RequestDelay  string         `json:"request_delay"`
 	WhoisDelay    string         `json:"whois_delay"`
@@ -176,12 +177,14 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 				var res []string
 				for _, item := range list {
 					val := strings.ToLower(strings.TrimSpace(item))
-					if val != "" && val != ";" && val != "none" {
+					val = strings.Trim(val, "\"")
+					val = strings.TrimSpace(val)
+					if val != "" && val != ";" {
 						res = append(res, val)
 					}
 				}
 				if len(res) == 0 {
-					return []string{} // non-nil empty slice represents explicit deny-all
+					return []string{} // non-nil empty slice represents explicit deny-all (e.g. [] or [";"])
 				}
 				return res
 			}
