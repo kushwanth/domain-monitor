@@ -765,6 +765,7 @@
                 <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value" style="text-transform: lowercase;">${ns}</div></div>
                 <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="text-transform: capitalize;">${statuses}</div></div>
                 <div class="detail-row"><div class="detail-label">DNSSEC:</div><div class="detail-value">${rdapState.dnssec ? 'Enabled' : 'Disabled'}</div></div>
+                ${rdapState.source ? `<div class="detail-row"><div class="detail-label">Lookup Source:</div><div class="detail-value" style="text-transform: uppercase; font-size: 0.85em; opacity: 0.8;">${escapeHTML(rdapState.source)}</div></div>` : ''}
               </div>`;
           }
         }

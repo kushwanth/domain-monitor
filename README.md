@@ -93,9 +93,13 @@ docker run -d \
   --restart always \
   -p 8080:8080 \
   -v /path/to/your/config.jsonnet:/app/config.jsonnet:ro \
+  -v /path/to/your/data:/app/data:rw \
   -e CONFIG_PATH=/app/config.jsonnet \
+  -e DATA_DIR=/app/data \
   ghcr.io/your-github-username/your-repo-name:latest
 ```
+
+> **Note on Permissions**: The container runs with the minimal non-root user `UID 65532`. Ensure your host data directory (`/path/to/your/data`) has write permissions for UID 65532 (`chown -R 65532:65532 /path/to/your/data`).
 
 ### Systemd / Podman Quadlet
 
@@ -119,7 +123,7 @@ For Linux environments, you can use the included `domain-monitor.container` file
 
 This project maintains strict testing requirements. 
 *   **Run all tests:** `go test ./src/... -v -race`
-*   **Unit tests:** Located alongside source files (e.g., `src/notify_test.go`) to test internal state. Exhaustive, parallel, and table-driven.
+*   **Unit tests:** Located alongside source files (e.g., `src/notify_test.go`, `src/lookup_test.go`, `src/dns_test.go`) to test internal state. Exhaustive, parallel, and table-driven.
 
 ---
 
@@ -127,6 +131,18 @@ This project maintains strict testing requirements.
 
 *   **`/api/state`:** Real-time JSON dump of the current evaluation state (powers the Web Dashboard). The HTTP server purposefully blocks and does not listen on its port until the first execution loop is finished, guaranteeing that no partial or empty states are ever served.
 *   **`/health`:** Lightweight HTTP 200 liveness probe.
+*   **`/api/certs?domain=example.com`:** Historical and real-time SSL certificate logs discovered via Certificate Transparency monitoring.
+
+---
+
+## References & Acknowledgements
+
+This project builds upon and references ideas from several open-source libraries and services:
+*   [**lissy93/who-dat**](https://github.com/lissy93/who-dat) by Alicia Sykes: Reference implementation for unified WHOIS/RDAP JSON lookups and jCard data parsing.
+*   [**likexian/whois**](https://github.com/likexian/whois) & [**likexian/whois-parser**](https://github.com/likexian/whois-parser) by Li Kexian: Raw port-43 WHOIS transport and schema parser.
+*   [**openrdap/rdap**](https://github.com/openrdap/rdap): RFC 7480 / RFC 9083 Registration Data Access Protocol (RDAP) decoder for Go.
+*   [**miekg/dns**](https://github.com/miekg/dns) by Miek Gieben: Complete DNS wire protocol and cryptographic DNSSEC verification library for Go.
+*   [**google/go-jsonnet**](https://github.com/google/go-jsonnet): Official Go implementation of the Jsonnet data templating language.
 
 ---
 

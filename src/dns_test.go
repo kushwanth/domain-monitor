@@ -186,6 +186,54 @@ func TestValidateCAATag(t *testing.T) {
 			live:        map[string]bool{"letsencrypt.org": true, "rogue-ca.com": true},
 			expectValid: false,
 		},
+		{
+			name: "Valid Deny All With Semicolon Record",
+			target: DomainConfig{
+				Domain:         "example.com",
+				Name:           "Example",
+				SuppressAlerts: true,
+			},
+			tag:         "issuewild",
+			expected:    []string{},
+			live:        map[string]bool{";": true},
+			expectValid: true,
+		},
+		{
+			name: "Deny All Failed Due To Unauthorized CA",
+			target: DomainConfig{
+				Domain:         "example.com",
+				Name:           "Example",
+				SuppressAlerts: true,
+			},
+			tag:         "issuewild",
+			expected:    []string{},
+			live:        map[string]bool{"letsencrypt.org": true},
+			expectValid: false,
+		},
+		{
+			name: "Deny All Failed Due To Missing CAA Record",
+			target: DomainConfig{
+				Domain:         "example.com",
+				Name:           "Example",
+				SuppressAlerts: true,
+			},
+			tag:         "issuewild",
+			expected:    []string{},
+			live:        map[string]bool{},
+			expectValid: false,
+		},
+		{
+			name: "Skipped Tag (nil)",
+			target: DomainConfig{
+				Domain:         "example.com",
+				Name:           "Example",
+				SuppressAlerts: true,
+			},
+			tag:         "issuemail",
+			expected:    nil,
+			live:        map[string]bool{"any-mail-ca.com": true},
+			expectValid: true,
+		},
 	}
 
 	for _, tt := range tests {

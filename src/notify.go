@@ -1,19 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"html"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 )
-
-const TelegramAPIEndpoint = "https://api.telegram.org/bot%s/sendMessage"
 
 type AlertPriority string
 
@@ -34,14 +33,14 @@ type Alert struct {
 	Name     string
 }
 
-// Notifier interface allows easy expansion to Slack, Telegram, Discord, etc.
-type Notifier interface {
-	Send(alerts []Alert, wg *sync.WaitGroup)
+// NotificationProvider interface allows easy expansion to Slack, Telegram, Discord, etc.
+type NotificationProvider interface {
+	Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup)
 }
 
 // NotificationManager handles broadcasting to all configured providers
 type NotificationManager struct {
-	Providers     []Notifier
+	Providers     []NotificationProvider
 	Buffer        []Alert
 	mu            sync.Mutex
 	wg            sync.WaitGroup
@@ -68,7 +67,7 @@ func (nm *NotificationManager) EndCycle() {
 }
 
 func (nm *NotificationManager) Dispatch(message, redacted string, priority AlertPriority, tag, domain, name string) {
-	log.Println(message)
+	slog.Info(message)
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
@@ -99,7 +98,7 @@ func (nm *NotificationManager) Dispatch(message, redacted string, priority Alert
 	})
 }
 
-func (nm *NotificationManager) Flush() {
+func (nm *NotificationManager) Flush(ctx context.Context) {
 	nm.mu.Lock()
 	if len(nm.Buffer) == 0 {
 		nm.mu.Unlock()
@@ -113,7 +112,7 @@ func (nm *NotificationManager) Flush() {
 
 	for _, provider := range nm.Providers {
 		nm.wg.Add(1)
-		provider.Send(alerts, &nm.wg)
+		provider.Send(ctx, alerts, &nm.wg)
 	}
 }
 
@@ -128,26 +127,24 @@ type NtfyProvider struct {
 	Auth string
 }
 
-func (n *NtfyProvider) Send(alerts []Alert, wg *sync.WaitGroup) {
+func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup) {
 	go func() {
 		defer wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[ERROR] Ntfy provider panicked: %v", r)
+				slog.Error("Ntfy provider panicked", "error", r)
 			}
 		}()
 
 		const maxLen = 3500 // Safe limit for Ntfy
 
 		sendChunk := func(text string, highestPriority AlertPriority, tags []string) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			req, err := http.NewRequestWithContext(ctx, "POST", n.URL, strings.NewReader(strings.TrimSpace(text)))
+			req, err := http.NewRequestWithContext(ctx, "POST", p.URL, strings.NewReader(strings.TrimSpace(text)))
 			if err != nil {
 				return
 			}
-			if n.Auth != "" {
-				req.Header.Set("Authorization", n.Auth)
+			if p.Auth != "" {
+				req.Header.Set("Authorization", p.Auth)
 			}
 			req.Header.Set("Title", "Domain Monitor Alerts")
 			req.Header.Set("Priority", string(highestPriority))
@@ -174,13 +171,13 @@ func (n *NtfyProvider) Send(alerts []Alert, wg *sync.WaitGroup) {
 			if resp, err := client.Do(req); err == nil {
 				if resp.StatusCode >= 400 {
 					bodyBytes, _ := io.ReadAll(resp.Body)
-					log.Printf("[ERROR] Ntfy delivery failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+					slog.Error("Ntfy delivery failed", "status", resp.StatusCode, "response", string(bodyBytes))
 				} else {
 					_, _ = io.Copy(io.Discard, resp.Body)
 				}
 				_ = resp.Body.Close()
 			} else {
-				log.Printf("[ERROR] Ntfy request error: %v", err)
+				slog.Error("Ntfy request error", "error", err)
 			}
 			time.Sleep(1 * time.Second)
 		}
@@ -225,28 +222,26 @@ type TelegramProvider struct {
 	ChatID string
 }
 
-func (t *TelegramProvider) Send(alerts []Alert, wg *sync.WaitGroup) {
+func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup) {
 	go func() {
 		defer wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[ERROR] Telegram provider panicked: %v", r)
+				slog.Error("Telegram provider panicked", "error", r)
 			}
 		}()
 
 		const maxLen = 3500 // Leave room for prefix, suffix, JSON overhead
 
 		sendChunk := func(text string) {
-			apiURL := fmt.Sprintf(TelegramAPIEndpoint, t.Token)
+			apiURL := fmt.Sprintf(TelegramAPIEndpoint, p.Token)
 			payloadBytes, _ := json.Marshal(map[string]interface{}{
-				"chat_id":    t.ChatID,
+				"chat_id":    p.ChatID,
 				"text":       text,
 				"parse_mode": "HTML",
 			})
 
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			req, err := http.NewRequestWithContext(ctx, "POST", apiURL, strings.NewReader(string(payloadBytes)))
+			req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(payloadBytes))
 			if err != nil {
 				return
 			}
@@ -256,13 +251,13 @@ func (t *TelegramProvider) Send(alerts []Alert, wg *sync.WaitGroup) {
 			if resp, err := client.Do(req); err == nil {
 				if resp.StatusCode >= 400 {
 					bodyBytes, _ := io.ReadAll(resp.Body)
-					log.Printf("[ERROR] Telegram delivery failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+					slog.Error("Telegram delivery failed", "status", resp.StatusCode, "response", string(bodyBytes))
 				} else {
 					_, _ = io.Copy(io.Discard, resp.Body)
 				}
 				_ = resp.Body.Close()
 			} else {
-				log.Printf("[ERROR] Telegram request error: %v", err)
+				slog.Error("Telegram request error", "error", err)
 			}
 			time.Sleep(1 * time.Second)
 		}
@@ -304,64 +299,3 @@ func (t *TelegramProvider) Send(alerts []Alert, wg *sync.WaitGroup) {
 		}
 	}()
 }
-
-const (
-	// DNS Alerts
-	MsgAlertDNSFailed   = "[CRITICAL] DNS Resolution Failed: %s (%s)"
-	MsgAlertDNSMismatch = "[CRITICAL] Mismatch on %s (%s)! Missing expected: %s. Found: [%s]"
-	MsgAlertDNSUnauth   = "[CRITICAL] Unauthorized record found on %s (%s): %s! Expected: [%s]"
-
-	// DNS Info
-	MsgLogDNSCustomFail = "[WARN] Custom resolver %s failed for %s. Falling back to global pool."
-
-	// DNSSEC Alerts
-	MsgAlertDNSSECNoDS        = "[HIGH] DNSSEC: No DS record at parent for %s"
-	MsgAlertDNSSECNoDNSKEY    = "[HIGH] DNSSEC: No DNSKEY records found for %s"
-	MsgAlertDNSSECMismatch    = "[CRITICAL] DNSSEC: DS does not match any DNSKEY for %s"
-	MsgAlertDNSSECRRSIGFail   = "[CRITICAL] DNSSEC: RRSIG verification failed for %s"
-	MsgAlertDNSSECChainBroken = "[CRITICAL] DNSSEC: Full chain of trust validation failed (AD flag missing) for %s"
-
-	// CAA Alerts
-	MsgAlertCAAMissing    = "[HIGH] CAA: No %s records found for %s"
-	MsgAlertCAAUnauth     = "[CRITICAL] CAA: Unauthorized CA '%s' in %s record for %s"
-	MsgAlertCAAExpectedNA = "[HIGH] CAA: Expected CA '%s' missing from %s record for %s"
-
-	// CT Logs Alerts
-	MsgAlertNewSSLCert = "[INFO] New SSL Certificate issued for %s by %s. Match: %s"
-
-	// Email Security Alerts
-	MsgAlertEmailNoMX      = "[CRITICAL] Email Security: No MX records found for %s"
-	MsgAlertEmailMXMissing = "[CRITICAL] Email Security: Missing expected MX %s on %s. Found: [%s]"
-	MsgAlertEmailMXUnauth  = "[CRITICAL] Email Security: Unauthorized MX %s on %s! Expected: [%s]"
-	MsgAlertEmailMXHijack  = "[CRITICAL] MX HIJACK DETECTED for %s! Expected provider %s infrastructure, found: [%s]"
-	MsgAlertEmailNoSPF     = "[HIGH] Missing SPF record for %s"
-	MsgAlertEmailMultiSPF  = "[CRITICAL] Multiple SPF records found for %s! This breaks email delivery."
-	MsgAlertEmailNoDMARC   = "[HIGH] Missing DMARC record for %s (_dmarc.%s)"
-	MsgAlertEmailNoDKIM    = "[HIGH] No valid DKIM records found for %s (checked: %s)"
-
-	// Email Security Info
-	MsgLogEmailUnknownProv = "[WARN] Unknown mail_provider '%s' for %s. Skipping MX hijack prevention."
-
-	// RDAP Alerts
-	MsgAlertRDAPExpiry    = "%s expires in %.0f days"
-	MsgAlertRDAPModified  = "registry record modified for %s! timestamp: %s"
-	MsgAlertRDAPUnauthNS  = "unauthorized ns on %s: %s"
-	MsgAlertRDAPMissingNS = "expected ns missing from %s: %s"
-	MsgAlertRDAPSuspended = "domain %s suspended! status: %s"
-	MsgAlertRDAPUnlocked  = "%s is unlocked (missing transfer prohibitions)"
-
-	// RDAP Info
-	MsgLogRDAPFail = "[ERROR] RDAP query failed for %s: %v"
-
-	// WHOIS Info
-	MsgLogWHOISFallback = "[INFO] RDAP failed for %s, attempting WHOIS fallback..."
-	MsgLogWHOISFail     = "[ERROR] WHOIS fallback also failed for %s: %v"
-	MsgLogWHOISSuccess  = "[INFO] WHOIS fallback succeeded for %s"
-
-	// System Info
-	MsgLogStartup          = "[INFO] Daemon initialized successfully. Domains: %d, DNS Records: %d"
-	MsgLogHTTPAPI          = "[INFO] HTTP API running on :%s (Endpoints: /, /health)"
-	MsgLogTelegramConfig   = "[INFO] Telegram notifications configured."
-	MsgLogShutdownSignal   = "[INFO] Received signal: %v. Initiating graceful shutdown..."
-	MsgLogShutdownComplete = "[INFO] Daemon shutdown complete."
-)

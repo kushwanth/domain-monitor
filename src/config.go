@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -16,10 +16,6 @@ import (
 
 	"github.com/google/go-jsonnet"
 	"github.com/miekg/dns"
-)
-
-const (
-	DefaultDoHURL = "https://dns.google/resolve"
 )
 
 type CAAConfig struct {
@@ -144,63 +140,12 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 		rawCfg.DoHURL = u
 	}
 
-	nm := &NotificationManager{}
-
-	// 1. Validate and Register Ntfy
-	if rawCfg.Notifications.Ntfy != nil && rawCfg.Notifications.Ntfy.URL != "" {
-		if rawCfg.Notifications.Ntfy.Auth != "" && !strings.HasPrefix(strings.ToLower(rawCfg.Notifications.Ntfy.Auth), "bearer ") && !strings.HasPrefix(strings.ToLower(rawCfg.Notifications.Ntfy.Auth), "basic ") {
-			rawCfg.Notifications.Ntfy.Auth = "Bearer " + rawCfg.Notifications.Ntfy.Auth
-		}
-
-		client := &http.Client{Timeout: 5 * time.Second}
-		req, err := http.NewRequestWithContext(ctx, "POST", rawCfg.Notifications.Ntfy.URL, strings.NewReader("System Boot: Connectivity Test"))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create ntfy request: %w", err)
-		}
-		if rawCfg.Notifications.Ntfy.Auth != "" {
-			req.Header.Set("Authorization", rawCfg.Notifications.Ntfy.Auth)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("ntfy URL provided is unreachable: %w", err)
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-
-		nm.Providers = append(nm.Providers, &NtfyProvider{
-			URL:  rawCfg.Notifications.Ntfy.URL,
-			Auth: rawCfg.Notifications.Ntfy.Auth,
-		})
-	}
-
-	if rawCfg.Notifications.Telegram != nil && rawCfg.Notifications.Telegram.Token != "" && rawCfg.Notifications.Telegram.ChatID != "" {
-		nm.Providers = append(nm.Providers, &TelegramProvider{
-			Token:  rawCfg.Notifications.Telegram.Token,
-			ChatID: rawCfg.Notifications.Telegram.ChatID,
-		})
-		log.Println("[INFO] Telegram notifications configured.")
-	}
-
-	// 2. Set Default Resolvers and Verify Health
+	// Defaults that do not require side-effects
 	if len(rawCfg.Resolvers) == 0 {
 		rawCfg.Resolvers = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 	}
 	if len(rawCfg.Resolvers) > 9 {
 		return nil, fmt.Errorf("configured resolvers exceed maximum limit of 9")
-	}
-	for _, res := range rawCfg.Resolvers {
-		ip := res
-		if _, _, err := net.SplitHostPort(ip); err != nil {
-			ip = net.JoinHostPort(ip, "53")
-		}
-		c := new(dns.Client)
-		c.Timeout = 5 * time.Second
-		m := new(dns.Msg)
-		m.SetQuestion(dns.Fqdn("example.com"), dns.TypeA)
-		m.RecursionDesired = true
-		if _, _, err := c.ExchangeContext(ctx, m, ip); err != nil {
-			return nil, fmt.Errorf("global resolver health check failed for %s: %w", res, err)
-		}
 	}
 
 	// 3. Schema Normalization
@@ -224,26 +169,31 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 		}
 
 		if d.CAA != nil {
-			for j := range d.CAA.Issue {
-				val := strings.ToLower(strings.TrimSpace(d.CAA.Issue[j]))
-				if val == ";" {
-					val = ""
+			normalizeCAAList := func(list []string) []string {
+				if list == nil {
+					return nil
 				}
-				d.CAA.Issue[j] = val
+				var res []string
+				for _, item := range list {
+					val := strings.ToLower(strings.TrimSpace(item))
+					if val != "" && val != ";" && val != "none" {
+						res = append(res, val)
+					}
+				}
+				if len(res) == 0 {
+					return []string{} // non-nil empty slice represents explicit deny-all
+				}
+				return res
 			}
-			for j := range d.CAA.IssueWild {
-				val := strings.ToLower(strings.TrimSpace(d.CAA.IssueWild[j]))
-				if val == ";" {
-					val = ""
-				}
-				d.CAA.IssueWild[j] = val
+
+			if d.CAA.Issue != nil {
+				d.CAA.Issue = normalizeCAAList(d.CAA.Issue)
 			}
-			for j := range d.CAA.IssueMail {
-				val := strings.ToLower(strings.TrimSpace(d.CAA.IssueMail[j]))
-				if val == ";" {
-					val = ""
-				}
-				d.CAA.IssueMail[j] = val
+			if d.CAA.IssueWild != nil {
+				d.CAA.IssueWild = normalizeCAAList(d.CAA.IssueWild)
+			}
+			if d.CAA.IssueMail != nil {
+				d.CAA.IssueMail = normalizeCAAList(d.CAA.IssueMail)
 			}
 		}
 
@@ -297,7 +247,7 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 
 	app := &AppState{
 		Config:           &rawCfg,
-		Notifier:         nm,
+		Notifier:         &NotificationManager{},
 		StateLastChanged: make(map[string]string),
 	}
 
@@ -315,4 +265,61 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	}
 
 	return app, nil
+}
+
+// InitializeDependencies handles side-effects like validating notifications and resolver health checks
+func InitializeDependencies(ctx context.Context, app *AppState) error {
+	rawCfg := app.Config
+	nm := app.Notifier
+
+	if rawCfg.Notifications.Ntfy != nil && rawCfg.Notifications.Ntfy.URL != "" {
+		if rawCfg.Notifications.Ntfy.Auth != "" && !strings.HasPrefix(strings.ToLower(rawCfg.Notifications.Ntfy.Auth), "bearer ") && !strings.HasPrefix(strings.ToLower(rawCfg.Notifications.Ntfy.Auth), "basic ") {
+			rawCfg.Notifications.Ntfy.Auth = "Bearer " + rawCfg.Notifications.Ntfy.Auth
+		}
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		req, err := http.NewRequestWithContext(ctx, "POST", rawCfg.Notifications.Ntfy.URL, strings.NewReader("System Boot: Connectivity Test"))
+		if err != nil {
+			return fmt.Errorf("failed to create ntfy request: %w", err)
+		}
+		if rawCfg.Notifications.Ntfy.Auth != "" {
+			req.Header.Set("Authorization", rawCfg.Notifications.Ntfy.Auth)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("ntfy URL provided is unreachable: %w", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+
+		nm.Providers = append(nm.Providers, &NtfyProvider{
+			URL:  rawCfg.Notifications.Ntfy.URL,
+			Auth: rawCfg.Notifications.Ntfy.Auth,
+		})
+	}
+
+	if rawCfg.Notifications.Telegram != nil && rawCfg.Notifications.Telegram.Token != "" && rawCfg.Notifications.Telegram.ChatID != "" {
+		nm.Providers = append(nm.Providers, &TelegramProvider{
+			Token:  rawCfg.Notifications.Telegram.Token,
+			ChatID: rawCfg.Notifications.Telegram.ChatID,
+		})
+		slog.Info(MsgLogTelegramConfig)
+	}
+
+	for _, res := range rawCfg.Resolvers {
+		ip := res
+		if _, _, err := net.SplitHostPort(ip); err != nil {
+			ip = net.JoinHostPort(ip, "53")
+		}
+		c := new(dns.Client)
+		c.Timeout = 5 * time.Second
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn("example.com"), dns.TypeA)
+		m.RecursionDesired = true
+		if _, _, err := c.ExchangeContext(ctx, m, ip); err != nil {
+			return fmt.Errorf("global resolver health check failed for %s: %w", res, err)
+		}
+	}
+
+	return nil
 }

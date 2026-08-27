@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,44 +12,6 @@ import (
 
 func init() {
 	CTLogsPath = filepath.Join(os.TempDir(), "ct_logs_test")
-}
-
-func TestFetchWhois(t *testing.T) {
-	sampleWhois := `
-Domain Name: EXAMPLE.COM
-Registry Domain ID: 2336799_DOMAIN_COM-VRSN
-Registrar WHOIS Server: whois.verisign-grs.com
-Updated Date: 2024-08-14T07:00:00Z
-Creation Date: 1995-08-14T04:00:00Z
-Registry Expiry Date: 2025-08-13T04:00:00Z
-Registrar: RESERVED-Internet Assigned Numbers Authority
-Name Server: A.IANA-SERVERS.NET
-Name Server: B.IANA-SERVERS.NET
-DNSSEC: unsigned
-`
-	orig := whoisQueryFn
-	defer func() { whoisQueryFn = orig }()
-
-	whoisQueryFn = func(domain string) (string, error) {
-		return sampleWhois, nil
-	}
-
-	state, err := fetchWhois("example.com")
-	if err != nil {
-		t.Fatalf("fetchWhois failed: %v", err)
-	}
-
-	if state.Status != StatusOk {
-		t.Errorf("Expected status '%s', got '%s'", StatusOk, state.Status)
-	}
-
-	if len(state.Nameservers) == 0 {
-		t.Errorf("Expected nameservers to be populated")
-	}
-
-	if state.Expiration == "" {
-		t.Errorf("Expected expiration to be populated")
-	}
 }
 
 func TestEmailMXVerification(t *testing.T) {
@@ -193,5 +157,86 @@ func TestSaveCertsToHistory(t *testing.T) {
 
 	if len(combined) != 3 {
 		t.Errorf("Expected 3 deduplicated certs, got %d", len(combined))
+	}
+}
+
+func TestHTTPServerRoutes(t *testing.T) {
+	app := &AppState{}
+	app.PrerenderedJSON.Store([]byte(`{"status":"prerendered"}`))
+	app.PrerenderedHTML.Store([]byte(`<!DOCTYPE html><html><body>Loaded</body></html>`))
+
+	firstRunDone := make(chan struct{})
+	close(firstRunDone)
+
+	server := setupHTTPServer(app, "0", firstRunDone)
+	handler := server.Handler
+
+	// Write a mock certs file for testdomain.com
+	testDomain := "testdomain.com"
+	_ = saveCertsToHistory(testDomain, []CTCert{{ID: "c1", Match: testDomain, Issuer: "CA1"}})
+
+	// 1. GET /health
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("/health status = %d, expected 200", rec.Code)
+	}
+
+	// 2. GET /api/state
+	req = httptest.NewRequest("GET", "/api/state", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("/api/state status = %d, expected 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "prerendered") {
+		t.Errorf("/api/state body = %s, expected prerendered json", rec.Body.String())
+	}
+
+	// 3. GET /api/certs?domain=testdomain.com
+	req = httptest.NewRequest("GET", "/api/certs?domain="+testDomain, nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("/api/certs valid status = %d, expected 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "c1") {
+		t.Errorf("/api/certs body = %s, expected c1", rec.Body.String())
+	}
+
+	// 4. GET /api/certs invalid domain
+	req = httptest.NewRequest("GET", "/api/certs?domain=invalid%20domain!", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("/api/certs invalid domain status = %d, expected 400", rec.Code)
+	}
+
+	// 5. GET /api/ctlogs/testdomain.com
+	req = httptest.NewRequest("GET", "/api/ctlogs/"+testDomain, nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("/api/ctlogs valid status = %d, expected 200", rec.Code)
+	}
+
+	// 6. GET /
+	req = httptest.NewRequest("GET", "/", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("/ status = %d, expected 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Loaded") {
+		t.Errorf("/ body = %s, expected Loaded", rec.Body.String())
+	}
+
+	// 7. GET /non-existent
+	req = httptest.NewRequest("GET", "/non-existent", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("/non-existent status = %d, expected 404", rec.Code)
 	}
 }

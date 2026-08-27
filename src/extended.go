@@ -9,14 +9,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
-
-	"github.com/likexian/whois"
-	whoisparser "github.com/likexian/whois-parser"
 )
 
-const CTLogsAPIEndpoint = "https://api.ctlogs.dev/v1/subdomains/"
 var CTLogsPath = "ct_logs"
 
 type CTCert struct {
@@ -46,7 +41,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 		return
 	}
 
-	state.Lock()
+	state.CTLogsMu.Lock()
 	currentState, exists := state.CTLogs[target.Domain]
 	if !exists {
 		currentState = &CTLogState{Status: StatusPending}
@@ -55,7 +50,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 	latestID := currentState.LatestID
 	backfillCursor := currentState.BackfillCursor
 	backfillComplete := currentState.BackfillComplete
-	state.Unlock()
+	state.CTLogsMu.Unlock()
 
 	// 1. Fetch Page 1 (Forward Polling for New Certs)
 	apiURL := fmt.Sprintf("%s%s", CTLogsAPIEndpoint, target.Domain)
@@ -274,74 +269,4 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 		return err
 	}
 	return nil
-}
-
-var whoisQueryFn = defaultWhoisQuery
-
-func defaultWhoisQuery(domain string) (string, error) {
-	client := whois.NewClient().SetTimeout(10 * time.Second)
-	return client.Whois(domain)
-}
-
-func fetchWhois(domain string) (*RDAPState, error) {
-	result, err := whoisQueryFn(domain)
-	if err != nil {
-		return nil, fmt.Errorf("whois query failed: %w", err)
-	}
-
-	parsed, parseErr := whoisparser.Parse(result)
-
-	state := &RDAPState{
-		Status: StatusOk,
-		DNSSEC: false,
-	}
-
-	if parseErr == nil && parsed.Registrar != nil && parsed.Registrar.Name != "" {
-		state.Registrar = parsed.Registrar.Name
-	}
-
-	if parseErr == nil && parsed.Domain != nil {
-		if parsed.Domain.ExpirationDateInTime != nil {
-			state.Expiration = parsed.Domain.ExpirationDateInTime.UTC().Format(time.RFC3339)
-		} else if parsed.Domain.ExpirationDate != "" {
-			state.Expiration = parsed.Domain.ExpirationDate
-		}
-
-		state.DomainStatus = parsed.Domain.Status
-		state.DNSSEC = parsed.Domain.DNSSec
-
-		for _, ns := range parsed.Domain.NameServers {
-			if ns != "" {
-				state.Nameservers = append(state.Nameservers, strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns), ".")))
-			}
-		}
-	}
-
-	// Fallback to manual parsing for critical fields from the raw string
-	// The likexian/whois result contains the registry WHOIS at the top, which usually
-	// contains the expiration date even if the registrar WHOIS rate limits or fails parsing.
-	if state.Expiration == "" || state.Registrar == "" {
-		lines := strings.Split(result, "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if state.Expiration == "" && (strings.HasPrefix(line, "Registry Expiry Date:") || strings.HasPrefix(line, "Expiry date:")) {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) == 2 {
-					state.Expiration = strings.TrimSpace(parts[1])
-				}
-			}
-			if state.Registrar == "" && strings.HasPrefix(line, "Registrar:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) == 2 {
-					state.Registrar = strings.TrimSpace(parts[1])
-				}
-			}
-		}
-	}
-
-	if state.Expiration == "" && parseErr != nil {
-		return nil, fmt.Errorf("whois parsing failed completely: %w", parseErr)
-	}
-
-	return state, nil
 }

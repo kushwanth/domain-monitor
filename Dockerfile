@@ -18,10 +18,17 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -a -t
 # Compress the binary
 RUN upx -9 domain-monitor
 
+# Create data directory with appropriate ownership for nonroot user (UID 65532)
+RUN mkdir -p /app/data && chown -R 65532:65532 /app/data
+
 # Stage 3: Ultra-Minimal Production Image (Distroless)
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /app
 COPY --from=builder /app/domain-monitor /app/domain-monitor
+COPY --from=builder --chown=65532:65532 /app/data /app/data
+
+# Declare volume for data persistence
+VOLUME ["/app/data"]
 
 # Use the nonroot user for security
 USER 65532:65532

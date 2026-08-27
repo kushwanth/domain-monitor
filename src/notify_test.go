@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ type MockNotifier struct {
 	mu           sync.Mutex
 }
 
-func (m *MockNotifier) Send(alerts []Alert, wg *sync.WaitGroup) {
+func (m *MockNotifier) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup) {
 	defer wg.Done()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -57,13 +58,13 @@ func TestNotificationManager(t *testing.T) {
 			mock2 := &MockNotifier{}
 
 			nm := &NotificationManager{
-				Providers: []Notifier{mock1, mock2},
+				Providers: []NotificationProvider{mock1, mock2},
 			}
 
 			for _, a := range tt.alerts {
 				nm.Dispatch(a.Message, a.Redacted, a.Priority, a.Tag, a.Domain, a.Name)
 			}
-			nm.Flush()
+			nm.Flush(context.Background())
 
 			if mock1.MessagesSent != tt.expectSent {
 				t.Errorf("Mock1: expected %d, got %d", tt.expectSent, mock1.MessagesSent)
@@ -80,13 +81,13 @@ func TestNotificationDeduplication(t *testing.T) {
 
 	mock := &MockNotifier{}
 	nm := &NotificationManager{
-		Providers: []Notifier{mock},
+		Providers: []NotificationProvider{mock},
 	}
 
 	// Cycle 1: First occurrence of alert
 	nm.StartCycle()
 	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
-	nm.Flush()
+	nm.Flush(context.Background())
 	nm.EndCycle()
 
 	if mock.MessagesSent != 1 {
@@ -96,7 +97,7 @@ func TestNotificationDeduplication(t *testing.T) {
 	// Cycle 2: Same alert within 24h should be deduplicated / suppressed
 	nm.StartCycle()
 	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
-	nm.Flush()
+	nm.Flush(context.Background())
 	nm.EndCycle()
 
 	if mock.MessagesSent != 1 {
@@ -106,7 +107,7 @@ func TestNotificationDeduplication(t *testing.T) {
 	// Cycle 3: Issue resolves, alert not dispatched
 	nm.StartCycle()
 	// No dispatch this cycle
-	nm.Flush()
+	nm.Flush(context.Background())
 	nm.EndCycle()
 
 	if mock.MessagesSent != 1 {
@@ -116,7 +117,7 @@ func TestNotificationDeduplication(t *testing.T) {
 	// Cycle 4: Issue re-occurs, should alert again since it was resolved in Cycle 3
 	nm.StartCycle()
 	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
-	nm.Flush()
+	nm.Flush(context.Background())
 	nm.EndCycle()
 
 	if mock.MessagesSent != 2 {
@@ -129,12 +130,12 @@ func TestNotification24hExpiry(t *testing.T) {
 
 	mock := &MockNotifier{}
 	nm := &NotificationManager{
-		Providers: []Notifier{mock},
+		Providers: []NotificationProvider{mock},
 	}
 
 	nm.StartCycle()
 	nm.Dispatch("Alert", "Redacted", PriorityHigh, "warning", "example.com", "Test")
-	nm.Flush()
+	nm.Flush(context.Background())
 	nm.EndCycle()
 
 	if mock.MessagesSent != 1 {
@@ -150,7 +151,7 @@ func TestNotification24hExpiry(t *testing.T) {
 	// Should alert again because > 24 hours passed
 	nm.StartCycle()
 	nm.Dispatch("Alert", "Redacted", PriorityHigh, "warning", "example.com", "Test")
-	nm.Flush()
+	nm.Flush(context.Background())
 	nm.EndCycle()
 
 	if mock.MessagesSent != 2 {

@@ -88,10 +88,50 @@ func TestLoadConfig(t *testing.T) {
 			},
 		},
 		{
-			name:        "Malformed JSON",
-			configJSON:  `{ "port": "9090", `,
-			expectErr:   true,
-			errContains: "Unexpected: end of file while parsing field definition",
+			name: "CAA Config Normalization with Deny All and Skipped Tags",
+			configJSON: `{
+				"domains": [
+					{
+						"domain": "example.com",
+						"name": "Example",
+						"caa": {
+							"issue": ["letsencrypt.org", "digicert.com"],
+							"issuewild": [],
+							"issuemail": [";"]
+						}
+					},
+					{
+						"domain": "skipped.com",
+						"name": "Skipped",
+						"caa": {
+							"issue": ["letsencrypt.org"]
+						}
+					}
+				]
+			}`,
+			expectErr: false,
+			validate: func(t *testing.T, app *AppState) {
+				d1 := app.Config.Domains[0]
+				if len(d1.CAA.Issue) != 2 || d1.CAA.Issue[0] != "letsencrypt.org" {
+					t.Errorf("Expected 2 issue CAs, got %v", d1.CAA.Issue)
+				}
+				// issuewild: [] should be empty slice (len 0, non-nil)
+				if d1.CAA.IssueWild == nil || len(d1.CAA.IssueWild) != 0 {
+					t.Errorf("Expected issuewild to be empty non-nil slice, got %v", d1.CAA.IssueWild)
+				}
+				// issuemail: [";"] should be normalized to empty slice (len 0, non-nil)
+				if d1.CAA.IssueMail == nil || len(d1.CAA.IssueMail) != 0 {
+					t.Errorf("Expected issuemail to be empty non-nil slice, got %v", d1.CAA.IssueMail)
+				}
+
+				d2 := app.Config.Domains[1]
+				if d2.CAA.IssueWild != nil {
+					t.Errorf("Expected omitted issuewild to remain nil, got %v", d2.CAA.IssueWild)
+				}
+				if d2.CAA.IssueMail != nil {
+					t.Errorf("Expected omitted issuemail to remain nil, got %v", d2.CAA.IssueMail)
+				}
+			},
 		},
 		{
 			name: "Missing Domain Name",

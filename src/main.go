@@ -6,14 +6,14 @@ import (
 	_ "embed"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"html/template"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -39,12 +39,12 @@ const (
 func setupHTTPServer(app *AppState, port string, firstRunDone chan struct{}) *http.Server {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-cache")
 		if firstRunDone != nil {
@@ -61,16 +61,27 @@ func setupHTTPServer(app *AppState, port string, firstRunDone chan struct{}) *ht
 		}
 	})
 
-	mux.HandleFunc("/api/certs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/certs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		domain := r.URL.Query().Get("domain")
-		if domain == "" {
-			http.Error(w, `{"error": "domain required"}`, http.StatusBadRequest)
+		if domain == "" || !ValidDomainRegex.MatchString(domain) {
+			http.Error(w, `{"error": "invalid domain"}`, http.StatusBadRequest)
 			return
 		}
 
-		// Prevent path traversal — domain must be a simple filename component
-		if domain != filepath.Base(domain) || strings.Contains(domain, "..") || strings.ContainsAny(domain, "/\\") {
+		filePath := filepath.Join(CTLogsPath, domain+".json")
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
+		_, _ = w.Write(b)
+	})
+
+	mux.HandleFunc("GET /api/ctlogs/{domain}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		domain := r.PathValue("domain")
+		if !ValidDomainRegex.MatchString(domain) {
 			http.Error(w, `{"error": "invalid domain"}`, http.StatusBadRequest)
 			return
 		}
@@ -113,9 +124,10 @@ func setupHTTPServer(app *AppState, port string, firstRunDone chan struct{}) *ht
 	}
 
 	go func() {
-		log.Printf(MsgLogHTTPAPI, port)
+		slog.Info(fmt.Sprintf(MsgLogHTTPAPI, port))
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[FATAL] HTTP server failed: %v", err)
+			slog.Error("HTTP server failed", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -136,24 +148,42 @@ func main() {
 
 	app, err := LoadConfig(ctx, configPath)
 	if err != nil {
-		log.Fatalf("[FATAL] Configuration error: %v", err)
+		slog.Error("Configuration error", "error", err)
+		os.Exit(1)
 	}
 
-	defaultDataDir := "./data"
-	CTLogsPath = filepath.Join(defaultDataDir, "ct_logs")
-	ctStatePath := filepath.Join(defaultDataDir, "ct_state.json")
+	if err := InitializeDependencies(ctx, app); err != nil {
+		slog.Error("Initialization error", "error", err)
+		os.Exit(1)
+	}
+
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = DefaultDataDir
+		if _, err := os.Stat("/app"); os.IsNotExist(err) {
+			dataDir = "./data"
+		}
+	}
+	if err := os.MkdirAll(dataDir, 0775); err != nil {
+		slog.Warn("Failed to ensure data directory exists", "path", dataDir, "error", err)
+	}
+	CTLogsPath = filepath.Join(dataDir, "ct_logs")
+	if err := os.MkdirAll(CTLogsPath, 0775); err != nil {
+		slog.Warn("Failed to ensure ct_logs directory exists", "path", CTLogsPath, "error", err)
+	}
+	ctStatePath := filepath.Join(dataDir, "ct_state.json")
 
 	rdapClient := &rdap.Client{
-		HTTP: &http.Client{Timeout: 10 * time.Second},
+		HTTP: NewRDAPHTTPClient(10 * time.Second),
 	}
-	log.Printf(MsgLogStartup, len(app.Config.Domains), len(app.Config.DNSRecords))
+	slog.Info(fmt.Sprintf(MsgLogStartup, len(app.Config.Domains), len(app.Config.DNSRecords)))
 
 	firstRunDone := make(chan struct{})
 	server := setupHTTPServer(app, app.Config.Port, firstRunDone)
 
 	// Execute concurrent engine
 	go func() {
-		defer app.Notifier.Flush()
+		defer app.Notifier.Flush(ctx)
 		maxWorkers := runtime.NumCPU() * 10
 		if maxWorkers < 50 {
 			maxWorkers = 50
@@ -164,13 +194,13 @@ func main() {
 
 		if b, err := os.ReadFile(ctStatePath); err == nil {
 			if jsonErr := json.Unmarshal(b, &ctLogPersist); jsonErr != nil {
-				log.Printf("[WARN] Failed to parse ct_state.json: %v", jsonErr)
+				slog.Warn("Failed to parse ct_state.json", "error", jsonErr)
 			}
 		}
 
 		indexTmpl, err := template.New("index").Parse(string(indexHTML))
 		if err != nil {
-			log.Printf("[ERROR] Failed to parse index template: %v", err)
+			slog.Error("Failed to parse index template", "error", err)
 		}
 
 		for {
@@ -236,53 +266,49 @@ func main() {
 			_ = g.Wait()
 
 			// Run RDAP sequentially with rate limits
+			whoisTicker := time.NewTicker(app.WhoisDelay)
 			for _, dt := range app.Config.Domains {
 				if dt.IsDelegatedZone {
 					continue
 				}
 				select {
 				case <-ctx.Done():
+					whoisTicker.Stop()
 					return
-				default:
+				case <-whoisTicker.C:
 					evaluateRDAP(ctx, rdapClient, app, dt, loopState)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(app.WhoisDelay):
-					}
 				}
 			}
+			whoisTicker.Stop()
 
 			// Run CTLogs sequentially with rate limits
+			reqTicker := time.NewTicker(app.ReqDelay)
 			for _, dt := range app.Config.Domains {
 				if !dt.MonitorCTLogs {
 					continue
 				}
 				select {
 				case <-ctx.Done():
+					reqTicker.Stop()
 					return
-				default:
+				case <-reqTicker.C:
 					evaluateCTLogs(ctx, app, dt, loopState)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(app.ReqDelay):
-					}
 				}
 			}
+			reqTicker.Stop()
 
 			for k, v := range loopState.ExportCTLogs() {
 				ctLogPersist[k] = v
 			}
 
 			if b, err := json.Marshal(ctLogPersist); err == nil {
-				if writeErr := atomicWriteFile(ctStatePath, b, 0644); writeErr != nil {
-					log.Printf("[WARN] Failed to write ct_state.json: %v", writeErr)
+				if writeErr := atomicWriteFile(ctStatePath, b, 0600); writeErr != nil {
+					slog.Warn("Failed to write ct_state.json", "error", writeErr)
 				}
 			}
 
 			// Dispatch notifications
-			app.Notifier.Flush()
+			app.Notifier.Flush(ctx)
 			app.Notifier.EndCycle()
 
 			// Pre-render JSON and HTML
@@ -295,7 +321,7 @@ func main() {
 				if err := indexTmpl.Execute(&buf, map[string]interface{}{
 					"StateJSON": template.JS(jsonBytes),
 				}); err != nil {
-					log.Printf("[ERROR] HTML prerender failed: %v", err)
+					slog.Error("HTML prerender failed", "error", err)
 				} else {
 					app.PrerenderedHTML.Store(buf.Bytes())
 				}
@@ -322,7 +348,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	sig := <-sigChan
-	log.Printf(MsgLogShutdownSignal, sig)
+	slog.Info(fmt.Sprintf(MsgLogShutdownSignal, sig))
 
 	// Trigger cancellation for engines
 	cancel()
@@ -335,18 +361,36 @@ func main() {
 	// Wait for notifications to complete
 	app.Notifier.Wait()
 
-	log.Println(MsgLogShutdownComplete)
+	slog.Info(MsgLogShutdownComplete)
+}
+
+type DomainTierData struct {
+	Source       string   `json:"source,omitempty"`
+	Server       string   `json:"server,omitempty"`
+	Registrar    string   `json:"registrar,omitempty"`
+	IANAID       string   `json:"iana_id,omitempty"`
+	Expiration   string   `json:"expiration,omitempty"`
+	Created      string   `json:"created,omitempty"`
+	Updated      string   `json:"updated,omitempty"`
+	Nameservers  []string `json:"nameservers,omitempty"`
+	DomainStatus []string `json:"domain_status,omitempty"`
+	DNSSEC       bool     `json:"dnssec,omitempty"`
+	Raw          string   `json:"-"`
 }
 
 type RDAPState struct {
-	Status          CheckStatus `json:"status"`
-	Registrar       string      `json:"registrar,omitempty"`
-	Expiration      string      `json:"expiration,omitempty"`
-	Nameservers     []string    `json:"nameservers,omitempty"`
-	DomainStatus    []string    `json:"domain_status,omitempty"`
-	DNSSEC          bool        `json:"dnssec,omitempty"`
-	Error           string      `json:"error,omitempty"`
-	IsDelegatedZone bool        `json:"is_delegated_zone,omitempty"`
+	Status          CheckStatus     `json:"status"`
+	Registrar       string          `json:"registrar,omitempty"`
+	Expiration      string          `json:"expiration,omitempty"`
+	Nameservers     []string        `json:"nameservers,omitempty"`
+	DomainStatus    []string        `json:"domain_status,omitempty"`
+	DNSSEC          bool            `json:"dnssec,omitempty"`
+	Error           string          `json:"error,omitempty"`
+	IsDelegatedZone bool            `json:"is_delegated_zone,omitempty"`
+	Source          string          `json:"source,omitempty"`
+	RegistryTier    *DomainTierData `json:"registry_tier,omitempty"`
+	RegistrarTier   *DomainTierData `json:"registrar_tier,omitempty"`
+	Discrepancies   []string        `json:"discrepancies,omitempty"`
 }
 
 type DNSState struct {
@@ -371,62 +415,80 @@ type EmailState struct {
 }
 
 type CheckState struct {
-	sync.Mutex  `json:"-"`
+	RDAPMu      sync.RWMutex             `json:"-"`
 	RDAP        map[string]*RDAPState    `json:"rdap_checks"`
+	DNSMu       sync.RWMutex             `json:"-"`
 	DNS         map[string]*DNSState     `json:"dns_checks"`
+	EmailMu     sync.RWMutex             `json:"-"`
 	Email       map[string]*EmailState   `json:"email_checks"`
+	CAAMu       sync.RWMutex             `json:"-"`
 	CAA         map[string]*CAAResult    `json:"caa_checks,omitempty"`
+	DNSSECMu    sync.RWMutex             `json:"-"`
 	DNSSEC      map[string]*DNSSECResult `json:"dnssec_checks,omitempty"`
+	CTLogsMu    sync.RWMutex             `json:"-"`
 	CTLogs      map[string]*CTLogState   `json:"ct_logs,omitempty"`
+	LastMu      sync.RWMutex             `json:"-"`
 	LastUpdated string                   `json:"last_updated"`
 	NextRefresh string                   `json:"next_refresh"`
 }
 
 func (c *CheckState) UpdateRDAP(key string, state *RDAPState) {
-	c.Lock()
-	defer c.Unlock()
+	c.RDAPMu.Lock()
 	c.RDAP[key] = state
+	c.RDAPMu.Unlock()
+	c.LastMu.Lock()
+	defer c.LastMu.Unlock()
 	c.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 }
 
 func (c *CheckState) UpdateDNS(key string, state *DNSState) {
-	c.Lock()
-	defer c.Unlock()
+	c.DNSMu.Lock()
 	c.DNS[key] = state
+	c.DNSMu.Unlock()
+	c.LastMu.Lock()
+	defer c.LastMu.Unlock()
 	c.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 }
 
 func (c *CheckState) UpdateEmail(key string, state *EmailState) {
-	c.Lock()
-	defer c.Unlock()
+	c.EmailMu.Lock()
 	c.Email[key] = state
+	c.EmailMu.Unlock()
+	c.LastMu.Lock()
+	defer c.LastMu.Unlock()
 	c.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 }
 
 func (c *CheckState) UpdateCAA(key string, state *CAAResult) {
-	c.Lock()
-	defer c.Unlock()
+	c.CAAMu.Lock()
 	c.CAA[key] = state
+	c.CAAMu.Unlock()
+	c.LastMu.Lock()
+	defer c.LastMu.Unlock()
 	c.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 }
 
 func (c *CheckState) UpdateDNSSEC(key string, state *DNSSECResult) {
-	c.Lock()
-	defer c.Unlock()
+	c.DNSSECMu.Lock()
 	c.DNSSEC[key] = state
+	c.DNSSECMu.Unlock()
+	c.LastMu.Lock()
+	defer c.LastMu.Unlock()
 	c.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 }
 
 func (c *CheckState) UpdateCTLogs(key string, state *CTLogState) {
-	c.Lock()
-	defer c.Unlock()
+	c.CTLogsMu.Lock()
 	c.CTLogs[key] = state
+	c.CTLogsMu.Unlock()
+	c.LastMu.Lock()
+	defer c.LastMu.Unlock()
 	c.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 }
 
 func (c *CheckState) ExportCTLogs() map[string]*CTLogState {
-	c.Lock()
-	defer c.Unlock()
+	c.CTLogsMu.RLock()
+	defer c.CTLogsMu.RUnlock()
 	res := make(map[string]*CTLogState)
 	for k, v := range c.CTLogs {
 		res[k] = v
