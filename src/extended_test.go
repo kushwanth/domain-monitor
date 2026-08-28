@@ -17,14 +17,6 @@ func init() {
 func TestEmailMXVerification(t *testing.T) {
 	t.Parallel()
 
-	providerMXMap := map[string][]string{
-		"google":    {"google.com", "googlemail.com"},
-		"microsoft": {"protection.outlook.com"},
-		"zoho":      {"zoho.com", "zoho.in"},
-		"fastmail":  {"messagingengine.com"},
-		"proton":    {"protonmail.ch"},
-	}
-
 	tests := []struct {
 		name         string
 		provider     string
@@ -55,34 +47,59 @@ func TestEmailMXVerification(t *testing.T) {
 			liveMXs:      []string{"example-com.mail.protection.outlook.com"},
 			expectHijack: false,
 		},
+		{
+			name:         "Zoho Valid",
+			provider:     "zoho",
+			liveMXs:      []string{"mx.zoho.com", "mx2.zoho.in"},
+			expectHijack: false,
+		},
+		{
+			name:         "Fastmail Valid",
+			provider:     "fastmail",
+			liveMXs:      []string{"in1-smtp.messagingengine.com"},
+			expectHijack: false,
+		},
+		{
+			name:         "Google Valid Modern (smtp.google.com)",
+			provider:     "google",
+			liveMXs:      []string{"smtp.google.com"},
+			expectHijack: false,
+		},
+		{
+			name:         "Google Valid Legacy & Backup",
+			provider:     "google",
+			liveMXs:      []string{"aspmx.l.google.com", "aspmx2.googlemail.com"},
+			expectHijack: false,
+		},
+		{
+			name:         "Proton Modern Valid (proton.me)",
+			provider:     "proton",
+			liveMXs:      []string{"mail.proton.me"},
+			expectHijack: false,
+		},
+		{
+			name:         "Proton Valid (protonmail.ch)",
+			provider:     "protonmail",
+			liveMXs:      []string{"mail.protonmail.ch"},
+			expectHijack: false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			expectedSuffixes, ok := providerMXMap[tt.provider]
-			if !ok {
-				// Unknown provider, hijacking logic is skipped
+			isSafe, known := isProviderMXSafe(tt.liveMXs, tt.provider)
+			if !known {
+				if tt.expectHijack {
+					t.Errorf("Unexpected unknown provider marked as hijack")
+				}
 				return
 			}
 
-			hijackSafe := false
-			for _, live := range tt.liveMXs {
-				for _, suffix := range expectedSuffixes {
-					if strings.HasSuffix(live, suffix) {
-						hijackSafe = true
-						break
-					}
-				}
-				if hijackSafe {
-					break
-				}
-			}
-
-			isHijacked := !hijackSafe
+			isHijacked := !isSafe
 			if isHijacked != tt.expectHijack {
-				t.Errorf("Expected Hijack: %v, got %v", tt.expectHijack, isHijacked)
+				t.Errorf("Provider %s: Expected Hijack=%v, got %v (live: %v)", tt.provider, tt.expectHijack, isHijacked, tt.liveMXs)
 			}
 		})
 	}
@@ -167,7 +184,7 @@ func TestHTTPServerRoutes(t *testing.T) {
 	firstRunDone := make(chan struct{})
 	close(firstRunDone)
 
-	server, _ := setupHTTPServer(app, "0", firstRunDone)
+	server, _ := setupHTTPServer(app, "0")
 	handler := server.Handler
 
 	// Write a mock certs file for testdomain.com
@@ -245,7 +262,7 @@ func TestPathTraversalProtection(t *testing.T) {
 	firstRunDone := make(chan struct{})
 	close(firstRunDone)
 
-	server, _ := setupHTTPServer(app, "0", firstRunDone)
+	server, _ := setupHTTPServer(app, "0")
 	handler := server.Handler
 
 	traversalPayloads := []string{

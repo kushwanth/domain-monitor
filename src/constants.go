@@ -42,6 +42,12 @@ const (
 	PriorityDefault AlertPriority = "default"
 )
 
+// SSL Expiration Sentinel Values
+const (
+	SSLDaysNotApplicable = -9999
+	SSLDaysError         = -9998
+)
+
 // System Errors
 var (
 	ErrDNSResolution   = errors.New("dns resolution failed")
@@ -50,6 +56,7 @@ var (
 	ErrSSLValidation   = errors.New("ssl validation failed")
 	ErrRDAPNotFound    = fmt.Errorf("RDAP domain not found (404)")
 	ErrRDAPRateLimited = fmt.Errorf("RDAP rate limited (429)")
+	ErrDomainNotFound  = errors.New("domain not found in whois (404)")
 )
 
 // DNSTypeMap maps record type string names to miekg/dns uint16 type constants.
@@ -96,6 +103,7 @@ var EPPStatusMap = map[string]string{
 	"validated":                "validated",
 	"associated":               "associated",
 	"notassociated":            "notAssociated",
+	"connected":                "active",
 }
 
 // TZReplacements provides standard timezone abbreviation offsets for flexible date parsing.
@@ -177,9 +185,17 @@ var WhoisNotFoundIndicators = []string{
 	"not found",
 	"status: free",
 	"status: available",
+	"status: not registered",
+	"status: unregistered",
+	"is free",
+	"is available",
+	"domain is free",
 	"domain not found",
+	"domain name not found",
+	"not found in whois",
 	"no data found",
 	"domain not registered",
+	"domain not registered in",
 	"no entries found",
 	"the queried object does not exist",
 	"is available for registration",
@@ -189,6 +205,8 @@ var WhoisNotFoundIndicators = []string{
 	"object does not exist",
 	"not registered",
 	"no information was found",
+	"el dominio no existe",
+	"not exist",
 }
 
 // Precompiled Regular Expressions
@@ -196,14 +214,14 @@ var (
 	ValidDomainRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 
 	ReWhoisReferral  = regexp.MustCompile(`(?i)(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)\s*:\s*(?:whois:\/\/)?([a-zA-Z0-9.-]+)`)
-	ReWhoisExpiry    = regexp.MustCompile(`(?i)(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\s*:\s*([^\r\n]+)`)
-	ReWhoisCreated   = regexp.MustCompile(`(?i)(?:Creation Date|Created on|Created|Registration Date|created|registered|created-date)\s*:\s*([^\r\n]+)`)
-	ReWhoisUpdated   = regexp.MustCompile(`(?i)(?:Updated Date|Last Updated Date|Last Modified|changed|modified|updated-date)\s*:\s*([^\r\n]+)`)
-	ReWhoisRegistrar = regexp.MustCompile(`(?i)(?:Registrar Name|Sponsoring Registrar Organization|Sponsoring Registrar|registrar-name|Registrar|Organization|sponsoring-registrar|registrar)\s*:\s*([^\r\n]+)`)
-	ReWhoisIANAID    = regexp.MustCompile(`(?i)(?:Registrar IANA ID|Sponsoring Registrar IANA ID|IANA ID|Registrar IANA ID Number)\s*:\s*([0-9]+)`)
-	ReWhoisNS        = regexp.MustCompile(`(?i)(?:Name Server|nameserver|nserver|DNS|Name Server Name)\s*:\s*([a-zA-Z0-9.-]+)`)
-	ReWhoisStatus    = regexp.MustCompile(`(?i)(?:Domain Status|Status|state|Domain State|status)\s*:\s*([^\r\n]+)`)
-	ReWhoisDNSSEC    = regexp.MustCompile(`(?i)(?:DNSSEC|dnssec)\s*:\s*([^\r\n]+)`)
+	ReWhoisExpiry    = regexp.MustCompile(`(?i)(?:\[?(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\]?)\s*[:\]]?\s*([^\r\n]+)`)
+	ReWhoisCreated   = regexp.MustCompile(`(?i)(?:\[?(?:Creation Date|Created on|Created|Registration Date|created|registered|created-date|Registered Date|Connected Date)\]?)\s*[:\]]?\s*([^\r\n]+)`)
+	ReWhoisUpdated   = regexp.MustCompile(`(?i)(?:\[?(?:Updated Date|Last Updated Date|Last Modified|changed|modified|updated-date|Last Update)\]?)\s*[:\]]?\s*([^\r\n]+)`)
+	ReWhoisRegistrar = regexp.MustCompile(`(?i)(?:\[?(?:Registrar Name|Sponsoring Registrar Organization|Sponsoring Registrar|registrar-name|Registrar|Organization|sponsoring-registrar|registrar)\]?)\s*[:\]]?\s*([^\r\n]+)`)
+	ReWhoisIANAID    = regexp.MustCompile(`(?i)(?:\[?(?:Registrar IANA ID|Sponsoring Registrar IANA ID|IANA ID|Registrar IANA ID Number)\]?)\s*[:\]]?\s*([0-9]+)`)
+	ReWhoisNS        = regexp.MustCompile(`(?i)(?:\[?(?:Name Server|nameserver|nserver|DNS|Name Server Name)\]?)\s*[:\]]?\s*([a-zA-Z0-9.-]+)`)
+	ReWhoisStatus    = regexp.MustCompile(`(?i)(?:\[?(?:Domain Status|Status|state|Domain State|Registration status)\]?)\s*[:\]]?\s*([^\r\n]+)`)
+	ReWhoisDNSSEC    = regexp.MustCompile(`(?i)(?:\[?(?:DNSSEC|dnssec)\]?)\s*[:\]]?\s*([^\r\n]+)`)
 )
 
 // Stealth RDAP Seeds for ccTLDs not yet published in IANA bootstrap
@@ -308,10 +326,11 @@ var CCTLDWhoisServers = map[string]string{
 
 // Mail Provider MX Suffix Map for Anti-Hijacking
 var ProviderMXMap = map[string][]string{
-	"google":     {"aspmx.l.google.com"},
+	"google":     {"aspmx.l.google.com", "smtp.google.com", "googlemail.com", "google.com"},
 	"microsoft":  {"mail.protection.outlook.com"},
 	"fastmail":   {"messagingengine.com"},
-	"protonmail": {"protonmail.ch"},
+	"proton":     {"protonmail.ch", "proton.me"},
+	"protonmail": {"protonmail.ch", "proton.me"},
 	"icloud":     {"icloud.com"},
 	"zoho":       {"zoho.com", "zoho.in", "zoho.eu"},
 	"aws":        {"amazonaws.com"},
@@ -326,6 +345,7 @@ var ProviderDKIMMap = map[string][]string{
 	"google":     {"google"},
 	"microsoft":  {"selector1"},
 	"fastmail":   {"fm1", "fm2", "fm3", "mesmtp"},
+	"proton":     {"protonmail", "protonmail2", "protonmail3"},
 	"protonmail": {"protonmail", "protonmail2", "protonmail3"},
 	"icloud":     {"sig1"},
 	"zoho":       {"zoho", "zmail"},

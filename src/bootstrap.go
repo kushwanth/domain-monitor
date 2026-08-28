@@ -54,6 +54,15 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: transport,
 		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if !isSafeRDAPURL(req.URL.String()) {
+				return fmt.Errorf("insecure or invalid redirect URL: %s", req.URL.String())
+			}
+			return nil
+		},
 	}
 }
 
@@ -100,21 +109,32 @@ func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, er
 	return nil, fmt.Errorf("no rdap server found for domain %s", domain)
 }
 
-func (b *Bootstrap) ensure(ctx context.Context) error {
+func (b *Bootstrap) isFresh() bool {
 	b.mu.RLock()
-	hasData := b.services != nil && len(b.services) > 0
-	fresh := hasData && time.Since(b.fetchedAt) < BootstrapTTL
-	tooOld := hasData && time.Since(b.fetchedAt) > BootstrapMaxAge
-	b.mu.RUnlock()
+	defer b.mu.RUnlock()
+	return len(b.services) > 0 && time.Since(b.fetchedAt) < BootstrapTTL
+}
 
-	if fresh {
+func (b *Bootstrap) ensure(ctx context.Context) error {
+	if b.isFresh() {
 		return nil
 	}
 
-	err := b.fetch(ctx)
-	if err != nil {
-		if hasData && !tooOld {
-			slog.Warn("Failed to refresh RDAP bootstrap from IANA; falling back to cached registry", "error", err, "cache_age", time.Since(b.fetchedAt).Round(time.Minute))
+	b.fetchMu.Lock()
+	defer b.fetchMu.Unlock()
+
+	if b.isFresh() {
+		return nil
+	}
+
+	if err := b.fetch(ctx); err != nil {
+		b.mu.RLock()
+		hasData := len(b.services) > 0
+		cacheAge := time.Since(b.fetchedAt)
+		b.mu.RUnlock()
+
+		if hasData && cacheAge <= BootstrapMaxAge {
+			slog.Warn("Failed to refresh RDAP bootstrap from IANA; falling back to cached registry", "error", err, "cache_age", cacheAge.Round(time.Minute))
 			return nil
 		}
 		return fmt.Errorf("bootstrap registry unavailable: %w", err)

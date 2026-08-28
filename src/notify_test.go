@@ -142,7 +142,7 @@ func TestNotification24hExpiry(t *testing.T) {
 	}
 
 	// Artificially age the sent state by 25 hours
-	key := "example.com|Redacted"
+	key := "example.com|warning|Redacted"
 	nm.mu.Lock()
 	nm.sentState[key] = time.Now().Add(-25 * time.Hour)
 	nm.mu.Unlock()
@@ -157,3 +157,73 @@ func TestNotification24hExpiry(t *testing.T) {
 		t.Fatalf("Expected 2 messages after 25h expiry, got %d", mock.MessagesSent)
 	}
 }
+
+func TestNotificationCycleWait(t *testing.T) {
+	t.Parallel()
+
+	mock := &MockNotifier{}
+	nm := &NotificationManager{
+		Providers: []NotificationProvider{mock},
+	}
+
+	cycleCtx, cycleCancel := context.WithCancel(context.Background())
+
+	nm.StartCycle()
+	nm.Dispatch("Critical Alert", "Redacted", PriorityUrgent, "rotating_light", "example.com", "Test")
+	nm.Flush(cycleCtx)
+	nm.Wait() // Synchronously wait before cancelling cycle context
+	nm.EndCycle()
+	cycleCancel()
+
+	if mock.MessagesSent != 1 {
+		t.Fatalf("Expected 1 message delivered before cycleCancel, got %d", mock.MessagesSent)
+	}
+}
+
+func TestNotificationDeduplication_MultipleDistinctCAsInSameCycle(t *testing.T) {
+	t.Parallel()
+
+	mock := &MockNotifier{}
+	nm := &NotificationManager{
+		Providers: []NotificationProvider{mock},
+	}
+
+	nm.StartCycle()
+	// Alert 1: missing letsencrypt.org
+	nm.Dispatch("Expected CA 'letsencrypt.org' missing in issue for example.com", "Expected CA 'letsencrypt.org' missing in issue.", PriorityHigh, "warning", "example.com", "Example")
+	// Alert 2: missing digicert.com
+	nm.Dispatch("Expected CA 'digicert.com' missing in issue for example.com", "Expected CA 'digicert.com' missing in issue.", PriorityHigh, "warning", "example.com", "Example")
+	nm.Flush(context.Background())
+	nm.EndCycle()
+
+	if mock.MessagesSent != 2 {
+		t.Errorf("Expected 2 distinct alerts sent in the same cycle, got %d", mock.MessagesSent)
+	}
+}
+
+func TestTelegramTokenRedaction(t *testing.T) {
+	t.Parallel()
+
+	token := "123456789:ABCDefGhIJKlmNoPQRsTUVwxyZ_SECRET"
+	provider := &TelegramProvider{
+		Token:  token,
+		ChatID: "987654321",
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// Use an expired/cancelled context to force immediate client.Do error
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	alerts := []Alert{
+		{Message: "Test Alert", Priority: PriorityHigh, Domain: "example.com"},
+	}
+
+	// Send should recover, handle error cleanly, and redact token
+	provider.Send(ctx, alerts, &wg)
+	wg.Wait()
+}
+
+

@@ -95,7 +95,7 @@ func TestLoadConfig(t *testing.T) {
 						"domain": "example.com",
 						"name": "Example",
 						"caa": {
-							"issue": ["letsencrypt.org", "digicert.com"],
+							"issue": ["letsencrypt.org; validationmethods=dns-01", "digicert.com"],
 							"issuewild": [],
 							"issuemail": [";"]
 						}
@@ -112,8 +112,8 @@ func TestLoadConfig(t *testing.T) {
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
 				d1 := app.Config.Domains[0]
-				if len(d1.CAA.Issue) != 2 || d1.CAA.Issue[0] != "letsencrypt.org" {
-					t.Errorf("Expected 2 issue CAs, got %v", d1.CAA.Issue)
+				if len(d1.CAA.Issue) != 2 || d1.CAA.Issue[0] != "letsencrypt.org" || d1.CAA.Issue[1] != "digicert.com" {
+					t.Errorf("Expected 2 normalized issue CAs (letsencrypt.org, digicert.com), got %v", d1.CAA.Issue)
 				}
 				// issuewild: [] should be empty slice (len 0, non-nil)
 				if d1.CAA.IssueWild == nil || len(d1.CAA.IssueWild) != 0 {
@@ -130,6 +130,26 @@ func TestLoadConfig(t *testing.T) {
 				}
 				if d2.CAA.IssueMail != nil {
 					t.Errorf("Expected omitted issuemail to remain nil, got %v", d2.CAA.IssueMail)
+				}
+			},
+		},
+		{
+			name: "RFC 7505 Null MX Normalization",
+			configJSON: `{
+				"domains": [
+					{
+						"domain": "nomail.example.com",
+						"name": "NoMail Domain",
+						"check_email_security": true,
+						"mx_records": ["."]
+					}
+				]
+			}`,
+			expectErr: false,
+			validate: func(t *testing.T, app *AppState) {
+				d := app.Config.Domains[0]
+				if len(d.MXRecords) != 1 || d.MXRecords[0] != "." {
+					t.Errorf("Expected Null MX '.' to be preserved, got %v", d.MXRecords)
 				}
 			},
 		},
@@ -247,7 +267,7 @@ func TestLoadConfig(t *testing.T) {
 				if err == nil {
 					t.Fatalf("Expected error containing '%s', got nil", tt.errContains)
 				}
-				if err != nil && tt.errContains != "" {
+				if tt.errContains != "" {
 					if !strings.Contains(err.Error(), tt.errContains) {
 						t.Errorf("Expected error to contain '%s', got '%v'", tt.errContains, err)
 					}
@@ -263,5 +283,92 @@ func TestLoadConfig(t *testing.T) {
 				tt.validate(t, app)
 			}
 		})
+	}
+}
+
+func TestInitializeDependencies_ResolverResilience(t *testing.T) {
+	// Scenario 1: One valid resolver, one invalid resolver
+	app1 := &AppState{
+		Config: &AppConfig{
+			Resolvers: []string{"8.8.8.8", "192.0.2.1:53"}, // 192.0.2.1 is unroutable TEST-NET-1
+		},
+		Notifier: &NotificationManager{},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+
+	err := InitializeDependencies(ctx, app1)
+	if err != nil {
+		t.Errorf("Expected InitializeDependencies to succeed with 1 healthy resolver, got error: %v", err)
+	}
+	if len(app1.Config.Resolvers) != 1 || app1.Config.Resolvers[0] != "8.8.8.8" {
+		t.Errorf("Expected resolvers to contain only healthy '8.8.8.8', got %v", app1.Config.Resolvers)
+	}
+
+	// Scenario 2: All resolvers invalid
+	app2 := &AppState{
+		Config: &AppConfig{
+			Resolvers: []string{"192.0.2.1:53", "192.0.2.2:53"},
+		},
+		Notifier: &NotificationManager{},
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel2()
+
+	err2 := InitializeDependencies(ctx2, app2)
+	if err2 == nil {
+		t.Errorf("Expected error when all resolvers fail health check, got nil")
+	}
+}
+
+func TestIDNNormalizationAndAliasCase(t *testing.T) {
+	configJSON := `{
+		"domains": [
+			{
+				"domain": "münchen.de",
+				"name": "Munich Domain",
+				"expected_ns": ["ns1.münchen.de"],
+				"check_email_security": true,
+				"mx_records": ["mail.münchen.de"]
+			}
+		],
+		"dns_records": [
+			{
+				"hostname": "münchen.de",
+				"name": "Alias Record",
+				"type": "CNAME",
+				"expected": ["ALIAS:target.münchen.de"]
+			}
+		]
+	}`
+
+	tmpDir := t.TempDir()
+	cfgPath := tmpDir + "/config.json"
+	if err := os.WriteFile(cfgPath, []byte(configJSON), 0644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	app, err := LoadConfig(context.Background(), cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	d := app.Config.Domains[0]
+	if d.Domain != "xn--mnchen-3ya.de" {
+		t.Errorf("Expected Punycode xn--mnchen-3ya.de, got %s", d.Domain)
+	}
+	if d.ExpectedNS[0] != "ns1.xn--mnchen-3ya.de" {
+		t.Errorf("Expected Punycode NS ns1.xn--mnchen-3ya.de, got %s", d.ExpectedNS[0])
+	}
+	if d.MXRecords[0] != "mail.xn--mnchen-3ya.de" {
+		t.Errorf("Expected Punycode MX mail.xn--mnchen-3ya.de, got %s", d.MXRecords[0])
+	}
+
+	r := app.Config.DNSRecords[0]
+	if r.Hostname != "xn--mnchen-3ya.de" {
+		t.Errorf("Expected Punycode Hostname xn--mnchen-3ya.de, got %s", r.Hostname)
+	}
+	if len(r.Expected) == 0 || r.Expected[0] != "target.xn--mnchen-3ya.de" {
+		t.Errorf("Expected stripped and Punycode expected target.xn--mnchen-3ya.de, got %v", r.Expected)
 	}
 }

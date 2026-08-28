@@ -19,14 +19,12 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/openrdap/rdap"
 )
 
 //go:embed index.html
 var indexHTML []byte
 
-func setupHTTPServer(app *AppState, port string, firstRunDone chan struct{}) (*http.Server, <-chan error) {
+func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -37,23 +35,16 @@ func setupHTTPServer(app *AppState, port string, firstRunDone chan struct{}) (*h
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-cache")
-		if firstRunDone != nil {
-			select {
-			case <-firstRunDone:
-			case <-r.Context().Done():
-				return
-			}
-		}
 		if b, ok := app.PrerenderedJSON.Load().([]byte); ok {
 			_, _ = w.Write(b)
 		} else {
-			_, _ = w.Write([]byte("{}"))
+			_, _ = w.Write([]byte(`{"status":"initializing"}`))
 		}
 	})
 
 	mux.HandleFunc("GET /api/certs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		domain := strings.TrimSuffix(strings.TrimSpace(r.URL.Query().Get("domain")), ".")
+		domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(r.URL.Query().Get("domain")), "."))
 		if domain == "" || !ValidDomainRegex.MatchString(domain) {
 			http.Error(w, `{"error": "invalid domain"}`, http.StatusBadRequest)
 			return
@@ -77,7 +68,7 @@ func setupHTTPServer(app *AppState, port string, firstRunDone chan struct{}) (*h
 
 	mux.HandleFunc("GET /api/ctlogs/{domain}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		domain := strings.TrimSuffix(strings.TrimSpace(r.PathValue("domain")), ".")
+		domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(r.PathValue("domain")), "."))
 		if domain == "" || !ValidDomainRegex.MatchString(domain) {
 			http.Error(w, `{"error": "invalid domain"}`, http.StatusBadRequest)
 			return
@@ -105,17 +96,10 @@ func setupHTTPServer(app *AppState, port string, firstRunDone chan struct{}) (*h
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if firstRunDone != nil {
-			select {
-			case <-firstRunDone:
-			case <-r.Context().Done():
-				return
-			}
-		}
 		if b, ok := app.PrerenderedHTML.Load().([]byte); ok {
 			_, _ = w.Write(b)
 		} else {
-			_, _ = w.Write([]byte("Loading..."))
+			_, _ = w.Write([]byte("Loading initial monitoring state..."))
 		}
 	})
 
@@ -182,16 +166,16 @@ func main() {
 	}
 	ctStatePath := filepath.Join(dataDir, "ct_state.json")
 
-	rdapClient := &rdap.Client{
-		HTTP: NewRDAPHTTPClient(10 * time.Second),
-	}
+	rdapHTTPClient := NewRDAPHTTPClient(10 * time.Second)
 	slog.Info(fmt.Sprintf(MsgLogStartup, len(app.Config.Domains), len(app.Config.DNSRecords)))
 
 	firstRunDone := make(chan struct{})
-	server, serverErrChan := setupHTTPServer(app, app.Config.Port, firstRunDone)
+	server, serverErrChan := setupHTTPServer(app, app.Config.Port)
 
+	engineDone := make(chan struct{})
 	// Execute concurrent engine
 	go func() {
+		defer close(engineDone)
 		defer app.Notifier.Flush(ctx)
 		maxWorkers := max(runtime.NumCPU()*10, 50)
 
@@ -286,24 +270,30 @@ func main() {
 			// Run RDAP concurrently with bounded workers & rate limiting
 			gRDAP := newWorkerGroup(cycleCtx, 3)
 			rdapTicker := time.NewTicker(app.WhoisDelay)
+			rdapFirst := true
 
+		rdapLoop:
 			for _, dt := range app.Config.Domains {
 				if dt.IsDelegatedZone {
 					continue
 				}
 				targetDomain := dt
-				select {
-				case <-cycleCtx.Done():
-					break
-				case <-rdapTicker.C:
+				if !rdapFirst {
+					select {
+					case <-cycleCtx.Done():
+						break rdapLoop
+					case <-rdapTicker.C:
+					}
 				}
+				rdapFirst = false
+
 				gRDAP.Go(func() {
 					defer func() {
 						if r := recover(); r != nil {
 							slog.Error("RDAP check panicked", "domain", targetDomain.Domain, "panic", r)
 						}
 					}()
-					evaluateRDAP(cycleCtx, rdapClient, app, targetDomain, loopState)
+					evaluateRDAP(cycleCtx, rdapHTTPClient, app, targetDomain, loopState)
 				})
 			}
 			gRDAP.Wait()
@@ -312,17 +302,23 @@ func main() {
 			// Run CTLogs concurrently with bounded workers & rate limiting
 			gCT := newWorkerGroup(cycleCtx, 3)
 			ctTicker := time.NewTicker(app.ReqDelay)
+			ctFirst := true
 
+		ctLoop:
 			for _, dt := range app.Config.Domains {
 				if !dt.MonitorCTLogs {
 					continue
 				}
 				targetDomain := dt
-				select {
-				case <-cycleCtx.Done():
-					break
-				case <-ctTicker.C:
+				if !ctFirst {
+					select {
+					case <-cycleCtx.Done():
+						break ctLoop
+					case <-ctTicker.C:
+					}
 				}
+				ctFirst = false
+
 				gCT.Go(func() {
 					defer func() {
 						if r := recover(); r != nil {
@@ -363,8 +359,9 @@ func main() {
 				prevEmailStatus[domain] = currEmail.Status
 			}
 
-			// Dispatch notifications
+			// Dispatch notifications and wait for transmissions to complete before cycle cancellation
 			app.Notifier.Flush(cycleCtx)
+			app.Notifier.Wait()
 			app.Notifier.EndCycle()
 
 			// Pre-render JSON and HTML
@@ -375,8 +372,9 @@ func main() {
 
 			if indexTmpl != nil {
 				var buf bytes.Buffer
+				escapedJSON := bytes.ReplaceAll(jsonBytes, []byte("</"), []byte(`<\/`))
 				if err := indexTmpl.Execute(&buf, map[string]any{
-					"StateJSON": template.JS(jsonBytes),
+					"StateJSON": template.JS(escapedJSON),
 				}); err != nil {
 					slog.Error("HTML prerender failed", "error", err)
 				} else {
@@ -433,6 +431,13 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = server.Shutdown(shutdownCtx)
+
+	// Wait for monitoring engine to complete in-flight writes
+	select {
+	case <-engineDone:
+	case <-time.After(5 * time.Second):
+		slog.Warn("Monitoring engine shutdown timed out")
+	}
 
 	// Wait for notifications to complete
 	app.Notifier.Wait()

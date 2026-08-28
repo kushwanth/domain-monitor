@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/go-jsonnet"
 	"github.com/miekg/dns"
+	"golang.org/x/net/idna"
 )
 
 func LoadConfig(ctx context.Context, path string) (*AppState, error) {
@@ -76,8 +77,15 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	for i := range rawCfg.Domains {
 		d := &rawCfg.Domains[i]
 		d.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.Domain), "."))
+		if ascii, err := idna.ToASCII(d.Domain); err == nil && ascii != "" {
+			d.Domain = ascii
+		}
 		for j := range d.ExpectedNS {
-			d.ExpectedNS[j] = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.ExpectedNS[j]), "."))
+			nsClean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.ExpectedNS[j]), "."))
+			if ascii, err := idna.ToASCII(nsClean); err == nil && ascii != "" {
+				nsClean = ascii
+			}
+			d.ExpectedNS[j] = nsClean
 		}
 
 		// Enforce Name is mandatory for domains
@@ -87,6 +95,9 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 
 		if d.IsDelegatedZone {
 			d.RootZone = strings.ToLower(strings.TrimSpace(d.RootZone))
+			if ascii, err := idna.ToASCII(d.RootZone); err == nil && ascii != "" {
+				d.RootZone = ascii
+			}
 			if d.RootZone == "" {
 				return nil, fmt.Errorf("delegated domain %s is missing a mandatory 'root_zone' field", d.Domain)
 			}
@@ -99,9 +110,7 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 				}
 				var res []string
 				for _, item := range list {
-					val := strings.ToLower(strings.TrimSpace(item))
-					val = strings.Trim(val, "\"")
-					val = strings.TrimSpace(val)
+					val := parseCAAIssuer(item)
 					if val != "" && val != ";" {
 						res = append(res, val)
 					}
@@ -129,7 +138,17 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 			}
 			d.MailProvider = strings.ToLower(strings.TrimSpace(d.MailProvider))
 			for j := range d.MXRecords {
-				d.MXRecords[j] = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.MXRecords[j]), "."))
+				rawMX := strings.TrimSpace(d.MXRecords[j])
+				var mxClean string
+				if rawMX == "." {
+					mxClean = "."
+				} else {
+					mxClean = strings.ToLower(strings.TrimSuffix(rawMX, "."))
+					if ascii, err := idna.ToASCII(mxClean); err == nil && ascii != "" {
+						mxClean = ascii
+					}
+				}
+				d.MXRecords[j] = mxClean
 			}
 			for j := range d.DKIMSelectors {
 				d.DKIMSelectors[j] = strings.ToLower(strings.TrimSpace(d.DKIMSelectors[j]))
@@ -140,6 +159,9 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	for i := range rawCfg.DNSRecords {
 		r := &rawCfg.DNSRecords[i]
 		r.Hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(r.Hostname), "."))
+		if ascii, err := idna.ToASCII(r.Hostname); err == nil && ascii != "" {
+			r.Hostname = ascii
+		}
 
 		if r.Name == "" {
 			return nil, fmt.Errorf("dns record %s (%s) is missing a mandatory 'name' field", r.Hostname, r.Type)
@@ -150,9 +172,15 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 			return nil, fmt.Errorf("dns record %s is missing a type (e.g. A, CNAME)", r.Hostname)
 		}
 		for j := range r.Expected {
-			cleanVal := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(r.Expected[j]), "."), "alias:")
+			cleanVal := strings.TrimSuffix(strings.TrimSpace(r.Expected[j]), ".")
+			if strings.HasPrefix(strings.ToLower(cleanVal), "alias:") {
+				cleanVal = cleanVal[6:]
+			}
 			if r.Type != "TXT" {
 				cleanVal = strings.ToLower(cleanVal)
+				if ascii, err := idna.ToASCII(cleanVal); err == nil && ascii != "" {
+					cleanVal = ascii
+				}
 			}
 
 			// Normalize IPs for A, AAAA, IP types
@@ -204,7 +232,7 @@ func InitializeDependencies(ctx context.Context, app *AppState) error {
 		}
 
 		client := &http.Client{Timeout: 5 * time.Second}
-		req, err := http.NewRequestWithContext(ctx, "POST", rawCfg.Notifications.Ntfy.URL, strings.NewReader("System Boot: Connectivity Test"))
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawCfg.Notifications.Ntfy.URL, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create ntfy request: %w", err)
 		}
@@ -232,6 +260,8 @@ func InitializeDependencies(ctx context.Context, app *AppState) error {
 		slog.Info(MsgLogTelegramConfig)
 	}
 
+	var healthyResolvers []string
+	var lastResolverErr error
 	for _, res := range rawCfg.Resolvers {
 		ip := res
 		if _, _, err := net.SplitHostPort(ip); err != nil {
@@ -243,9 +273,17 @@ func InitializeDependencies(ctx context.Context, app *AppState) error {
 		m.SetQuestion(dns.Fqdn("example.com"), dns.TypeA)
 		m.RecursionDesired = true
 		if _, _, err := c.ExchangeContext(ctx, m, ip); err != nil {
-			return fmt.Errorf("global resolver health check failed for %s: %w", res, err)
+			slog.Warn("Configured resolver unreachable during health check", "resolver", res, "error", err)
+			lastResolverErr = err
+		} else {
+			healthyResolvers = append(healthyResolvers, res)
 		}
 	}
+
+	if len(healthyResolvers) == 0 {
+		return fmt.Errorf("all configured resolvers failed health checks: %w", lastResolverErr)
+	}
+	rawCfg.Resolvers = healthyResolvers
 
 	return nil
 }

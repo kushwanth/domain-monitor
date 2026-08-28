@@ -5,9 +5,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Domain Monitor</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {
       /* Light Theme Variables */
@@ -58,7 +55,7 @@
 
     * {
       box-sizing: border-box;
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
     }
 
     body {
@@ -181,9 +178,9 @@
     }
 
     .domain-header {
-      padding: 20px 24px;
-      display: grid;
-      grid-template-columns: 250px 120px 1fr auto;
+      padding: 18px 24px;
+      display: flex;
+      justify-content: space-between;
       align-items: center;
       gap: 16px;
       cursor: pointer;
@@ -192,11 +189,49 @@
       /* Remove native detail marker */
     }
 
+    .domain-header-left {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .domain-header-domains .domain-title {
+      width: 280px;
+      min-width: 200px;
+      flex-shrink: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .domain-header-domains .domain-expiry {
+      width: 120px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+    }
+
+    .domain-header-dns .domain-title {
+      flex: 1;
+      min-width: 0;
+      word-break: break-word;
+    }
+
+    .domain-header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
     .domain-expiry {
       display: flex;
       align-items: center;
       color: var(--text-muted);
-      font-size: 0.9rem;
+      font-size: 0.85rem;
+      white-space: nowrap;
     }
 
     .domain-header::-webkit-details-marker {
@@ -210,7 +245,6 @@
     .domain-title {
       font-weight: 600;
       font-size: 1.1rem;
-      margin-right: 16px;
     }
 
     .domain-status {
@@ -398,6 +432,16 @@
 
       .main {
         margin-left: 0;
+      }
+
+      .domain-header-domains .domain-title {
+        width: auto;
+        max-width: 100%;
+      }
+
+      .domain-header-left {
+        flex-wrap: wrap;
+        gap: 8px;
       }
 
       .domain-details {
@@ -821,17 +865,21 @@
         }
         
         card.innerHTML = `
-          <summary class="domain-header">
-            <div class="domain-title" style="text-transform: lowercase;">${escapeHTML(domain)}</div>
-            <div class="domain-expiry">
-              ${badgeHtml ? badgeHtml : `<span style="opacity: 0.6;">${expText}</span>`}
+          <summary class="domain-header domain-header-domains">
+            <div class="domain-header-left">
+              <div class="domain-title" style="text-transform: lowercase;">${escapeHTML(domain)}</div>
+              <div class="domain-expiry">
+                ${badgeHtml ? badgeHtml : `<span style="opacity: 0.6;">${expText}</span>`}
+              </div>
             </div>
-            <div class="domain-status">
-              <span class="status-label">
-                ${labelsHtml}
-              </span>
+            <div class="domain-header-right">
+              <div class="domain-status">
+                <span class="status-label">
+                  ${labelsHtml}
+                </span>
+              </div>
+              ${chevronHtml}
             </div>
-            ${chevronHtml}
           </summary>
           <div class="domain-details">
             ${rdapHtml}
@@ -888,16 +936,18 @@
         let isExpiringCert = false;
         let sslRow = '';
         let badgeHtml = '';
-        if (state.ssl_days !== undefined && state.ssl_days !== -2) {
-          if (state.ssl_days === -1) {
+        if (state.ssl_days !== undefined && state.ssl_days !== -9999 && state.ssl_days !== -2) {
+          if (state.ssl_days === -9998 || (state.ssl_days === -1 && state.error)) {
              sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value" style="color: var(--warning);">No Cert / Error</div></div>`;
              badgeHtml = `<span class="badge error">No Cert</span>`;
              badges.push({label: 'ssl_missing', cls: 'error'});
           } else {
-             sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value">${state.ssl_days > 0 ? 'Valid (' + state.ssl_days + ' days)' : '<span style="color: var(--error);">Expired</span>'}</div></div>`;
+             const isExpired = state.ssl_days < 0;
+             const absDays = Math.abs(state.ssl_days);
+             sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value">${!isExpired ? 'Valid (' + state.ssl_days + ' days)' : '<span style="color: var(--error);">Expired (' + absDays + 'd ago)</span>'}</div></div>`;
              
-             if (state.ssl_days < 0) {
-               badgeHtml = `<span class="badge error">Expired</span>`;
+             if (isExpired) {
+               badgeHtml = `<span class="badge error">Expired (${absDays}d)</span>`;
                isExpiringCert = true;
                expiringCertCount++;
                badges.push({label: 'ssl_expired', cls: 'error'});
@@ -938,17 +988,21 @@
         card.className = 'domain-card';
         card.setAttribute('data-search', escapeHTML(key.toLowerCase()));
         card.innerHTML = `
-          <summary class="domain-header">
-            <div class="domain-title" style="text-transform: lowercase;">${hostname}</div>
-            <div class="domain-expiry">
-              ${badgeHtml}
+          <summary class="domain-header domain-header-dns">
+            <div class="domain-header-left">
+              <div class="domain-title" style="text-transform: lowercase;">${hostname}</div>
             </div>
-            <div class="domain-status">
-              <span class="status-label">
-                ${labelsHtml}
-              </span>
+            <div class="domain-header-right">
+              <div class="domain-expiry">
+                ${badgeHtml}
+              </div>
+              <div class="domain-status">
+                <span class="status-label">
+                  ${labelsHtml}
+                </span>
+              </div>
+              <svg class="domain-chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
             </div>
-            <svg class="domain-chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
           </summary>
           <div class="domain-details">
             <div class="detail-panel">

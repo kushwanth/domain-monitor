@@ -9,10 +9,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
-var CTLogsPath = DefaultCTLogsSubdir
+var (
+	CTLogsPath   = DefaultCTLogsSubdir
+	ctHTTPClient = &http.Client{Timeout: 10 * time.Second}
+)
 
 func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, state *CheckState) {
 	if !target.MonitorCTLogs {
@@ -76,7 +80,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 	if len(newCerts) > 0 {
 		if err := saveCertsToHistory(target.Domain, newCerts); err != nil {
 			state.UpdateCTLogs(target.Domain, &CTLogState{
-				LatestID:         newLatestID,
+				LatestID:         latestID, // Keep previous checkpoint on write failure to allow retry
 				BackfillCursor:   backfillCursor,
 				BackfillComplete: backfillComplete,
 				Status:           StatusFailed,
@@ -161,8 +165,7 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevR
 
 	req.Header.Set("User-Agent", "DomainMonitor/1.0")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := ctHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -185,13 +188,22 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevR
 }
 
 func saveCertsToHistory(domain string, certs []CTCert) error {
+	cleanDomain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	if cleanDomain == "" || !ValidDomainRegex.MatchString(cleanDomain) {
+		return fmt.Errorf("invalid domain for certs history: %q", domain)
+	}
 	if err := os.MkdirAll(CTLogsPath, 0755); err != nil {
 		return err
 	}
-	filePath := filepath.Join(CTLogsPath, domain+".json")
+	filePath := filepath.Join(CTLogsPath, cleanDomain+".json")
+	cleanPath := filepath.Clean(filePath)
+	cleanBase := filepath.Clean(CTLogsPath)
+	if cleanPath != cleanBase && !strings.HasPrefix(cleanPath, cleanBase+string(filepath.Separator)) {
+		return fmt.Errorf("invalid file path for certs history: %q", domain)
+	}
 
 	var existing []CTCert
-	if b, err := os.ReadFile(filePath); err == nil {
+	if b, err := os.ReadFile(cleanPath); err == nil {
 		_ = jsonv2.Unmarshal(b, &existing)
 	}
 
@@ -217,7 +229,7 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 
 	if addedNew {
 		if b, err := jsonv2.Marshal(combined); err == nil {
-			return atomicWriteFile(filePath, b, 0644)
+			return atomicWriteFile(cleanPath, b, 0644)
 		} else {
 			return err
 		}

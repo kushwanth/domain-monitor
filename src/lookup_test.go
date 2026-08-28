@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/openrdap/rdap"
 )
 
 func TestRDAPValidation(t *testing.T) {
@@ -51,33 +49,44 @@ func TestRDAPValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			expectedMap := make(map[string]bool)
-			for _, expected := range tt.targetNS {
-				expectedMap[expected] = true
+			app := &AppState{
+				Notifier: &NotificationManager{},
+			}
+			state := &CheckState{
+				RDAP: make(map[string]*RDAPState),
 			}
 
-			liveNSMap := make(map[string]bool)
-			unauthFound := false
+			target := DomainConfig{
+				Domain:     "example.com",
+				Name:       "Example",
+				ExpectedNS: tt.targetNS,
+			}
 
-			for _, live := range tt.liveNS {
-				liveNSMap[live] = true
-				if !expectedMap[live] {
-					unauthFound = true
+			parsed := &RDAPState{
+				Status:       StatusOk,
+				Nameservers:  tt.liveNS,
+				DomainStatus: []string{"clientTransferProhibited"},
+			}
+
+			validateRDAPState(app, target, state, parsed)
+
+			unauthAlert := false
+			missingAlert := false
+
+			for _, alert := range app.Notifier.Buffer {
+				if strings.Contains(alert.Message, "unauthorized ns on") || alert.Redacted == "Unauthorized nameserver detected." {
+					unauthAlert = true
+				}
+				if strings.Contains(alert.Message, "expected ns missing from") || alert.Redacted == "Expected nameserver is missing." {
+					missingAlert = true
 				}
 			}
 
-			missingFound := false
-			for _, expected := range tt.targetNS {
-				if !liveNSMap[expected] {
-					missingFound = true
-				}
+			if unauthAlert != tt.expectUnauth {
+				t.Errorf("Expected Unauth alert=%v, got %v (buffer: %+v)", tt.expectUnauth, unauthAlert, app.Notifier.Buffer)
 			}
-
-			if unauthFound != tt.expectUnauth {
-				t.Errorf("Expected Unauth: %v, got %v", tt.expectUnauth, unauthFound)
-			}
-			if missingFound != tt.expectMissing {
-				t.Errorf("Expected Missing: %v, got %v", tt.expectMissing, missingFound)
+			if missingAlert != tt.expectMissing {
+				t.Errorf("Expected Missing alert=%v, got %v (buffer: %+v)", tt.expectMissing, missingAlert, app.Notifier.Buffer)
 			}
 		})
 	}
@@ -267,20 +276,17 @@ func TestExtractVCardText(t *testing.T) {
 	t.Parallel()
 
 	// 1. String property
-	p1 := &rdap.VCardProperty{Name: "fn", Value: "Cloudflare, Inc."}
-	if val := extractVCardText(p1); val != "Cloudflare, Inc." {
+	if val := extractVCardText("Cloudflare, Inc."); val != "Cloudflare, Inc." {
 		t.Errorf("Expected 'Cloudflare, Inc.', got %q", val)
 	}
 
 	// 2. Array of interface{} property (RFC 7095 multi-part jCard)
-	p2 := &rdap.VCardProperty{Name: "org", Value: []any{"GoDaddy.com, LLC", "Domain Services"}}
-	if val := extractVCardText(p2); val != "GoDaddy.com, LLC Domain Services" {
+	if val := extractVCardText([]any{"GoDaddy.com, LLC", "Domain Services"}); val != "GoDaddy.com, LLC Domain Services" {
 		t.Errorf("Expected 'GoDaddy.com, LLC Domain Services', got %q", val)
 	}
 
 	// 3. Array of string property
-	p3 := &rdap.VCardProperty{Name: "fn", Value: []string{"Namecheap", "Support"}}
-	if val := extractVCardText(p3); val != "Namecheap Support" {
+	if val := extractVCardText([]string{"Namecheap", "Support"}); val != "Namecheap Support" {
 		t.Errorf("Expected 'Namecheap Support', got %q", val)
 	}
 
@@ -288,19 +294,35 @@ func TestExtractVCardText(t *testing.T) {
 	if val := extractVCardText(nil); val != "" {
 		t.Errorf("Expected empty string for nil property, got %q", val)
 	}
+
+	// 5. extractVCardProperty from full vcardArray
+	vcard := []any{
+		"vcard",
+		[]any{
+			[]any{"version", map[string]any{}, "text", "4.0"},
+			[]any{"fn", map[string]any{}, "text", "Cloudflare, Inc."},
+			[]any{"org", map[string]any{}, "text", []any{"GoDaddy.com, LLC", "Domain Services"}},
+		},
+	}
+	if fn := extractVCardProperty(vcard, "fn"); fn != "Cloudflare, Inc." {
+		t.Errorf("Expected 'Cloudflare, Inc.', got %q", fn)
+	}
+	if org := extractVCardProperty(vcard, "org"); org != "GoDaddy.com, LLC Domain Services" {
+		t.Errorf("Expected 'GoDaddy.com, LLC Domain Services', got %q", org)
+	}
 }
 
 func TestCollectRDAPReferralLinks(t *testing.T) {
 	t.Parallel()
 
-	domainInfo := &rdap.Domain{
-		Links: []rdap.Link{
+	domainInfo := &RDAPDomainResponse{
+		Links: []RDAPLink{
 			{Rel: "self", Href: "https://rdap.verisign.com/com/v1/domain/example.com"},
 		},
-		Entities: []rdap.Entity{
+		Entities: []RDAPEntity{
 			{
 				Roles: []string{"registrar"},
-				Links: []rdap.Link{
+				Links: []RDAPLink{
 					{
 						Rel:  "related",
 						Href: "https://rdap.markmonitor.com/rdap/domain/example.com",
@@ -457,12 +479,13 @@ func TestFindRegistrarRecursively(t *testing.T) {
 	t.Parallel()
 
 	// Entity with VCard fn
-	entities1 := []rdap.Entity{
+	entities1 := []RDAPEntity{
 		{
 			Roles: []string{"registrar"},
-			VCard: &rdap.VCard{
-				Properties: []*rdap.VCardProperty{
-					{Name: "fn", Value: "GoDaddy.com, LLC"},
+			VCardArray: []any{
+				"vcard",
+				[]any{
+					[]any{"fn", map[string]any{}, "text", "GoDaddy.com, LLC"},
 				},
 			},
 		},
@@ -472,12 +495,13 @@ func TestFindRegistrarRecursively(t *testing.T) {
 	}
 
 	// Entity with VCard org as array
-	entities2 := []rdap.Entity{
+	entities2 := []RDAPEntity{
 		{
 			Roles: []string{"sponsor"},
-			VCard: &rdap.VCard{
-				Properties: []*rdap.VCardProperty{
-					{Name: "org", Value: []any{"NameCheap, Inc."}},
+			VCardArray: []any{
+				"vcard",
+				[]any{
+					[]any{"org", map[string]any{}, "text", []any{"NameCheap, Inc."}},
 				},
 			},
 		},
@@ -487,10 +511,10 @@ func TestFindRegistrarRecursively(t *testing.T) {
 	}
 
 	// Entity with PublicID (IANA ID)
-	entities3 := []rdap.Entity{
+	entities3 := []RDAPEntity{
 		{
 			Roles: []string{"registrar"},
-			PublicIDs: []rdap.PublicID{
+			PublicIDs: []RDAPPublicID{
 				{Type: "iana", Identifier: "1068"},
 			},
 		},
@@ -520,7 +544,7 @@ DNSSEC: unsigned
 		return sampleWhois, nil
 	})
 
-	state, err := fetchWhois("example.com")
+	state, err := fetchWhois(context.Background(), "example.com")
 	if err != nil {
 		t.Fatalf("fetchWhois failed: %v", err)
 	}
@@ -556,7 +580,7 @@ paid-till:     2026-09-15
 		return whoisRu, nil
 	})
 
-	state, err := fetchWhois("example.ru")
+	state, err := fetchWhois(context.Background(), "example.ru")
 	if err != nil {
 		t.Fatalf("fetchWhois failed on RU template: %v", err)
 	}
@@ -592,12 +616,38 @@ paid-till:     2026-09-15
 		return whoisUk, nil
 	})
 
-	stateUk, err := fetchWhois("example.co.uk")
+	stateUk, err := fetchWhois(context.Background(), "example.co.uk")
 	if err != nil {
 		t.Fatalf("fetchWhois failed on UK template: %v", err)
 	}
 	if stateUk.Expiration == "" || !strings.HasPrefix(stateUk.Expiration, "2027-08-01") {
 		t.Errorf("Expected expiration 2027-08-01, got %q", stateUk.Expiration)
+	}
+
+	// Test Japanese JPRS style with [Header] brackets
+	whoisJp := `
+[Domain Name]                   SONY.CO.JP
+[Organization]                  Sony Group Corporation
+[State]                         Connected (2027/01/31)
+[Registered Date]               1996/01/29
+[Connected Date]                1996/02/06
+[Last Update]                   2026/02/01 01:21:40 (JST)
+[Name Server]                   ns1.sony.co.jp
+[Name Server]                   ns2.sony.co.jp
+`
+	setWhoisQueryFn(func(domain string) (string, error) {
+		return whoisJp, nil
+	})
+
+	stateJp, err := fetchWhois(context.Background(), "sony.co.jp")
+	if err != nil {
+		t.Fatalf("fetchWhois failed on JPRS template: %v", err)
+	}
+	if len(stateJp.Nameservers) < 2 {
+		t.Errorf("Expected at least 2 nameservers for JPRS, got %v", stateJp.Nameservers)
+	}
+	if stateJp.Registrar != "Sony Group Corporation" {
+		t.Errorf("Expected organization/registrar Sony Group Corporation, got %q", stateJp.Registrar)
 	}
 }
 
@@ -609,16 +659,31 @@ func TestFetchWhois_NotFound(t *testing.T) {
 		return "No match for domain NOTFOUND12345.COM.", nil
 	})
 
-	_, err := fetchWhois("notfound12345.com")
+	_, err := fetchWhois(context.Background(), "notfound12345.com")
 	if err == nil {
 		t.Fatalf("Expected error for non-existent domain, got nil")
 	}
 	if !strings.Contains(err.Error(), "404") && !strings.Contains(err.Error(), "not found") {
 		t.Errorf("Expected 404 or not found error, got: %v", err)
 	}
+
+	// Test SIDN Dutch "is free" response
+	setWhoisQueryFn(func(domain string) (string, error) {
+		return "unregistered-dutch-test-555.nl is free\n", nil
+	})
+	_, errNl := fetchWhois(context.Background(), "unregistered-dutch-test-555.nl")
+	if errNl == nil {
+		t.Fatalf("Expected error for SIDN is free domain, got nil")
+	}
+	if !strings.Contains(errNl.Error(), "404") && !strings.Contains(errNl.Error(), "not found") {
+		t.Errorf("Expected 404 error for is free domain, got: %v", errNl)
+	}
 }
 
 func TestFollowRegistrarRDAPLinks(t *testing.T) {
+	allowInsecureRDAPURLs = true
+	defer func() { allowInsecureRDAPURLs = false }()
+
 	registrarServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/rdap+json")
 		_, _ = w.Write([]byte(`{
@@ -668,7 +733,7 @@ func TestFollowRegistrarRDAPLinks(t *testing.T) {
 		DomainStatus: []string{"serverTransferProhibited"},
 	}
 
-	state, _ := synthesizeTierData("example.com", regTier, rarTier)
+	state, _ := synthesizeTierData(regTier, rarTier)
 
 	if state.Source != "registry_rdap+registrar_rdap" {
 		t.Errorf("Expected Source 'registry_rdap+registrar_rdap', got %q", state.Source)
@@ -716,7 +781,7 @@ func TestTwoTierHierarchySynthesis(t *testing.T) {
 		DNSSEC:       true,
 	}
 
-	state, disc := synthesizeTierData("example.com", regTier, rarTier)
+	state, disc := synthesizeTierData(regTier, rarTier)
 
 	if len(disc) == 0 {
 		t.Errorf("Expected Auto-Renew Grace Period discrepancy to be detected")
@@ -747,7 +812,7 @@ func TestTwoTierHierarchySynthesis(t *testing.T) {
 		DomainStatus: []string{"clientTransferProhibited"},
 	}
 
-	state2, disc2 := synthesizeTierData("example.com", regTier, rarTierDesync)
+	state2, disc2 := synthesizeTierData(regTier, rarTierDesync)
 	if len(disc2) == 0 {
 		t.Errorf("Expected Nameserver desync discrepancy to be detected")
 	}
@@ -795,34 +860,6 @@ func TestWHOISRateLimitingClassification(t *testing.T) {
 	}
 }
 
-func TestRDAPTLSConfig(t *testing.T) {
-	t.Parallel()
-
-	tlsCfg := RDAPTLSConfig()
-	if tlsCfg == nil {
-		t.Fatalf("RDAPTLSConfig returned nil")
-	}
-
-	if tlsCfg.MinVersion != tls.VersionTLS12 {
-		t.Errorf("Expected MinVersion to be TLS 1.2 (0x%x), got 0x%x", tls.VersionTLS12, tlsCfg.MinVersion)
-	}
-
-	if len(tlsCfg.CipherSuites) == 0 {
-		t.Fatalf("Expected CipherSuites to be populated")
-	}
-
-	// Verify modern ciphers (such as AES-GCM / ChaCha20) come before legacy CBC ciphers
-	modernCount := len(tls.CipherSuites())
-	if len(tlsCfg.CipherSuites) <= modernCount {
-		t.Errorf("Expected legacy cipher suites to be appended after modern suites")
-	}
-
-	// Verify the first suite is a modern suite, not RSA-CBC
-	if tlsCfg.CipherSuites[0] == tls.TLS_RSA_WITH_AES_128_CBC_SHA || tlsCfg.CipherSuites[0] == tls.TLS_RSA_WITH_AES_256_CBC_SHA {
-		t.Errorf("Weak RSA-CBC cipher suite found at top priority in CipherSuites")
-	}
-}
-
 func TestFetchWhois_Extensive(t *testing.T) {
 	files, err := os.ReadDir("testdata/whois")
 	if err != nil {
@@ -856,7 +893,7 @@ func TestFetchWhois_Extensive(t *testing.T) {
 			return content, nil
 		})
 
-		state, err := fetchWhois("example" + filepath.Ext(name))
+		state, err := fetchWhois(context.Background(), "example"+filepath.Ext(name))
 		if err != nil {
 			t.Logf("Failed to parse %s: %v", name, err)
 			continue
@@ -868,40 +905,6 @@ func TestFetchWhois_Extensive(t *testing.T) {
 	}
 
 	t.Logf("Successfully extracted some data from %d/%d WHOIS templates", successCount, totalCount)
-}
-
-func TestBootstrapCacheGracePeriod(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "simulated 500 internal error", http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	b := NewBootstrap(server.Client())
-	b.url = server.URL
-
-	// 1. Pre-populate cache with timestamp 30 hours ago (expired TTL, but within 72h max age)
-	b.services = map[string][]string{
-		"com": {"https://rdap.verisign.com/com/v1/"},
-	}
-	b.fetchedAt = time.Now().Add(-30 * time.Hour)
-
-	// ensure() should encounter server error, but successfully fall back to cached services
-	err := b.ensure(context.Background())
-	if err != nil {
-		t.Fatalf("Expected graceful fallback to cache within 72h, got error: %v", err)
-	}
-
-	servers, err := b.ServersFor(context.Background(), "example.com")
-	if err != nil || len(servers) == 0 || servers[0] != "https://rdap.verisign.com/com/v1/" {
-		t.Errorf("Expected cached server URL, got %v (err: %v)", servers, err)
-	}
-
-	// 2. Set timestamp to 80 hours ago (beyond 72h max age)
-	b.fetchedAt = time.Now().Add(-80 * time.Hour)
-	err = b.ensure(context.Background())
-	if err == nil {
-		t.Errorf("Expected error when cache is older than 72h and IANA is down, got nil")
-	}
 }
 
 func FuzzFlexibleDateParsing(f *testing.F) {
@@ -943,4 +946,192 @@ func FuzzNormalizeEPPStatus(f *testing.F) {
 		// Should never panic regardless of arbitrary input
 		_ = normalizeEPPStatus(rawStatus)
 	})
+}
+
+func TestNativeRDAPDomainParsing(t *testing.T) {
+	t.Parallel()
+
+	rawJSON := `{
+		"objectClassName": "domain",
+		"handle": "2336799_DOMAIN_COM-VRSN",
+		"ldhName": "EXAMPLE.COM",
+		"status": [
+			"clientDeleteProhibited https://icann.org/epp#clientDeleteProhibited",
+			"clientTransferProhibited https://icann.org/epp#clientTransferProhibited",
+			"clientUpdateProhibited https://icann.org/epp#clientUpdateProhibited"
+		],
+		"entities": [
+			{
+				"objectClassName": "entity",
+				"handle": "292",
+				"roles": ["registrar"],
+				"publicIds": [
+					{
+						"type": "IANA Registrar ID",
+						"identifier": "292"
+					}
+				],
+				"vcardArray": [
+					"vcard",
+					[
+						["version", {}, "text", "4.0"],
+						["fn", {}, "text", "Example Registrar, Inc."],
+						["email", {"type": "work"}, "text", "abuse@exampleregistrar.com"]
+					]
+				],
+				"links": [
+					{
+						"value": "https://rdap.verisign.com/com/v1/domain/EXAMPLE.COM",
+						"rel": "related",
+						"href": "https://rdap.exampleregistrar.com/rdap/domain/EXAMPLE.COM",
+						"type": "application/rdap+json"
+					}
+				]
+			}
+		],
+		"events": [
+			{
+				"eventAction": "registration",
+				"eventDate": "1995-08-14T04:00:00Z"
+			},
+			{
+				"eventAction": "expiration",
+				"eventDate": "2028-08-13T04:00:00Z"
+			},
+			{
+				"eventAction": "last changed",
+				"eventDate": "2024-08-14T07:00:00Z"
+			}
+		],
+		"nameservers": [
+			{"objectClassName": "nameserver", "ldhName": "a.iana-servers.net."},
+			{"objectClassName": "nameserver", "ldhName": "b.iana-servers.net."}
+		],
+		"secureDNS": {
+			"delegationSigned": true,
+			"zoneSigned": true
+		}
+	}`
+
+	var domain RDAPDomainResponse
+	if err := json.Unmarshal([]byte(rawJSON), &domain); err != nil {
+		t.Fatalf("Failed to unmarshal RDAP JSON: %v", err)
+	}
+
+	tier := extractRDAPDomainTier(&domain, "registry_rdap", "https://rdap.verisign.com/com/v1")
+	if tier.Registrar != "Example Registrar, Inc." {
+		t.Errorf("Expected registrar 'Example Registrar, Inc.', got %q", tier.Registrar)
+	}
+	if tier.IANAID != "292" {
+		t.Errorf("Expected IANA ID '292', got %q", tier.IANAID)
+	}
+	if tier.Expiration != "2028-08-13T04:00:00Z" {
+		t.Errorf("Expected expiration '2028-08-13T04:00:00Z', got %q", tier.Expiration)
+	}
+	if tier.Created != "1995-08-14T04:00:00Z" {
+		t.Errorf("Expected created '1995-08-14T04:00:00Z', got %q", tier.Created)
+	}
+	if len(tier.Nameservers) != 2 || tier.Nameservers[0] != "a.iana-servers.net" || tier.Nameservers[1] != "b.iana-servers.net" {
+		t.Errorf("Unexpected nameservers: %v", tier.Nameservers)
+	}
+	if !tier.DNSSEC {
+		t.Errorf("Expected DNSSEC true")
+	}
+
+	referrals := collectRDAPReferralLinks(&domain, "https://rdap.verisign.com/com/v1")
+	if len(referrals) != 1 || referrals[0] != "https://rdap.exampleregistrar.com/rdap/domain/EXAMPLE.COM" {
+		t.Errorf("Unexpected referral links: %v", referrals)
+	}
+}
+
+func TestFollowRegistrarRDAPLinks_SSRFProtection(t *testing.T) {
+	unsafeLinks := []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://127.0.0.1:8080/api/certs",
+		"http://[::1]:8080/api/state",
+		"http://10.0.0.1/admin",
+		"http://192.168.1.1/secret",
+		"http://172.16.0.1/internal",
+		"http://localhost:8080/metrics",
+		"http://service.local/rdap",
+		"http://metadata.google.internal/computeMetadata/v1/",
+		"ftp://rdap.example.com/domain/test",
+	}
+
+	for _, unsafeURL := range unsafeLinks {
+		if isSafeRDAPURL(unsafeURL) {
+			t.Errorf("Expected isSafeRDAPURL to reject unsafe URL %q", unsafeURL)
+		}
+	}
+
+	res := followRegistrarRDAPLinks(context.Background(), "example.com", unsafeLinks, nil)
+	if res != nil {
+		t.Errorf("Expected nil response when all referral links are unsafe SSRF targets")
+	}
+
+	// Valid public HTTPS RDAP endpoint format should be permitted
+	validPublicURL := "https://rdap.markmonitor.com/rdap/domain/example.com"
+	if !isSafeRDAPURL(validPublicURL) {
+		t.Errorf("Expected isSafeRDAPURL to accept valid public HTTPS URL %q", validPublicURL)
+	}
+}
+
+func TestFollowRegistrarRDAPLinks_QueryParamReferral(t *testing.T) {
+	allowInsecureRDAPURLs = true
+	defer func() { allowInsecureRDAPURLs = false }()
+
+	var receivedPath string
+	var receivedQuery string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/rdap+json")
+		_, _ = w.Write([]byte(`{
+			"objectClassName": "domain",
+			"handle": "REG-QUERY-TEST",
+			"ldhName": "example.com",
+			"status": ["clientTransferProhibited"]
+		}`))
+	}))
+	defer server.Close()
+
+	// Referral URL with query parameter and base path
+	links := []string{server.URL + "/rdap_service?apiKey=secret123"}
+	res := followRegistrarRDAPLinks(context.Background(), "example.com", links, nil)
+
+	if res == nil {
+		t.Fatalf("Expected non-nil response from referral server")
+	}
+	if receivedPath != "/rdap_service/domain/example.com" {
+		t.Errorf("Expected URL path '/rdap_service/domain/example.com', got %q", receivedPath)
+	}
+	if receivedQuery != "apiKey=secret123" {
+		t.Errorf("Expected query 'apiKey=secret123' preserved, got %q", receivedQuery)
+	}
+}
+
+func TestNewRDAPHTTPClient_BlocksInsecureRedirects(t *testing.T) {
+	// Server that redirects to unsafe destination (http://127.0.0.1 or http scheme)
+	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:80/secret", http.StatusFound)
+	}))
+	defer redirectServer.Close()
+
+	// Insecure RDAP URLs disallowed (default)
+	allowInsecureRDAPURLs = false
+
+	client := NewRDAPHTTPClient(2 * time.Second)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", redirectServer.URL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+
+	_, err = client.Do(req)
+	if err == nil {
+		t.Fatalf("Expected client.Do to fail on redirect to insecure URL, got nil error")
+	}
+	if !strings.Contains(err.Error(), "insecure or invalid redirect URL") && !strings.Contains(err.Error(), "stopped after") {
+		t.Errorf("Expected insecure redirect error, got: %v", err)
+	}
 }

@@ -80,8 +80,9 @@ type DNSTask struct {
 	Name             string   `json:"name"`
 	Type             string   `json:"type"`
 	Expected         []string `json:"expected"`
-	CustomResolver   string   `json:"custom_resolver"`
-	AcceptSelfSigned bool     `json:"accept_self_signed"`
+	MatchType        string   `json:"match_type,omitempty"`
+	CustomResolver   string   `json:"custom_resolver,omitempty"`
+	AcceptSelfSigned bool     `json:"accept_self_signed,omitempty"`
 }
 
 // AppState holds application configuration, notification manager, and atomic runtime state caches.
@@ -101,6 +102,59 @@ type AppState struct {
 // ==========================================
 // 3. Domain & Check Result Models
 // ==========================================
+
+// RDAPLink represents an RFC 9083 web link.
+type RDAPLink struct {
+	Rel  string `json:"rel,omitempty"`
+	Href string `json:"href"`
+	Type string `json:"type,omitempty"`
+}
+
+// RDAPEvent represents an RFC 9083 lifecycle event (registration, expiration, last-changed).
+type RDAPEvent struct {
+	Action string `json:"eventAction"`
+	Date   string `json:"eventDate"`
+}
+
+// RDAPNameserver represents an RFC 9083 nameserver object.
+type RDAPNameserver struct {
+	LDHName string `json:"ldhName"`
+}
+
+// RDAPPublicID represents an RFC 9083 public identifier (e.g. IANA registrar ID).
+type RDAPPublicID struct {
+	Type       string `json:"type"`
+	Identifier string `json:"identifier"`
+}
+
+// RDAPSecureDNS represents RFC 9083 DNSSEC status.
+type RDAPSecureDNS struct {
+	DelegationSigned *bool `json:"delegationSigned,omitempty"`
+	ZoneSigned       *bool `json:"zoneSigned,omitempty"`
+}
+
+// RDAPEntity represents an RFC 9083 entity (registrar, registrant, reseller, etc.).
+type RDAPEntity struct {
+	Handle     string         `json:"handle,omitempty"`
+	Roles      []string       `json:"roles,omitempty"`
+	Port43     string         `json:"port43,omitempty"`
+	PublicIDs  []RDAPPublicID `json:"publicIds,omitempty"`
+	VCardArray []any          `json:"vcardArray,omitempty"`
+	Links      []RDAPLink     `json:"links,omitempty"`
+	Entities   []RDAPEntity   `json:"entities,omitempty"`
+}
+
+// RDAPDomainResponse represents an RFC 9083 domain object response.
+type RDAPDomainResponse struct {
+	Handle      string           `json:"handle,omitempty"`
+	LDHName     string           `json:"ldhName,omitempty"`
+	Status      []string         `json:"status,omitempty"`
+	Events      []RDAPEvent      `json:"events,omitempty"`
+	Nameservers []RDAPNameserver `json:"nameservers,omitempty"`
+	SecureDNS   *RDAPSecureDNS   `json:"secureDNS,omitempty"`
+	Entities    []RDAPEntity     `json:"entities,omitempty"`
+	Links       []RDAPLink       `json:"links,omitempty"`
+}
 
 type DomainTierData struct {
 	Source       string   `json:"source,omitempty"`
@@ -126,6 +180,9 @@ type RDAPState struct {
 	Error           string          `json:"error,omitempty"`
 	IsDelegatedZone bool            `json:"is_delegated_zone,omitempty"`
 	Source          string          `json:"source,omitempty"`
+	ProtocolUsed    string          `json:"protocol_used,omitempty"`
+	RawResponsePath string          `json:"raw_response_path,omitempty"`
+	QueryDurationMs int64           `json:"query_duration_ms,omitempty"`
 	RegistryTier    *DomainTierData `json:"registry_tier,omitempty"`
 	RegistrarTier   *DomainTierData `json:"registrar_tier,omitempty"`
 	Discrepancies   []string        `json:"discrepancies,omitempty"`
@@ -363,10 +420,10 @@ func (g *workerGroup) Wait() {
 
 // Bootstrap manages IANA RDAP bootstrap registry caches and queries.
 type Bootstrap struct {
-	http *http.Client
-	url  string
-
+	http      *http.Client
+	url       string
 	mu        sync.RWMutex
+	fetchMu   sync.Mutex
 	services  map[string][]string
 	fetchedAt time.Time
 }

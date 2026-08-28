@@ -41,7 +41,7 @@ func (nm *NotificationManager) Dispatch(message, redacted string, priority Alert
 		nm.sentState = make(map[string]time.Time)
 	}
 
-	key := fmt.Sprintf("%s|%s", domain, redacted)
+	key := fmt.Sprintf("%s|%s|%s", domain, tag, redacted)
 	if nm.seenThisCycle != nil {
 		nm.seenThisCycle[key] = true
 	}
@@ -209,7 +209,11 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 				}
 				_ = resp.Body.Close()
 			} else {
-				slog.Error("Telegram request error", "error", err)
+				errStr := err.Error()
+				if p.Token != "" {
+					errStr = strings.ReplaceAll(errStr, p.Token, "[REDACTED_TELEGRAM_TOKEN]")
+				}
+				slog.Error("Telegram request error", "error", errStr)
 			}
 			time.Sleep(1 * time.Second)
 		}
