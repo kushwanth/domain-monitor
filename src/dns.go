@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -114,7 +114,7 @@ func queryDNSMsg(ctx context.Context, app *AppState, hostname string, qtype uint
 	}
 
 	var lastErr error
-	for attempt := 0; attempt < len(resolvers); attempt++ {
+	for attempt := range resolvers {
 		idx := (startIdx + attempt) % len(resolvers)
 		ip := resolvers[idx]
 		if _, _, err := net.SplitHostPort(ip); err != nil {
@@ -139,6 +139,19 @@ func queryDNSMsg(ctx context.Context, app *AppState, hostname string, qtype uint
 		if err != nil {
 			lastErr = fmt.Errorf("lookup %s on %s: %w", hostname, ip, err)
 			continue
+		}
+
+		if r == nil {
+			lastErr = fmt.Errorf("lookup %s on %s: empty response", hostname, ip)
+			continue
+		}
+
+		// Verify question section echoes request if present
+		if len(r.Question) > 0 {
+			if !strings.EqualFold(r.Question[0].Name, fqdn) || r.Question[0].Qtype != qtype {
+				lastErr = fmt.Errorf("lookup %s on %s: response question mismatch", hostname, ip)
+				continue
+			}
 		}
 
 		if r.Rcode != dns.RcodeSuccess {
@@ -209,13 +222,6 @@ func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16,
 	return results, nil
 }
 
-// CAAEntry represents a structured CAA DNS record.
-type CAAEntry struct {
-	Flag  uint8
-	Tag   string
-	Value string
-}
-
 // queryCAARecords queries CAA records and returns structured entries
 // instead of raw string representations that require brittle re-parsing.
 func queryCAARecords(ctx context.Context, app *AppState, hostname string, resolvers []string) ([]CAAEntry, error) {
@@ -274,15 +280,6 @@ func queryIPRecords(ctx context.Context, app *AppState, hostname string, resolve
 		return found, fmt.Errorf("lookup failed for A and AAAA: %w", errors.Join(aErr, aaaaErr))
 	}
 	return found, nil
-}
-
-type CAAResult struct {
-	Valid      bool     `json:"valid"`
-	Issue      []string `json:"issue"`
-	IssueWild  []string `json:"issuewild"`
-	IssueMail  []string `json:"issuemail"`
-	UnknownCAs []string `json:"unknown_cas,omitempty"`
-	Error      string   `json:"error,omitempty"`
 }
 
 func evaluateCAA(ctx context.Context, app *AppState, target DomainConfig, state *CheckState) {
@@ -412,7 +409,11 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 
 func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []string) *CAAResult {
 	res := &CAAResult{}
-	currentDomain := domain
+	currentDomain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	if currentDomain == "" {
+		res.Error = "invalid empty domain for CAA"
+		return res
+	}
 
 	for {
 		entries, err := queryCAARecords(ctx, app, currentDomain, resolvers)
@@ -439,33 +440,18 @@ func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []str
 			return res
 		}
 
-		// Tree climbing
-		parts := strings.SplitN(currentDomain, ".", 2)
-		if len(parts) < 2 || !strings.Contains(parts[1], ".") {
-			break // Reached TLD or invalid domain
+		// Tree climbing: strip leftmost label
+		_, parent, found := strings.Cut(currentDomain, ".")
+		if !found {
+			break // Reached top-level label
 		}
-		currentDomain = parts[1]
+		if parent == "" || !strings.Contains(parent, ".") {
+			break // Stop at TLD or single label
+		}
+		currentDomain = parent
 	}
 
 	return res
-}
-
-type DNSSECResult struct {
-	Valid           bool     `json:"valid"`
-	HasDS           bool     `json:"has_ds"`
-	HasDNSKEY       bool     `json:"has_dnskey"`
-	DSMatchesDNSKEY bool     `json:"ds_matches_dnskey"`
-	RRSIGValid      bool     `json:"rrsig_valid"`
-	RRSIGExpiry     string   `json:"rrsig_expiry,omitempty"`
-	ChainIntact     bool     `json:"chain_intact"`
-	Algorithms      []string `json:"algorithms,omitempty"`
-	Source          string   `json:"source"`
-	Error           string   `json:"error,omitempty"`
-}
-
-type googleDoHResponse struct {
-	Status int  `json:"Status"`
-	AD     bool `json:"AD"`
 }
 
 func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers []string, dohURLTemplate string) *DNSSECResult {
@@ -517,13 +503,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 					algoStr = fmt.Sprintf("ALGO_%d", key.Algorithm)
 				}
 
-				found := false
-				for _, a := range res.Algorithms {
-					if a == algoStr {
-						found = true
-						break
-					}
-				}
+				found := slices.Contains(res.Algorithms, algoStr)
 				if !found {
 					res.Algorithms = append(res.Algorithms, algoStr)
 				}
@@ -608,7 +588,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 		} else {
 			defer func() { _ = dohResp.Body.Close() }()
 			var dohResult googleDoHResponse
-			if err := json.NewDecoder(dohResp.Body).Decode(&dohResult); err == nil {
+			if err := jsonv2.UnmarshalRead(dohResp.Body, &dohResult); err == nil {
 				if dohResult.Status == 0 && dohResult.AD {
 					res.ChainIntact = true
 				}
@@ -616,8 +596,20 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 		}
 	}
 
-	if res.HasDS && res.HasDNSKEY && res.DSMatchesDNSKEY && res.RRSIGValid && (res.ChainIntact || res.Source == "local_only") {
-		res.Valid = true
+	if res.HasDS && res.HasDNSKEY && res.DSMatchesDNSKEY && res.RRSIGValid {
+		if res.ChainIntact {
+			res.Valid = true
+		} else if res.Source == "local_only" {
+			res.Valid = true
+			if res.Error == "" {
+				res.Error = "Local DNSSEC records verified; upstream DoH chain integrity unavailable"
+			}
+		} else {
+			res.Valid = false
+			if res.Error == "" {
+				res.Error = "Upstream validating resolver returned AD=false (chain broken)"
+			}
+		}
 	} else if !res.HasDS && !res.HasDNSKEY {
 		// Not signed
 		res.Valid = false
@@ -746,11 +738,8 @@ func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string
 					if len(expectedIPs) > 0 {
 						matchFound := false
 						for _, aIP := range apexIPs {
-							for _, eIP := range expectedIPs {
-								if aIP == eIP {
-									matchFound = true
-									break
-								}
+							if slices.Contains(expectedIPs, aIP) {
+								matchFound = true
 							}
 							if matchFound {
 								break

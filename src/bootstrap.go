@@ -3,31 +3,37 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/net/idna"
 )
 
 // RDAPTLSConfig returns a TLS configuration compatible with both modern and legacy ccTLD
-// RDAP registries (such as older RSA-CBC cipher suites).
+// RDAP registries (such as older RSA-CBC cipher suites). Modern AEAD ciphers are prioritized first.
 func RDAPTLSConfig() *tls.Config {
-	ids := []uint16{
-		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-	}
+	var ids []uint16
+	// 1. Add all secure modern cipher suites first (AES-GCM, ChaCha20-Poly1305, etc.)
 	for _, cs := range tls.CipherSuites() {
 		ids = append(ids, cs.ID)
 	}
+	// 2. Append legacy fallback cipher suites for older ccTLD registries
+	legacySuites := []uint16{
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+	}
+	ids = append(ids, legacySuites...)
+
 	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
 		CipherSuites: ids,
 	}
 }
@@ -67,21 +73,8 @@ func GetKnownWhoisServer(domain string) string {
 	return ""
 }
 
-type Bootstrap struct {
-	http *http.Client
-	url  string
-
-	mu        sync.RWMutex
-	services  map[string][]string
-	fetchedAt time.Time
-}
-
 func NewBootstrap(httpClient *http.Client) *Bootstrap {
 	return &Bootstrap{http: httpClient, url: BootstrapURL}
-}
-
-type dnsRegistry struct {
-	Services [][][]string `json:"services"`
 }
 
 func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, error) {
@@ -109,12 +102,24 @@ func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, er
 
 func (b *Bootstrap) ensure(ctx context.Context) error {
 	b.mu.RLock()
-	fresh := b.services != nil && time.Since(b.fetchedAt) < BootstrapTTL
+	hasData := b.services != nil && len(b.services) > 0
+	fresh := hasData && time.Since(b.fetchedAt) < BootstrapTTL
+	tooOld := hasData && time.Since(b.fetchedAt) > BootstrapMaxAge
 	b.mu.RUnlock()
+
 	if fresh {
 		return nil
 	}
-	return b.fetch(ctx)
+
+	err := b.fetch(ctx)
+	if err != nil {
+		if hasData && !tooOld {
+			slog.Warn("Failed to refresh RDAP bootstrap from IANA; falling back to cached registry", "error", err, "cache_age", time.Since(b.fetchedAt).Round(time.Minute))
+			return nil
+		}
+		return fmt.Errorf("bootstrap registry unavailable: %w", err)
+	}
+	return nil
 }
 
 func (b *Bootstrap) fetch(ctx context.Context) error {
@@ -135,7 +140,7 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	}
 
 	var reg dnsRegistry
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&reg); err != nil {
+	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, 8<<20), &reg); err != nil {
 		return fmt.Errorf("bootstrap decode error: %w", err)
 	}
 
@@ -144,8 +149,17 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 		if len(svc) < 2 {
 			continue
 		}
-		for _, tld := range svc[0] {
-			services[strings.ToLower(tld)] = svc[1]
+		var validURLs []string
+		for _, rawURL := range svc[1] {
+			trimmed := strings.TrimSpace(rawURL)
+			if strings.HasPrefix(trimmed, "https://") || strings.HasPrefix(trimmed, "http://") {
+				validURLs = append(validURLs, trimmed)
+			}
+		}
+		if len(validURLs) > 0 {
+			for _, tld := range svc[0] {
+				services[strings.ToLower(tld)] = validURLs
+			}
 		}
 	}
 

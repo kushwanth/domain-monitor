@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"html"
 	"io"
@@ -13,31 +13,6 @@ import (
 	"sync"
 	"time"
 )
-
-// Alert represents a single notification event
-type Alert struct {
-	Message  string
-	Redacted string
-	Priority AlertPriority
-	Tag      string
-	Domain   string
-	Name     string
-}
-
-// NotificationProvider interface allows easy expansion to Slack, Telegram, Discord, etc.
-type NotificationProvider interface {
-	Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup)
-}
-
-// NotificationManager handles broadcasting to all configured providers
-type NotificationManager struct {
-	Providers     []NotificationProvider
-	Buffer        []Alert
-	mu            sync.Mutex
-	wg            sync.WaitGroup
-	sentState     map[string]time.Time
-	seenThisCycle map[string]bool
-}
 
 func (nm *NotificationManager) StartCycle() {
 	nm.mu.Lock()
@@ -112,11 +87,6 @@ func (nm *NotificationManager) Wait() {
 }
 
 // --- Ntfy Implementation ---
-
-type NtfyProvider struct {
-	URL  string
-	Auth string
-}
 
 func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup) {
 	go func() {
@@ -206,11 +176,6 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 
 // --- Telegram Implementation ---
 
-type TelegramProvider struct {
-	Token  string
-	ChatID string
-}
-
 func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup) {
 	go func() {
 		defer wg.Done()
@@ -222,7 +187,7 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 
 		sendChunk := func(text string) {
 			apiURL := fmt.Sprintf(TelegramAPIEndpoint, p.Token)
-			payloadBytes, _ := json.Marshal(map[string]interface{}{
+			payloadBytes, _ := jsonv2.Marshal(map[string]any{
 				"chat_id":    p.ChatID,
 				"text":       text,
 				"parse_mode": "HTML",

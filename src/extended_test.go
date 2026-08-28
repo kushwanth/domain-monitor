@@ -58,7 +58,6 @@ func TestEmailMXVerification(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -168,7 +167,7 @@ func TestHTTPServerRoutes(t *testing.T) {
 	firstRunDone := make(chan struct{})
 	close(firstRunDone)
 
-	server := setupHTTPServer(app, "0", firstRunDone)
+	server, _ := setupHTTPServer(app, "0", firstRunDone)
 	handler := server.Handler
 
 	// Write a mock certs file for testdomain.com
@@ -238,5 +237,49 @@ func TestHTTPServerRoutes(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("/non-existent status = %d, expected 404", rec.Code)
+	}
+}
+
+func TestPathTraversalProtection(t *testing.T) {
+	app := &AppState{}
+	firstRunDone := make(chan struct{})
+	close(firstRunDone)
+
+	server, _ := setupHTTPServer(app, "0", firstRunDone)
+	handler := server.Handler
+
+	traversalPayloads := []string{
+		"../../etc/passwd",
+		"../ct_state",
+		"..",
+		"....",
+		"test/domain.com",
+		"domain..com",
+		"-badlabel.com",
+		"badlabel-.com",
+		"domain.com/something",
+		"domain.com%2f..%2f..",
+		"..\\windows\\win.ini",
+	}
+
+	for _, payload := range traversalPayloads {
+		t.Run("CertsQuery_"+payload, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/api/certs?domain="+payload, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("Expected 400 Bad Request for traversal payload %q, got %d", payload, rec.Code)
+			}
+		})
+
+		t.Run("CTLogsPath_"+payload, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/api/ctlogs/"+payload, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			// Route match may 404 or 400 depending on path parsing, but must never be 200 reading files outside
+			if rec.Code == http.StatusOK {
+				t.Errorf("Expected non-200 for traversal payload %q, got %d", payload, rec.Code)
+			}
+		})
 	}
 }

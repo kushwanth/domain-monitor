@@ -58,10 +58,6 @@ func queryWhoisWithContext(ctx context.Context, domain string, host ...string) (
 		asciiDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
 	}
 
-	type queryResult struct {
-		raw string
-		err error
-	}
 	ch := make(chan queryResult, 1)
 	go func() {
 		client := whois.NewClient().SetTimeout(10 * time.Second)
@@ -91,24 +87,24 @@ func parseFlexibleDate(dateStr string) (time.Time, string, error) {
 	}
 
 	// Remove common leading prefixes like "Expires on:", "Renewal:", etc.
-	if colonIdx := strings.Index(clean, ":"); colonIdx != -1 && !strings.Contains(clean[:colonIdx], "T") {
-		prefix := strings.ToLower(clean[:colonIdx])
-		if strings.Contains(prefix, "expire") || strings.Contains(prefix, "date") || strings.Contains(prefix, "valid") {
-			clean = strings.TrimSpace(clean[colonIdx+1:])
+	if prefix, after, found := strings.Cut(clean, ":"); found && !strings.Contains(prefix, "T") {
+		prefixLower := strings.ToLower(prefix)
+		if strings.Contains(prefixLower, "expire") || strings.Contains(prefixLower, "date") || strings.Contains(prefixLower, "valid") {
+			clean = strings.TrimSpace(after)
 		}
 	}
 
 	// Remove trailing parenthetical notes like "(UTC)", "(YYYY-MM-DD)", "(JST)", etc.
-	if idx := strings.Index(clean, "("); idx != -1 {
-		clean = strings.TrimSpace(clean[:idx])
+	if before, _, found := strings.Cut(clean, "("); found {
+		clean = strings.TrimSpace(before)
 	}
 	clean = strings.Trim(clean, `"' `)
 
 	// Clean known timezone abbreviations and normalize
 	cleanNormalized := clean
 	for tz, repl := range TZReplacements {
-		if strings.HasSuffix(cleanNormalized, tz) {
-			cleanNormalized = strings.TrimSuffix(cleanNormalized, tz) + repl
+		if before, ok := strings.CutSuffix(cleanNormalized, tz); ok {
+			cleanNormalized = before + repl
 			break
 		}
 	}
@@ -140,8 +136,8 @@ func normalizeEPPStatus(raw string) string {
 
 	// 1. If raw contains a URL with an anchor (e.g., "https://icann.org/epp#clientTransferProhibited"
 	// or "clientTransferProhibited https://icann.org/epp#clientTransferProhibited"), extract the anchor token if valid.
-	if hashIdx := strings.Index(s, "#"); hashIdx != -1 {
-		token := strings.TrimSpace(s[hashIdx+1:])
+	if _, tokenRaw, found := strings.CutLast(s, "#"); found {
+		token := strings.TrimSpace(tokenRaw)
 		token = strings.TrimRight(token, ")/;, \t\r\n")
 		if token != "" && !strings.Contains(token, "/") && !strings.Contains(token, " ") {
 			cleanKey := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(token, " ", ""), "-", ""), "_", ""))
@@ -153,8 +149,8 @@ func normalizeEPPStatus(raw string) string {
 	}
 
 	// 2. Strip parenthesis notes like "(server-managed)"
-	if parenIdx := strings.Index(s, "("); parenIdx != -1 {
-		s = strings.TrimSpace(s[:parenIdx])
+	if before, _, found := strings.Cut(s, "("); found {
+		s = strings.TrimSpace(before)
 	}
 
 	// 3. Strip any full URL tokens (e.g., "https://...", "http://...")
@@ -184,18 +180,48 @@ func normalizeEPPStatus(raw string) string {
 }
 
 // cleanStatuses deduplicates and normalizes status strings.
+// It also removes redundant generic status tokens (e.g. "transferProhibited", "deleteProhibited")
+// when a more specific client/server status (e.g. "clientTransferProhibited", "serverTransferProhibited") is present.
 func cleanStatuses(statuses []string) []string {
-	var result []string
 	seen := make(map[string]bool)
+	var normalized []string
 	for _, s := range statuses {
 		norm := normalizeEPPStatus(s)
 		if norm != "" {
 			key := strings.ToLower(norm)
 			if !seen[key] {
 				seen[key] = true
-				result = append(result, norm)
+				normalized = append(normalized, norm)
 			}
 		}
+	}
+
+	var result []string
+	for _, norm := range normalized {
+		key := strings.ToLower(norm)
+		switch key {
+		case "transferprohibited":
+			if seen["clienttransferprohibited"] || seen["servertransferprohibited"] {
+				continue
+			}
+		case "deleteprohibited":
+			if seen["clientdeleteprohibited"] || seen["serverdeleteprohibited"] {
+				continue
+			}
+		case "updateprohibited":
+			if seen["clientupdateprohibited"] || seen["serverupdateprohibited"] {
+				continue
+			}
+		case "renewprohibited":
+			if seen["clientrenewprohibited"] || seen["serverrenewprohibited"] {
+				continue
+			}
+		case "hold":
+			if seen["clienthold"] || seen["serverhold"] {
+				continue
+			}
+		}
+		result = append(result, norm)
 	}
 	return result
 }
@@ -213,7 +239,7 @@ func isTransferLocked(statuses []string) bool {
 func getSuspensionStatus(statuses []string) (bool, string) {
 	for _, s := range statuses {
 		clean := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, " ", ""), "-", ""), "_", ""))
-		if clean == "serverhold" || clean == "clienthold" || clean == "pendingdelete" || clean == "redemptionperiod" || clean == "inactive" {
+		if clean == "serverhold" || clean == "clienthold" || clean == "pendingdelete" || clean == "redemptionperiod" || clean == "inactive" || clean == "hold" {
 			return true, s
 		}
 	}
@@ -268,7 +294,7 @@ func extractVCardText(prop *rdap.VCardProperty) string {
 	switch v := prop.Value.(type) {
 	case string:
 		return strings.TrimSpace(v)
-	case []interface{}:
+	case []any:
 		var parts []string
 		for _, item := range v {
 			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
@@ -873,7 +899,7 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 			continue
 		}
 		relReq.Header.Set("Accept", "application/rdap+json, application/json")
-		relReq.Header.Set("User-Agent", "DomainMonitor/1.0 (+https://github.com/domain-monitor)")
+		relReq.Header.Set("User-Agent", "DomainMonitor/1.0")
 
 		relResp, err := httpClient.Do(relReq)
 		if err != nil || relResp.StatusCode != http.StatusOK {

@@ -21,12 +21,10 @@ const (
 const (
 	BootstrapURL        = "https://data.iana.org/rdap/dns.json"
 	BootstrapTTL        = 24 * time.Hour
+	BootstrapMaxAge     = 72 * time.Hour
 	CTLogsAPIEndpoint   = "https://api.ctlogs.dev/v1/subdomains/"
 	TelegramAPIEndpoint = "https://api.telegram.org/bot%s/sendMessage"
 )
-
-// CheckStatus represents lifecycle status of a check
-type CheckStatus string
 
 const (
 	StatusPending  CheckStatus = "pending"
@@ -36,9 +34,6 @@ const (
 	StatusWarning  CheckStatus = "warning"
 	StatusHijacked CheckStatus = "hijacked"
 )
-
-// AlertPriority defines the urgency level of a notification alert
-type AlertPriority string
 
 const (
 	PriorityUrgent  AlertPriority = "urgent"
@@ -198,7 +193,7 @@ var WhoisNotFoundIndicators = []string{
 
 // Precompiled Regular Expressions
 var (
-	ValidDomainRegex = regexp.MustCompile(`^[a-zA-Z0-9.-]+$`)
+	ValidDomainRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 
 	ReWhoisReferral  = regexp.MustCompile(`(?i)(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)\s*:\s*(?:whois:\/\/)?([a-zA-Z0-9.-]+)`)
 	ReWhoisExpiry    = regexp.MustCompile(`(?i)(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\s*:\s*([^\r\n]+)`)

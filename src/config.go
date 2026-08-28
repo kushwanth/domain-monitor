@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,88 +10,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/go-jsonnet"
 	"github.com/miekg/dns"
 )
-
-type CAAConfig struct {
-	Issue     []string `json:"issue"`
-	IssueWild []string `json:"issuewild"`
-	IssueMail []string `json:"issuemail"`
-}
-
-type NtfyConfig struct {
-	URL  string `json:"url"`
-	Auth string `json:"auth"`
-}
-
-type TelegramConfig struct {
-	Token  string `json:"token"`
-	ChatID string `json:"chat_id"`
-}
-
-type Notifications struct {
-	Ntfy     *NtfyConfig     `json:"ntfy"`
-	Telegram *TelegramConfig `json:"telegram"`
-	// Add other platforms here in the future
-}
-
-type AppConfig struct {
-	Port          string         `json:"port"`
-	DataDir       string         `json:"data_dir,omitempty"`
-	LoopInterval  string         `json:"loop_interval"`
-	RequestDelay  string         `json:"request_delay"`
-	WhoisDelay    string         `json:"whois_delay"`
-	Notifications Notifications  `json:"notifications"`
-	Resolvers     []string       `json:"resolvers"`
-	DoHURL        string         `json:"doh_url,omitempty"`
-	CTLogsAPIKey  string         `json:"ctlogs_api_key,omitempty"`
-	Domains       []DomainConfig `json:"domains"`
-	DNSRecords    []DNSTask      `json:"dns_records"`
-}
-
-type DomainConfig struct {
-	Domain             string     `json:"domain"`
-	Name               string     `json:"name"`
-	IsDelegatedZone    bool       `json:"is_delegated_zone"`
-	RootZone           string     `json:"root_zone"`
-	ExpectedNS         []string   `json:"expected_ns"`
-	CheckEmailSecurity bool       `json:"check_email_security"`
-	MailProvider       string     `json:"mail_provider"`
-	MXRecords          []string   `json:"mx_records"`
-	DKIMSelectors      []string   `json:"dkim_selectors"`
-	DNSSEC             bool       `json:"dnssec"`
-	MonitorCTLogs      bool       `json:"monitor_ct_logs"`
-	CAA                *CAAConfig `json:"caa,omitempty"`
-	AcceptSelfSigned   bool       `json:"accept_self_signed"`
-	SuppressAlerts     bool       `json:"suppress_alerts"`
-}
-
-type DNSTask struct {
-	Hostname         string   `json:"hostname"`
-	Name             string   `json:"name"`
-	Type             string   `json:"type"`
-	Expected         []string `json:"expected"`
-	CustomResolver   string   `json:"custom_resolver"`
-	AcceptSelfSigned bool     `json:"accept_self_signed"`
-}
-
-type AppState struct {
-	Config              *AppConfig
-	Notifier            *NotificationManager
-	LoopDuration        time.Duration
-	ReqDelay            time.Duration
-	WhoisDelay          time.Duration
-	StateMu             sync.Mutex
-	StateLastChanged    map[string]string
-	PrerenderedHTML     atomic.Value
-	PrerenderedJSON     atomic.Value
-	GlobalResolverIndex atomic.Uint32
-}
 
 func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	if path == "" {
@@ -105,7 +28,7 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	}
 
 	var rawCfg AppConfig
-	if err := json.Unmarshal([]byte(jsonStr), &rawCfg); err != nil {
+	if err := jsonv2.Unmarshal([]byte(jsonStr), &rawCfg); err != nil {
 		return nil, fmt.Errorf("json unmarshal failed: %v", err)
 	}
 

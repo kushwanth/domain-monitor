@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"slices"
 	"testing"
 )
 
@@ -22,7 +23,6 @@ func TestDNSCheck(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			_, ok := DNSTypeMap[tt.recordType]
@@ -47,13 +47,7 @@ func TestFetchCAA(t *testing.T) {
 		// Actually, google.com has issue "pki.goog"
 		t.Logf("google.com CAA issue is empty, this might happen depending on tree climbing or actual records.")
 	} else {
-		found := false
-		for _, v := range res.Issue {
-			if v == "pki.goog" {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(res.Issue, "pki.goog")
 		if !found {
 			t.Errorf("Expected pki.goog in issue records for google.com, got %v", res.Issue)
 		}
@@ -70,13 +64,7 @@ func TestFetchCAATreeClimbing(t *testing.T) {
 	}
 
 	if len(res.Issue) > 0 {
-		found := false
-		for _, v := range res.Issue {
-			if v == "pki.goog" {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(res.Issue, "pki.goog")
 		if !found {
 			t.Errorf("Expected pki.goog from parent google.com, got %v", res.Issue)
 		}
@@ -243,7 +231,6 @@ func TestValidateCAATag(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			res := &CAAResult{Valid: true}
@@ -253,13 +240,7 @@ func TestValidateCAATag(t *testing.T) {
 			}
 			if len(tt.expectUnk) > 0 {
 				for _, unk := range tt.expectUnk {
-					found := false
-					for _, u := range res.UnknownCAs {
-						if u == unk {
-							found = true
-							break
-						}
-					}
+					found := slices.Contains(res.UnknownCAs, unk)
 					if !found {
 						t.Errorf("Expected UnknownCA %s in %v", unk, res.UnknownCAs)
 					}
@@ -296,4 +277,57 @@ func TestParseCAAIssuer(t *testing.T) {
 			t.Errorf("parseCAAIssuer(%q) = %q, expected %q", tt.input, actual, tt.expected)
 		}
 	}
+}
+
+func TestFetchCAABoundaries(t *testing.T) {
+	app := &AppState{}
+	resolvers := []string{"8.8.8.8"}
+
+	// Empty domain
+	res := fetchCAA(context.Background(), app, "", resolvers)
+	if res.Error == "" {
+		t.Errorf("Expected error for empty domain, got none")
+	}
+
+	// Single label domain
+	res = fetchCAA(context.Background(), app, "localhost", resolvers)
+	if res == nil {
+		t.Fatalf("fetchCAA returned nil")
+	}
+}
+
+func TestDNSSECValidationFallback(t *testing.T) {
+	app := &AppState{}
+	resolvers := []string{"8.8.8.8"}
+
+	// When DoH URL is invalid or unreachable, validation falls back to local_only
+	res := validateDNSSEC(context.Background(), app, "example.com", resolvers, "http://127.0.0.1:1/invalid_doh")
+	if res.Source != "local_only" {
+		t.Errorf("Expected Source 'local_only', got %q", res.Source)
+	}
+	if !res.Valid {
+		t.Errorf("Expected example.com to be Valid=true under local checks, got false (error: %s)", res.Error)
+	}
+	if res.Error == "" {
+		t.Errorf("Expected descriptive fallback message in res.Error when DoH is offline, got empty")
+	}
+}
+
+func FuzzParseCAAIssuer(f *testing.F) {
+	seeds := []string{
+		";",
+		"letsencrypt.org",
+		"\"letsencrypt.org\"",
+		"digicert.com; validationmethods=dns-01",
+		"; policy=ev",
+		"",
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, rawVal string) {
+		// Should never panic regardless of arbitrary input
+		_ = parseCAAIssuer(rawVal)
+	})
 }

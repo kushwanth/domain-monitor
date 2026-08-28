@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,28 +13,6 @@ import (
 )
 
 var CTLogsPath = DefaultCTLogsSubdir
-
-type CTCert struct {
-	ID        string `json:"id"`
-	Match     string `json:"match"`
-	Issuer    string `json:"issuer"`
-	NotBefore string `json:"not_before"`
-	NotAfter  string `json:"not_after"`
-}
-
-type CTLogsDevResponse struct {
-	Rows       []CTCert `json:"rows"`
-	HasNext    bool     `json:"has_next"`
-	NextCursor string   `json:"next_cursor"`
-}
-
-type CTLogState struct {
-	LatestID         string      `json:"latest_id"`
-	BackfillCursor   string      `json:"backfill_cursor"`
-	BackfillComplete bool        `json:"backfill_complete"`
-	Status           CheckStatus `json:"status"`
-	Error            string      `json:"error,omitempty"`
-}
 
 func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, state *CheckState) {
 	if !target.MonitorCTLogs {
@@ -116,7 +94,17 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 		}
 
 		if cursorToUse != "" {
-			backfillURL := fmt.Sprintf("%s%s?after=%s", CTLogsAPIEndpoint, target.Domain, url.QueryEscape(cursorToUse))
+			var backfillURL string
+			if baseParsed, pErr := url.Parse(fmt.Sprintf("%s%s", CTLogsAPIEndpoint, target.Domain)); pErr == nil {
+				u := baseParsed.Clone()
+				q := u.Query()
+				q.Set("after", cursorToUse)
+				u.RawQuery = q.Encode()
+				backfillURL = u.String()
+			} else {
+				backfillURL = fmt.Sprintf("%s%s?after=%s", CTLogsAPIEndpoint, target.Domain, url.QueryEscape(cursorToUse))
+			}
+
 			respBackfill, err := fetchCTPage(ctx, app, backfillURL)
 			if err != nil {
 				state.UpdateCTLogs(target.Domain, &CTLogState{
@@ -189,7 +177,7 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevR
 	}
 
 	var ctResp CTLogsDevResponse
-	if err := json.NewDecoder(resp.Body).Decode(&ctResp); err != nil {
+	if err := jsonv2.UnmarshalRead(resp.Body, &ctResp); err != nil {
 		return nil, fmt.Errorf("JSON parse error: %v", err)
 	}
 
@@ -204,7 +192,7 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 
 	var existing []CTCert
 	if b, err := os.ReadFile(filePath); err == nil {
-		_ = json.Unmarshal(b, &existing)
+		_ = jsonv2.Unmarshal(b, &existing)
 	}
 
 	// We create a map to deduplicate, just in case backfill overlaps or page 1 repeats
@@ -228,7 +216,7 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 	}
 
 	if addedNew {
-		if b, err := json.Marshal(combined); err == nil {
+		if b, err := jsonv2.Marshal(combined); err == nil {
 			return atomicWriteFile(filePath, b, 0644)
 		} else {
 			return err

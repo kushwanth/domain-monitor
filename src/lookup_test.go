@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -47,7 +48,6 @@ func TestRDAPValidation(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -191,7 +191,6 @@ func TestRDAPStatusLock(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			cleaned := cleanStatuses(tt.statuses)
@@ -208,6 +207,62 @@ func TestRDAPStatusLock(t *testing.T) {
 	}
 }
 
+func TestCleanStatusesDeduplication(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    []string
+		expected []string
+	}{
+		{
+			name:     "Client and Generic Duplicate Prohibitions",
+			input:    []string{"Client Delete Prohibited", "Client Transfer Prohibited", "Delete Prohibited", "Transfer Prohibited"},
+			expected: []string{"clientDeleteProhibited", "clientTransferProhibited"},
+		},
+		{
+			name:     "Server and Generic Duplicate Prohibitions",
+			input:    []string{"serverDeleteProhibited", "serverTransferProhibited", "deleteProhibited", "transferProhibited"},
+			expected: []string{"serverDeleteProhibited", "serverTransferProhibited"},
+		},
+		{
+			name:     "Update and Renew Prohibitions",
+			input:    []string{"clientUpdateProhibited", "updateProhibited", "clientRenewProhibited", "renewProhibited"},
+			expected: []string{"clientUpdateProhibited", "clientRenewProhibited"},
+		},
+		{
+			name:     "Hold Deduplication",
+			input:    []string{"clientHold", "hold"},
+			expected: []string{"clientHold"},
+		},
+		{
+			name:     "Generic Only Prohibitions Retained",
+			input:    []string{"transferProhibited", "deleteProhibited"},
+			expected: []string{"transferProhibited", "deleteProhibited"},
+		},
+		{
+			name:     "Both Client and Server Prohibitions Retained",
+			input:    []string{"clientTransferProhibited", "serverTransferProhibited", "transferProhibited"},
+			expected: []string{"clientTransferProhibited", "serverTransferProhibited"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			actual := cleanStatuses(tt.input)
+			if len(actual) != len(tt.expected) {
+				t.Fatalf("cleanStatuses(%v) = %v (len %d), expected %v (len %d)", tt.input, actual, len(actual), tt.expected, len(tt.expected))
+			}
+			for i := range actual {
+				if actual[i] != tt.expected[i] {
+					t.Errorf("Index %d: got %s, expected %s", i, actual[i], tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
 func TestExtractVCardText(t *testing.T) {
 	t.Parallel()
 
@@ -218,7 +273,7 @@ func TestExtractVCardText(t *testing.T) {
 	}
 
 	// 2. Array of interface{} property (RFC 7095 multi-part jCard)
-	p2 := &rdap.VCardProperty{Name: "org", Value: []interface{}{"GoDaddy.com, LLC", "Domain Services"}}
+	p2 := &rdap.VCardProperty{Name: "org", Value: []any{"GoDaddy.com, LLC", "Domain Services"}}
 	if val := extractVCardText(p2); val != "GoDaddy.com, LLC Domain Services" {
 		t.Errorf("Expected 'GoDaddy.com, LLC Domain Services', got %q", val)
 	}
@@ -422,7 +477,7 @@ func TestFindRegistrarRecursively(t *testing.T) {
 			Roles: []string{"sponsor"},
 			VCard: &rdap.VCard{
 				Properties: []*rdap.VCardProperty{
-					{Name: "org", Value: []interface{}{"NameCheap, Inc."}},
+					{Name: "org", Value: []any{"NameCheap, Inc."}},
 				},
 			},
 		},
@@ -748,8 +803,23 @@ func TestRDAPTLSConfig(t *testing.T) {
 		t.Fatalf("RDAPTLSConfig returned nil")
 	}
 
+	if tlsCfg.MinVersion != tls.VersionTLS12 {
+		t.Errorf("Expected MinVersion to be TLS 1.2 (0x%x), got 0x%x", tls.VersionTLS12, tlsCfg.MinVersion)
+	}
+
 	if len(tlsCfg.CipherSuites) == 0 {
-		t.Errorf("Expected CipherSuites to be populated")
+		t.Fatalf("Expected CipherSuites to be populated")
+	}
+
+	// Verify modern ciphers (such as AES-GCM / ChaCha20) come before legacy CBC ciphers
+	modernCount := len(tls.CipherSuites())
+	if len(tlsCfg.CipherSuites) <= modernCount {
+		t.Errorf("Expected legacy cipher suites to be appended after modern suites")
+	}
+
+	// Verify the first suite is a modern suite, not RSA-CBC
+	if tlsCfg.CipherSuites[0] == tls.TLS_RSA_WITH_AES_128_CBC_SHA || tlsCfg.CipherSuites[0] == tls.TLS_RSA_WITH_AES_256_CBC_SHA {
+		t.Errorf("Weak RSA-CBC cipher suite found at top priority in CipherSuites")
 	}
 }
 
@@ -798,4 +868,79 @@ func TestFetchWhois_Extensive(t *testing.T) {
 	}
 
 	t.Logf("Successfully extracted some data from %d/%d WHOIS templates", successCount, totalCount)
+}
+
+func TestBootstrapCacheGracePeriod(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "simulated 500 internal error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	b := NewBootstrap(server.Client())
+	b.url = server.URL
+
+	// 1. Pre-populate cache with timestamp 30 hours ago (expired TTL, but within 72h max age)
+	b.services = map[string][]string{
+		"com": {"https://rdap.verisign.com/com/v1/"},
+	}
+	b.fetchedAt = time.Now().Add(-30 * time.Hour)
+
+	// ensure() should encounter server error, but successfully fall back to cached services
+	err := b.ensure(context.Background())
+	if err != nil {
+		t.Fatalf("Expected graceful fallback to cache within 72h, got error: %v", err)
+	}
+
+	servers, err := b.ServersFor(context.Background(), "example.com")
+	if err != nil || len(servers) == 0 || servers[0] != "https://rdap.verisign.com/com/v1/" {
+		t.Errorf("Expected cached server URL, got %v (err: %v)", servers, err)
+	}
+
+	// 2. Set timestamp to 80 hours ago (beyond 72h max age)
+	b.fetchedAt = time.Now().Add(-80 * time.Hour)
+	err = b.ensure(context.Background())
+	if err == nil {
+		t.Errorf("Expected error when cache is older than 72h and IANA is down, got nil")
+	}
+}
+
+func FuzzFlexibleDateParsing(f *testing.F) {
+	seeds := []string{
+		"2026-08-28T12:00:00Z",
+		"2026-08-28",
+		"28-Aug-2026",
+		"28/08/2026",
+		"2026.08.28",
+		"Fri Aug 28 12:00:00 2026",
+		"Expires: 2026-08-28 (UTC)",
+		"invalid-date",
+		"",
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, dateStr string) {
+		// Should never panic regardless of arbitrary input
+		_, _, _ = parseFlexibleDate(dateStr)
+	})
+}
+
+func FuzzNormalizeEPPStatus(f *testing.F) {
+	seeds := []string{
+		"clientTransferProhibited",
+		"https://icann.org/epp#clientTransferProhibited",
+		"serverDeleteProhibited",
+		"ok",
+		"clientHold (inactive)",
+		"",
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, rawStatus string) {
+		// Should never panic regardless of arbitrary input
+		_ = normalizeEPPStatus(rawStatus)
+	})
 }

@@ -25,5 +25,4 @@ require (
 	github.com/miekg/dns v1.1.73
 	github.com/openrdap/rdap v0.10.1
 	golang.org/x/net v0.58.0
-	golang.org/x/sync v0.22.0
 )
