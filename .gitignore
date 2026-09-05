@@ -13,6 +13,7 @@ src/src
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+*.prof
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -20,3 +21,5 @@ src/src
 # Runtime state and history
 ct_logs/
 ct_state.json
+domain_snapshots.json
+data/

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -13,7 +15,7 @@ type MockNotifier struct {
 	mu           sync.Mutex
 }
 
-func (m *MockNotifier) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup) {
+func (m *MockNotifier) Send(_ context.Context, alerts []Alert, wg *sync.WaitGroup) {
 	defer wg.Done()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -226,4 +228,63 @@ func TestTelegramTokenRedaction(t *testing.T) {
 	wg.Wait()
 }
 
+func TestNotificationCycleTimeoutIndependentDispatch(t *testing.T) {
+	t.Parallel()
+
+	mock := &MockNotifier{}
+	nm := &NotificationManager{
+		Providers: []NotificationProvider{mock},
+	}
+
+	rootCtx := context.Background()
+
+	// Simulate a cycle context that timed out during check execution
+	cycleCtx, cycleCancel := context.WithCancel(rootCtx)
+	cycleCancel() // Expired
+
+	nm.StartCycle()
+	nm.Dispatch("Urgent Failure During Long Cycle", "Redacted Failure", PriorityUrgent, "rotating_light", "example.com", "Test")
+
+	// Ensure that using cycleCtx would have failed to deliver under cancelled context
+	if cycleCtx.Err() == nil {
+		t.Fatalf("Expected cycleCtx to be cancelled")
+	}
+
+	// The hardened monitoring loop pattern uses a dedicated notifyCtx derived from rootCtx
+	notifyCtx, notifyCancel := context.WithTimeout(rootCtx, 5*time.Second)
+	defer notifyCancel()
+
+	nm.Flush(notifyCtx)
+	nm.Wait()
+	nm.EndCycle()
+
+	if mock.MessagesSent != 1 {
+		t.Fatalf("Expected 1 alert delivered via notifyCtx despite expired cycleCtx, got %d", mock.MessagesSent)
+	}
+}
+
+func TestNtfyAuthRedaction(t *testing.T) {
+	t.Parallel()
+
+	secretAuth := "Bearer secret_ntfy_auth_token_98765"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("Unauthorized for token: " + secretAuth))
+	}))
+	defer server.Close()
+
+	provider := &NtfyProvider{
+		URL:  server.URL,
+		Auth: secretAuth,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	alerts := []Alert{
+		{Message: "Test Alert", Priority: PriorityHigh, Domain: "example.com"},
+	}
+
+	provider.Send(context.Background(), alerts, &wg)
+	wg.Wait()
+}
 

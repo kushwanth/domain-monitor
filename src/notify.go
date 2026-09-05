@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+var notifyHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 func (nm *NotificationManager) StartCycle() {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
@@ -126,19 +128,30 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 				req.Header.Set("Tags", "rotating_light")
 			}
 
-			client := &http.Client{Timeout: 10 * time.Second}
-			if resp, err := client.Do(req); err == nil {
+			if resp, err := notifyHTTPClient.Do(req); err == nil {
 				if resp.StatusCode >= 400 {
-					bodyBytes, _ := io.ReadAll(resp.Body)
-					slog.Error("Ntfy delivery failed", "status", resp.StatusCode, "response", string(bodyBytes))
+					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					bodyStr := string(bodyBytes)
+					if p.Auth != "" {
+						bodyStr = strings.ReplaceAll(bodyStr, p.Auth, "[REDACTED_AUTH]")
+					}
+					slog.Error("Ntfy delivery failed", "status", resp.StatusCode, "response", bodyStr)
 				} else {
 					_, _ = io.Copy(io.Discard, resp.Body)
 				}
 				_ = resp.Body.Close()
 			} else {
-				slog.Error("Ntfy request error", "error", err)
+				errStr := err.Error()
+				if p.Auth != "" {
+					errStr = strings.ReplaceAll(errStr, p.Auth, "[REDACTED_AUTH]")
+				}
+				slog.Error("Ntfy request error", "error", errStr)
 			}
-			time.Sleep(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
 		}
 
 		var currentChunk strings.Builder
@@ -199,11 +212,14 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 			}
 			req.Header.Set("Content-Type", "application/json")
 
-			client := &http.Client{Timeout: 10 * time.Second}
-			if resp, err := client.Do(req); err == nil {
+			if resp, err := notifyHTTPClient.Do(req); err == nil {
 				if resp.StatusCode >= 400 {
-					bodyBytes, _ := io.ReadAll(resp.Body)
-					slog.Error("Telegram delivery failed", "status", resp.StatusCode, "response", string(bodyBytes))
+					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					bodyStr := string(bodyBytes)
+					if p.Token != "" {
+						bodyStr = strings.ReplaceAll(bodyStr, p.Token, "[REDACTED_TELEGRAM_TOKEN]")
+					}
+					slog.Error("Telegram delivery failed", "status", resp.StatusCode, "response", bodyStr)
 				} else {
 					_, _ = io.Copy(io.Discard, resp.Body)
 				}
@@ -215,7 +231,11 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 				}
 				slog.Error("Telegram request error", "error", errStr)
 			}
-			time.Sleep(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
 		}
 
 		var currentChunk strings.Builder

@@ -1,3 +1,4 @@
+// Package main implements domain and DNS monitoring services.
 package main
 
 import (

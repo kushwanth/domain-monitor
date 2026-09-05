@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,6 +19,9 @@ import (
 )
 
 func LoadConfig(ctx context.Context, path string) (*AppState, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if path == "" {
 		path = "config.jsonnet"
 	}
@@ -80,17 +84,50 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 		if ascii, err := idna.ToASCII(d.Domain); err == nil && ascii != "" {
 			d.Domain = ascii
 		}
+		if d.Domain == "" {
+			return nil, fmt.Errorf("domain entry at index %d has an empty domain", i)
+		}
 		for j := range d.ExpectedNS {
 			nsClean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.ExpectedNS[j]), "."))
 			if ascii, err := idna.ToASCII(nsClean); err == nil && ascii != "" {
 				nsClean = ascii
 			}
+			if nsClean == "" {
+				return nil, fmt.Errorf("domain %s has an empty entry in expected_ns at index %d", d.Domain, j)
+			}
 			d.ExpectedNS[j] = nsClean
+		}
+		for j := range d.SecondaryNS {
+			nsClean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.SecondaryNS[j]), "."))
+			if ascii, err := idna.ToASCII(nsClean); err == nil && ascii != "" {
+				nsClean = ascii
+			}
+			if nsClean == "" {
+				return nil, fmt.Errorf("domain %s has an empty entry in secondary_ns at index %d", d.Domain, j)
+			}
+			d.SecondaryNS[j] = nsClean
 		}
 
 		// Enforce Name is mandatory for domains
 		if d.Name == "" {
 			return nil, fmt.Errorf("domain %s is missing a mandatory 'name' field", d.Domain)
+		}
+
+		// Registrar validation fields: config accepts both expected_registrar_id and expected_registrar_name.
+		// Order of priority: expected_registrar_id (Priority 1) takes precedence over expected_registrar_name (Priority 2).
+		// In evaluation, they are mutually exclusive (if expected_registrar_id is specified, it is evaluated and name is superseded).
+		d.ExpectedRegistrarID = strings.TrimSpace(d.ExpectedRegistrarID)
+		d.ExpectedRegistrarName = strings.TrimSpace(d.ExpectedRegistrarName)
+
+		if len(d.SecondaryNS) > 0 && len(d.ExpectedNS) == 0 {
+			return nil, fmt.Errorf("domain %s has secondary_ns configured but no primary expected_ns configured", d.Domain)
+		}
+
+		if d.VerifyNSHealth {
+			if len(d.ExpectedNS) == 0 {
+				return nil, fmt.Errorf("domain %s has verify_ns_health enabled but no primary expected_ns configured", d.Domain)
+			}
+			// secondary_ns is optional: if configured, secondary NS replication is checked; if omitted, secondary checks are skipped.
 		}
 
 		if d.IsDelegatedZone {
@@ -156,6 +193,7 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 		}
 	}
 
+	seenDNSNames := make(map[string]bool, len(rawCfg.DNSRecords))
 	for i := range rawCfg.DNSRecords {
 		r := &rawCfg.DNSRecords[i]
 		r.Hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(r.Hostname), "."))
@@ -163,36 +201,94 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 			r.Hostname = ascii
 		}
 
+		if r.Hostname == "" {
+			return nil, fmt.Errorf("dns record at index %d has an empty hostname", i)
+		}
+
+		r.Name = strings.TrimSpace(r.Name)
 		if r.Name == "" {
 			return nil, fmt.Errorf("dns record %s (%s) is missing a mandatory 'name' field", r.Hostname, r.Type)
 		}
+		if seenDNSNames[r.Name] {
+			return nil, fmt.Errorf("duplicate dns record name %q; each dns record must have a unique name", r.Name)
+		}
+		seenDNSNames[r.Name] = true
 
 		r.Type = strings.ToUpper(strings.TrimSpace(r.Type))
 		if r.Type == "" {
 			return nil, fmt.Errorf("dns record %s is missing a type (e.g. A, CNAME)", r.Hostname)
 		}
-		for j := range r.Expected {
-			cleanVal := strings.TrimSuffix(strings.TrimSpace(r.Expected[j]), ".")
+		if r.SkipSSL {
+			if r.Type != "A" && r.Type != "AAAA" && r.Type != "CNAME" && r.Type != "ALIAS" && r.Type != "IP" {
+				return nil, fmt.Errorf("dns record %s (%s) has skip_ssl enabled; skip_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types", r.Hostname, r.Type)
+			}
+		}
+
+		var normalizedExpected []string
+		for _, rawVal := range r.Expected {
+			cleanVal := strings.TrimSuffix(strings.TrimSpace(rawVal), ".")
+			if cleanVal == "" {
+				continue
+			}
 			if strings.HasPrefix(strings.ToLower(cleanVal), "alias:") {
-				cleanVal = cleanVal[6:]
+				cleanVal = strings.TrimSpace(cleanVal[6:])
 			}
 			if r.Type != "TXT" {
 				cleanVal = strings.ToLower(cleanVal)
+			}
+
+			// Validate and normalize according to record type
+			parsedIP := net.ParseIP(cleanVal)
+			switch r.Type {
+			case "A":
+				if parsedIP != nil {
+					if parsedIP.To4() == nil {
+						return nil, fmt.Errorf("dns record %q (%s): expected %q is an IPv6 address, but record type is A (requires IPv4)", r.Name, r.Hostname, rawVal)
+					}
+					cleanVal = parsedIP.String()
+				} else {
+					return nil, fmt.Errorf("dns record %q (%s): expected %q is not a valid IPv4 address for type A", r.Name, r.Hostname, rawVal)
+				}
+			case "AAAA":
+				if parsedIP != nil {
+					if parsedIP.To4() != nil {
+						return nil, fmt.Errorf("dns record %q (%s): expected %q is an IPv4 address, but record type is AAAA (requires IPv6)", r.Name, r.Hostname, rawVal)
+					}
+					cleanVal = parsedIP.String()
+				} else {
+					return nil, fmt.Errorf("dns record %q (%s): expected %q is not a valid IPv6 address for type AAAA", r.Name, r.Hostname, rawVal)
+				}
+			case "IP":
+				if parsedIP != nil {
+					cleanVal = parsedIP.String()
+				} else {
+					return nil, fmt.Errorf("dns record %q (%s): expected %q is not a valid IPv4 or IPv6 address for composite type IP", r.Name, r.Hostname, rawVal)
+				}
+			case "ALIAS", "CNAME":
+				if parsedIP != nil {
+					cleanVal = parsedIP.String()
+				} else {
+					if ascii, err := idna.ToASCII(cleanVal); err == nil && ascii != "" {
+						cleanVal = ascii
+					}
+				}
+			default:
 				if ascii, err := idna.ToASCII(cleanVal); err == nil && ascii != "" {
 					cleanVal = ascii
 				}
 			}
 
-			// Normalize IPs for A, AAAA, IP types
-			if r.Type == "A" || r.Type == "AAAA" || r.Type == "IP" {
-				if ip := net.ParseIP(cleanVal); ip != nil {
-					cleanVal = ip.String()
-				}
+			if !slices.Contains(normalizedExpected, cleanVal) {
+				normalizedExpected = append(normalizedExpected, cleanVal)
 			}
-
-			r.Expected[j] = cleanVal
 		}
 
+		// Sort IP arrays for deterministic canonical order
+		if r.Type == "A" || r.Type == "AAAA" || r.Type == "IP" {
+			slices.Sort(normalizedExpected)
+		}
+
+		r.Expected = normalizedExpected
 	}
 
 	if rawCfg.DoHURL == "" {
@@ -206,15 +302,17 @@ func LoadConfig(ctx context.Context, path string) (*AppState, error) {
 	}
 
 	app.LoopDuration, _ = time.ParseDuration(rawCfg.LoopInterval)
-	if app.LoopDuration == 0 {
+	if app.LoopDuration <= 0 {
 		app.LoopDuration = 6 * time.Hour
 	}
+
 	app.ReqDelay, _ = time.ParseDuration(rawCfg.RequestDelay)
-	if app.ReqDelay == 0 {
+	if app.ReqDelay < 0 || rawCfg.RequestDelay == "" {
 		app.ReqDelay = 5 * time.Second
 	}
+
 	app.WhoisDelay, _ = time.ParseDuration(rawCfg.WhoisDelay)
-	if app.WhoisDelay == 0 {
+	if app.WhoisDelay < 0 || rawCfg.WhoisDelay == "" {
 		app.WhoisDelay = 10 * time.Second
 	}
 

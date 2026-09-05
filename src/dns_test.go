@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -39,9 +42,15 @@ func TestDNSCheck(t *testing.T) {
 	}
 }
 
+// testResolvers returns the default resolver set matching config.jsonnet.
+// Tests needing real DNS should use these; tests needing determinism should use mock DNS servers.
+func testResolvers() []string {
+	return []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+}
+
 func TestFetchCAA(t *testing.T) {
 	app := &AppState{}
-	resolvers := []string{"8.8.8.8"}
+	resolvers := testResolvers()
 	res := fetchCAA(context.Background(), app, "google.com", resolvers)
 
 	if res.Error != "" {
@@ -62,7 +71,7 @@ func TestFetchCAA(t *testing.T) {
 
 func TestFetchCAATreeClimbing(t *testing.T) {
 	app := &AppState{}
-	resolvers := []string{"8.8.8.8"}
+	resolvers := testResolvers()
 	res := fetchCAA(context.Background(), app, "some-random-subdomain.google.com", resolvers)
 
 	if res.Error != "" {
@@ -79,7 +88,7 @@ func TestFetchCAATreeClimbing(t *testing.T) {
 
 func TestValidateDNSSEC(t *testing.T) {
 	app := &AppState{}
-	resolvers := []string{"8.8.8.8"}
+	resolvers := testResolvers()
 	res := validateDNSSEC(context.Background(), app, "example.com", resolvers, "https://dns.google/resolve")
 
 	if !res.Valid {
@@ -107,7 +116,7 @@ func TestValidateDNSSEC(t *testing.T) {
 
 func TestValidateDNSSECUnsigned(t *testing.T) {
 	app := &AppState{}
-	resolvers := []string{"8.8.8.8"}
+	resolvers := testResolvers()
 	res := validateDNSSEC(context.Background(), app, "google.com", resolvers, "https://dns.google/resolve")
 
 	if res.Valid {
@@ -287,7 +296,7 @@ func TestParseCAAIssuer(t *testing.T) {
 
 func TestFetchCAABoundaries(t *testing.T) {
 	app := &AppState{}
-	resolvers := []string{"8.8.8.8"}
+	resolvers := testResolvers()
 
 	// Empty domain
 	res := fetchCAA(context.Background(), app, "", resolvers)
@@ -304,7 +313,7 @@ func TestFetchCAABoundaries(t *testing.T) {
 
 func TestDNSSECValidationFallback(t *testing.T) {
 	app := &AppState{}
-	resolvers := []string{"8.8.8.8"}
+	resolvers := testResolvers()
 
 	// When DoH URL is invalid or unreachable, validation falls back to local_only
 	res := validateDNSSEC(context.Background(), app, "example.com", resolvers, "http://127.0.0.1:1/invalid_doh")
@@ -320,11 +329,16 @@ func TestDNSSECValidationFallback(t *testing.T) {
 }
 
 func TestDNSSECValidationDoHHTTPError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
 	app := &AppState{}
-	resolvers := []string{"8.8.8.8"}
+	resolvers := testResolvers()
 
 	// When DoH server returns HTTP 500 or 429, it must fall back to local_only without marking chain broken
-	res := validateDNSSEC(context.Background(), app, "example.com", resolvers, "https://httpbin.org/status/500")
+	res := validateDNSSEC(context.Background(), app, "example.com", resolvers, ts.URL)
 	if res.Source != "local_only" {
 		t.Errorf("Expected Source 'local_only' on DoH HTTP 500, got %q", res.Source)
 	}
@@ -346,7 +360,7 @@ func FuzzParseCAAIssuer(f *testing.F) {
 		f.Add(seed)
 	}
 
-	f.Fuzz(func(t *testing.T, rawVal string) {
+	f.Fuzz(func(_ *testing.T, rawVal string) {
 		// Should never panic regardless of arbitrary input
 		_ = parseCAAIssuer(rawVal)
 	})
@@ -416,7 +430,7 @@ func TestSSLSentinels(t *testing.T) {
 
 	app := &AppState{
 		Config: &AppConfig{
-			Resolvers: []string{"8.8.8.8"},
+			Resolvers: testResolvers(),
 		},
 		Notifier: &NotificationManager{},
 	}
@@ -532,15 +546,131 @@ func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 		}
 	}
 
-	state.EmailMu.Lock()
+	state.mu.Lock()
 	savedState := state.Email["unreachable-domain.com"]
-	state.EmailMu.Unlock()
+	state.mu.Unlock()
 
 	if savedState == nil {
 		t.Fatalf("Expected EmailState to be saved")
 	}
 	if savedState.Status != StatusFailed && savedState.Status != StatusWarning {
 		t.Errorf("Expected status Failed or Warning, got %s", savedState.Status)
+	}
+}
+
+func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
+	mux := dns.NewServeMux()
+
+	mxRR := &dns.MX{
+		Hdr:        dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeMX, Class: dns.ClassINET, Ttl: 300},
+		Preference: 10,
+		Mx:         "mail.example.com.",
+	}
+	spfRR := &dns.TXT{
+		Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300},
+		Txt: []string{"v=spf1 include:_spf.example.com ~all"},
+	}
+	dmarcRR := &dns.TXT{
+		Hdr: dns.RR_Header{Name: "_dmarc.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300},
+		Txt: []string{"v=DMARC1; p=reject;"},
+	}
+	dkim1RR := &dns.TXT{
+		Hdr: dns.RR_Header{Name: "s1._domainkey.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300},
+		Txt: []string{"v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC12345"},
+	}
+
+	mux.HandleFunc("example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		if len(r.Question) > 0 {
+			switch r.Question[0].Qtype {
+			case dns.TypeMX:
+				m.Answer = append(m.Answer, mxRR)
+			case dns.TypeTXT:
+				m.Answer = append(m.Answer, spfRR)
+			}
+		}
+		_ = w.WriteMsg(m)
+	})
+
+	mux.HandleFunc("_dmarc.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		if len(r.Question) > 0 && r.Question[0].Qtype == dns.TypeTXT {
+			m.Answer = append(m.Answer, dmarcRR)
+		}
+		_ = w.WriteMsg(m)
+	})
+
+	mux.HandleFunc("s1._domainkey.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		if len(r.Question) > 0 && r.Question[0].Qtype == dns.TypeTXT {
+			m.Answer = append(m.Answer, dkim1RR)
+		}
+		_ = w.WriteMsg(m)
+	})
+
+	// s2 returns NXDOMAIN to simulate unused/alternate candidate selector
+	mux.HandleFunc("s2._domainkey.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Rcode = dns.RcodeNameError
+		_ = w.WriteMsg(m)
+	})
+
+	server := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
+	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen packet: %v", err)
+	}
+	server.PacketConn = l
+	defer server.Shutdown()
+	go func() { _ = server.ActivateAndServe() }()
+
+	app := &AppState{
+		Config: &AppConfig{
+			Resolvers: []string{l.LocalAddr().String()},
+		},
+		Notifier: &NotificationManager{},
+	}
+	target := DomainConfig{
+		Domain:             "example.com",
+		Name:               "Example Test",
+		CheckEmailSecurity: true,
+		MXRecords:          []string{"mail.example.com"},
+		DKIMSelectors:      []string{"s1", "s2"},
+	}
+	state := &CheckState{
+		Email: make(map[string]*EmailState),
+	}
+
+	evaluateEmailSecurity(context.Background(), app, target, state)
+
+	state.mu.Lock()
+	savedState := state.Email["example.com"]
+	state.mu.Unlock()
+
+	if savedState == nil {
+		t.Fatalf("Expected EmailState to be saved for example.com")
+	}
+	if savedState.Status != StatusOk {
+		t.Errorf("Expected email status StatusOk when at least one selector is valid, got %s (error: %s)", savedState.Status, savedState.Error)
+	}
+	if !savedState.SPF {
+		t.Errorf("Expected SPF=true, got false")
+	}
+	if !savedState.DMARC {
+		t.Errorf("Expected DMARC=true, got false")
+	}
+	if !savedState.DKIMExpected {
+		t.Errorf("Expected DKIMExpected=true, got false")
+	}
+	if len(savedState.DKIMValid) != 1 || savedState.DKIMValid[0] != "s1" {
+		t.Errorf("Expected DKIMValid=[s1], got %v", savedState.DKIMValid)
+	}
+	if savedState.Error != "" {
+		t.Errorf("Expected empty error, got %q", savedState.Error)
 	}
 }
 
@@ -654,11 +784,11 @@ func TestMultipleSameTypeDNSTasks_NoKeyCollision(t *testing.T) {
 	evaluateDNS(context.Background(), app, task1, state)
 	evaluateDNS(context.Background(), app, task2, state)
 
-	state.DNSMu.Lock()
+	state.mu.Lock()
 	count := len(state.DNS)
-	s1 := state.DNS["example.com_TXT_SPF TXT"]
-	s2 := state.DNS["example.com_TXT_Google Verification"]
-	state.DNSMu.Unlock()
+	s1 := state.DNS["SPF TXT"]
+	s2 := state.DNS["Google Verification"]
+	state.mu.Unlock()
 
 	if count != 2 {
 		t.Errorf("Expected 2 distinct DNS states, got %d", count)
@@ -946,4 +1076,728 @@ func TestQueryDNSMsg_QuestionEchoValidation(t *testing.T) {
 		t.Errorf("Expected question mismatch error, got: %v", qErr)
 	}
 }
+
+func TestFetchCAA_CNAMELoopTermination(t *testing.T) {
+	t.Parallel()
+
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		if len(r.Question) > 0 {
+			q := r.Question[0]
+			if q.Qtype == dns.TypeCNAME {
+				// Create a cycle between loop.example. and alias.example.
+				target := "alias.example."
+				if strings.HasPrefix(q.Name, "alias") {
+					target = "loop.example."
+				}
+				rr, _ := dns.NewRR(q.Name + " 300 IN CNAME " + target)
+				m.Answer = append(m.Answer, rr)
+			}
+			// For CAA or other types, return empty Answer (NODATA)
+		}
+		_ = w.WriteMsg(m)
+	})
+
+	server := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
+	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen packet: %v", err)
+	}
+	server.PacketConn = l
+	defer server.Shutdown()
+	go func() { _ = server.ActivateAndServe() }()
+
+	app := &AppState{Config: &AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	res := fetchCAA(ctx, app, "loop.example.com", []string{l.LocalAddr().String()})
+	if res == nil {
+		t.Fatalf("fetchCAA returned nil on CNAME loop")
+	}
+}
+
+func TestEvaluateNSHealth(t *testing.T) {
+	t.Parallel()
+
+	startMockNSWithKeys := func(serial uint32, authoritative bool, dnskeys []dns.RR) (string, func()) {
+		mux := dns.NewServeMux()
+		mux.HandleFunc("example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+			m := new(dns.Msg)
+			m.SetReply(r)
+			m.Authoritative = authoritative
+			if len(r.Question) > 0 {
+				q := r.Question[0]
+				if q.Qtype == dns.TypeSOA {
+					soaStr := fmt.Sprintf("example.com. 3600 IN SOA ns1.example.com. hostmaster.example.com. %d 7200 3600 1209600 3600", serial)
+					rr, _ := dns.NewRR(soaStr)
+					m.Answer = append(m.Answer, rr)
+				} else if q.Qtype == dns.TypeDNSKEY {
+					for _, k := range dnskeys {
+						if k != nil {
+							m.Answer = append(m.Answer, dns.Copy(k))
+						}
+					}
+				}
+			}
+			_ = w.WriteMsg(m)
+		})
+		l, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen packet: %v", err)
+		}
+		srv := &dns.Server{PacketConn: l, Handler: mux}
+		go func() { _ = srv.ActivateAndServe() }()
+		return l.LocalAddr().String(), func() { _ = srv.Shutdown() }
+	}
+
+	primaryKey := &dns.DNSKEY{
+		Hdr:       dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: dns.ECDSAP256SHA256,
+		PublicKey: "mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9UxUovEsok4rA==",
+	}
+	independentKey := &dns.DNSKEY{
+		Hdr:       dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
+		Flags:     256,
+		Protocol:  3,
+		Algorithm: dns.RSASHA256,
+		PublicKey: "AQAB",
+	}
+
+	// 1. Happy Path: Dumb Secondary replicates primary's exact DNSKEYs
+	t.Run("HappyPathReplicatedDNSKEY", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
+		defer pClose()
+		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
+		defer sClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Sync Domain",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    []string{sAddr},
+			VerifyNSHealth: true,
+			DNSSEC:         true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || !res.Valid {
+			t.Fatalf("Expected valid NSHealth for identical replicated DNSKEY")
+		}
+		if len(app.Notifier.Buffer) != 0 {
+			t.Errorf("Expected 0 alerts on healthy NS, got %d", len(app.Notifier.Buffer))
+		}
+	})
+
+	// 2. Happy Path: Unsigned zone (neither primary nor secondary has DNSKEY)
+	t.Run("HappyPathUnsignedZone", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090101, true, nil)
+		defer pClose()
+		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil)
+		defer sClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Unsigned Domain",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    []string{sAddr},
+			VerifyNSHealth: true,
+			DNSSEC:         true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || !res.Valid {
+			t.Fatalf("Expected valid NSHealth for unsigned zone without DNSKEY")
+		}
+	})
+
+	// 3. DNSKEY Mismatch (Secondary generates its own keys / smart secondary) -> REJECTED
+	t.Run("DNSKEYMismatchIndependentKeys", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
+		defer pClose()
+		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Distinct key!
+		defer sClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Mismatched DNSKEY Domain",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    []string{sAddr},
+			VerifyNSHealth: true,
+			DNSSEC:         true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || res.Valid {
+			t.Errorf("Expected NSHealth to be invalid when secondary uses its own DNSKEYs")
+		}
+		if len(app.Notifier.Buffer) != 1 {
+			t.Errorf("Expected 1 alert for DNSKEY mismatch, got %d", len(app.Notifier.Buffer))
+		}
+	})
+
+	// 4. DNSKEY Unexpected (Primary is unsigned, but secondary serves DNSKEY) -> REJECTED
+	t.Run("DNSKEYUnexpectedOnSecondary", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090101, true, nil) // Unsigned primary
+		defer pClose()
+		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Signed secondary!
+		defer sClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Unexpected DNSKEY Domain",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    []string{sAddr},
+			VerifyNSHealth: true,
+			DNSSEC:         true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || res.Valid {
+			t.Errorf("Expected NSHealth to be invalid when secondary serves unexpected DNSKEY")
+		}
+		if len(app.Notifier.Buffer) != 1 {
+			t.Errorf("Expected 1 alert for unexpected DNSKEY, got %d", len(app.Notifier.Buffer))
+		}
+	})
+
+	// 5. DNSKEY Unexpected on Secondary even when target.DNSSEC is false -> REJECTED
+	t.Run("DNSKEYUnexpectedEvenWhenDNSSECIsFalse", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090101, true, nil) // Unsigned primary
+		defer pClose()
+		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Secondary serves DNSKEY!
+		defer sClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Dumb Secondary Unsigned Violation",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    []string{sAddr},
+			VerifyNSHealth: true,
+			DNSSEC:         false, // Explicitly false!
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || res.Valid {
+			t.Errorf("Expected NSHealth to be invalid when secondary serves DNSKEY even if DNSSEC=false")
+		}
+		if len(app.Notifier.Buffer) != 1 {
+			t.Errorf("Expected 1 alert for unexpected DNSKEY, got %d", len(app.Notifier.Buffer))
+		}
+	})
+
+	// 6. DNSKEY Missing on Secondary when Primary is signed -> REJECTED
+	t.Run("DNSKEYMissingOnSecondary", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
+		defer pClose()
+		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil) // Missing DNSKEY!
+		defer sClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Missing DNSKEY Domain",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    []string{sAddr},
+			VerifyNSHealth: true,
+			DNSSEC:         true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || res.Valid {
+			t.Errorf("Expected NSHealth to be invalid on missing DNSKEY")
+		}
+		if len(app.Notifier.Buffer) != 1 {
+			t.Errorf("Expected 1 alert for missing DNSKEY, got %d", len(app.Notifier.Buffer))
+		}
+	})
+
+	// 6. Secondary SOA Lag (stale zone transfer)
+	t.Run("SecondarySOALag", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090102, true, nil)
+		defer pClose()
+		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil) // 2026090101 < 2026090102
+		defer sClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Lagging Domain",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    []string{sAddr},
+			VerifyNSHealth: true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || res.Valid {
+			t.Errorf("Expected NSHealth to be invalid on secondary SOA lag")
+		}
+		if len(app.Notifier.Buffer) != 1 {
+			t.Errorf("Expected 1 alert for secondary SOA lag, got %d", len(app.Notifier.Buffer))
+		}
+	})
+
+	// 7. Happy Path: Primary Only (secondary_ns omitted -> secondary checks skipped)
+	t.Run("HappyPathPrimaryOnly", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
+		defer pClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Primary Only Domain",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    nil, // secondary_ns is omitted!
+			VerifyNSHealth: true,
+			DNSSEC:         true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || !res.Valid {
+			t.Fatalf("Expected valid NSHealth for primary-only nameserver check")
+		}
+		if len(res.Servers) != 1 {
+			t.Errorf("Expected exactly 1 server (primary), got %d", len(res.Servers))
+		}
+		if !res.Servers[0].IsPrimary {
+			t.Errorf("Expected server to be marked primary")
+		}
+		if !res.Servers[0].Authoritative {
+			t.Errorf("Expected primary server to be authoritative")
+		}
+		if res.Servers[0].SOASerial != 2026090101 {
+			t.Errorf("Expected SOA serial 2026090101, got %d", res.Servers[0].SOASerial)
+		}
+		if len(app.Notifier.Buffer) != 0 {
+			t.Errorf("Expected 0 alerts for healthy primary-only NS, got %d", len(app.Notifier.Buffer))
+		}
+	})
+
+	// 8. Primary Only Non-Authoritative (fails and alerts even without secondary_ns)
+	t.Run("PrimaryOnlyNonAuthoritative", func(t *testing.T) {
+		pAddr, pClose := startMockNSWithKeys(2026090101, false, nil) // AA=0!
+		defer pClose()
+
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Non-Authoritative Primary Domain",
+			ExpectedNS:     []string{pAddr},
+			SecondaryNS:    nil, // secondary_ns is omitted!
+			VerifyNSHealth: true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || res.Valid {
+			t.Fatalf("Expected NSHealth to be invalid when primary is not authoritative")
+		}
+		if len(app.Notifier.Buffer) != 1 {
+			t.Errorf("Expected 1 alert for non-authoritative primary, got %d", len(app.Notifier.Buffer))
+		}
+	})
+
+	// 9. Primary Missing SOA Record (fails and alerts)
+	t.Run("PrimaryMissingSOA", func(t *testing.T) {
+		mux := dns.NewServeMux()
+		mux.HandleFunc("example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+			m := new(dns.Msg)
+			m.SetReply(r)
+			m.Authoritative = true
+			// Deliberately empty Answer and Ns sections (no SOA)
+			_ = w.WriteMsg(m)
+		})
+		l, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen packet: %v", err)
+		}
+		srv := &dns.Server{PacketConn: l, Handler: mux}
+		go func() { _ = srv.ActivateAndServe() }()
+		defer srv.Shutdown()
+
+		pAddr := l.LocalAddr().String()
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "Missing SOA Primary Domain",
+			ExpectedNS:     []string{pAddr},
+			VerifyNSHealth: true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || res.Valid {
+			t.Fatalf("Expected NSHealth to be invalid when primary returns no SOA")
+		}
+		if len(app.Notifier.Buffer) != 1 {
+			t.Errorf("Expected 1 alert for missing SOA, got %d", len(app.Notifier.Buffer))
+		}
+		if res.Servers[0].Error != "No SOA record returned in answer or authority sections" {
+			t.Errorf("Expected specific missing SOA error, got %q", res.Servers[0].Error)
+		}
+	})
+
+	// 10. Primary SOA in Authority Section (standard DNS behavior, succeeds and parses serial)
+	t.Run("PrimarySOAInAuthoritySection", func(t *testing.T) {
+		mux := dns.NewServeMux()
+		mux.HandleFunc("example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+			m := new(dns.Msg)
+			m.SetReply(r)
+			m.Authoritative = true
+			// SOA placed in Authority (Ns) section, NOT Answer section
+			m.Ns = []dns.RR{
+				&dns.SOA{
+					Hdr:     dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 3600},
+					Ns:      "ns1.example.com.",
+					Mbox:    "hostmaster.example.com.",
+					Serial:  2026090501,
+					Refresh: 3600,
+					Retry:   600,
+					Expire:  86400,
+					Minttl:  300,
+				},
+			}
+			_ = w.WriteMsg(m)
+		})
+		l, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen packet: %v", err)
+		}
+		srv := &dns.Server{PacketConn: l, Handler: mux}
+		go func() { _ = srv.ActivateAndServe() }()
+		defer srv.Shutdown()
+
+		pAddr := l.LocalAddr().String()
+		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		target := DomainConfig{
+			Domain:         "example.com",
+			Name:           "SOA In Authority Domain",
+			ExpectedNS:     []string{pAddr},
+			VerifyNSHealth: true,
+		}
+		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
+
+		evaluateNSHealth(context.Background(), app, target, state)
+
+		state.mu.Lock()
+		res := state.NSHealth["example.com"]
+		state.mu.Unlock()
+
+		if res == nil || !res.Valid {
+			t.Fatalf("Expected NSHealth to be valid when primary returns SOA in Ns section, got invalid")
+		}
+		if len(app.Notifier.Buffer) != 0 {
+			t.Errorf("Expected 0 alerts for valid SOA in Ns section, got %d", len(app.Notifier.Buffer))
+		}
+		if res.Servers[0].SOASerial != 2026090501 {
+			t.Errorf("Expected SOA serial 2026090501, got %d", res.Servers[0].SOASerial)
+		}
+	})
+}
+
+func TestEvaluateDNS_SkipSSL(t *testing.T) {
+	mux := dns.NewServeMux()
+	mux.HandleFunc("web.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = append(m.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "web.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.ParseIP("127.0.0.1"),
+		})
+		_ = w.WriteMsg(m)
+	})
+
+	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen packet: %v", err)
+	}
+	srv := &dns.Server{PacketConn: l, Handler: mux}
+	go func() { _ = srv.ActivateAndServe() }()
+	defer srv.Shutdown()
+
+	pAddr := l.LocalAddr().String()
+	app := &AppState{
+		Config: &AppConfig{
+			Resolvers: []string{pAddr},
+		},
+		Notifier: &NotificationManager{},
+	}
+
+	state := &CheckState{
+		DNS: make(map[string]*DNSState),
+	}
+
+	// 1. Task with SkipSSL = true: port 443 should NOT be dialed at all, SSLDays should be SSLDaysNotApplicable (-9999)
+	taskSkip := DNSTask{
+		Hostname: "web.example.com",
+		Name:     "Web Server No SSL",
+		Type:     "A",
+		Expected: []string{"127.0.0.1"},
+		SkipSSL:  true,
+	}
+
+	evaluateDNS(context.Background(), app, taskSkip, state)
+
+	state.mu.Lock()
+	resSkip := state.DNS["Web Server No SSL"]
+	state.mu.Unlock()
+
+	if resSkip == nil {
+		t.Fatalf("expected DNS state to be recorded for taskSkip")
+	}
+	if resSkip.Status != StatusOk {
+		t.Errorf("expected StatusOk, got %v", resSkip.Status)
+	}
+	if !resSkip.SkipSSL {
+		t.Errorf("expected DNSState.SkipSSL to be true")
+	}
+	if resSkip.SSLDays != SSLDaysNotApplicable {
+		t.Errorf("expected SSLDays to be %d, got %d", SSLDaysNotApplicable, resSkip.SSLDays)
+	}
+	if resSkip.Error != "" {
+		t.Errorf("expected no error, got %s", resSkip.Error)
+	}
+
+	// 2. Direct call to validateCertificate: when SkipSSL is true, immediately returns SSLDaysNotApplicable
+	days := validateCertificate(context.Background(), app, taskSkip, []string{"127.0.0.1"})
+	if days != SSLDaysNotApplicable {
+		t.Errorf("validateCertificate expected SSLDaysNotApplicable, got %d", days)
+	}
+}
+
+func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
+	mux := dns.NewServeMux()
+	mux.HandleFunc("multi.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		if r.Question[0].Qtype == dns.TypeA {
+			m.Answer = append(m.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: "multi.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.ParseIP("198.51.100.2"),
+			})
+			m.Answer = append(m.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: "multi.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.ParseIP("192.0.2.1"),
+			})
+			m.Answer = append(m.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: "multi.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.ParseIP("192.0.2.1"), // duplicate
+			})
+		} else if r.Question[0].Qtype == dns.TypeAAAA {
+			m.Answer = append(m.Answer, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: "multi.example.com.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+				AAAA: net.ParseIP("2001:db8::1"),
+			})
+		}
+		_ = w.WriteMsg(m)
+	})
+
+	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen packet: %v", err)
+	}
+	srv := &dns.Server{PacketConn: l, Handler: mux}
+	go func() { _ = srv.ActivateAndServe() }()
+	defer srv.Shutdown()
+
+	pAddr := l.LocalAddr().String()
+	app := &AppState{
+		Config: &AppConfig{
+			Resolvers: []string{pAddr},
+		},
+		Notifier: &NotificationManager{},
+	}
+	state := &CheckState{
+		DNS: make(map[string]*DNSState),
+	}
+
+	task := DNSTask{
+		Hostname: "multi.example.com",
+		Name:     "Multi IP Test",
+		Type:     "IP",
+		Expected: []string{"192.0.2.1", "198.51.100.2", "2001:db8::1"},
+		SkipSSL:  true,
+	}
+
+	evaluateDNS(context.Background(), app, task, state)
+
+	state.mu.Lock()
+	res := state.DNS["Multi IP Test"]
+	state.mu.Unlock()
+
+	if res == nil {
+		t.Fatalf("expected state for 'Multi IP Test' to exist")
+	}
+	if res.Status != StatusOk {
+		t.Fatalf("expected StatusOk, got %s (error: %s)", res.Status, res.Error)
+	}
+	expectedOrder := []string{"192.0.2.1", "198.51.100.2", "2001:db8::1"}
+	if !slices.Equal(res.Found, expectedOrder) {
+		t.Errorf("expected sorted and deduplicated Found %v, got %v", expectedOrder, res.Found)
+	}
+}
+
+func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
+	mux := dns.NewServeMux()
+	mux.HandleFunc("flattened.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		if r.Question[0].Qtype == dns.TypeA {
+			m.Answer = append(m.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: "flattened.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.ParseIP("192.0.2.99"),
+			})
+		}
+		_ = w.WriteMsg(m)
+	})
+
+	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen packet: %v", err)
+	}
+	srv := &dns.Server{PacketConn: l, Handler: mux}
+	go func() { _ = srv.ActivateAndServe() }()
+	defer srv.Shutdown()
+
+	pAddr := l.LocalAddr().String()
+	app := &AppState{
+		Config: &AppConfig{
+			Resolvers: []string{pAddr},
+		},
+		Notifier: &NotificationManager{},
+	}
+	state := &CheckState{
+		DNS: make(map[string]*DNSState),
+	}
+
+	task := DNSTask{
+		Hostname: "flattened.example.com",
+		Name:     "Flattened CNAME Direct IP",
+		Type:     "CNAME",
+		Expected: []string{"192.0.2.99"},
+		SkipSSL:  true,
+	}
+
+	evaluateDNS(context.Background(), app, task, state)
+
+	state.mu.Lock()
+	res := state.DNS["Flattened CNAME Direct IP"]
+	state.mu.Unlock()
+
+	if res == nil {
+		t.Fatalf("expected state for 'Flattened CNAME Direct IP' to exist")
+	}
+	if res.Status != StatusOk {
+		t.Errorf("expected StatusOk, got %s (error: %s)", res.Status, res.Error)
+	}
+	if len(res.Found) != 1 || res.Found[0] != "192.0.2.99" {
+		t.Errorf("expected Found [192.0.2.99], got %v", res.Found)
+	}
+}
+
+func TestDNS_ValidateRecords_MultiIPConsolidatedAlert(t *testing.T) {
+	app := &AppState{
+		Config:   &AppConfig{},
+		Notifier: &NotificationManager{},
+	}
+
+	task := DNSTask{
+		Hostname: "cluster.example.com",
+		Name:     "Cluster Multi IP",
+		Type:     "IP",
+		Expected: []string{"192.0.2.1", "192.0.2.2"},
+	}
+
+	// 2 missing ("192.0.2.1", "192.0.2.2"), 2 unauthorized ("198.51.100.1", "198.51.100.2")
+	found := []string{"198.51.100.1", "198.51.100.2"}
+
+	valid := validateRecords(app, task, found)
+	if valid {
+		t.Fatalf("expected validateRecords to return false on mismatch")
+	}
+
+	// Expected exactly 2 consolidated alerts: 1 missing, 1 unauthorized (NOT 4 individual alerts)
+	if len(app.Notifier.Buffer) != 2 {
+		t.Fatalf("expected 2 consolidated alerts, got %d: %+v", len(app.Notifier.Buffer), app.Notifier.Buffer)
+	}
+
+	missingAlert := app.Notifier.Buffer[0]
+	if !strings.Contains(missingAlert.Message, "192.0.2.1, 192.0.2.2") {
+		t.Errorf("expected missing alert to join missing IPs, got: %s", missingAlert.Message)
+	}
+
+	unauthAlert := app.Notifier.Buffer[1]
+	if !strings.Contains(unauthAlert.Message, "198.51.100.1, 198.51.100.2") {
+		t.Errorf("expected unauthorized alert to join unauth IPs, got: %s", unauthAlert.Message)
+	}
+}
+
+
 

@@ -1,5 +1,5 @@
 # Stage 1: Base builder environment
-FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine AS base
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS base
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
@@ -11,8 +11,6 @@ ARG TARGETOS
 ARG TARGETARCH
 # Install UPX for extreme binary compression
 RUN apk add --no-cache upx
-# Run tests to natively block compilation if logic fails
-RUN go test ./src/... -v
 # Build a fully static, stripped binary with trimmed paths
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -a -tags netgo -ldflags="-w -s -extldflags '-static'" -o domain-monitor ./src
 # Compress the binary

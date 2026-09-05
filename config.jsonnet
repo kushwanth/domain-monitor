@@ -1,4 +1,7 @@
-local default_ns = ["ns1.example.com", "ns2.example.com"];
+local default_ns = [
+  "ns1.example.com",
+  "ns2.example.com",
+];
 local A = "A";
 local AAAA = "AAAA";
 local CNAME = "CNAME";
@@ -11,7 +14,7 @@ local TXT = "TXT";
   request_delay: "5s",
   whois_delay: "10s",
 
-  // The directory where state files (ct_logs/ and ct_state.json) are persisted
+  // The directory where state files (ct_logs/, ct_state.json, domain_snapshots.json) are persisted
   data_dir: "./data",
 
   // Optional: ctlogs.dev API key for higher rate limits on CT log monitoring
@@ -28,12 +31,26 @@ local TXT = "TXT";
     { 
       domain: "example.com", 
       name: "Example Prod Domain", 
-      expected_ns: ["a.iana-servers.net", "b.iana-servers.net"],
+      // Expected authoritative nameservers validated against RDAP & parent delegation:
+      expected_ns: [
+        "a.iana-servers.net",
+      ],
+      secondary_ns: [
+        "b.iana-servers.net",
+      ],
+      verify_ns_health: true,
+      // Config accepts both expected_registrar_id and expected_registrar_name:
+      // Priority 1: expected_registrar_id (takes precedence; mutually exclusive in evaluation)
+      // Priority 2: expected_registrar_name (evaluated only if expected_registrar_id is omitted)
+      // expected_registrar_id: "376",          // IANA Registrar ID (e.g. 292 for MarkMonitor, 146 for GoDaddy)
+      // expected_registrar_name: "markmonitor", // Fallback for ccTLDs without IANA ID (Priority 2)
+      domain_transfer_locked: true,           // Verifies transfer lock is enabled in EPP status
       check_email_security: false,
       monitor_ct_logs: true,
       dnssec: true,
       caa: {
-        issue: ["letsencrypt.org", "digicert.com"]
+        issue: ["letsencrypt.org", "digicert.com"],
+        // issuewild and issuemail omitted = only validate issue records
       },
       suppress_alerts: true
     },
@@ -51,7 +68,9 @@ local TXT = "TXT";
     { 
       domain: "example.net", 
       name: "Example Net Main", 
-      expected_ns: ["a.iana-servers.net", "b.iana-servers.net"],
+      expected_ns: ["a.iana-servers.net"],
+      secondary_ns: ["b.iana-servers.net"],
+      verify_ns_health: true,
       check_email_security: true,
       mail_provider: "google",
       monitor_ct_logs: true,
@@ -94,6 +113,6 @@ local TXT = "TXT";
     { hostname: "example.net", name: "Example Net MX", type: MX, expected: ["smtp.example.net"] },
     { hostname: "example.net", name: "Example Net TXT", type: TXT, expected: ["v=spf1 include:_spf.example.net ~all"] },
     { hostname: "www.example.net", name: "Example Net WWW", type: A, expected: ["93.184.215.14"] },
-    { hostname: "api.example.com", name: "Example API", type: A, expected: ["93.184.215.14"] }
+    { hostname: "api.example.com", name: "Example API", type: A, expected: ["93.184.215.14"], skip_ssl: true }
   ]
 }

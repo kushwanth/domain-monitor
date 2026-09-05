@@ -104,7 +104,7 @@ func TestBootstrapFetchAndResolution(t *testing.T) {
 		},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ianaData)
 	}))
@@ -147,7 +147,7 @@ func TestBootstrapFetchAndResolution(t *testing.T) {
 }
 
 func TestBootstrapCacheExpiryAndFallback(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "simulated 500 internal error", http.StatusInternalServerError)
 	}))
 	defer server.Close()
@@ -193,7 +193,7 @@ func TestBootstrapConcurrentColdStart(t *testing.T) {
 		},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		countMu.Lock()
 		requestCount++
 		countMu.Unlock()
@@ -236,4 +236,3 @@ func TestBootstrapConcurrentColdStart(t *testing.T) {
 		t.Errorf("Expected exactly 1 HTTP request due to singleflight double-checked fetch, got %d", totalReqs)
 	}
 }
-

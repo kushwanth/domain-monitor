@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -181,9 +184,6 @@ func TestHTTPServerRoutes(t *testing.T) {
 	app.PrerenderedJSON.Store([]byte(`{"status":"prerendered"}`))
 	app.PrerenderedHTML.Store([]byte(`<!DOCTYPE html><html><body>Loaded</body></html>`))
 
-	firstRunDone := make(chan struct{})
-	close(firstRunDone)
-
 	server, _ := setupHTTPServer(app, "0")
 	handler := server.Handler
 
@@ -259,9 +259,6 @@ func TestHTTPServerRoutes(t *testing.T) {
 
 func TestPathTraversalProtection(t *testing.T) {
 	app := &AppState{}
-	firstRunDone := make(chan struct{})
-	close(firstRunDone)
-
 	server, _ := setupHTTPServer(app, "0")
 	handler := server.Handler
 
@@ -300,3 +297,176 @@ func TestPathTraversalProtection(t *testing.T) {
 		})
 	}
 }
+
+type mockRoundTripper func(req *http.Request) (*http.Response, error)
+
+func (m mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m(req)
+}
+
+func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
+	origTransport := ctHTTPClient.Transport
+	defer func() { ctHTTPClient.Transport = origTransport }()
+
+	ctHTTPClient.Transport = mockRoundTripper(func(_ *http.Request) (*http.Response, error) {
+		payload := `{"rows":[{"id":"cert-first-1","match":"firstrun.example.com","issuer":"Let's Encrypt"}],"has_next":false,"next_cursor":""}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(payload)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	app := &AppState{Config: &AppConfig{}, Notifier: &NotificationManager{}}
+	domain := "firstrun.example.com"
+	defer func() { _ = os.Remove(filepath.Join(CTLogsPath, domain+".json")) }()
+
+	target := DomainConfig{
+		Domain:         domain,
+		MonitorCTLogs:  true,
+		SuppressAlerts: false,
+	}
+	state := &CheckState{
+		CTLogs: make(map[string]*CTLogState),
+	}
+
+	evaluateCTLogs(context.Background(), app, target, state)
+
+	// First run must not emit notifications for existing cert baseline
+	if len(app.Notifier.Buffer) != 0 {
+		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(app.Notifier.Buffer))
+	}
+
+	state.mu.Lock()
+	saved := state.CTLogs[domain]
+	state.mu.Unlock()
+
+	if saved == nil {
+		t.Fatalf("Expected CTLogState to be saved")
+	}
+	if saved.LatestID != "cert-first-1" {
+		t.Errorf("Expected LatestID 'cert-first-1', got %q", saved.LatestID)
+	}
+	if saved.Status != StatusOk {
+		t.Errorf("Expected StatusOk, got %s", saved.Status)
+	}
+}
+
+func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
+	origTransport := ctHTTPClient.Transport
+	defer func() { ctHTTPClient.Transport = origTransport }()
+
+	// Backfill request returns 429 Too Many Requests
+	ctHTTPClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.RawQuery, "after=") {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(bytes.NewBufferString("Too Many Requests")),
+				Header:     make(http.Header),
+			}, nil
+		}
+		// Page 1 succeeds with next_cursor
+		payload := `{"rows":[{"id":"cert-existing-1","match":"ratelimit.example.com","issuer":"CA"}],"has_next":true,"next_cursor":"page1-cursor"}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(payload)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	app := &AppState{Config: &AppConfig{}, Notifier: &NotificationManager{}}
+	domain := "ratelimit.example.com"
+	defer func() { _ = os.Remove(filepath.Join(CTLogsPath, domain+".json")) }()
+
+	target := DomainConfig{
+		Domain:         domain,
+		MonitorCTLogs:  true,
+		SuppressAlerts: false,
+	}
+	savedCursor := "cursor-prior-checkpoint"
+	state := &CheckState{
+		CTLogs: map[string]*CTLogState{
+			domain: {
+				LatestID:         "cert-existing-1",
+				BackfillCursor:   savedCursor,
+				BackfillComplete: false,
+				Status:           StatusOk,
+			},
+		},
+	}
+
+	evaluateCTLogs(context.Background(), app, target, state)
+
+	state.mu.Lock()
+	saved := state.CTLogs[domain]
+	state.mu.Unlock()
+
+	if saved == nil {
+		t.Fatalf("Expected CTLogState to be present")
+	}
+	if saved.Status != StatusFailed {
+		t.Errorf("Expected StatusFailed on 429 rate limit, got %s", saved.Status)
+	}
+	if saved.BackfillCursor != savedCursor {
+		t.Errorf("Expected backfill cursor to be preserved as %q, got %q", savedCursor, saved.BackfillCursor)
+	}
+	if saved.BackfillComplete {
+		t.Errorf("Expected BackfillComplete to remain false after rate limit failure")
+	}
+}
+
+func TestSecurityHeadersMiddleware(t *testing.T) {
+	app := &AppState{}
+	server, _ := setupHTTPServer(app, "0")
+	handler := server.Handler
+
+	endpoints := []string{"/health", "/api/state", "/"}
+	for _, ep := range endpoints {
+		req := httptest.NewRequest("GET", ep, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("Endpoint %s missing X-Content-Type-Options: nosniff", ep)
+		}
+		if rec.Header().Get("X-Frame-Options") != "DENY" {
+			t.Errorf("Endpoint %s missing X-Frame-Options: DENY", ep)
+		}
+		if rec.Header().Get("Referrer-Policy") != "strict-origin-when-cross-origin" {
+			t.Errorf("Endpoint %s missing Referrer-Policy", ep)
+		}
+		if rec.Header().Get("X-XSS-Protection") != "0" {
+			t.Errorf("Endpoint %s missing X-XSS-Protection: 0", ep)
+		}
+		if !strings.Contains(rec.Header().Get("Content-Security-Policy"), "default-src 'self'") {
+			t.Errorf("Endpoint %s missing CSP default-src 'self'", ep)
+		}
+	}
+}
+
+func TestFetchCTPage_KeyRedaction(t *testing.T) {
+	apiKey := "SUPER_SECRET_CTLOGS_KEY"
+	app := &AppState{
+		Config: &AppConfig{
+			CTLogsAPIKey: apiKey,
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("Invalid key: " + apiKey))
+	}))
+	defer server.Close()
+
+	_, err := fetchCTPage(context.Background(), app, server.URL)
+	if err == nil {
+		t.Fatalf("Expected error from 401 unauthorized")
+	}
+	if strings.Contains(err.Error(), apiKey) {
+		t.Errorf("API key leaked in error message: %v", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED_API_KEY]") {
+		t.Errorf("Expected [REDACTED_API_KEY] in error message: %v", err)
+	}
+}
+

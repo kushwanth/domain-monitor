@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -248,6 +253,58 @@ func TestLoadConfig(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "Empty Domain Rejection",
+			configJSON: `{
+				"domains": [{"domain": "", "name": "Empty"}]
+			}`,
+			expectErr:   true,
+			errContains: "empty domain",
+		},
+		{
+			name: "Multiple Domain Entries Allowed",
+			configJSON: `{
+				"domains": [
+					{"domain": "example.com", "name": "Primary"},
+					{"domain": "EXAMPLE.COM.", "name": "Secondary View"}
+				]
+			}`,
+			expectErr: false,
+			validate: func(t *testing.T, app *AppState) {
+				if len(app.Config.Domains) != 2 {
+					t.Errorf("Expected 2 domain entries, got %d", len(app.Config.Domains))
+				}
+			},
+		},
+		{
+			name: "Empty Hostname Rejection",
+			configJSON: `{
+				"dns_records": [{"hostname": "", "name": "NoHost", "type": "A"}]
+			}`,
+			expectErr:   true,
+			errContains: "empty hostname",
+		},
+		{
+			name: "Non-positive Durations Default Gracefully",
+			configJSON: `{
+				"loop_interval": "-1h",
+				"request_delay": "-5s",
+				"whois_delay": "-10s",
+				"domains": [{"domain": "example.com", "name": "Example"}]
+			}`,
+			expectErr: false,
+			validate: func(t *testing.T, app *AppState) {
+				if app.LoopDuration != 6*time.Hour {
+					t.Errorf("Expected fallback 6h, got %v", app.LoopDuration)
+				}
+				if app.ReqDelay != 5*time.Second {
+					t.Errorf("Expected fallback 5s, got %v", app.ReqDelay)
+				}
+				if app.WhoisDelay != 10*time.Second {
+					t.Errorf("Expected fallback 10s, got %v", app.WhoisDelay)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -287,22 +344,41 @@ func TestLoadConfig(t *testing.T) {
 }
 
 func TestInitializeDependencies_ResolverResilience(t *testing.T) {
+	mux := dns.NewServeMux()
+	mux.HandleFunc("example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		rr, _ := dns.NewRR("example.com. 300 IN A 93.184.215.14")
+		m.Answer = append(m.Answer, rr)
+		_ = w.WriteMsg(m)
+	})
+	server := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
+	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen packet: %v", err)
+	}
+	server.PacketConn = l
+	defer server.Shutdown()
+	go func() { _ = server.ActivateAndServe() }()
+
+	localAddr := l.LocalAddr().String()
+
 	// Scenario 1: One valid resolver, one invalid resolver
 	app1 := &AppState{
 		Config: &AppConfig{
-			Resolvers: []string{"8.8.8.8", "192.0.2.1:53"}, // 192.0.2.1 is unroutable TEST-NET-1
+			Resolvers: []string{localAddr, "192.0.2.1:53"}, // 192.0.2.1 is unroutable TEST-NET-1
 		},
 		Notifier: &NotificationManager{},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 
-	err := InitializeDependencies(ctx, app1)
+	err = InitializeDependencies(ctx, app1)
 	if err != nil {
 		t.Errorf("Expected InitializeDependencies to succeed with 1 healthy resolver, got error: %v", err)
 	}
-	if len(app1.Config.Resolvers) != 1 || app1.Config.Resolvers[0] != "8.8.8.8" {
-		t.Errorf("Expected resolvers to contain only healthy '8.8.8.8', got %v", app1.Config.Resolvers)
+	if len(app1.Config.Resolvers) != 1 || app1.Config.Resolvers[0] != localAddr {
+		t.Errorf("Expected resolvers to contain only healthy %s, got %v", localAddr, app1.Config.Resolvers)
 	}
 
 	// Scenario 2: All resolvers invalid
@@ -372,3 +448,438 @@ func TestIDNNormalizationAndAliasCase(t *testing.T) {
 		t.Errorf("Expected stripped and Punycode expected target.xn--mnchen-3ya.de, got %v", r.Expected)
 	}
 }
+
+func TestConfig_RegistrarBothAllowed(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	// Both set -> config allows both
+	bothJSON := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Both Registrar Fields Test",
+				"expected_registrar_id": "292",
+				"expected_registrar_name": "markmonitor"
+			}
+		]
+	}`
+	cfgPath := tmpDir + "/both_reg.json"
+	if err := os.WriteFile(cfgPath, []byte(bothJSON), 0644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+	appBoth, err := LoadConfig(context.Background(), cfgPath)
+	if err != nil {
+		t.Fatalf("Expected config with both registrar fields to load successfully, got error: %v", err)
+	}
+	if appBoth.Config.Domains[0].ExpectedRegistrarID != "292" {
+		t.Errorf("Expected ExpectedRegistrarID '292', got %q", appBoth.Config.Domains[0].ExpectedRegistrarID)
+	}
+	if appBoth.Config.Domains[0].ExpectedRegistrarName != "markmonitor" {
+		t.Errorf("Expected ExpectedRegistrarName 'markmonitor', got %q", appBoth.Config.Domains[0].ExpectedRegistrarName)
+	}
+
+	// Only ID set -> valid
+	validIDJSON := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Registrar ID Test",
+				"expected_registrar_id": "292"
+			}
+		]
+	}`
+	cfgPathID := tmpDir + "/valid_id.json"
+	_ = os.WriteFile(cfgPathID, []byte(validIDJSON), 0644)
+	appID, err := LoadConfig(context.Background(), cfgPathID)
+	if err != nil {
+		t.Fatalf("Expected valid config with only expected_registrar_id, got error: %v", err)
+	}
+	if appID.Config.Domains[0].ExpectedRegistrarID != "292" {
+		t.Errorf("Expected ExpectedRegistrarID '292', got %q", appID.Config.Domains[0].ExpectedRegistrarID)
+	}
+
+	// Only Name set -> valid
+	validNameJSON := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Registrar Name Test",
+				"expected_registrar_name": "markmonitor"
+			}
+		]
+	}`
+	cfgPathName := tmpDir + "/valid_name.json"
+	_ = os.WriteFile(cfgPathName, []byte(validNameJSON), 0644)
+	appName, err := LoadConfig(context.Background(), cfgPathName)
+	if err != nil {
+		t.Fatalf("Expected valid config with only expected_registrar_name, got error: %v", err)
+	}
+	if appName.Config.Domains[0].ExpectedRegistrarName != "markmonitor" {
+		t.Errorf("Expected ExpectedRegistrarName 'markmonitor', got %q", appName.Config.Domains[0].ExpectedRegistrarName)
+	}
+}
+
+func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	// 1. verify_ns_health: true but no expected_ns -> must error
+	invalidJSON1 := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "No Expected NS Test",
+				"verify_ns_health": true,
+				"secondary_ns": ["slave.example.com"]
+			}
+		]
+	}`
+	cfgPath1 := tmpDir + "/invalid_ns_health1.json"
+	_ = os.WriteFile(cfgPath1, []byte(invalidJSON1), 0644)
+	_, err1 := LoadConfig(context.Background(), cfgPath1)
+	if err1 == nil || !strings.Contains(err1.Error(), "no primary expected_ns") {
+		t.Fatalf("Expected error when verify_ns_health is enabled without expected_ns, got: %v", err1)
+	}
+
+	// 2. verify_ns_health: true with expected_ns but no secondary_ns -> valid (secondary_ns is optional)
+	validPrimaryOnlyJSON := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Primary Only NS Health Test",
+				"expected_ns": ["ns1.example.com"],
+				"verify_ns_health": true
+			}
+		]
+	}`
+	cfgPath2 := tmpDir + "/valid_primary_only.json"
+	_ = os.WriteFile(cfgPath2, []byte(validPrimaryOnlyJSON), 0644)
+	app2, err2 := LoadConfig(context.Background(), cfgPath2)
+	if err2 != nil {
+		t.Fatalf("Expected valid config when secondary_ns is omitted, got error: %v", err2)
+	}
+	if len(app2.Config.Domains[0].SecondaryNS) != 0 {
+		t.Errorf("Expected 0 secondary_ns, got %v", app2.Config.Domains[0].SecondaryNS)
+	}
+
+	// 3. verify_ns_health: true with both expected_ns and secondary_ns -> valid
+	validJSON := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Valid Dual-DNS",
+				"expected_ns": ["ns1.example.com"],
+				"secondary_ns": ["slave.otherprovider.com"],
+				"verify_ns_health": true
+			}
+		]
+	}`
+	cfgPath3 := tmpDir + "/valid_ns_health.json"
+	_ = os.WriteFile(cfgPath3, []byte(validJSON), 0644)
+	app, err3 := LoadConfig(context.Background(), cfgPath3)
+	if err3 != nil {
+		t.Fatalf("Expected valid config with expected_ns and secondary_ns, got error: %v", err3)
+	}
+	if len(app.Config.Domains[0].SecondaryNS) != 1 || app.Config.Domains[0].SecondaryNS[0] != "slave.otherprovider.com" {
+		t.Errorf("Expected secondary_ns 'slave.otherprovider.com', got %v", app.Config.Domains[0].SecondaryNS)
+	}
+
+	// 4. empty entry in expected_ns -> must error
+	emptyExpectedNSJSON := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Empty Expected NS Test",
+				"expected_ns": ["   "]
+			}
+		]
+	}`
+	cfgPath4 := tmpDir + "/empty_expected_ns.json"
+	_ = os.WriteFile(cfgPath4, []byte(emptyExpectedNSJSON), 0644)
+	_, err4 := LoadConfig(context.Background(), cfgPath4)
+	if err4 == nil || !strings.Contains(err4.Error(), "empty entry in expected_ns") {
+		t.Fatalf("Expected error for empty entry in expected_ns, got: %v", err4)
+	}
+
+	// 5. empty entry in secondary_ns -> must error
+	emptySecondaryNSJSON := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Empty Secondary NS Test",
+				"expected_ns": ["ns1.example.com"],
+				"secondary_ns": [""]
+			}
+		]
+	}`
+	cfgPath5 := tmpDir + "/empty_secondary_ns.json"
+	_ = os.WriteFile(cfgPath5, []byte(emptySecondaryNSJSON), 0644)
+	_, err5 := LoadConfig(context.Background(), cfgPath5)
+	if err5 == nil || !strings.Contains(err5.Error(), "empty entry in secondary_ns") {
+		t.Fatalf("Expected error for empty entry in secondary_ns, got: %v", err5)
+	}
+
+	// 6. secondary_ns configured but no expected_ns -> must error
+	secondaryNoExpectedJSON := `{
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Secondary Without Expected Test",
+				"secondary_ns": ["b.iana-servers.net"]
+			}
+		]
+	}`
+	cfgPath6 := tmpDir + "/secondary_no_expected.json"
+	_ = os.WriteFile(cfgPath6, []byte(secondaryNoExpectedJSON), 0644)
+	_, err6 := LoadConfig(context.Background(), cfgPath6)
+	if err6 == nil || !strings.Contains(err6.Error(), "no primary expected_ns configured") {
+		t.Fatalf("Expected error for secondary_ns without expected_ns, got: %v", err6)
+	}
+}
+
+func TestLoadDefaultConfigJsonnet(t *testing.T) {
+	app, err := LoadConfig(context.Background(), "../config.jsonnet")
+	if err != nil {
+		t.Fatalf("Failed to parse and load default repo config.jsonnet: %v", err)
+	}
+	if app == nil || app.Config == nil {
+		t.Fatalf("Loaded app or AppConfig is nil")
+	}
+	if len(app.Config.Domains) == 0 {
+		t.Errorf("Expected domains in config.jsonnet, got 0")
+	}
+}
+
+func TestSkipSSLValidation(t *testing.T) {
+	// 1. Valid record types that can have SSL: A, AAAA, CNAME, ALIAS, IP
+	validTypes := []string{"A", "AAAA", "CNAME", "ALIAS", "IP"}
+	for _, vt := range validTypes {
+		t.Run("Valid_"+vt, func(t *testing.T) {
+			expectedVal := `"1.2.3.4"`
+			if vt == "AAAA" {
+				expectedVal = `"2001:db8::1"`
+			}
+			cfgJSON := fmt.Sprintf(`{
+				"dns_records": [
+					{
+						"hostname": "web.example.com",
+						"name": "Web Test",
+						"type": "%s",
+						"expected": [%s],
+						"skip_ssl": true
+					}
+				]
+			}`, vt, expectedVal)
+			tmpFile := t.TempDir() + "/valid_skip_ssl.json"
+			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
+				t.Fatalf("failed to write temp file: %v", err)
+			}
+			app, err := LoadConfig(context.Background(), tmpFile)
+			if err != nil {
+				t.Fatalf("expected valid config for skip_ssl with type %s, got error: %v", vt, err)
+			}
+			if !app.Config.DNSRecords[0].SkipSSL {
+				t.Errorf("expected SkipSSL to be true for %s", vt)
+			}
+		})
+	}
+
+	// 2. Invalid record types for skip_ssl: TXT, MX, CAA, NS
+	invalidTypes := []string{"TXT", "MX", "CAA", "NS"}
+	for _, it := range invalidTypes {
+		t.Run("Invalid_"+it, func(t *testing.T) {
+			cfgJSON := fmt.Sprintf(`{
+				"dns_records": [
+					{
+						"hostname": "record.example.com",
+						"name": "Invalid Test",
+						"type": "%s",
+						"expected": ["something"],
+						"skip_ssl": true
+					}
+				]
+			}`, it)
+			tmpFile := t.TempDir() + "/invalid_skip_ssl.json"
+			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
+				t.Fatalf("failed to write temp file: %v", err)
+			}
+			_, err := LoadConfig(context.Background(), tmpFile)
+			if err == nil {
+				t.Fatalf("expected validation error when skip_ssl is configured on %s, got nil", it)
+			}
+			if !strings.Contains(err.Error(), "skip_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types") {
+				t.Errorf("expected error message to mention allowed types, got: %v", err)
+			}
+		})
+	}
+
+	// 3. Omitted skip_ssl defaults to false and succeeds for any valid record type
+	t.Run("Default_Omitted", func(t *testing.T) {
+		cfgJSON := `{
+			"dns_records": [
+				{
+					"hostname": "record.example.com",
+					"name": "Default Test",
+					"type": "TXT",
+					"expected": ["hello"]
+				}
+			]
+		}`
+		tmpFile := t.TempDir() + "/default_skip_ssl.json"
+		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
+			t.Fatalf("failed to write temp file: %v", err)
+		}
+		app, err := LoadConfig(context.Background(), tmpFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if app.Config.DNSRecords[0].SkipSSL {
+			t.Errorf("expected SkipSSL to default to false")
+		}
+	})
+}
+
+func TestConfig_DuplicateDNSRecordName(t *testing.T) {
+	cfgJSON := `{
+		"dns_records": [
+			{
+				"hostname": "a.example.com",
+				"name": "Duplicate Record",
+				"type": "A",
+				"expected": ["1.2.3.4"]
+			},
+			{
+				"hostname": "b.example.com",
+				"name": "Duplicate Record",
+				"type": "A",
+				"expected": ["1.2.3.5"]
+			}
+		]
+	}`
+	tmpFile := t.TempDir() + "/dup_name.json"
+	if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	_, err := LoadConfig(context.Background(), tmpFile)
+	if err == nil {
+		t.Fatalf("expected error for duplicate DNS record name, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate dns record name \"Duplicate Record\"") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestConfig_StringListExpected(t *testing.T) {
+	// 1. Single string in expected
+	cfgJSON := `{
+		"dns_records": [
+			{
+				"hostname": "single.example.com",
+				"name": "Single String Expected",
+				"type": "A",
+				"expected": "1.2.3.4"
+			},
+			{
+				"hostname": "slice.example.com",
+				"name": "Slice Expected",
+				"type": "A",
+				"expected": ["5.6.7.8", "9.10.11.12"]
+			}
+		]
+	}`
+	tmpFile := t.TempDir() + "/stringlist.json"
+	if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	app, err := LoadConfig(context.Background(), tmpFile)
+	if err != nil {
+		t.Fatalf("failed to load config with StringList expected: %v", err)
+	}
+	if len(app.Config.DNSRecords[0].Expected) != 1 || app.Config.DNSRecords[0].Expected[0] != "1.2.3.4" {
+		t.Errorf("expected single string parsed as slice of 1 element, got %v", app.Config.DNSRecords[0].Expected)
+	}
+	if len(app.Config.DNSRecords[1].Expected) != 2 {
+		t.Errorf("expected slice parsed with 2 elements, got %v", app.Config.DNSRecords[1].Expected)
+	}
+}
+
+func TestConfig_TypeSpecificIPValidation(t *testing.T) {
+	// A record with IPv6 should fail
+	t.Run("A_RejectIPv6", func(t *testing.T) {
+		cfgJSON := `{
+			"dns_records": [
+				{
+					"hostname": "a.example.com",
+					"name": "Bad A",
+					"type": "A",
+					"expected": ["2001:db8::1"]
+				}
+			]
+		}`
+		tmpFile := t.TempDir() + "/bad_a.json"
+		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
+			t.Fatalf("failed to write temp file: %v", err)
+		}
+		_, err := LoadConfig(context.Background(), tmpFile)
+		if err == nil || !strings.Contains(err.Error(), "requires IPv4") {
+			t.Errorf("expected error requiring IPv4, got %v", err)
+		}
+	})
+
+	// AAAA record with IPv4 should fail
+	t.Run("AAAA_RejectIPv4", func(t *testing.T) {
+		cfgJSON := `{
+			"dns_records": [
+				{
+					"hostname": "aaaa.example.com",
+					"name": "Bad AAAA",
+					"type": "AAAA",
+					"expected": ["1.2.3.4"]
+				}
+			]
+		}`
+		tmpFile := t.TempDir() + "/bad_aaaa.json"
+		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
+			t.Fatalf("failed to write temp file: %v", err)
+		}
+		_, err := LoadConfig(context.Background(), tmpFile)
+		if err == nil || !strings.Contains(err.Error(), "requires IPv6") {
+			t.Errorf("expected error requiring IPv6, got %v", err)
+		}
+	})
+
+	// IP record accepts both IPv4 and IPv6 and canonicalizes them sorted
+	t.Run("IP_AcceptsBothIPv4AndIPv6", func(t *testing.T) {
+		cfgJSON := `{
+			"dns_records": [
+				{
+					"hostname": "dual.example.com",
+					"name": "Dual Stack IP",
+					"type": "IP",
+					"expected": ["2001:db8::1", "192.0.2.1", "2001:db8::1", "198.51.100.1"]
+				}
+			]
+		}`
+		tmpFile := t.TempDir() + "/dual.json"
+		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
+			t.Fatalf("failed to write temp file: %v", err)
+		}
+		app, err := LoadConfig(context.Background(), tmpFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected := app.Config.DNSRecords[0].Expected
+		// Deduplicated: 3 elements ("192.0.2.1", "198.51.100.1", "2001:db8::1")
+		if len(expected) != 3 {
+			t.Fatalf("expected 3 canonicalized elements, got %d: %v", len(expected), expected)
+		}
+		if !slices.IsSorted(expected) {
+			t.Errorf("expected elements to be sorted, got %v", expected)
+		}
+	})
+}
+
+

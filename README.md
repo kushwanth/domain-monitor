@@ -17,7 +17,7 @@ Built specifically for low-resource environments, this monitor uses a completely
 *   **CAA Policy Enforcement & Tree Climbing:** Validates `issue`, `issuewild`, and `issuemail` tags with automatic DNS tree climbing (subdomain to parent zone) and support for explicit deny-all policies (`[]` or `[";"]`).
 *   **Certificate Transparency (CT) Log Monitoring:** Real-time forward polling for newly issued SSL/TLS certificates via `api.ctlogs.dev`, incremental backfilling with state cursors, and local JSON history persistence.
 *   **Consolidated Notification Engine & Privacy:** Buffers and throttles alerts to Ntfy and Telegram, deduplicates identical alerts for 24 hours, supports domain name privacy redaction in Telegram messages using human-readable names, and allows per-domain alert muting.
-*   **Embedded Web Dashboard & REST API:** Responsive modern single-page dashboard with Dark (OLED) and Light modes pre-rendered server-side. The HTTP server starts instantly for Docker/K8s liveness probes (`/health`), while gracefully blocking `/` and `/api/state` until the initial monitoring sweep completes to prevent zero-state flashes.
+*   **Embedded Web Dashboard & REST API:** Responsive modern single-page dashboard with Dark (OLED) and Light modes pre-rendered server-side. The HTTP server starts instantly for Docker/K8s liveness probes (`/health`), while returning an initializing status on `/api/state` and `/` until the initial monitoring sweep completes, avoiding blocked connections or zero-state crashes.
 
 ---
 
@@ -63,6 +63,11 @@ local IP = "IP";
       domain: "example.com", 
       name: "Prod Domain", 
       expected_ns: default_ns,
+      // secondary_ns: ["slave.otherprovider.com"], // Optional: for dumb secondary DNS verification (must reuse primary DNSKEYs)
+      expected_registrar_id: "292", // IANA ID (Priority 1: takes precedence; mutually exclusive in evaluation)
+      // expected_registrar_name: "markmonitor", // Fallback substring (Priority 2: evaluated only if expected_registrar_id is omitted)
+      domain_transfer_locked: true, // Verifies transfer lock is enabled in EPP status
+      // verify_ns_health: true, // Direct SOA consistency & dumb DNSKEY sync checks between primary and secondary_ns
       check_email_security: true,
       mail_provider: "google",
       // mx_records: ["mx.custom.com"], // Mutually exclusive with mail_provider
@@ -111,7 +116,10 @@ local IP = "IP";
     { hostname: "internal.example.com", name: "Internal Service", type: A, expected: ["10.0.0.5"], custom_resolver: "10.0.0.1" },
 
     // Self-Signed Certificate Acceptance
-    { hostname: "homelab.example.com", name: "Homelab Router", type: A, expected: ["192.168.1.1"], accept_self_signed: true }
+    { hostname: "homelab.example.com", name: "Homelab Router", type: A, expected: ["192.168.1.1"], accept_self_signed: true },
+
+    // Skip SSL Certificate Validation (for plain HTTP / internal endpoints)
+    { hostname: "plain.example.com", name: "Plain HTTP", type: A, expected: ["192.168.1.2"], skip_ssl: true }
   ]
 }
 ```
@@ -140,7 +148,8 @@ local IP = "IP";
 | :--- | :--- | :---: | :--- |
 | `domain` | string | **Yes** | Fully qualified domain name to monitor (e.g. `"example.com"`). |
 | `name` | string | **Yes** | Human-readable identifier (used for privacy redaction in notifications). |
-| `expected_ns` | array | No | Expected authoritative nameservers. Alerts on missing or unauthorized NS. |
+| `expected_ns` | array | No | Expected primary authoritative nameservers. Alerts on missing or unauthorized NS in RDAP/delegation. |
+| `secondary_ns` | array | No | Optional dumb secondary nameservers replicating zone from primary. Evaluated if given; skipped if omitted. Must either be unsigned or reuse primary's exact DNSKEY keys (independent signing with distinct keys is rejected). |
 | `is_delegated_zone`| bool | No | Set to `true` for subzones; queries authoritative NS directly without RDAP. |
 | `root_zone` | string | Conditional | Mandatory when `is_delegated_zone: true` (e.g. `"example.com"`). |
 | `check_email_security` | bool | No | Enables SPF, DMARC, DKIM, and MX integrity monitoring. |
@@ -150,6 +159,10 @@ local IP = "IP";
 | `dnssec` | bool | No | Enables 2-tier local cryptographic and upstream DoH DNSSEC validation. |
 | `monitor_ct_logs` | bool | No | Enables Certificate Transparency log polling and backfilling. |
 | `caa` | object | No | CAA validation policy (`issue`, `issuewild`, `issuemail`). |
+| `expected_registrar_id` | string | No | Expected IANA Registrar ID (numeric, e.g. `"292"`). **Priority 1** (takes precedence over `expected_registrar_name`). Evaluation is mutually exclusive. |
+| `expected_registrar_name` | string | No | Expected registrar name substring (case-insensitive). **Priority 2** (evaluated only if `expected_registrar_id` is omitted). Mutually exclusive in evaluation. |
+| `domain_transfer_locked` | bool | No | Set to `true` to alert if the domain transfer lock (`clientTransferProhibited` / `serverTransferProhibited`) is missing. |
+| `verify_ns_health` | bool | No | Directly queries primary `expected_ns[0]` (`RD=0`) for reachability, authority (`AA`), and SOA serial. If `secondary_ns` is given, also validates secondary reachability, authority, SOA consistency, and dumb secondary DNSKEY replication; if `secondary_ns` is omitted, secondary checks are cleanly skipped. |
 | `accept_self_signed` | bool | No | Allows self-signed certificates during TLS expiration checks. |
 | `suppress_alerts` | bool | No | Mutes notification alerts for this domain while maintaining state tracking. |
 
@@ -159,11 +172,12 @@ local IP = "IP";
 | :--- | :--- | :---: | :--- |
 | `hostname` | string | **Yes** | Hostname / FQDN to query. |
 | `name` | string | **Yes** | Human-readable identifier. |
-| `type` | string | **Yes** | Record type (`A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, or `IP`). |
+| `type` | string | **Yes** | Record type (`A`, `AAAA`, `CNAME`, `ALIAS`, `MX`, `TXT`, `CAA`, `NS`, or `IP`). |
 | `expected` | array | **Yes** | List of expected values. |
 | `match_type` | string | No | Match strategy: `"exact"` (default), `"prefix"`, `"contains"`, or `"any_of"`. |
 | `custom_resolver` | string | No | Custom resolver IP for this record (falls back to global resolvers on error). |
 | `accept_self_signed` | bool | No | Accepts self-signed TLS certificates for SSL expiration monitoring. |
+| `skip_ssl` | bool | No | Skip TLS/SSL certificate checks entirely for webserver record types (`A`, `AAAA`, `CNAME`, `ALIAS`, `IP`). Ideal for non-HTTPS services, plaintext HTTP, or internal infrastructure to prevent false alarms. |
 
 ---
 
@@ -244,7 +258,7 @@ The daemon provides an embedded Web UI and JSON API:
 *   **`GET /api/certs?domain=example.com`:** Certificate Transparency history for a domain via query parameter.
 *   **`GET /api/ctlogs/{domain}`:** Certificate Transparency history for a domain via path parameter.
 
-> **Safe Startup Guarantee:** The HTTP server listens immediately so `/health` responds right away, while `/` and `/api/state` gracefully await completion of the first monitoring sweep before serving data, guaranteeing no zero-state flashes.
+> **Safe Startup Guarantee:** The HTTP server listens immediately so `/health` responds right away, while `/` and `/api/state` return a clear initializing status until the initial monitoring sweep completes, guaranteeing no deadlocks or zero-state crashes.
 
 ---
 
@@ -292,7 +306,8 @@ For systemd-managed Linux environments, deploy using the included `domain-monito
 This project maintains strict testing standards, including table-driven unit tests and continuous fuzzing:
 
 *   **Run all tests:** `go test ./src/... -v -race`
-*   **Unit & Fuzz tests:** Located alongside source files (`notify_test.go`, `lookup_test.go`, `dns_test.go`, `config_test.go`, `bootstrap_test.go`, `extended_test.go`).
+*   **Unit Tests:** Located alongside source files (`notify_test.go`, `lookup_test.go`, `dns_test.go`, `config_test.go`, `bootstrap_test.go`, `extended_test.go`).
+*   **Continuous Fuzzing:** Dedicated native Go fuzz suites (`FuzzFlexibleDateParsing` and `FuzzNormalizeEPPStatus` in `lookup_test.go`, `FuzzParseCAAIssuer` in `dns_test.go`). Run with `go test -fuzz=FuzzFlexibleDateParsing -fuzztime=30s ./src/`.
 
 ---
 

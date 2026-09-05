@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -24,15 +25,26 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("X-XSS-Protection", "0")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self';")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-cache")
 		if b, ok := app.PrerenderedJSON.Load().([]byte); ok {
@@ -99,13 +111,35 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 		if b, ok := app.PrerenderedHTML.Load().([]byte); ok {
 			_, _ = w.Write(b)
 		} else {
-			_, _ = w.Write([]byte("Loading initial monitoring state..."))
+			_, _ = w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="2">
+  <title>DomainGuard - Initializing</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #1e293b; border: 1px solid #334155; padding: 32px; border-radius: 12px; text-align: center; max-width: 420px; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3); }
+    .spinner { width: 36px; height: 36px; border: 3px solid #334155; border-top-color: #3b82f6; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h2 { margin: 0 0 8px; font-size: 1.25rem; font-weight: 600; }
+    p { color: #94a3b8; font-size: 0.9rem; margin: 0; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <h2>DomainGuard Initializing</h2>
+    <p>Running initial domain, DNS, and SSL security checks. This page will update automatically in a moment...</p>
+  </div>
+</body>
+</html>`))
 		}
 	})
 
 	server := &http.Server{
 		Addr:                ":" + port,
-		Handler:             mux,
+		Handler:             securityHeadersMiddleware(mux),
 		ReadTimeout:         5 * time.Second,
 		WriteTimeout:        10 * time.Second,
 		IdleTimeout:         120 * time.Second,
@@ -169,17 +203,73 @@ func main() {
 	rdapHTTPClient := NewRDAPHTTPClient(10 * time.Second)
 	slog.Info(fmt.Sprintf(MsgLogStartup, len(app.Config.Domains), len(app.Config.DNSRecords)))
 
-	firstRunDone := make(chan struct{})
+	indexTmpl, err := template.New("index").Parse(string(indexHTML))
+	if err != nil {
+		slog.Error("Failed to parse index template", "error", err)
+	}
+
+	// Pre-render initial application state immediately so GET / and GET /api/state
+	// are instantly available upon process startup.
+	initialState := &CheckState{
+		RDAP:     make(map[string]*RDAPState),
+		DNS:      make(map[string]*DNSState),
+		Email:    make(map[string]*EmailState),
+		CAA:      make(map[string]*CAAResult),
+		DNSSEC:   make(map[string]*DNSSECResult),
+		CTLogs:   make(map[string]*CTLogState),
+		NSHealth: make(map[string]*NSHealthResult),
+	}
+	for _, dt := range app.Config.Domains {
+		initialState.RDAP[dt.Domain] = &RDAPState{Status: StatusPending}
+		if dt.VerifyNSHealth && len(dt.ExpectedNS) > 0 {
+			initialState.NSHealth[dt.Domain] = &NSHealthResult{
+				Primary: dt.ExpectedNS[0],
+			}
+		}
+	}
+	for _, rec := range app.Config.DNSRecords {
+		key := rec.Name
+		initialState.DNS[key] = &DNSState{
+			Hostname: rec.Hostname,
+			Name:     rec.Name,
+			Type:     rec.Type,
+			Expected: rec.Expected,
+			Status:   StatusPending,
+			SkipSSL:  rec.SkipSSL,
+			SSLDays:  SSLDaysNotApplicable,
+		}
+	}
+	if b, err := jsonv2.Marshal(initialState); err == nil {
+		app.PrerenderedJSON.Store(b)
+		if indexTmpl != nil {
+			var buf bytes.Buffer
+			escapedJSON := bytes.ReplaceAll(b, []byte("</"), []byte(`<\/`))
+			if err := indexTmpl.Execute(&buf, map[string]any{
+				"StateJSON": template.JS(escapedJSON),
+			}); err == nil {
+				app.PrerenderedHTML.Store(buf.Bytes())
+			}
+		}
+	}
+
 	server, serverErrChan := setupHTTPServer(app, app.Config.Port)
 
 	engineDone := make(chan struct{})
 	// Execute concurrent engine
 	go func() {
 		defer close(engineDone)
-		defer app.Notifier.Flush(ctx)
+		defer func() {
+			flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer flushCancel()
+			app.Notifier.Flush(flushCtx)
+		}()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("Monitoring engine encountered unexpected panic", "panic", r)
+			}
+		}()
 		maxWorkers := max(runtime.NumCPU()*10, 50)
 
-		isFirstRun := true
 		ctLogPersist := make(map[string]*CTLogState)
 		prevRDAPStatus := make(map[string]CheckStatus)
 		prevDNSStatus := make(map[string]CheckStatus)
@@ -191,209 +281,248 @@ func main() {
 			}
 		}
 
-		indexTmpl, err := template.New("index").Parse(string(indexHTML))
-		if err != nil {
-			slog.Error("Failed to parse index template", "error", err)
-		}
-
 		for {
-			cycleStart := time.Now()
-			cycleMaxTimeout := max(app.LoopDuration, 15*time.Minute)
-			cycleCtx, cycleCancel := context.WithTimeout(ctx, cycleMaxTimeout)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("Monitoring cycle encountered unexpected panic", "panic", r)
+					}
+				}()
 
-			app.Notifier.StartCycle()
-
-			loopState := &CheckState{
-				RDAP:   make(map[string]*RDAPState),
-				DNS:    make(map[string]*DNSState),
-				Email:  make(map[string]*EmailState),
-				CAA:    make(map[string]*CAAResult),
-				DNSSEC: make(map[string]*DNSSECResult),
-				CTLogs: make(map[string]*CTLogState),
-			}
-
-			for k, v := range ctLogPersist {
-				loopState.CTLogs[k] = &CTLogState{
-					LatestID:         v.LatestID,
-					BackfillCursor:   v.BackfillCursor,
-					BackfillComplete: v.BackfillComplete,
+				cycleStart := time.Now()
+				ctCount := 0
+				for _, dt := range app.Config.Domains {
+					if dt.MonitorCTLogs {
+						ctCount++
+					}
 				}
-			}
+				estimatedRequiredTime := (time.Duration(len(app.Config.Domains)) * app.WhoisDelay) +
+					(time.Duration(ctCount) * app.ReqDelay) + 5*time.Minute
+				cycleMaxTimeout := max(app.LoopDuration, 15*time.Minute, estimatedRequiredTime)
+				cycleCtx, cycleCancel := context.WithTimeout(ctx, cycleMaxTimeout)
 
-			for _, dt := range app.Config.Domains {
-				loopState.UpdateRDAP(dt.Domain, &RDAPState{Status: StatusPending})
-			}
+				app.Notifier.StartCycle()
 
-			// Execute DNS & Email concurrently with panic recovery
-			g := newWorkerGroup(cycleCtx, maxWorkers)
+				loopState := &CheckState{
+					RDAP:     make(map[string]*RDAPState),
+					DNS:      make(map[string]*DNSState),
+					Email:    make(map[string]*EmailState),
+					CAA:      make(map[string]*CAAResult),
+					DNSSEC:   make(map[string]*DNSSECResult),
+					CTLogs:   make(map[string]*CTLogState),
+					NSHealth: make(map[string]*NSHealthResult),
+				}
 
-			safeGo := func(fn func()) {
-				g.Go(func() {
-					defer func() {
-						if r := recover(); r != nil {
-							slog.Error("Worker panicked during check execution", "panic", r)
-						}
-					}()
-					fn()
-				})
-			}
+				activeDomains := make(map[string]bool, len(app.Config.Domains))
+				for _, dt := range app.Config.Domains {
+					activeDomains[dt.Domain] = true
+				}
 
-			// Dispatch DNS
-			for _, dnc := range app.Config.DNSRecords {
-				record := dnc
-				safeGo(func() {
-					evaluateDNS(cycleCtx, app, record, loopState)
-				})
-			}
+				for k, v := range ctLogPersist {
+					if !activeDomains[k] {
+						continue
+					}
+					loopState.CTLogs[k] = &CTLogState{
+						LatestID:         v.LatestID,
+						BackfillCursor:   v.BackfillCursor,
+						BackfillComplete: v.BackfillComplete,
+					}
+				}
 
-			// Dispatch Domain Checks
-			for _, dt := range app.Config.Domains {
-				domain := dt
-				safeGo(func() {
-					evaluateEmailSecurity(cycleCtx, app, domain, loopState)
-				})
-				if domain.IsDelegatedZone {
-					safeGo(func() {
-						validateNSDelegation(cycleCtx, app, domain, loopState)
+				for _, dt := range app.Config.Domains {
+					loopState.UpdateRDAP(dt.Domain, &RDAPState{Status: StatusPending})
+				}
+
+				// Execute DNS & Email concurrently with panic recovery
+				g := newWorkerGroup(cycleCtx, maxWorkers)
+
+				safeGo := func(fn func()) {
+					g.Go(func() {
+						defer func() {
+							if r := recover(); r != nil {
+								slog.Error("Worker panicked during check execution", "panic", r)
+							}
+						}()
+						fn()
 					})
 				}
-				safeGo(func() {
-					evaluateDNSSEC(cycleCtx, app, domain, loopState)
-				})
-				safeGo(func() {
-					evaluateCAA(cycleCtx, app, domain, loopState)
-				})
-			}
 
-			g.Wait()
-
-			// Run RDAP concurrently with bounded workers & rate limiting
-			gRDAP := newWorkerGroup(cycleCtx, 3)
-			rdapTicker := time.NewTicker(app.WhoisDelay)
-			rdapFirst := true
-
-		rdapLoop:
-			for _, dt := range app.Config.Domains {
-				if dt.IsDelegatedZone {
-					continue
+				// Dispatch DNS
+				for _, dnc := range app.Config.DNSRecords {
+					record := dnc
+					safeGo(func() {
+						evaluateDNS(cycleCtx, app, record, loopState)
+					})
 				}
-				targetDomain := dt
-				if !rdapFirst {
-					select {
-					case <-cycleCtx.Done():
-						break rdapLoop
-					case <-rdapTicker.C:
+
+				// Dispatch Domain Checks
+				for _, dt := range app.Config.Domains {
+					domain := dt
+					safeGo(func() {
+						evaluateEmailSecurity(cycleCtx, app, domain, loopState)
+					})
+					if domain.IsDelegatedZone {
+						safeGo(func() {
+							validateNSDelegation(cycleCtx, app, domain, loopState)
+						})
+					}
+					safeGo(func() {
+						evaluateDNSSEC(cycleCtx, app, domain, loopState)
+					})
+					safeGo(func() {
+						evaluateCAA(cycleCtx, app, domain, loopState)
+					})
+					if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
+						safeGo(func() {
+							evaluateNSHealth(cycleCtx, app, domain, loopState)
+						})
 					}
 				}
-				rdapFirst = false
 
-				gRDAP.Go(func() {
-					defer func() {
-						if r := recover(); r != nil {
-							slog.Error("RDAP check panicked", "domain", targetDomain.Domain, "panic", r)
+				g.Wait()
+
+				// Run RDAP concurrently with bounded workers & rate limiting
+				gRDAP := newWorkerGroup(cycleCtx, 3)
+				rdapTicker := time.NewTicker(app.WhoisDelay)
+				rdapFirst := true
+
+			rdapLoop:
+				for _, dt := range app.Config.Domains {
+					if dt.IsDelegatedZone {
+						continue
+					}
+					targetDomain := dt
+					if !rdapFirst {
+						select {
+						case <-cycleCtx.Done():
+							break rdapLoop
+						case <-rdapTicker.C:
 						}
-					}()
-					evaluateRDAP(cycleCtx, rdapHTTPClient, app, targetDomain, loopState)
-				})
-			}
-			gRDAP.Wait()
-			rdapTicker.Stop()
+					}
+					rdapFirst = false
 
-			// Run CTLogs concurrently with bounded workers & rate limiting
-			gCT := newWorkerGroup(cycleCtx, 3)
-			ctTicker := time.NewTicker(app.ReqDelay)
-			ctFirst := true
-
-		ctLoop:
-			for _, dt := range app.Config.Domains {
-				if !dt.MonitorCTLogs {
-					continue
+					gRDAP.Go(func() {
+						defer func() {
+							if r := recover(); r != nil {
+								slog.Error("RDAP check panicked", "domain", targetDomain.Domain, "panic", r)
+							}
+						}()
+						evaluateRDAP(cycleCtx, rdapHTTPClient, app, targetDomain, loopState)
+					})
 				}
-				targetDomain := dt
-				if !ctFirst {
-					select {
-					case <-cycleCtx.Done():
-						break ctLoop
-					case <-ctTicker.C:
+				gRDAP.Wait()
+				rdapTicker.Stop()
+
+				// Run CTLogs concurrently with bounded workers & rate limiting
+				gCT := newWorkerGroup(cycleCtx, 3)
+				ctTicker := time.NewTicker(app.ReqDelay)
+				ctFirst := true
+
+			ctLoop:
+				for _, dt := range app.Config.Domains {
+					if !dt.MonitorCTLogs {
+						continue
+					}
+					targetDomain := dt
+					if !ctFirst {
+						select {
+						case <-cycleCtx.Done():
+							break ctLoop
+						case <-ctTicker.C:
+						}
+					}
+					ctFirst = false
+
+					gCT.Go(func() {
+						defer func() {
+							if r := recover(); r != nil {
+								slog.Error("CT log check panicked", "domain", targetDomain.Domain, "panic", r)
+							}
+						}()
+						evaluateCTLogs(cycleCtx, app, targetDomain, loopState)
+					})
+				}
+				gCT.Wait()
+				ctTicker.Stop()
+
+				maps.Copy(ctLogPersist, loopState.ExportCTLogs())
+				for k := range ctLogPersist {
+					if !activeDomains[k] {
+						delete(ctLogPersist, k)
 					}
 				}
-				ctFirst = false
 
-				gCT.Go(func() {
-					defer func() {
-						if r := recover(); r != nil {
-							slog.Error("CT log check panicked", "domain", targetDomain.Domain, "panic", r)
-						}
-					}()
-					evaluateCTLogs(cycleCtx, app, targetDomain, loopState)
-				})
-			}
-			gCT.Wait()
-			ctTicker.Stop()
-
-			maps.Copy(ctLogPersist, loopState.ExportCTLogs())
-
-			if b, err := jsonv2.Marshal(ctLogPersist); err == nil {
-				if writeErr := atomicWriteFile(ctStatePath, b, 0600); writeErr != nil {
-					slog.Warn("Failed to write ct_state.json", "error", writeErr)
+				if b, err := jsonv2.Marshal(ctLogPersist); err == nil {
+					if writeErr := atomicWriteFile(ctStatePath, b, 0600); writeErr != nil {
+						slog.Warn("Failed to write ct_state.json", "error", writeErr)
+					}
 				}
-			}
 
-			// State transition logging
-			for domain, currRDAP := range loopState.RDAP {
-				if prev, ok := prevRDAPStatus[domain]; ok && prev != currRDAP.Status {
-					slog.Info("State transition", "check", "RDAP", "domain", domain, "prev", prev, "current", currRDAP.Status)
+				// State transition logging with Go 1.27 sorted map key iterators
+				for _, domain := range slices.Sorted(maps.Keys(loopState.RDAP)) {
+					currRDAP := loopState.RDAP[domain]
+					if currRDAP == nil {
+						continue
+					}
+					if prev, ok := prevRDAPStatus[domain]; ok && prev != currRDAP.Status {
+						slog.Info("State transition", "check", "RDAP", "domain", domain, "prev", prev, "current", currRDAP.Status)
+					}
+					prevRDAPStatus[domain] = currRDAP.Status
 				}
-				prevRDAPStatus[domain] = currRDAP.Status
-			}
-			for name, currDNS := range loopState.DNS {
-				if prev, ok := prevDNSStatus[name]; ok && prev != currDNS.Status {
-					slog.Info("State transition", "check", "DNS", "record", name, "prev", prev, "current", currDNS.Status)
+				for _, name := range slices.Sorted(maps.Keys(loopState.DNS)) {
+					currDNS := loopState.DNS[name]
+					if currDNS == nil {
+						continue
+					}
+					if prev, ok := prevDNSStatus[name]; ok && prev != currDNS.Status {
+						slog.Info("State transition", "check", "DNS", "record", name, "prev", prev, "current", currDNS.Status)
+					}
+					prevDNSStatus[name] = currDNS.Status
 				}
-				prevDNSStatus[name] = currDNS.Status
-			}
-			for domain, currEmail := range loopState.Email {
-				if prev, ok := prevEmailStatus[domain]; ok && prev != currEmail.Status {
-					slog.Info("State transition", "check", "Email", "domain", domain, "prev", prev, "current", currEmail.Status)
+				for _, domain := range slices.Sorted(maps.Keys(loopState.Email)) {
+					currEmail := loopState.Email[domain]
+					if currEmail == nil {
+						continue
+					}
+					if prev, ok := prevEmailStatus[domain]; ok && prev != currEmail.Status {
+						slog.Info("State transition", "check", "Email", "domain", domain, "prev", prev, "current", currEmail.Status)
+					}
+					prevEmailStatus[domain] = currEmail.Status
 				}
-				prevEmailStatus[domain] = currEmail.Status
-			}
 
-			// Dispatch notifications and wait for transmissions to complete before cycle cancellation
-			app.Notifier.Flush(cycleCtx)
-			app.Notifier.Wait()
-			app.Notifier.EndCycle()
+				// Dispatch notifications with dedicated context so alerts are sent even if cycleCtx expired
+				notifyCtx, notifyCancel := context.WithTimeout(ctx, 30*time.Second)
+				app.Notifier.Flush(notifyCtx)
+				app.Notifier.Wait()
+				notifyCancel()
+				app.Notifier.EndCycle()
 
-			// Pre-render JSON and HTML
-			loopState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
-			loopState.NextRefresh = time.Now().Add(app.LoopDuration).UTC().Format(time.RFC3339)
-			jsonBytes, _ := jsonv2.Marshal(loopState)
-			app.PrerenderedJSON.Store(jsonBytes)
+				// Pre-render JSON and HTML
+				loopState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+				loopState.NextRefresh = time.Now().Add(app.LoopDuration).UTC().Format(time.RFC3339)
+				jsonBytes, _ := jsonv2.Marshal(loopState)
+				app.PrerenderedJSON.Store(jsonBytes)
 
-			if indexTmpl != nil {
-				var buf bytes.Buffer
-				escapedJSON := bytes.ReplaceAll(jsonBytes, []byte("</"), []byte(`<\/`))
-				if err := indexTmpl.Execute(&buf, map[string]any{
-					"StateJSON": template.JS(escapedJSON),
-				}); err != nil {
-					slog.Error("HTML prerender failed", "error", err)
-				} else {
-					app.PrerenderedHTML.Store(buf.Bytes())
+				if indexTmpl != nil {
+					var buf bytes.Buffer
+					escapedJSON := bytes.ReplaceAll(jsonBytes, []byte("</"), []byte(`<\/`))
+					if err := indexTmpl.Execute(&buf, map[string]any{
+						"StateJSON": template.JS(escapedJSON),
+					}); err != nil {
+						slog.Error("HTML prerender failed", "error", err)
+					} else {
+						app.PrerenderedHTML.Store(buf.Bytes())
+					}
 				}
-			}
 
-			if isFirstRun {
-				close(firstRunDone)
-				isFirstRun = false
-			}
-
-			cycleDuration := time.Since(cycleStart)
-			slog.Info("Monitoring cycle completed",
-				"duration_ms", cycleDuration.Milliseconds(),
-				"domains_checked", len(app.Config.Domains),
-				"dns_records_checked", len(app.Config.DNSRecords),
-			)
-			cycleCancel()
+				cycleDuration := time.Since(cycleStart)
+				slog.Info("Monitoring cycle completed",
+					"duration_ms", cycleDuration.Milliseconds(),
+					"domains_checked", len(app.Config.Domains),
+					"dns_records_checked", len(app.Config.DNSRecords),
+				)
+				cycleCancel()
+			}()
 
 			// Wait for next cycle with ±5% jitter using Go 1.27 generic rand.N on time.Duration
 			jitterRange := app.LoopDuration / 20
@@ -422,6 +551,8 @@ func main() {
 		slog.Info(fmt.Sprintf(MsgLogShutdownSignal, sig))
 	case sErr := <-serverErrChan:
 		slog.Error("HTTP server stopped unexpectedly", "error", sErr)
+	case <-engineDone:
+		slog.Error("Monitoring engine stopped unexpectedly")
 	}
 
 	// Trigger cancellation for engines

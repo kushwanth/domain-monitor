@@ -23,7 +23,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 		return
 	}
 
-	state.CTLogsMu.Lock()
+	state.mu.Lock()
 	currentState, exists := state.CTLogs[target.Domain]
 	if !exists {
 		currentState = &CTLogState{Status: StatusPending}
@@ -32,7 +32,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 	latestID := currentState.LatestID
 	backfillCursor := currentState.BackfillCursor
 	backfillComplete := currentState.BackfillComplete
-	state.CTLogsMu.Unlock()
+	state.mu.Unlock()
 
 	// 1. Fetch Page 1 (Forward Polling for New Certs)
 	apiURL := fmt.Sprintf("%s%s", CTLogsAPIEndpoint, target.Domain)
@@ -159,7 +159,7 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevR
 		return nil, err
 	}
 
-	if app.Config.CTLogsAPIKey != "" {
+	if app.Config != nil && app.Config.CTLogsAPIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+app.Config.CTLogsAPIKey)
 	}
 
@@ -175,12 +175,16 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevR
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil, fmt.Errorf("api.ctlogs.dev rate limit exceeded")
 	} else if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(bodyBytes))
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		bodyStr := string(bodyBytes)
+		if app.Config != nil && app.Config.CTLogsAPIKey != "" {
+			bodyStr = strings.ReplaceAll(bodyStr, app.Config.CTLogsAPIKey, "[REDACTED_API_KEY]")
+		}
+		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, bodyStr)
 	}
 
 	var ctResp CTLogsDevResponse
-	if err := jsonv2.UnmarshalRead(resp.Body, &ctResp); err != nil {
+	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, 16<<20), &ctResp); err != nil {
 		return nil, fmt.Errorf("JSON parse error: %v", err)
 	}
 
@@ -228,11 +232,11 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 	}
 
 	if addedNew {
-		if b, err := jsonv2.Marshal(combined); err == nil {
-			return atomicWriteFile(cleanPath, b, 0644)
-		} else {
+		b, err := jsonv2.Marshal(combined)
+		if err != nil {
 			return err
 		}
+		return atomicWriteFile(cleanPath, b, 0644)
 	}
 	return nil
 }

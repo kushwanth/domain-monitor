@@ -11,10 +11,10 @@ import (
 
 // System & Default Paths
 const (
-	DefaultDataDir             = "/app/data"
-	DefaultDoHURL              = "https://dns.google/resolve"
-	DefaultCTLogsSubdir        = "ct_logs"
-	MaxNotificationMessageLen  = 3500
+	DefaultDataDir            = "/app/data"
+	DefaultDoHURL             = "https://dns.google/resolve"
+	DefaultCTLogsSubdir       = "ct_logs"
+	MaxNotificationMessageLen = 3500
 )
 
 // External API Endpoints
@@ -395,13 +395,25 @@ const (
 	MsgLogEmailUnknownProv = "Unknown mail_provider '%s' for %s. Skipping MX hijack prevention."
 
 	// RDAP Alerts
-	MsgAlertRDAPExpiry    = "%s expires in %.0f days"
-	MsgAlertRDAPModified  = "registry record modified for %s! timestamp: %s"
-	MsgAlertRDAPUnauthNS  = "unauthorized ns on %s: %s"
-	MsgAlertRDAPMissingNS = "expected ns missing from %s: %s"
-	MsgAlertRDAPSuspended = "domain %s suspended! status: %s"
-	MsgAlertRDAPUnlocked  = "%s is unlocked (missing transfer prohibitions)"
-	MsgAlertRDAPDiscrep   = "Hierarchy discrepancy for %s: %s"
+	MsgAlertRDAPExpiry                = "%s expires in %.0f days"
+	MsgAlertRDAPModified              = "registry record modified for %s! timestamp: %s"
+	MsgAlertRDAPUnauthNS              = "unauthorized ns on %s: %s"
+	MsgAlertRDAPMissingNS             = "expected ns missing from %s: %s"
+	MsgAlertRDAPSuspended             = "domain %s suspended! status: %s"
+	MsgAlertRDAPUnlocked              = "%s is unlocked (missing transfer prohibitions)"
+	MsgAlertRDAPDiscrep               = "Hierarchy discrepancy for %s: %s"
+	MsgAlertRDAPRegistrarIDMismatch   = "Registrar mismatch for %s: expected IANA ID '%s', found '%s'"
+	MsgAlertRDAPRegistrarNameMismatch = "Registrar mismatch for %s: expected registrar containing '%s', found '%s'"
+
+	// Nameserver Health Alerts
+	MsgAlertNSUnreachable      = "Nameserver %s unreachable for %s: %v"
+	MsgAlertNSNonAuthoritative = "Nameserver %s not authoritative (AA flag missing) for %s"
+	MsgAlertNSSOALag           = "Secondary nameserver %s SOA serial (%d) lags behind primary %s (%d) for %s"
+	MsgAlertNSSOAMismatch      = "Secondary nameserver %s SOA serial (%d) differs from primary %s (%d) for %s"
+	MsgAlertNSDNSKEYMissing    = "Secondary nameserver %s missing DNSKEY records present on primary for %s"
+	MsgAlertNSDNSKEYMismatch   = "Secondary nameserver %s serves mismatched DNSKEY records for %s (dumb secondary must replicate primary keys, independent signing not supported)"
+	MsgAlertNSDNSKEYUnexpected = "Secondary nameserver %s serves DNSKEY records for %s but primary is unsigned (dumb secondary must be unsigned)"
+	MsgAlertNSMissingSOA       = "Nameserver %s did not return an SOA record for %s"
 
 	// RDAP Info
 	MsgLogRDAPFail = "RDAP query failed for %s: %v"
