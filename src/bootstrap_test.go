@@ -60,7 +60,7 @@ func TestNewRDAPHTTPClient(t *testing.T) {
 	}
 }
 
-func TestGetKnownWhoisServer(t *testing.T) {
+func TestKnownWhoisServer(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -75,9 +75,9 @@ func TestGetKnownWhoisServer(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		server := GetKnownWhoisServer(tt.domain)
+		server := KnownWhoisServer(tt.domain)
 		if server != tt.expected {
-			t.Errorf("GetKnownWhoisServer(%q) = %q, expected %q", tt.domain, server, tt.expected)
+			t.Errorf("KnownWhoisServer(%q) = %q, expected %q", tt.domain, server, tt.expected)
 		}
 	}
 }
@@ -236,3 +236,20 @@ func TestBootstrapConcurrentColdStart(t *testing.T) {
 		t.Errorf("Expected exactly 1 HTTP request due to singleflight double-checked fetch, got %d", totalReqs)
 	}
 }
+
+func TestNilSafety_Bootstrap(t *testing.T) {
+	var nilB *Bootstrap
+	if _, err := nilB.ServersFor(context.Background(), "example.com"); err == nil {
+		t.Errorf("expected error from ServersFor on nil Bootstrap")
+	}
+	if nilB.isFresh() {
+		t.Errorf("expected isFresh to be false for nil Bootstrap")
+	}
+	if err := nilB.ensure(context.Background()); err == nil {
+		t.Errorf("expected error from ensure on nil Bootstrap")
+	}
+	if err := nilB.fetch(context.Background()); err == nil {
+		t.Errorf("expected error from fetch on nil Bootstrap")
+	}
+}
+

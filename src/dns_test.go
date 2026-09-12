@@ -531,24 +531,15 @@ func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 		Name:               "Unreachable",
 		CheckEmailSecurity: true,
 	}
-	state := &CheckState{
-		Email: make(map[string]*EmailState),
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-
-	evaluateEmailSecurity(ctx, app, target, state)
+	savedState := evaluateEmailSecurity(ctx, app, target)
 
 	for _, alert := range app.Notifier.Buffer {
 		if strings.Contains(alert.Message, "Missing SPF") || strings.Contains(alert.Message, "Missing DMARC") {
 			t.Errorf("Unexpected false alert on DNS lookup error: %s", alert.Message)
 		}
 	}
-
-	state.mu.Lock()
-	savedState := state.Email["unreachable-domain.com"]
-	state.mu.Unlock()
 
 	if savedState == nil {
 		t.Fatalf("Expected EmailState to be saved")
@@ -645,17 +636,16 @@ func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
 		Email: make(map[string]*EmailState),
 	}
 
-	evaluateEmailSecurity(context.Background(), app, target, state)
+	res := evaluateEmailSecurity(context.Background(), app, target)
 
-	state.mu.Lock()
+	state.Email["example.com"] = res
 	savedState := state.Email["example.com"]
-	state.mu.Unlock()
 
 	if savedState == nil {
 		t.Fatalf("Expected EmailState to be saved for example.com")
 	}
-	if savedState.Status != StatusOk {
-		t.Errorf("Expected email status StatusOk when at least one selector is valid, got %s (error: %s)", savedState.Status, savedState.Error)
+	if savedState.Status != StatusOK {
+		t.Errorf("Expected email status StatusOK when at least one selector is valid, got %s (error: %s)", savedState.Status, savedState.Error)
 	}
 	if !savedState.SPF {
 		t.Errorf("Expected SPF=true, got false")
@@ -781,23 +771,23 @@ func TestMultipleSameTypeDNSTasks_NoKeyCollision(t *testing.T) {
 		MatchType: "contains",
 	}
 
-	evaluateDNS(context.Background(), app, task1, state)
-	evaluateDNS(context.Background(), app, task2, state)
+	res1 := evaluateDNS(context.Background(), app, task1)
+	res2 := evaluateDNS(context.Background(), app, task2)
 
-	state.mu.Lock()
+	state.DNS[task1.Name] = res1
+	state.DNS[task2.Name] = res2
 	count := len(state.DNS)
 	s1 := state.DNS["SPF TXT"]
 	s2 := state.DNS["Google Verification"]
-	state.mu.Unlock()
 
 	if count != 2 {
 		t.Errorf("Expected 2 distinct DNS states, got %d", count)
 	}
-	if s1 == nil || s1.Status != StatusOk {
-		t.Errorf("Expected task 1 to be StatusOk, got %+v", s1)
+	if s1 == nil || s1.Status != StatusOK {
+		t.Errorf("Expected task 1 to be StatusOK, got %+v", s1)
 	}
-	if s2 == nil || s2.Status != StatusOk {
-		t.Errorf("Expected task 2 to be StatusOk, got %+v", s2)
+	if s2 == nil || s2.Status != StatusOK {
+		t.Errorf("Expected task 2 to be StatusOK, got %+v", s2)
 	}
 }
 
@@ -844,7 +834,7 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 		CheckEmailSecurity: true,
 	}
 
-	var status CheckStatus = StatusOk
+	status := StatusOK
 	found, err := validateDMARC(context.Background(), app, target, &status)
 	if err != nil {
 		t.Fatalf("validateDMARC failed: %v", err)
@@ -852,8 +842,8 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 	if !found {
 		t.Errorf("Expected DMARC to be discovered from parent organizational domain example.com")
 	}
-	if status != StatusOk {
-		t.Errorf("Expected StatusOk, got %s", status)
+	if status != StatusOK {
+		t.Errorf("Expected StatusOK, got %s", status)
 	}
 	if len(app.Notifier.Buffer) > 0 {
 		t.Errorf("Unexpected false positive alert dispatched: %+v", app.Notifier.Buffer)
@@ -1184,13 +1174,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			VerifyNSHealth: true,
 			DNSSEC:         true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || !res.Valid {
 			t.Fatalf("Expected valid NSHealth for identical replicated DNSKEY")
@@ -1216,13 +1200,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			VerifyNSHealth: true,
 			DNSSEC:         true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || !res.Valid {
 			t.Fatalf("Expected valid NSHealth for unsigned zone without DNSKEY")
@@ -1245,13 +1223,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			VerifyNSHealth: true,
 			DNSSEC:         true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid when secondary uses its own DNSKEYs")
@@ -1277,13 +1249,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			VerifyNSHealth: true,
 			DNSSEC:         true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid when secondary serves unexpected DNSKEY")
@@ -1309,13 +1275,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			VerifyNSHealth: true,
 			DNSSEC:         false, // Explicitly false!
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid when secondary serves DNSKEY even if DNSSEC=false")
@@ -1341,13 +1301,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			VerifyNSHealth: true,
 			DNSSEC:         true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid on missing DNSKEY")
@@ -1372,13 +1326,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			SecondaryNS:    []string{sAddr},
 			VerifyNSHealth: true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid on secondary SOA lag")
@@ -1402,13 +1350,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			VerifyNSHealth: true,
 			DNSSEC:         true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || !res.Valid {
 			t.Fatalf("Expected valid NSHealth for primary-only nameserver check")
@@ -1443,13 +1385,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			SecondaryNS:    nil, // secondary_ns is omitted!
 			VerifyNSHealth: true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || res.Valid {
 			t.Fatalf("Expected NSHealth to be invalid when primary is not authoritative")
@@ -1485,13 +1421,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			ExpectedNS:     []string{pAddr},
 			VerifyNSHealth: true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || res.Valid {
 			t.Fatalf("Expected NSHealth to be invalid when primary returns no SOA")
@@ -1542,13 +1472,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			ExpectedNS:     []string{pAddr},
 			VerifyNSHealth: true,
 		}
-		state := &CheckState{NSHealth: make(map[string]*NSHealthResult)}
-
-		evaluateNSHealth(context.Background(), app, target, state)
-
-		state.mu.Lock()
-		res := state.NSHealth["example.com"]
-		state.mu.Unlock()
+		res := evaluateNSHealth(context.Background(), app, target)
 
 		if res == nil || !res.Valid {
 			t.Fatalf("Expected NSHealth to be valid when primary returns SOA in Ns section, got invalid")
@@ -1603,17 +1527,16 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 		SkipSSL:  true,
 	}
 
-	evaluateDNS(context.Background(), app, taskSkip, state)
+	resSkip := evaluateDNS(context.Background(), app, taskSkip)
 
-	state.mu.Lock()
-	resSkip := state.DNS["Web Server No SSL"]
-	state.mu.Unlock()
+	state.DNS[taskSkip.Name] = resSkip
+	resSkip = state.DNS["Web Server No SSL"]
 
 	if resSkip == nil {
 		t.Fatalf("expected DNS state to be recorded for taskSkip")
 	}
-	if resSkip.Status != StatusOk {
-		t.Errorf("expected StatusOk, got %v", resSkip.Status)
+	if resSkip.Status != StatusOK {
+		t.Errorf("expected StatusOK, got %v", resSkip.Status)
 	}
 	if !resSkip.SkipSSL {
 		t.Errorf("expected DNSState.SkipSSL to be true")
@@ -1686,17 +1609,16 @@ func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
 		SkipSSL:  true,
 	}
 
-	evaluateDNS(context.Background(), app, task, state)
+	res := evaluateDNS(context.Background(), app, task)
 
-	state.mu.Lock()
-	res := state.DNS["Multi IP Test"]
-	state.mu.Unlock()
+	state.DNS[task.Name] = res
+	res = state.DNS["Multi IP Test"]
 
 	if res == nil {
 		t.Fatalf("expected state for 'Multi IP Test' to exist")
 	}
-	if res.Status != StatusOk {
-		t.Fatalf("expected StatusOk, got %s (error: %s)", res.Status, res.Error)
+	if res.Status != StatusOK {
+		t.Fatalf("expected StatusOK, got %s (error: %s)", res.Status, res.Error)
 	}
 	expectedOrder := []string{"192.0.2.1", "198.51.100.2", "2001:db8::1"}
 	if !slices.Equal(res.Found, expectedOrder) {
@@ -1745,17 +1667,16 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 		SkipSSL:  true,
 	}
 
-	evaluateDNS(context.Background(), app, task, state)
+	res := evaluateDNS(context.Background(), app, task)
 
-	state.mu.Lock()
-	res := state.DNS["Flattened CNAME Direct IP"]
-	state.mu.Unlock()
+	state.DNS[task.Name] = res
+	res = state.DNS["Flattened CNAME Direct IP"]
 
 	if res == nil {
 		t.Fatalf("expected state for 'Flattened CNAME Direct IP' to exist")
 	}
-	if res.Status != StatusOk {
-		t.Errorf("expected StatusOk, got %s (error: %s)", res.Status, res.Error)
+	if res.Status != StatusOK {
+		t.Errorf("expected StatusOK, got %s (error: %s)", res.Status, res.Error)
 	}
 	if len(res.Found) != 1 || res.Found[0] != "192.0.2.99" {
 		t.Errorf("expected Found [192.0.2.99], got %v", res.Found)
@@ -1799,5 +1720,166 @@ func TestDNS_ValidateRecords_MultiIPConsolidatedAlert(t *testing.T) {
 	}
 }
 
+func TestNilSafety_AppState(t *testing.T) {
+	// 1. Nil AppState
+	var nilApp *AppState
+	resolvers := nilApp.Resolvers()
+	if len(resolvers) == 0 {
+		t.Errorf("expected fallback resolvers for nil AppState")
+	}
+	nilApp.SafeDispatch("test message", "redacted", PriorityHigh, "tag", "domain", "name")
 
+	// 2. AppState with nil Config
+	appNilCfg := &AppState{Notifier: nil}
+	res2 := appNilCfg.Resolvers()
+	if len(res2) == 0 {
+		t.Errorf("expected fallback resolvers for AppState with nil Config")
+	}
+	appNilCfg.SafeDispatch("test message", "redacted", PriorityHigh, "tag", "domain", "name")
 
+	// 3. AppState with empty Config.Resolvers
+	appEmptyRes := &AppState{Config: &AppConfig{Resolvers: []string{}}}
+	res3 := appEmptyRes.Resolvers()
+	if len(res3) == 0 {
+		t.Errorf("expected fallback resolvers for empty Resolvers slice")
+	}
+}
+
+func TestNilSafety_EvaluationsWithNilApp(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 1. evaluateCAA with nil app and active CAA config
+	caaCfg := DomainConfig{
+		Domain: "example.com",
+		CAA: &CAAConfig{
+			Issue: []string{"letsencrypt.org"},
+		},
+	}
+	caaRes := evaluateCAA(ctx, nil, caaCfg)
+	if caaRes == nil {
+		t.Errorf("expected non-nil CAAResult")
+	}
+
+	// 2. validateCAATag with nil res
+	validateCAATag(nil, caaCfg, "issue", []string{"letsencrypt.org"}, nil, nil)
+
+	// 3. evaluateDNSSEC with nil app
+	dnssecCfg := DomainConfig{
+		Domain: "example.com",
+		DNSSEC: true,
+	}
+	dnssecRes := evaluateDNSSEC(ctx, nil, dnssecCfg)
+	if dnssecRes == nil {
+		t.Errorf("expected non-nil DNSSECResult")
+	}
+
+	// 4. evaluateDNS with nil app
+	dnsTask := DNSTask{
+		Hostname: "example.com",
+		Name:     "example-a",
+		Type:     "A",
+		Expected: StringList{"93.184.216.34"},
+		SkipSSL:  true,
+	}
+	dnsState := evaluateDNS(ctx, nil, dnsTask)
+	if dnsState == nil {
+		t.Errorf("expected non-nil DNSState")
+	}
+
+	// 5. evaluateEmailSecurity with nil app
+	emailCfg := DomainConfig{
+		Domain:             "example.com",
+		CheckEmailSecurity: true,
+		MXRecords:          []string{"mail.example.com"},
+	}
+	emailState := evaluateEmailSecurity(ctx, nil, emailCfg)
+	if emailState == nil {
+		t.Errorf("expected non-nil EmailState")
+	}
+
+	// 6. validateMX, validateSPF, validateDMARC, validateDKIM with nil emailStatus pointer
+	_, _ = validateMX(ctx, nil, emailCfg, nil)
+	_, _ = validateSPF(ctx, nil, emailCfg, nil)
+	_, _ = validateDMARC(ctx, nil, emailCfg, nil)
+	_, _ = validateDKIM(ctx, nil, emailCfg, nil)
+
+	// 7. evaluateNSHealth with nil app
+	nsCfg := DomainConfig{
+		Domain:         "example.com",
+		VerifyNSHealth: true,
+		ExpectedNS:     []string{"ns1.example.com"},
+	}
+	nsRes := evaluateNSHealth(ctx, nil, nsCfg)
+	if nsRes == nil {
+		t.Errorf("expected non-nil NSHealthResult")
+	}
+}
+
+func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
+	app := &AppState{
+		Config: &AppConfig{
+			Resolvers: []string{"192.0.2.1:53"}, // Unreachable
+		},
+		Notifier: &NotificationManager{},
+	}
+	target := DomainConfig{
+		Domain:             "transient-error.example.com",
+		CheckEmailSecurity: true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+
+	emailStatus := StatusOK
+	mxs, err := validateMX(ctx, app, target, &emailStatus)
+	if err == nil {
+		t.Fatalf("Expected error on unreachable resolver")
+	}
+	if len(mxs) != 0 {
+		t.Errorf("Expected 0 MX records on error, got %v", mxs)
+	}
+	// Must NOT alert "No MX records found. Email delivery is broken." on transient network failure
+	for _, alert := range app.Notifier.Buffer {
+		if strings.Contains(alert.Message, "No MX records found") || strings.Contains(alert.Redacted, "No MX records found") {
+			t.Errorf("Unexpected false alarm on transient query error: %+v", alert)
+		}
+	}
+}
+
+func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
+	app := &AppState{
+		Config:   &AppConfig{},
+		Notifier: &NotificationManager{},
+	}
+
+	task := DNSTask{
+		Hostname: "test.example.com",
+		Name:     "Test Mismatch Task",
+		Type:     "A",
+		Expected: []string{"192.0.2.1"},
+	}
+
+	valid, reason := validateRecordsWithReason(app, task, []string{"198.51.100.1"})
+	if valid {
+		t.Fatalf("expected mismatch to return valid=false")
+	}
+	if reason == "" || !strings.Contains(reason, "missing expected records") {
+		t.Errorf("expected reason to document missing records, got: %q", reason)
+	}
+
+	// Also verify prefix mismatch reason
+	prefixTask := DNSTask{
+		Hostname:  "prefix.example.com",
+		Name:      "Prefix Task",
+		Type:      "TXT",
+		MatchType: "prefix",
+		Expected:  []string{"v=spf1"},
+	}
+	pValid, pReason := validateRecordsWithReason(app, prefixTask, []string{"other text"})
+	if pValid {
+		t.Fatalf("expected prefix mismatch to return valid=false")
+	}
+	if !strings.Contains(pReason, "prefix") {
+		t.Errorf("expected prefix mismatch reason, got: %q", pReason)
+	}
+}

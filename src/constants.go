@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"regexp"
 	"time"
 
@@ -14,7 +13,11 @@ const (
 	DefaultDataDir            = "/app/data"
 	DefaultDoHURL             = "https://dns.google/resolve"
 	DefaultCTLogsSubdir       = "ct_logs"
+	DefaultUserAgent          = "DomainMonitor/1.0 (+https://github.com/domain-monitor)"
 	MaxNotificationMessageLen = 3500
+	MaxBootstrapResponseSize  = 8 << 20  // 8 MB
+	MaxCTLogsResponseSize     = 16 << 20 // 16 MB
+	MaxNotificationPayloadSize = 1 << 20 // 1 MB
 )
 
 // External API Endpoints
@@ -28,7 +31,7 @@ const (
 
 const (
 	StatusPending  CheckStatus = "pending"
-	StatusOk       CheckStatus = "ok"
+	StatusOK       CheckStatus = "ok"
 	StatusFailed   CheckStatus = "failed"
 	StatusMismatch CheckStatus = "mismatch"
 	StatusWarning  CheckStatus = "warning"
@@ -50,13 +53,14 @@ const (
 
 // System Errors
 var (
-	ErrDNSResolution   = errors.New("dns resolution failed")
-	ErrNXDOMAIN        = errors.New("no such host (NXDOMAIN)")
-	ErrSERVFAIL        = errors.New("server failure (SERVFAIL)")
-	ErrSSLValidation   = errors.New("ssl validation failed")
-	ErrRDAPNotFound    = fmt.Errorf("RDAP domain not found (404)")
-	ErrRDAPRateLimited = fmt.Errorf("RDAP rate limited (429)")
-	ErrDomainNotFound  = errors.New("domain not found in whois (404)")
+	ErrDNSResolution    = errors.New("dns resolution failed")
+	ErrNXDOMAIN         = errors.New("no such host (NXDOMAIN)")
+	ErrSERVFAIL         = errors.New("server failure (SERVFAIL)")
+	ErrSSLValidation    = errors.New("ssl validation failed")
+	ErrRDAPNotFound     = errors.New("RDAP domain not found (404)")
+	ErrRDAPRateLimited  = errors.New("RDAP rate limited (429)")
+	ErrWhoisRateLimited = errors.New("whois rate limited (429)")
+	ErrDomainNotFound   = errors.New("domain not found in whois (404)")
 )
 
 // DNSTypeMap maps record type string names to miekg/dns uint16 type constants.
@@ -211,7 +215,8 @@ var WhoisNotFoundIndicators = []string{
 
 // Precompiled Regular Expressions
 var (
-	ValidDomainRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+	ReValidDomain    = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+	ValidDomainRegex = ReValidDomain
 
 	ReWhoisReferral  = regexp.MustCompile(`(?i)(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)\s*:\s*(?:whois:\/\/)?([a-zA-Z0-9.-]+)`)
 	ReWhoisExpiry    = regexp.MustCompile(`(?i)(?:\[?(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\]?)\s*[:\]]?\s*([^\r\n]+)`)
@@ -359,49 +364,49 @@ var ProviderDKIMMap = map[string][]string{
 // Alert & Log Notification Messages
 const (
 	// DNS Alerts
-	MsgAlertDNSFailed   = "DNS Resolution Failed: %s (%s)"
-	MsgAlertDNSMismatch = "Mismatch on %s (%s)! Missing expected: %s. Found: [%s]"
-	MsgAlertDNSUnauth   = "Unauthorized record found on %s (%s): %s! Expected: [%s]"
+	MsgAlertDNSFailed       = "DNS Resolution Failed: %s (%s)"
+	MsgAlertDNSMismatch     = "Mismatch on %s (%s)! Missing expected: %s. Found: [%s]"
+	MsgAlertDNSUnauthorized = "Unauthorized record found on %s (%s): %s! Expected: [%s]"
 
 	// DNS Info
-	MsgLogDNSCustomFail = "Custom resolver %s failed for %s. Falling back to global pool."
+	MsgLogDNSCustomResolverFailed = "Custom resolver %s failed for %s. Falling back to global pool."
 
 	// DNSSEC Alerts
-	MsgAlertDNSSECNoDS        = "DNSSEC: No DS record at parent for %s"
-	MsgAlertDNSSECNoDNSKEY    = "DNSSEC: No DNSKEY records found for %s"
-	MsgAlertDNSSECMismatch    = "DNSSEC: DS does not match any DNSKEY for %s"
-	MsgAlertDNSSECRRSIGFail   = "DNSSEC: RRSIG verification failed for %s"
-	MsgAlertDNSSECChainBroken = "DNSSEC: Full chain of trust validation failed (AD flag missing) for %s"
+	MsgAlertDNSSECNoDS          = "DNSSEC: No DS record at parent for %s"
+	MsgAlertDNSSECNoDNSKEY      = "DNSSEC: No DNSKEY records found for %s"
+	MsgAlertDNSSECMismatch      = "DNSSEC: DS does not match any DNSKEY for %s"
+	MsgAlertDNSSECRRSIGFailed   = "DNSSEC: RRSIG verification failed for %s"
+	MsgAlertDNSSECChainBroken   = "DNSSEC: Full chain of trust validation failed (AD flag missing) for %s"
 
 	// CAA Alerts
-	MsgAlertCAAMissing    = "CAA: No %s records found for %s"
-	MsgAlertCAAUnauth     = "CAA: Unauthorized CA '%s' in %s record for %s"
-	MsgAlertCAAExpectedNA = "CAA: Expected CA '%s' missing from %s record for %s"
+	MsgAlertCAAMissing         = "CAA: No %s records found for %s"
+	MsgAlertCAAUnauthorized    = "CAA: Unauthorized CA '%s' in %s record for %s"
+	MsgAlertCAAExpectedNA      = "CAA: Expected CA '%s' missing from %s record for %s"
 
 	// CT Logs Alerts
 	MsgAlertNewSSLCert = "New SSL Certificate issued for %s by %s. Match: %s"
 
 	// Email Security Alerts
-	MsgAlertEmailNoMX      = "Email Security: No MX records found for %s"
-	MsgAlertEmailMXMissing = "Email Security: Missing expected MX %s on %s. Found: [%s]"
-	MsgAlertEmailMXUnauth  = "Email Security: Unauthorized MX %s on %s! Expected: [%s]"
-	MsgAlertEmailMXHijack  = "MX HIJACK DETECTED for %s! Expected provider %s infrastructure, found: [%s]"
-	MsgAlertEmailNoSPF     = "Missing SPF record for %s"
-	MsgAlertEmailMultiSPF  = "Multiple SPF records found for %s! This breaks email delivery."
-	MsgAlertEmailNoDMARC   = "Missing DMARC record for %s (_dmarc.%s)"
-	MsgAlertEmailNoDKIM    = "No valid DKIM records found for %s (checked: %s)"
+	MsgAlertEmailNoMX            = "Email Security: No MX records found for %s"
+	MsgAlertEmailMXMissing       = "Email Security: Missing expected MX %s on %s. Found: [%s]"
+	MsgAlertEmailMXUnauthorized  = "Email Security: Unauthorized MX %s on %s! Expected: [%s]"
+	MsgAlertEmailMXHijack        = "MX HIJACK DETECTED for %s! Expected provider %s infrastructure, found: [%s]"
+	MsgAlertEmailNoSPF           = "Missing SPF record for %s"
+	MsgAlertEmailMultiSPF        = "Multiple SPF records found for %s! This breaks email delivery."
+	MsgAlertEmailNoDMARC         = "Missing DMARC record for %s (_dmarc.%s)"
+	MsgAlertEmailNoDKIM          = "No valid DKIM records found for %s (checked: %s)"
 
 	// Email Security Info
-	MsgLogEmailUnknownProv = "Unknown mail_provider '%s' for %s. Skipping MX hijack prevention."
+	MsgLogEmailUnknownProvider = "Unknown mail_provider '%s' for %s. Skipping MX hijack prevention."
 
 	// RDAP Alerts
 	MsgAlertRDAPExpiry                = "%s expires in %.0f days"
-	MsgAlertRDAPModified              = "registry record modified for %s! timestamp: %s"
-	MsgAlertRDAPUnauthNS              = "unauthorized ns on %s: %s"
+	MsgAlertRDAPExpired               = "Domain %s is EXPIRED! (expired %.0f days ago)"
+	MsgAlertRDAPUnauthorizedNS        = "unauthorized ns on %s: %s"
 	MsgAlertRDAPMissingNS             = "expected ns missing from %s: %s"
 	MsgAlertRDAPSuspended             = "domain %s suspended! status: %s"
 	MsgAlertRDAPUnlocked              = "%s is unlocked (missing transfer prohibitions)"
-	MsgAlertRDAPDiscrep               = "Hierarchy discrepancy for %s: %s"
+	MsgAlertRDAPDiscrepancy           = "Hierarchy discrepancy for %s: %s"
 	MsgAlertRDAPRegistrarIDMismatch   = "Registrar mismatch for %s: expected IANA ID '%s', found '%s'"
 	MsgAlertRDAPRegistrarNameMismatch = "Registrar mismatch for %s: expected registrar containing '%s', found '%s'"
 
@@ -415,12 +420,9 @@ const (
 	MsgAlertNSDNSKEYUnexpected = "Secondary nameserver %s serves DNSKEY records for %s but primary is unsigned (dumb secondary must be unsigned)"
 	MsgAlertNSMissingSOA       = "Nameserver %s did not return an SOA record for %s"
 
-	// RDAP Info
-	MsgLogRDAPFail = "RDAP query failed for %s: %v"
-
 	// WHOIS Info
 	MsgLogWHOISFallback = "RDAP failed for %s, attempting WHOIS fallback..."
-	MsgLogWHOISFail     = "WHOIS fallback also failed for %s: %v"
+	MsgLogWHOISFailed   = "WHOIS fallback also failed for %s: %v"
 	MsgLogWHOISSuccess  = "WHOIS fallback succeeded for %s"
 	MsgLogHierarchyWarn = "Hierarchy discrepancy detected for %s: %s"
 

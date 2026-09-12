@@ -4,8 +4,7 @@ import (
 	"bytes"
 	"context"
 	jsonv2 "encoding/json/v2"
-	"log/slog"
-	"maps"
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -16,6 +15,9 @@ import (
 type StringList []string
 
 func (s *StringList) UnmarshalJSON(data []byte) error {
+	if s == nil {
+		return errors.New("nil StringList receiver")
+	}
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		*s = nil
@@ -37,9 +39,7 @@ func (s *StringList) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// ==========================================
 // 1. Status & Priority Enums
-// ==========================================
 
 // CheckStatus represents lifecycle status of a check
 type CheckStatus string
@@ -47,9 +47,7 @@ type CheckStatus string
 // AlertPriority defines the urgency level of a notification alert
 type AlertPriority string
 
-// ==========================================
 // 2. Configuration Models
-// ==========================================
 
 type CAAConfig struct {
 	Issue     []string `json:"issue"`
@@ -73,12 +71,10 @@ type Notifications struct {
 }
 
 type AppConfig struct {
-	Port          string         `json:"port"`
-	DataDir       string         `json:"data_dir,omitempty"`
-	LoopInterval  string         `json:"loop_interval"`
-	RequestDelay  string         `json:"request_delay"`
-	WhoisDelay    string         `json:"whois_delay"`
-	Notifications Notifications  `json:"notifications"`
+	Port             string         `json:"port"`
+	DataDir          string         `json:"data_dir,omitempty"`
+	LoopIntervalDays float64        `json:"loop_interval_days"`
+	Notifications    Notifications  `json:"notifications"`
 	Resolvers     []string       `json:"resolvers"`
 	DoHURL        string         `json:"doh_url,omitempty"`
 	CTLogsAPIKey  string         `json:"ctlogs_api_key,omitempty"`
@@ -124,18 +120,37 @@ type AppState struct {
 	Config              *AppConfig
 	Notifier            *NotificationManager
 	LoopDuration        time.Duration
-	ReqDelay            time.Duration
-	WhoisDelay          time.Duration
-	StateMu             sync.Mutex
-	StateLastChanged    map[string]string
-	PrerenderedHTML     atomic.Value
 	PrerenderedJSON     atomic.Value
 	GlobalResolverIndex atomic.Uint32
 }
 
-// ==========================================
+// Resolvers returns the configured DNS resolvers, or safe default public resolvers
+// if app, Config, or Resolvers is nil/empty.
+func (a *AppState) Resolvers() []string {
+	if a != nil && a.Config != nil && len(a.Config.Resolvers) > 0 {
+		return a.Config.Resolvers
+	}
+	return []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+}
+
+// SafeDispatch safely dispatches an alert via Notifier if both app and Notifier are non-nil,
+// while always logging the alert message.
+func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority, tag, domain, name string) {
+	if a == nil || a.Notifier == nil {
+		switch priority {
+		case PriorityUrgent, PriorityHigh:
+			LogError(message, "domain", domain, "priority", priority, "tag", tag)
+		case PriorityWarning:
+			LogWarn(message, "domain", domain, "priority", priority, "tag", tag)
+		default:
+			LogInfo(message, "domain", domain, "priority", priority, "tag", tag)
+		}
+		return
+	}
+	a.Notifier.Dispatch(message, redacted, priority, tag, domain, name)
+}
+
 // 3. Domain & Check Result Models
-// ==========================================
 
 // RDAPLink represents an RFC 9083 web link.
 type RDAPLink struct {
@@ -313,7 +328,6 @@ type NSHealthResult struct {
 
 // CheckState coordinates the per-cycle aggregated state across all checks.
 type CheckState struct {
-	mu          sync.Mutex                 `json:"-"`
 	RDAP        map[string]*RDAPState      `json:"rdap_checks"`
 	DNS         map[string]*DNSState       `json:"dns_checks"`
 	Email       map[string]*EmailState     `json:"email_checks"`
@@ -325,55 +339,64 @@ type CheckState struct {
 	NextRefresh string                     `json:"next_refresh"`
 }
 
-// updateStateMap safely updates a keyed entry in any state map using Go generics.
-func updateStateMap[T any](c *CheckState, m map[string]T, key string, val T) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	m[key] = val
+// DomainResult holds the evaluation results for a single domain.
+type DomainResult struct {
+	Domain   string
+	RDAP     *RDAPState
+	Email    *EmailState
+	CAA      *CAAResult
+	DNSSEC   *DNSSECResult
+	CTLogs   *CTLogState
+	NSHealth *NSHealthResult
 }
 
-func (c *CheckState) UpdateRDAP(key string, state *RDAPState) {
-	updateStateMap(c, c.RDAP, key, state)
-}
-
-func (c *CheckState) UpdateDNS(key string, state *DNSState) {
-	updateStateMap(c, c.DNS, key, state)
-}
-
-func (c *CheckState) UpdateEmail(key string, state *EmailState) {
-	updateStateMap(c, c.Email, key, state)
-}
-
-func (c *CheckState) UpdateCAA(key string, state *CAAResult) {
-	updateStateMap(c, c.CAA, key, state)
-}
-
-func (c *CheckState) UpdateDNSSEC(key string, state *DNSSECResult) {
-	updateStateMap(c, c.DNSSEC, key, state)
-}
-
-func (c *CheckState) UpdateCTLogs(key string, state *CTLogState) {
-	updateStateMap(c, c.CTLogs, key, state)
-}
-
-func (c *CheckState) UpdateNSHealth(key string, state *NSHealthResult) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.NSHealth == nil {
-		c.NSHealth = make(map[string]*NSHealthResult)
-	}
-	c.NSHealth[key] = state
+// DNSResult holds the evaluation result for a single DNS task.
+type DNSResult struct {
+	Name  string
+	State *DNSState
 }
 
 func (c *CheckState) ExportCTLogs() map[string]*CTLogState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return maps.Clone(c.CTLogs)
+	if c == nil {
+		return make(map[string]*CTLogState)
+	}
+	return CopyMap(c.CTLogs)
 }
 
-// ==========================================
+// ApplyDNSResult safely incorporates an individual DNS check result into the state.
+func (c *CheckState) ApplyDNSResult(res DNSResult) {
+	if c == nil || res.State == nil || res.Name == "" {
+		return
+	}
+	InitMap(&c.DNS)[res.Name] = res.State
+}
+
+// ApplyDomainResult safely incorporates an individual domain check result into the state.
+func (c *CheckState) ApplyDomainResult(res DomainResult) {
+	if c == nil || res.Domain == "" {
+		return
+	}
+	if res.RDAP != nil {
+		InitMap(&c.RDAP)[res.Domain] = res.RDAP
+	}
+	if res.Email != nil {
+		InitMap(&c.Email)[res.Domain] = res.Email
+	}
+	if res.CAA != nil {
+		InitMap(&c.CAA)[res.Domain] = res.CAA
+	}
+	if res.DNSSEC != nil {
+		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
+	}
+	if res.CTLogs != nil {
+		InitMap(&c.CTLogs)[res.Domain] = res.CTLogs
+	}
+	if res.NSHealth != nil {
+		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
+	}
+}
+
 // 4. Notification Models & Interfaces
-// ==========================================
 
 // Alert represents a single notification event
 type Alert struct {
@@ -410,9 +433,7 @@ type TelegramProvider struct {
 	ChatID string
 }
 
-// ==========================================
 // 5. External API & Response Payloads
-// ==========================================
 
 type CTLogsDevResponse struct {
 	Rows       []CTCert `json:"rows"`
@@ -434,57 +455,7 @@ type queryResult struct {
 	err error
 }
 
-// ==========================================
 // 6. Concurrency & Network Infrastructure
-// ==========================================
-
-// workerGroup coordinates bounded concurrent task execution using standard library primitives.
-type workerGroup struct {
-	ctx context.Context
-	sem chan struct{}
-	wg  sync.WaitGroup
-}
-
-func newWorkerGroup(ctx context.Context, limit int) *workerGroup {
-	var sem chan struct{}
-	if limit > 0 {
-		sem = make(chan struct{}, limit)
-	}
-	return &workerGroup{
-		ctx: ctx,
-		sem: sem,
-	}
-}
-
-func (g *workerGroup) Go(fn func()) {
-	if g.ctx != nil && g.ctx.Err() != nil {
-		return
-	}
-	if g.sem != nil {
-		select {
-		case <-g.ctx.Done():
-			return
-		case g.sem <- struct{}{}:
-		}
-	}
-	g.wg.Add(1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("Worker group task panicked", "panic", r)
-			}
-			if g.sem != nil {
-				<-g.sem
-			}
-			g.wg.Done()
-		}()
-		fn()
-	}()
-}
-
-func (g *workerGroup) Wait() {
-	g.wg.Wait()
-}
 
 // Bootstrap manages IANA RDAP bootstrap registry caches and queries.
 type Bootstrap struct {

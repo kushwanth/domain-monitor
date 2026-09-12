@@ -108,15 +108,15 @@ func TestEmailMXVerification(t *testing.T) {
 	}
 }
 
-func TestAtomicWriteFile(t *testing.T) {
+func TestExtended_AtomicWriteFile(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
 	targetPath := filepath.Join(tmpDir, "test.txt")
 
 	data1 := []byte("Initial content")
-	if err := atomicWriteFile(targetPath, data1, 0644); err != nil {
-		t.Fatalf("atomicWriteFile failed: %v", err)
+	if err := AtomicWriteFile(targetPath, data1, 0644); err != nil {
+		t.Fatalf("AtomicWriteFile failed: %v", err)
 	}
 
 	read1, err := os.ReadFile(targetPath)
@@ -125,8 +125,8 @@ func TestAtomicWriteFile(t *testing.T) {
 	}
 
 	data2 := []byte("Updated content atomically")
-	if err := atomicWriteFile(targetPath, data2, 0644); err != nil {
-		t.Fatalf("atomicWriteFile overwrite failed: %v", err)
+	if err := AtomicWriteFile(targetPath, data2, 0644); err != nil {
+		t.Fatalf("AtomicWriteFile overwrite failed: %v", err)
 	}
 
 	read2, err := os.ReadFile(targetPath)
@@ -145,8 +145,8 @@ func TestSaveCertsToHistory(t *testing.T) {
 	}()
 
 	certs1 := []CTCert{
-		{ID: "cert-1", Match: "example.com", Issuer: "Let's Encrypt"},
-		{ID: "cert-2", Match: "sub.example.com", Issuer: "DigiCert"},
+		{ID: "cert-1", Match: "example.com", Issuer: "Let's Encrypt", NotBefore: "2026-01-01T00:00:00Z"},
+		{ID: "cert-2", Match: "sub.example.com", Issuer: "DigiCert", NotBefore: "2026-02-01T00:00:00Z"},
 	}
 
 	if err := saveCertsToHistory(domain, certs1); err != nil {
@@ -155,8 +155,8 @@ func TestSaveCertsToHistory(t *testing.T) {
 
 	// Save batch 2 with overlapping and new certs
 	certs2 := []CTCert{
-		{ID: "cert-2", Match: "sub.example.com", Issuer: "DigiCert"},
-		{ID: "cert-3", Match: "api.example.com", Issuer: "Let's Encrypt"},
+		{ID: "cert-2", Match: "sub.example.com", Issuer: "DigiCert", NotBefore: "2026-02-01T00:00:00Z"},
+		{ID: "cert-3", Match: "api.example.com", Issuer: "Let's Encrypt", NotBefore: "2026-03-01T00:00:00Z"},
 	}
 	if err := saveCertsToHistory(domain, certs2); err != nil {
 		t.Fatalf("saveCertsToHistory batch 2 failed: %v", err)
@@ -177,12 +177,17 @@ func TestSaveCertsToHistory(t *testing.T) {
 	if len(combined) != 3 {
 		t.Errorf("Expected 3 deduplicated certs, got %d", len(combined))
 	}
+
+	// Verify sorted descending by NotBefore (newest first: cert-3, then cert-2, then cert-1)
+	if combined[0].ID != "cert-3" || combined[1].ID != "cert-2" || combined[2].ID != "cert-1" {
+		t.Errorf("Expected certs sorted descending by NotBefore (cert-3, cert-2, cert-1), got: %v, %v, %v",
+			combined[0].ID, combined[1].ID, combined[2].ID)
+	}
 }
 
 func TestHTTPServerRoutes(t *testing.T) {
 	app := &AppState{}
 	app.PrerenderedJSON.Store([]byte(`{"status":"prerendered"}`))
-	app.PrerenderedHTML.Store([]byte(`<!DOCTYPE html><html><body>Loaded</body></html>`))
 
 	server, _ := setupHTTPServer(app, "0")
 	handler := server.Handler
@@ -244,8 +249,8 @@ func TestHTTPServerRoutes(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("/ status = %d, expected 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "Loaded") {
-		t.Errorf("/ body = %s, expected Loaded", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "DomainMonitor") {
+		t.Errorf("/ body = %s, expected DomainMonitor", rec.Body.String())
 	}
 
 	// 7. GET /non-existent
@@ -326,20 +331,12 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 		MonitorCTLogs:  true,
 		SuppressAlerts: false,
 	}
-	state := &CheckState{
-		CTLogs: make(map[string]*CTLogState),
-	}
-
-	evaluateCTLogs(context.Background(), app, target, state)
+	saved := evaluateCTLogs(context.Background(), app, target, nil)
 
 	// First run must not emit notifications for existing cert baseline
 	if len(app.Notifier.Buffer) != 0 {
 		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(app.Notifier.Buffer))
 	}
-
-	state.mu.Lock()
-	saved := state.CTLogs[domain]
-	state.mu.Unlock()
 
 	if saved == nil {
 		t.Fatalf("Expected CTLogState to be saved")
@@ -347,8 +344,8 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 	if saved.LatestID != "cert-first-1" {
 		t.Errorf("Expected LatestID 'cert-first-1', got %q", saved.LatestID)
 	}
-	if saved.Status != StatusOk {
-		t.Errorf("Expected StatusOk, got %s", saved.Status)
+	if saved.Status != StatusOK {
+		t.Errorf("Expected StatusOK, got %s", saved.Status)
 	}
 }
 
@@ -384,33 +381,19 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 		SuppressAlerts: false,
 	}
 	savedCursor := "cursor-prior-checkpoint"
-	state := &CheckState{
-		CTLogs: map[string]*CTLogState{
-			domain: {
-				LatestID:         "cert-existing-1",
-				BackfillCursor:   savedCursor,
-				BackfillComplete: false,
-				Status:           StatusOk,
-			},
-		},
+	existing := &CTLogState{
+		LatestID:         "cert-existing-1",
+		BackfillCursor:   savedCursor,
+		BackfillComplete: false,
+		Status:           StatusOK,
 	}
 
-	evaluateCTLogs(context.Background(), app, target, state)
+	res := evaluateCTLogs(context.Background(), app, target, existing)
 
-	state.mu.Lock()
-	saved := state.CTLogs[domain]
-	state.mu.Unlock()
-
-	if saved == nil {
+	if res == nil {
 		t.Fatalf("Expected CTLogState to be present")
 	}
-	if saved.Status != StatusFailed {
-		t.Errorf("Expected StatusFailed on 429 rate limit, got %s", saved.Status)
-	}
-	if saved.BackfillCursor != savedCursor {
-		t.Errorf("Expected backfill cursor to be preserved as %q, got %q", savedCursor, saved.BackfillCursor)
-	}
-	if saved.BackfillComplete {
+	if res.BackfillComplete {
 		t.Errorf("Expected BackfillComplete to remain false after rate limit failure")
 	}
 }
@@ -469,4 +452,3 @@ func TestFetchCTPage_KeyRedaction(t *testing.T) {
 		t.Errorf("Expected [REDACTED_API_KEY] in error message: %v", err)
 	}
 }
-

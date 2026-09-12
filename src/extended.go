@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	jsonv2 "encoding/json/v2"
 	"fmt"
@@ -9,43 +10,41 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
 
 var (
 	CTLogsPath   = DefaultCTLogsSubdir
-	ctHTTPClient = &http.Client{Timeout: 10 * time.Second}
+	ctHTTPClient = ResolveHTTPClient(&http.Client{Timeout: 10 * time.Second})
 )
 
-func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, state *CheckState) {
+func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, prevState *CTLogState) *CTLogState {
 	if !target.MonitorCTLogs {
-		return
+		return nil
 	}
 
-	state.mu.Lock()
-	currentState, exists := state.CTLogs[target.Domain]
-	if !exists {
-		currentState = &CTLogState{Status: StatusPending}
-		state.CTLogs[target.Domain] = currentState
+	var latestID, backfillCursor string
+	var backfillComplete bool
+	if prevState != nil {
+		latestID = prevState.LatestID
+		backfillCursor = prevState.BackfillCursor
+		backfillComplete = prevState.BackfillComplete
 	}
-	latestID := currentState.LatestID
-	backfillCursor := currentState.BackfillCursor
-	backfillComplete := currentState.BackfillComplete
-	state.mu.Unlock()
 
 	// 1. Fetch Page 1 (Forward Polling for New Certs)
 	apiURL := fmt.Sprintf("%s%s", CTLogsAPIEndpoint, target.Domain)
 	respPage1, err := fetchCTPage(ctx, app, apiURL)
 	if err != nil {
-		state.UpdateCTLogs(target.Domain, &CTLogState{
+		LogError("CT logs polling failed", "domain", target.Domain, "error", err)
+		return &CTLogState{
 			LatestID:         latestID,
 			BackfillCursor:   backfillCursor,
 			BackfillComplete: backfillComplete,
 			Status:           StatusFailed,
 			Error:            err.Error(),
-		})
-		return
+		}
 	}
 
 	var newCerts []CTCert
@@ -70,7 +69,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 				msg := fmt.Sprintf(MsgAlertNewSSLCert, target.Domain, issuerName, row.Match)
 				redacted := fmt.Sprintf("New SSL Certificate issued by %s for %s.", issuerName, row.Match)
 				if !target.SuppressAlerts {
-					app.Notifier.Dispatch(msg, redacted, PriorityHigh, "lock", target.Domain, target.Name)
+					app.SafeDispatch(msg, redacted, PriorityHigh, "lock", target.Domain, target.Name)
 				}
 			}
 		}
@@ -78,15 +77,16 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 
 	// Save new certs to history
 	if len(newCerts) > 0 {
+		LogInfo("Discovered new SSL certificates via CT logs", "domain", target.Domain, "count", len(newCerts))
 		if err := saveCertsToHistory(target.Domain, newCerts); err != nil {
-			state.UpdateCTLogs(target.Domain, &CTLogState{
+			LogError("Failed to save CT logs history", "domain", target.Domain, "error", err)
+			return &CTLogState{
 				LatestID:         latestID, // Keep previous checkpoint on write failure to allow retry
 				BackfillCursor:   backfillCursor,
 				BackfillComplete: backfillComplete,
 				Status:           StatusFailed,
 				Error:            "History save failed: " + err.Error(),
-			})
-			return
+			}
 		}
 	}
 
@@ -111,26 +111,26 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 
 			respBackfill, err := fetchCTPage(ctx, app, backfillURL)
 			if err != nil {
-				state.UpdateCTLogs(target.Domain, &CTLogState{
+				LogWarn("CT logs backfill failed", "domain", target.Domain, "error", err)
+				return &CTLogState{
 					LatestID:         newLatestID,
 					BackfillCursor:   cursorToUse, // Keep old cursor to retry later
 					BackfillComplete: false,
 					Status:           StatusFailed,
 					Error:            "Backfill error: " + err.Error(),
-				})
-				return
+				}
 			}
 
 			if len(respBackfill.Rows) > 0 {
 				if err := saveCertsToHistory(target.Domain, respBackfill.Rows); err != nil {
-					state.UpdateCTLogs(target.Domain, &CTLogState{
+					LogError("Failed to save backfilled CT logs", "domain", target.Domain, "error", err)
+					return &CTLogState{
 						LatestID:         newLatestID,
 						BackfillCursor:   cursorToUse, // don't advance cursor
 						BackfillComplete: false,
 						Status:           StatusFailed,
 						Error:            "Backfill save failed: " + err.Error(),
-					})
-					return
+					}
 				}
 			}
 
@@ -144,13 +144,13 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, sta
 		}
 	}
 
-	state.UpdateCTLogs(target.Domain, &CTLogState{
+	return &CTLogState{
 		LatestID:         newLatestID,
 		BackfillCursor:   backfillCursor,
 		BackfillComplete: backfillComplete,
-		Status:           StatusOk,
+		Status:           StatusOK,
 		Error:            "",
-	})
+	}
 }
 
 func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevResponse, error) {
@@ -159,50 +159,48 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevR
 		return nil, err
 	}
 
-	if app.Config != nil && app.Config.CTLogsAPIKey != "" {
+	if app != nil && app.Config != nil && app.Config.CTLogsAPIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+app.Config.CTLogsAPIKey)
 	}
 
-	req.Header.Set("User-Agent", "DomainMonitor/1.0")
+	req.Header.Set("User-Agent", DefaultUserAgent)
 
 	resp, err := ctHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer DrainAndClose(resp.Body, 4096)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil, fmt.Errorf("api.ctlogs.dev rate limit exceeded")
 	} else if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize))
 		bodyStr := string(bodyBytes)
-		if app.Config != nil && app.Config.CTLogsAPIKey != "" {
+		if app != nil && app.Config != nil && app.Config.CTLogsAPIKey != "" {
 			bodyStr = strings.ReplaceAll(bodyStr, app.Config.CTLogsAPIKey, "[REDACTED_API_KEY]")
 		}
 		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, bodyStr)
 	}
 
 	var ctResp CTLogsDevResponse
-	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, 16<<20), &ctResp); err != nil {
-		return nil, fmt.Errorf("JSON parse error: %v", err)
+	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, MaxCTLogsResponseSize), &ctResp); err != nil {
+		return nil, fmt.Errorf("json parse error: %w", err)
 	}
 
 	return &ctResp, nil
 }
 
 func saveCertsToHistory(domain string, certs []CTCert) error {
-	cleanDomain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-	if cleanDomain == "" || !ValidDomainRegex.MatchString(cleanDomain) {
+	cleanDomain := NormalizeDomain(domain)
+	if cleanDomain == "" || !ReValidDomain.MatchString(cleanDomain) {
 		return fmt.Errorf("invalid domain for certs history: %q", domain)
 	}
-	if err := os.MkdirAll(CTLogsPath, 0755); err != nil {
+	if err := os.MkdirAll(CTLogsPath, 0775); err != nil {
 		return err
 	}
 	filePath := filepath.Join(CTLogsPath, cleanDomain+".json")
 	cleanPath := filepath.Clean(filePath)
-	cleanBase := filepath.Clean(CTLogsPath)
-	if cleanPath != cleanBase && !strings.HasPrefix(cleanPath, cleanBase+string(filepath.Separator)) {
+	if !IsSafeSubpath(CTLogsPath, cleanPath) {
 		return fmt.Errorf("invalid file path for certs history: %q", domain)
 	}
 
@@ -215,62 +213,34 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 	seen := make(map[string]bool)
 	var combined []CTCert
 
-	for _, c := range existing {
-		if !seen[c.ID] {
-			seen[c.ID] = true
-			combined = append(combined, c)
+	for _, cert := range existing {
+		if !seen[cert.ID] {
+			seen[cert.ID] = true
+			combined = append(combined, cert)
 		}
 	}
 
 	addedNew := false
-	for _, c := range certs {
-		if !seen[c.ID] {
-			seen[c.ID] = true
-			combined = append(combined, c)
+	for _, cert := range certs {
+		if !seen[cert.ID] {
+			seen[cert.ID] = true
+			combined = append(combined, cert)
 			addedNew = true
 		}
 	}
 
 	if addedNew {
+		slices.SortFunc(combined, func(a, b CTCert) int {
+			if n := cmp.Compare(b.NotBefore, a.NotBefore); n != 0 {
+				return n
+			}
+			return cmp.Compare(b.ID, a.ID)
+		})
 		b, err := jsonv2.Marshal(combined)
 		if err != nil {
 			return err
 		}
-		return atomicWriteFile(cleanPath, b, 0644)
-	}
-	return nil
-}
-
-// atomicWriteFile writes data to a temp file then renames it into place,
-// preventing corruption if the process is killed mid-write.
-func atomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		if err != nil {
-			_ = tmp.Close()
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if err = os.Chmod(tmpName, perm); err != nil {
-		return err
-	}
-	if _, err = tmp.Write(data); err != nil {
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(tmpName, path); err != nil {
-		return err
+		return AtomicWriteFile(cleanPath, b, 0644)
 	}
 	return nil
 }

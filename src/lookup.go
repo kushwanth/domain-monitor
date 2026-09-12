@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -18,7 +17,6 @@ import (
 	"github.com/likexian/whois"
 	whoisparser "github.com/likexian/whois-parser"
 	"github.com/miekg/dns"
-	"golang.org/x/net/idna"
 )
 
 var (
@@ -28,23 +26,20 @@ var (
 )
 
 func defaultWhoisQuery(domain string) (string, error) {
-	asciiDomain, err := idna.ToASCII(strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), ".")))
-	if err != nil {
-		asciiDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-	}
+	asciiDomain := NormalizeDomainToASCIIText(domain)
 	client := whois.NewClient().SetTimeout(10 * time.Second)
-	if knownServer := GetKnownWhoisServer(asciiDomain); knownServer != "" {
+	if knownServer := KnownWhoisServer(asciiDomain); knownServer != "" {
 		return client.Whois(asciiDomain, knownServer)
 	}
 	return client.Whois(asciiDomain)
 }
 
 // queryWhoisWithContext executes a WHOIS query asynchronously, honoring ctx cancellation.
+// Note: the WHOIS library (likexian/whois) does not natively support context. When ctx is
+// cancelled, the spawned goroutine continues running until the library's 10s TCP timeout
+// expires. This is a bounded leak by design — the goroutine always terminates within 10s.
 func queryWhoisWithContext(ctx context.Context, domain string, host ...string) (string, error) {
-	asciiDomain, err := idna.ToASCII(strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), ".")))
-	if err != nil {
-		asciiDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-	}
+	asciiDomain := NormalizeDomainToASCIIText(domain)
 
 	ch := make(chan queryResult, 1)
 	go func() {
@@ -131,7 +126,7 @@ func normalizeEPPStatus(raw string) string {
 		token := strings.TrimSpace(tokenRaw)
 		token = strings.TrimRight(token, ")/;, \t\r\n")
 		if token != "" && !strings.Contains(token, "/") && !strings.Contains(token, " ") {
-			cleanKey := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(token, " ", ""), "-", ""), "_", ""))
+			cleanKey := NormalizeStatusToken(token)
 			if canon, ok := EPPStatusMap[cleanKey]; ok {
 				return canon
 			}
@@ -162,7 +157,7 @@ func normalizeEPPStatus(raw string) string {
 	}
 
 	// 4. Map known multi-word, hyphenated, or camelCase EPP / RDAP status strings to canonical format
-	cleanKey := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, " ", ""), "-", ""), "_", ""))
+	cleanKey := NormalizeStatusToken(s)
 	if canon, ok := EPPStatusMap[cleanKey]; ok {
 		return unique.Make(canon).Value()
 	}
@@ -170,10 +165,10 @@ func normalizeEPPStatus(raw string) string {
 	return unique.Make(s).Value()
 }
 
-// cleanStatuses deduplicates and normalizes status strings.
+// NormalizeDomainStatuses deduplicates and normalizes status strings.
 // It also removes redundant generic status tokens (e.g. "transferProhibited", "deleteProhibited")
 // when a more specific client/server status (e.g. "clientTransferProhibited", "serverTransferProhibited") is present.
-func cleanStatuses(statuses []string) []string {
+func NormalizeDomainStatuses(statuses []string) []string {
 	seen := make(map[string]bool)
 	var normalized []string
 	for _, s := range statuses {
@@ -219,7 +214,7 @@ func cleanStatuses(statuses []string) []string {
 
 func isTransferLocked(statuses []string) bool {
 	for _, s := range statuses {
-		clean := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, " ", ""), "-", ""), "_", ""))
+		clean := NormalizeStatusToken(s)
 		if strings.Contains(clean, "transferprohibited") || strings.Contains(clean, "prohibittransfer") || strings.Contains(clean, "transferlock") {
 			return true
 		}
@@ -227,9 +222,9 @@ func isTransferLocked(statuses []string) bool {
 	return false
 }
 
-func getSuspensionStatus(statuses []string) (bool, string) {
+func isDomainSuspended(statuses []string) (bool, string) {
 	for _, s := range statuses {
-		clean := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, " ", ""), "-", ""), "_", ""))
+		clean := NormalizeStatusToken(s)
 		if clean == "serverhold" || clean == "clienthold" || clean == "pendingdelete" || clean == "redemptionperiod" || clean == "inactive" || clean == "hold" {
 			return true, s
 		}
@@ -405,6 +400,9 @@ func findRegistrarRecursively(entities []RDAPEntity) string {
 
 // collectRDAPReferralLinks scans both top-level domain links and all entity links for candidate registrar RDAP endpoints.
 func collectRDAPReferralLinks(domainInfo *RDAPDomainResponse, baseURL string) []string {
+	if domainInfo == nil {
+		return nil
+	}
 	var candidates []string
 	seen := make(map[string]bool)
 
@@ -446,6 +444,9 @@ func collectRDAPReferralLinks(domainInfo *RDAPDomainResponse, baseURL string) []
 
 // extractRDAPDomainTier converts an RDAPDomainResponse object to a DomainTierData.
 func extractRDAPDomainTier(domainInfo *RDAPDomainResponse, source string, server string) *DomainTierData {
+	if domainInfo == nil {
+		return nil
+	}
 	tier := &DomainTierData{
 		Source: source,
 		Server: server,
@@ -477,15 +478,15 @@ func extractRDAPDomainTier(domainInfo *RDAPDomainResponse, source string, server
 	}
 
 	for _, ns := range domainInfo.Nameservers {
-		live := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns.LDHName), "."))
+		live := NormalizeDomain(ns.LDHName)
 		if live != "" {
 			tier.Nameservers = append(tier.Nameservers, live)
 		}
 	}
 
-	tier.DomainStatus = cleanStatuses(domainInfo.Status)
+	tier.DomainStatus = NormalizeDomainStatuses(domainInfo.Status)
 
-	if domainInfo.SecureDNS != nil && domainInfo.SecureDNS.DelegationSigned != nil && *domainInfo.SecureDNS.DelegationSigned {
+	if domainInfo.SecureDNS != nil && DerefOrDefault(domainInfo.SecureDNS.DelegationSigned, false) {
 		tier.DNSSEC = true
 	}
 
@@ -537,12 +538,12 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 			}
 		}
 
-		tier.DomainStatus = cleanStatuses(parsed.Domain.Status)
+		tier.DomainStatus = NormalizeDomainStatuses(parsed.Domain.Status)
 		tier.DNSSEC = parsed.Domain.DNSSec
 
 		for _, ns := range parsed.Domain.NameServers {
 			if ns != "" {
-				tier.Nameservers = append(tier.Nameservers, strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns), ".")))
+				tier.Nameservers = append(tier.Nameservers, NormalizeDomain(ns))
 			}
 		}
 	}
@@ -596,7 +597,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 		matches := ReWhoisNS.FindAllStringSubmatch(raw, -1)
 		for _, m := range matches {
 			if len(m) > 1 {
-				ns := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(m[1]), "."))
+				ns := NormalizeDomain(m[1])
 				if ns != "" && !strings.Contains(ns, " ") {
 					tier.Nameservers = append(tier.Nameservers, ns)
 				}
@@ -612,7 +613,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 				statuses = append(statuses, strings.TrimSpace(m[1]))
 			}
 		}
-		tier.DomainStatus = cleanStatuses(statuses)
+		tier.DomainStatus = NormalizeDomainStatuses(statuses)
 	}
 
 	if !tier.DNSSEC {
@@ -631,7 +632,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 // detecting hierarchy discrepancies like Auto-Renew Grace Period date mismatch and NS desync.
 func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*RDAPState, []string) {
 	state := &RDAPState{
-		Status:        StatusOk,
+		Status:        StatusOK,
 		RegistryTier:  registry,
 		RegistrarTier: registrar,
 	}
@@ -702,7 +703,7 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*R
 		}
 
 		mismatch := false
-		if len(registry.Nameservers) != len(registrar.Nameservers) {
+		if len(registry.Nameservers) != len(registrar.Nameservers) || len(regMap) != len(rarMap) {
 			mismatch = true
 		} else {
 			for ns := range regMap {
@@ -734,7 +735,7 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*R
 	if registrar != nil {
 		allStatuses = append(allStatuses, registrar.DomainStatus...)
 	}
-	state.DomainStatus = cleanStatuses(allStatuses)
+	state.DomainStatus = NormalizeDomainStatuses(allStatuses)
 
 	// 6. Synthesize DNSSEC
 	if (registry != nil && registry.DNSSEC) || (registrar != nil && registrar.DNSSEC) {
@@ -745,91 +746,82 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*R
 	return state, discrepancies
 }
 
-func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, target DomainConfig, state *CheckState) {
+func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, target DomainConfig) *RDAPState {
 	rdapState, err := fetchRDAP(ctx, httpClient, target.Domain)
 	if err != nil {
-		switch err {
-		case ErrRDAPNotFound:
-			slog.Info(fmt.Sprintf("RDAP 404 for %s, attempting WHOIS fallback...", target.Domain))
-		case ErrRDAPRateLimited:
-			slog.Warn(fmt.Sprintf("RDAP rate limited for %s, falling back to WHOIS...", target.Domain))
-		default:
-			slog.Info(fmt.Sprintf(MsgLogWHOISFallback, target.Domain))
+		if errors.Is(err, ErrRDAPNotFound) {
+			LogInfo("RDAP returned 404, attempting WHOIS fallback", "domain", target.Domain)
+		} else if errors.Is(err, ErrRDAPRateLimited) {
+			LogWarn("RDAP rate limited, falling back to WHOIS", "domain", target.Domain)
+		} else {
+			LogInfof(MsgLogWHOISFallback, target.Domain)
 		}
 
 		whoisState, whoisErr := fetchWhois(ctx, target.Domain)
 		if whoisErr != nil {
 			if errors.Is(whoisErr, ErrDomainNotFound) || strings.Contains(whoisErr.Error(), "404") || strings.Contains(whoisErr.Error(), "not found") {
-				slog.Info(fmt.Sprintf("WHOIS reports %s is unregistered (404).", target.Domain))
-				state.UpdateRDAP(target.Domain, &RDAPState{
+				LogInfo("WHOIS reports domain is unregistered (404)", "domain", target.Domain)
+				return &RDAPState{
 					Status:       StatusFailed,
 					Error:        "Domain not found (404)",
 					Source:       "whois_404",
 					ProtocolUsed: "whois",
-				})
-				return
+				}
 			}
 
-			slog.Error(fmt.Sprintf(MsgLogWHOISFail, target.Domain, whoisErr))
+			LogErrorf(MsgLogWHOISFailed, target.Domain, whoisErr)
 
 			status := StatusFailed
 			errStr := whoisErr.Error()
-			if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "i/o timeout") || strings.Contains(errStr, "no such host") || strings.Contains(errStr, "temporary failure") || isWhoisRateLimited(errStr, whoisErr) {
+			if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "i/o timeout") || strings.Contains(errStr, "no such host") || strings.Contains(errStr, "temporary failure") || isWhoisRateLimited(errStr, whoisErr) || errors.Is(whoisErr, ErrWhoisRateLimited) {
 				status = StatusWarning
 			}
 
-			state.UpdateRDAP(target.Domain, &RDAPState{
+			return &RDAPState{
 				Status:       status,
 				Error:        fmt.Sprintf("RDAP: %v | WHOIS: %v", err, whoisErr),
 				ProtocolUsed: "whois_failed",
-			})
-			return
+			}
 		}
 
-		slog.Info(fmt.Sprintf(MsgLogWHOISSuccess, target.Domain))
-		validateRDAPState(app, target, state, whoisState)
-		return
+		LogInfof(MsgLogWHOISSuccess, target.Domain)
+		return validateRDAPState(app, target, whoisState)
 	}
 
 	// Hybrid Tier Supplementation: If RDAP is thin (no registrar tier), attempt WHOIS referral supplement
-	if rdapState.RegistrarTier == nil && (rdapState.Expiration == "" || rdapState.Registrar == "") {
+	if rdapState != nil && rdapState.RegistrarTier == nil && (rdapState.Expiration == "" || rdapState.Registrar == "") {
 		if whoisState, whoisErr := fetchWhois(ctx, target.Domain); whoisErr == nil {
 			if whoisState.RegistrarTier != nil {
 				rdapState.RegistrarTier = whoisState.RegistrarTier
 			} else if whoisState.RegistryTier != nil && rdapState.RegistryTier == nil {
 				rdapState.RegistryTier = whoisState.RegistryTier
 			}
-			synthesized, disc := synthesizeTierData(rdapState.RegistryTier, rdapState.RegistrarTier)
+			synthesized, discrepancies := synthesizeTierData(rdapState.RegistryTier, rdapState.RegistrarTier)
 			rdapState.Expiration = synthesized.Expiration
 			rdapState.Registrar = synthesized.Registrar
 			rdapState.RegistrarIANAID = synthesized.RegistrarIANAID
 			rdapState.Nameservers = synthesized.Nameservers
 			rdapState.DomainStatus = synthesized.DomainStatus
 			rdapState.DNSSEC = synthesized.DNSSEC
-			rdapState.Discrepancies = disc
+			rdapState.Discrepancies = discrepancies
 			rdapState.Source = synthesized.Source
 			rdapState.ProtocolUsed = "hybrid"
 		}
 	}
 
-	validateRDAPState(app, target, state, rdapState)
+	return validateRDAPState(app, target, rdapState)
 }
 
 func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RDAPState, error) {
 	start := time.Now()
-	asciiDomain, err := idna.ToASCII(strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), ".")))
-	if err != nil {
-		asciiDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-	}
+	asciiDomain := NormalizeDomainToASCIIText(domain)
 
 	urls, err := rdapBootstrap.ServersFor(ctx, asciiDomain)
 	if err != nil {
 		return nil, fmt.Errorf("no RDAP server: %w", err)
 	}
 
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
+	httpClient = ResolveHTTPClient(httpClient)
 
 	var lastErr error
 	for _, rawBaseURL := range urls {
@@ -841,7 +833,7 @@ func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RD
 			continue
 		}
 		req.Header.Set("Accept", "application/rdap+json, application/json")
-		req.Header.Set("User-Agent", "DomainMonitor/1.0 (+https://github.com/domain-monitor)")
+		req.Header.Set("User-Agent", DefaultUserAgent)
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
@@ -850,21 +842,21 @@ func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RD
 		}
 
 		if resp.StatusCode == http.StatusNotFound {
-			_ = resp.Body.Close()
+			DrainAndClose(resp.Body, 4096)
 			return nil, ErrRDAPNotFound
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			_ = resp.Body.Close()
+			DrainAndClose(resp.Body, 4096)
 			return nil, ErrRDAPRateLimited
 		}
 		if resp.StatusCode != http.StatusOK {
-			_ = resp.Body.Close()
+			DrainAndClose(resp.Body, 4096)
 			lastErr = fmt.Errorf("rdap HTTP error: %d", resp.StatusCode)
 			continue
 		}
 
-		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-		_ = resp.Body.Close()
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, MaxBootstrapResponseSize))
+		DrainAndClose(resp.Body, 4096)
 		if err != nil {
 			lastErr = err
 			continue
@@ -921,18 +913,8 @@ func isSafeRDAPURL(rawURL string) bool {
 		return false
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() {
+		if IsRestrictedIP(ip) {
 			return false
-		}
-		if ip4 := ip.To4(); ip4 != nil {
-			// RFC 6598: Carrier Grade NAT (100.64.0.0/10)
-			if ip4[0] == 100 && (ip4[1]&0xc0) == 64 {
-				return false
-			}
-			// RFC 1122: "This network" (0.0.0.0/8)
-			if ip4[0] == 0 {
-				return false
-			}
 		}
 	}
 	return true
@@ -961,30 +943,30 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 			}
 		}
 		if !isSafeRDAPURL(targetURL) {
-			slog.Warn("Skipping unsafe RDAP referral URL", "domain", domain, "url", targetURL)
+			LogWarn("Skipping unsafe RDAP referral URL", "domain", domain, "url", targetURL)
 			continue
 		}
-		slog.Info(fmt.Sprintf("Querying registrar RDAP link for %s: %s", domain, targetURL))
+		LogInfo("Querying registrar RDAP link", "domain", domain, "url", targetURL)
 		relReq, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 		if err != nil {
 			continue
 		}
 		relReq.Header.Set("Accept", "application/rdap+json, application/json")
-		relReq.Header.Set("User-Agent", "DomainMonitor/1.0")
+		relReq.Header.Set("User-Agent", DefaultUserAgent)
 
 		relResp, err := httpClient.Do(relReq)
 		if err != nil || relResp.StatusCode != http.StatusOK {
 			if relResp != nil {
 				if relResp.StatusCode == http.StatusTooManyRequests {
-					slog.Warn(fmt.Sprintf("Rate limited by registrar RDAP for %s", domain))
+					LogWarn("Rate limited by registrar RDAP", "domain", domain)
 				}
-				_ = relResp.Body.Close()
+				DrainAndClose(relResp.Body, 4096)
 			}
 			continue
 		}
 
-		bodyBytes, err := io.ReadAll(io.LimitReader(relResp.Body, 8<<20))
-		_ = relResp.Body.Close()
+		bodyBytes, err := io.ReadAll(io.LimitReader(relResp.Body, MaxBootstrapResponseSize))
+		DrainAndClose(relResp.Body, 4096)
 		if err != nil {
 			continue
 		}
@@ -1015,7 +997,7 @@ func fetchWhois(ctx context.Context, domain string) (*RDAPState, error) {
 	}
 
 	if isWhoisRateLimited(result, queryErr) {
-		return nil, fmt.Errorf("whois rate limited (429)")
+		return nil, ErrWhoisRateLimited
 	}
 
 	registryTier := extractWhoisTier(result, "registry_whois", "registry")
@@ -1025,7 +1007,7 @@ func fetchWhois(ctx context.Context, domain string) (*RDAPState, error) {
 	if m := ReWhoisReferral.FindStringSubmatch(result); len(m) > 1 {
 		referralServer := strings.TrimSpace(m[1])
 		if referralServer != "" && !strings.Contains(referralServer, "iana") && !strings.Contains(referralServer, "internic") {
-			slog.Info(fmt.Sprintf("Following WHOIS referral for %s to %s", domain, referralServer))
+			LogInfo("Following WHOIS referral", "domain", domain, "referral_server", referralServer)
 			refCtx, refCancel := context.WithTimeout(ctx, 10*time.Second)
 			defer refCancel()
 
@@ -1054,43 +1036,59 @@ func fetchWhois(ctx context.Context, domain string) (*RDAPState, error) {
 	return state, nil
 }
 
-func validateRDAPState(app *AppState, target DomainConfig, state *CheckState, parsed *RDAPState) {
+func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *RDAPState {
+	if parsed == nil {
+		return nil
+	}
 	if parsed.Expiration != "" {
 		if t, norm, err := parseFlexibleDate(parsed.Expiration); err == nil {
 			parsed.Expiration = norm
 			days := time.Until(t).Hours() / 24
-			if days <= 30 {
+			if days < 0 {
+				parsed.Status = StatusFailed
+				msg := fmt.Sprintf(MsgAlertRDAPExpired, target.Domain, math.Abs(days))
+				redacted := "Domain registration has EXPIRED."
+				if !target.SuppressAlerts {
+					app.SafeDispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
+				}
+			} else if days <= 30 {
 				priority := PriorityWarning
 				if days <= 7 {
 					priority = PriorityUrgent
 				}
+				if parsed.Status == StatusOK {
+					parsed.Status = StatusWarning
+				}
 				msg := fmt.Sprintf(MsgAlertRDAPExpiry, target.Domain, days)
 				redacted := fmt.Sprintf("Domain is expiring in %.0f days.", days)
 				if !target.SuppressAlerts {
-					app.Notifier.Dispatch(msg, redacted, priority, "warning", target.Domain, target.Name)
+					app.SafeDispatch(msg, redacted, priority, "warning", target.Domain, target.Name)
 				}
 			}
 		}
 	}
 
-	validateDelegatedNameservers(app, target, parsed.Nameservers)
+	validateDelegatedNameservers(app, target, parsed.Nameservers, parsed)
 
 	// Status & Suspension evaluation
-	parsed.DomainStatus = cleanStatuses(parsed.DomainStatus)
-	if isSusp, suspStatus := getSuspensionStatus(parsed.DomainStatus); isSusp {
+	parsed.DomainStatus = NormalizeDomainStatuses(parsed.DomainStatus)
+	if isSusp, suspStatus := isDomainSuspended(parsed.DomainStatus); isSusp {
 		parsed.Status = StatusFailed
 		msg := fmt.Sprintf(MsgAlertRDAPSuspended, target.Domain, suspStatus)
 		redacted := fmt.Sprintf("Domain suspended (Status: %s).", suspStatus)
 		if !target.SuppressAlerts {
-			app.Notifier.Dispatch(msg, redacted, PriorityUrgent, "x", target.Domain, target.Name)
+			app.SafeDispatch(msg, redacted, PriorityUrgent, "x", target.Domain, target.Name)
 		}
 	}
 
 	if target.DomainTransferLocked && !isTransferLocked(parsed.DomainStatus) {
+		if parsed.Status == StatusOK {
+			parsed.Status = StatusWarning
+		}
 		msg := fmt.Sprintf(MsgAlertRDAPUnlocked, target.Domain)
 		redacted := "Domain transfer lock is disabled."
 		if !target.SuppressAlerts {
-			app.Notifier.Dispatch(msg, redacted, PriorityHigh, "unlock", target.Domain, target.Name)
+			app.SafeDispatch(msg, redacted, PriorityHigh, "unlock", target.Domain, target.Name)
 		}
 	}
 
@@ -1105,7 +1103,7 @@ func validateRDAPState(app *AppState, target DomainConfig, state *CheckState, pa
 			msg := fmt.Sprintf(MsgAlertRDAPRegistrarIDMismatch, target.Domain, target.ExpectedRegistrarID, parsed.RegistrarIANAID)
 			redacted := fmt.Sprintf("Registrar IANA ID mismatch (expected %s).", target.ExpectedRegistrarID)
 			if !target.SuppressAlerts {
-				app.Notifier.Dispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
+				app.SafeDispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
 			}
 		}
 	} else if target.ExpectedRegistrarName != "" {
@@ -1116,24 +1114,24 @@ func validateRDAPState(app *AppState, target DomainConfig, state *CheckState, pa
 			msg := fmt.Sprintf(MsgAlertRDAPRegistrarNameMismatch, target.Domain, target.ExpectedRegistrarName, parsed.Registrar)
 			redacted := fmt.Sprintf("Registrar name mismatch (expected %s).", target.ExpectedRegistrarName)
 			if !target.SuppressAlerts {
-				app.Notifier.Dispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
+				app.SafeDispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
 			}
 		}
 	}
 
 	// Report Hierarchy Discrepancies if detected
-	for _, disc := range parsed.Discrepancies {
-		slog.Warn(fmt.Sprintf(MsgLogHierarchyWarn, target.Domain, disc))
+	for _, discrepancy := range parsed.Discrepancies {
+		LogWarnf(MsgLogHierarchyWarn, target.Domain, discrepancy)
 		if !target.SuppressAlerts {
-			msg := fmt.Sprintf(MsgAlertRDAPDiscrep, target.Domain, disc)
-			app.Notifier.Dispatch(msg, disc, PriorityWarning, "warning", target.Domain, target.Name)
+			msg := fmt.Sprintf(MsgAlertRDAPDiscrepancy, target.Domain, discrepancy)
+			app.SafeDispatch(msg, discrepancy, PriorityWarning, "warning", target.Domain, target.Name)
 		}
 	}
 
-	state.UpdateRDAP(target.Domain, parsed)
+	return parsed
 }
 
-func getRootZoneResolvers(ctx context.Context, app *AppState, rootZone string, globalResolvers []string) []string {
+func resolveRootZoneResolvers(ctx context.Context, app *AppState, rootZone string, globalResolvers []string) []string {
 	rootNS, err := queryDNS(ctx, app, rootZone, dns.TypeNS, globalResolvers)
 	if err != nil || len(rootNS) == 0 {
 		return nil
@@ -1148,17 +1146,17 @@ func getRootZoneResolvers(ctx context.Context, app *AppState, rootZone string, g
 	return rootIPs
 }
 
-func validateNSDelegation(ctx context.Context, app *AppState, target DomainConfig, state *CheckState) {
+func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfig) *RDAPState {
 	parsed := &RDAPState{
-		Status:          StatusOk,
+		Status:          StatusOK,
 		IsDelegatedZone: true,
 		Source:          "dns_delegation",
 	}
 
-	resolversToUse := app.Config.Resolvers
+	resolversToUse := app.Resolvers()
 	rd := true
 	if target.RootZone != "" {
-		rootIPs := getRootZoneResolvers(ctx, app, target.RootZone, app.Config.Resolvers)
+		rootIPs := resolveRootZoneResolvers(ctx, app, target.RootZone, app.Resolvers())
 		if len(rootIPs) > 0 {
 			resolversToUse = rootIPs
 			rd = false // Querying parent authoritative nameservers directly
@@ -1169,49 +1167,50 @@ func validateNSDelegation(ctx context.Context, app *AppState, target DomainConfi
 	if err != nil {
 		parsed.Status = StatusFailed
 		parsed.Error = fmt.Sprintf("Failed to query NS records: %v", err)
-		state.UpdateRDAP(target.Domain, parsed)
-		return
+		return parsed
 	}
 
 	var nsRecords []string
-	for _, ans := range r.Answer {
-		if ns, ok := ans.(*dns.NS); ok {
-			nsRecords = append(nsRecords, ns.Ns)
-		}
-	}
-
-	if len(nsRecords) == 0 {
-		fqdn := dns.Fqdn(target.Domain)
-		for _, auth := range r.Ns {
-			if ns, ok := auth.(*dns.NS); ok && strings.EqualFold(ns.Header().Name, fqdn) {
+	if r != nil {
+		for _, ans := range r.Answer {
+			if ns, ok := ans.(*dns.NS); ok {
 				nsRecords = append(nsRecords, ns.Ns)
+			}
+		}
+
+		if len(nsRecords) == 0 {
+			fqdn := dns.Fqdn(target.Domain)
+			for _, auth := range r.Ns {
+				if ns, ok := auth.(*dns.NS); ok && strings.EqualFold(ns.Header().Name, fqdn) {
+					nsRecords = append(nsRecords, ns.Ns)
+				}
 			}
 		}
 	}
 
 	for _, ns := range nsRecords {
-		parsed.Nameservers = append(parsed.Nameservers, strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns), ".")))
+		parsed.Nameservers = append(parsed.Nameservers, NormalizeDomain(ns))
 	}
 
-	validateDelegatedNameservers(app, target, parsed.Nameservers)
+	validateDelegatedNameservers(app, target, parsed.Nameservers, parsed)
 
-	state.UpdateRDAP(target.Domain, parsed)
+	return parsed
 }
 
 // validateDelegatedNameservers verifies that delegated nameservers returned by the registrar/registry
 // match the configured expected primary nameservers and secondary (slave/replica) nameservers.
-func validateDelegatedNameservers(app *AppState, target DomainConfig, nameservers []string) {
+func validateDelegatedNameservers(app *AppState, target DomainConfig, nameservers []string, parsed *RDAPState) {
 	liveNS := make(map[string]bool)
 	authorizedMap := make(map[string]bool)
 
 	for _, ns := range target.ExpectedNS {
-		norm := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns), "."))
+		norm := NormalizeDomain(ns)
 		if norm != "" {
 			authorizedMap[norm] = true
 		}
 	}
 	for _, ns := range target.SecondaryNS {
-		norm := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns), "."))
+		norm := NormalizeDomain(ns)
 		if norm != "" {
 			authorizedMap[norm] = true
 		}
@@ -1219,29 +1218,34 @@ func validateDelegatedNameservers(app *AppState, target DomainConfig, nameserver
 
 	hasConfiguredNS := len(authorizedMap) > 0
 	for _, raw := range nameservers {
-		ns := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+		ns := NormalizeDomain(raw)
 		if ns == "" {
 			continue
 		}
 		liveNS[ns] = true
 		if hasConfiguredNS && !authorizedMap[ns] {
-			msg := fmt.Sprintf(MsgAlertRDAPUnauthNS, target.Domain, ns)
+			if parsed != nil {
+				parsed.Status = StatusFailed
+			}
+			msg := fmt.Sprintf(MsgAlertRDAPUnauthorizedNS, target.Domain, ns)
 			redacted := "Unauthorized nameserver detected."
 			if !target.SuppressAlerts {
-				app.Notifier.Dispatch(msg, redacted, PriorityUrgent, "skull", target.Domain, target.Name)
+				app.SafeDispatch(msg, redacted, PriorityUrgent, "skull", target.Domain, target.Name)
 			}
 		}
 	}
 
 	for _, expectedRaw := range target.ExpectedNS {
-		expected := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(expectedRaw), "."))
+		expected := NormalizeDomain(expectedRaw)
 		if expected != "" && !liveNS[expected] {
+			if parsed != nil {
+				parsed.Status = StatusFailed
+			}
 			msg := fmt.Sprintf(MsgAlertRDAPMissingNS, target.Domain, expectedRaw)
 			redacted := "Expected nameserver is missing."
 			if !target.SuppressAlerts {
-				app.Notifier.Dispatch(msg, redacted, PriorityHigh, "warning", target.Domain, target.Name)
+				app.SafeDispatch(msg, redacted, PriorityHigh, "warning", target.Domain, target.Name)
 			}
 		}
 	}
 }
-

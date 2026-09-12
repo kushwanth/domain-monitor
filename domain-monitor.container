@@ -6,7 +6,7 @@ After=network-online.target
 # Replace with your actual GitHub username and repository name
 Image=ghcr.io/your-github-username/your-repo-name:latest
 
-# Add your auth tokens using Secrets here to avoid hardcoding them in config.jsonnet
+# Add your auth tokens using Secrets here to avoid hardcoding them in config.json
 # Create them using: podman secret create <secret-name> <file-with-secret>
 # Secret=ntfy-auth,type=env,target=NTFY_AUTH
 # Secret=telegram-token,type=env,target=TELEGRAM_TOKEN
@@ -16,15 +16,15 @@ Image=ghcr.io/your-github-username/your-repo-name:latest
 AutoUpdate=registry
 
 # Set environment variables telling the Go app where to find config and data
-Environment=CONFIG_PATH=/app/config.jsonnet
+Environment=CONFIG_PATH=/app/config.json
 Environment=DATA_DIR=/app/data
 
 # Expose the HTTP port for JSON State (/api/state) and Web Dashboard (/)
-# Ensure this matches the port defined in your config.jsonnet
+# Ensure this matches the port defined in your config.json
 PublishPort=8080:8080
 
 # Mount your configuration file into the container as read-only
-Volume=/path/to/your/homelab/config.jsonnet:/app/config.jsonnet:ro
+Volume=/path/to/your/homelab/config.json:/app/config.json:ro
 
 # Mount a directory to persist data (CT logs, state)
 # Note: :U flag tells Podman to recursively map ownership to container UID 65532

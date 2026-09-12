@@ -1,0 +1,93 @@
+{
+  "port": "8080",
+  "loop_interval_days": 0.25,
+  "data_dir": "./data",
+  "notifications": {
+    "ntfy": {
+      "url": "https://ntfy.sh/example_domain_monitor_topic"
+    }
+  },
+  "resolvers": ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"],
+  "domains": [
+    {
+      "domain": "example.com",
+      "name": "Example Prod Domain",
+      "expected_ns": [
+        "a.iana-servers.net"
+      ],
+      "secondary_ns": [
+        "b.iana-servers.net"
+      ],
+      "verify_ns_health": true,
+      "domain_transfer_locked": true,
+      "check_email_security": false,
+      "monitor_ct_logs": true,
+      "dnssec": true,
+      "caa": {
+        "issue": ["letsencrypt.org", "digicert.com"]
+      },
+      "suppress_alerts": true
+    },
+    {
+      "domain": "api.example.com",
+      "name": "Example API Zone",
+      "is_delegated_zone": true,
+      "root_zone": "example.com",
+      "expected_ns": ["ns1.example.net", "ns2.example.net"],
+      "check_email_security": false,
+      "dnssec": true,
+      "caa": {
+        "issue": ["letsencrypt.org"]
+      },
+      "suppress_alerts": true
+    },
+    {
+      "domain": "example.net",
+      "name": "Example Net Main",
+      "expected_ns": ["a.iana-servers.net"],
+      "secondary_ns": ["b.iana-servers.net"],
+      "verify_ns_health": true,
+      "check_email_security": true,
+      "mail_provider": "google",
+      "monitor_ct_logs": true,
+      "dnssec": true,
+      "caa": {
+        "issue": ["digicert.com", "letsencrypt.org"],
+        "issuewild": ["digicert.com", "letsencrypt.org"]
+      },
+      "suppress_alerts": true
+    },
+    {
+      "domain": "example.org",
+      "name": "Example Org Main",
+      "expected_ns": ["a.iana-servers.net", "b.iana-servers.net"],
+      "check_email_security": true,
+      "mx_records": ["mail.example.org"],
+      "dkim_selectors": ["default"],
+      "monitor_ct_logs": true,
+      "dnssec": true,
+      "caa": {
+        "issue": ["letsencrypt.org"]
+      },
+      "suppress_alerts": true
+    },
+    {
+      "domain": "example.edu",
+      "name": "Example Edu Fallback",
+      "expected_ns": ["a.iana-servers.net", "b.iana-servers.net"],
+      "check_email_security": false,
+      "dnssec": false,
+      "suppress_alerts": true
+    }
+  ],
+  "dns_records": [
+    { "hostname": "example.com", "name": "Example A", "type": "A", "expected": ["93.184.215.14"] },
+    { "hostname": "example.com", "name": "Example AAAA", "type": "AAAA", "expected": ["2606:2800:21f:cb07:6820:80da:af6b:8b2c"] },
+    { "hostname": "www.example.com", "name": "Example WWW", "type": "A", "expected": ["93.184.215.14"] },
+    { "hostname": "example.net", "name": "Example Net A", "type": "A", "expected": ["93.184.215.14"] },
+    { "hostname": "example.net", "name": "Example Net MX", "type": "MX", "expected": ["smtp.example.net"] },
+    { "hostname": "example.net", "name": "Example Net TXT", "type": "TXT", "expected": ["v=spf1 include:_spf.example.net ~all"] },
+    { "hostname": "www.example.net", "name": "Example Net WWW", "type": "A", "expected": ["93.184.215.14"] },
+    { "hostname": "api.example.com", "name": "Example API", "type": "A", "expected": ["93.184.215.14"], "skip_ssl": true }
+  ]
+}

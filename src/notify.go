@@ -7,22 +7,27 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 )
 
-var notifyHTTPClient = &http.Client{Timeout: 10 * time.Second}
+var notifyHTTPClient = ResolveHTTPClient(&http.Client{Timeout: 10 * time.Second})
 
 func (nm *NotificationManager) StartCycle() {
+	if nm == nil {
+		return
+	}
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 	nm.seenThisCycle = make(map[string]bool)
 }
 
 func (nm *NotificationManager) EndCycle() {
+	if nm == nil {
+		return
+	}
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 	if nm.sentState != nil {
@@ -35,24 +40,31 @@ func (nm *NotificationManager) EndCycle() {
 }
 
 func (nm *NotificationManager) Dispatch(message, redacted string, priority AlertPriority, tag, domain, name string) {
-	slog.Info(message)
+	switch priority {
+	case PriorityUrgent, PriorityHigh:
+		LogError(message, "domain", domain, "priority", priority, "tag", tag)
+	case PriorityWarning:
+		LogWarn(message, "domain", domain, "priority", priority, "tag", tag)
+	default:
+		LogInfo(message, "domain", domain, "priority", priority, "tag", tag)
+	}
+
+	if nm == nil {
+		return
+	}
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
-	if nm.sentState == nil {
-		nm.sentState = make(map[string]time.Time)
-	}
+	InitMap(&nm.sentState)
 
 	key := fmt.Sprintf("%s|%s|%s", domain, tag, redacted)
 	if nm.seenThisCycle != nil {
 		nm.seenThisCycle[key] = true
 	}
 
-	if lastSent, exists := nm.sentState[key]; exists {
-		// Alert deduplication: suppress exact same alert for 24 hours
-		if time.Since(lastSent) < 24*time.Hour {
-			return
-		}
+	if _, exists := nm.sentState[key]; exists {
+		// Alert deduplication: suppress exact same alert as long as it remains active
+		return
 	}
 	nm.sentState[key] = time.Now()
 
@@ -67,6 +79,9 @@ func (nm *NotificationManager) Dispatch(message, redacted string, priority Alert
 }
 
 func (nm *NotificationManager) Flush(ctx context.Context) {
+	if nm == nil {
+		return
+	}
 	nm.mu.Lock()
 	if len(nm.Buffer) == 0 {
 		nm.mu.Unlock()
@@ -79,90 +94,115 @@ func (nm *NotificationManager) Flush(ctx context.Context) {
 	nm.mu.Unlock()
 
 	for _, provider := range nm.Providers {
+		if provider == nil {
+			continue
+		}
 		nm.wg.Add(1)
 		provider.Send(ctx, alerts, &nm.wg)
 	}
 }
 
 func (nm *NotificationManager) Wait() {
+	if nm == nil {
+		return
+	}
 	nm.wg.Wait()
 }
 
 // --- Ntfy Implementation ---
 
 func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup) {
+	if p == nil {
+		if wg != nil {
+			wg.Done()
+		}
+		return
+	}
 	go func() {
-		defer wg.Done()
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("Ntfy provider panicked", "error", r)
-			}
-		}()
+		if wg != nil {
+			defer wg.Done()
+		}
+		defer RecoverAndLogPanic("Ntfy provider")
 
 		sendChunk := func(text string, highestPriority AlertPriority, tags []string) {
 			req, err := http.NewRequestWithContext(ctx, "POST", p.URL, strings.NewReader(strings.TrimSpace(text)))
 			if err != nil {
+				LogError("Ntfy request creation failed", "error", err)
 				return
 			}
+			req.Header.Set("User-Agent", DefaultUserAgent)
 			if p.Auth != "" {
 				req.Header.Set("Authorization", p.Auth)
 			}
-			req.Header.Set("Title", "Domain Monitor Alerts")
+			req.Header.Set("Title", "Domain Monitor Alert")
 			req.Header.Set("Priority", string(highestPriority))
 
 			// Deduplicate tags and limit to 5
-			uniqueTags := make(map[string]bool)
-			var finalTags []string
-			for _, t := range tags {
-				if !uniqueTags[t] {
-					uniqueTags[t] = true
-					if len(finalTags) < 5 {
-						finalTags = append(finalTags, t)
-					}
-				}
+			finalTags := DeduplicateNonEmptyStrings(tags)
+			if len(finalTags) > 5 {
+				finalTags = finalTags[:5]
 			}
 
 			if len(finalTags) > 0 {
 				req.Header.Set("Tags", strings.Join(finalTags, ","))
-			} else {
-				req.Header.Set("Tags", "rotating_light")
 			}
 
 			if resp, err := notifyHTTPClient.Do(req); err == nil {
 				if resp.StatusCode >= 400 {
-					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize))
 					bodyStr := string(bodyBytes)
 					if p.Auth != "" {
 						bodyStr = strings.ReplaceAll(bodyStr, p.Auth, "[REDACTED_AUTH]")
 					}
-					slog.Error("Ntfy delivery failed", "status", resp.StatusCode, "response", bodyStr)
-				} else {
-					_, _ = io.Copy(io.Discard, resp.Body)
+					LogError("Ntfy delivery failed", "status", resp.StatusCode, "response", bodyStr)
 				}
-				_ = resp.Body.Close()
+				DrainAndClose(resp.Body, 4096)
 			} else {
 				errStr := err.Error()
 				if p.Auth != "" {
 					errStr = strings.ReplaceAll(errStr, p.Auth, "[REDACTED_AUTH]")
 				}
-				slog.Error("Ntfy request error", "error", errStr)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(1 * time.Second):
+				LogError("Ntfy request error", "error", errStr)
 			}
 		}
 
+		type chunkData struct {
+			text     string
+			priority AlertPriority
+			tags     []string
+		}
+		var chunks []chunkData
 		var currentChunk strings.Builder
 		highestPriority := PriorityDefault
 		var currentTags []string
 
 		for _, alert := range alerts {
-			line := alert.Message + "\n\n"
+			msg := alert.Redacted
+			if msg == "" {
+				msg = alert.Message
+			}
+
+			if alert.Domain != "" {
+				replacement := "[Hidden Domain]"
+				if alert.Name != "" {
+					replacement = alert.Name
+				}
+				msg = strings.ReplaceAll(msg, alert.Domain, replacement)
+			}
+
+			prefix := ""
+			if alert.Name != "" {
+				prefix = fmt.Sprintf("[%s] ", alert.Name)
+			}
+
+			line := prefix + TruncateRunes(msg, 1000) + "\n\n"
 
 			if currentChunk.Len()+len(line) > MaxNotificationMessageLen {
-				sendChunk(currentChunk.String(), highestPriority, currentTags)
+				chunks = append(chunks, chunkData{
+					text:     currentChunk.String(),
+					priority: highestPriority,
+					tags:     currentTags,
+				})
 				currentChunk.Reset()
 				highestPriority = PriorityDefault
 				currentTags = nil
@@ -182,7 +222,24 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 		}
 
 		if currentChunk.Len() > 0 {
-			sendChunk(currentChunk.String(), highestPriority, currentTags)
+			chunks = append(chunks, chunkData{
+				text:     currentChunk.String(),
+				priority: highestPriority,
+				tags:     currentTags,
+			})
+		}
+
+		for i, chunk := range chunks {
+			sendChunk(chunk.text, chunk.priority, chunk.tags)
+			if i < len(chunks)-1 {
+				timer := time.NewTimer(1 * time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
 		}
 	}()
 }
@@ -190,13 +247,17 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 // --- Telegram Implementation ---
 
 func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup) {
+	if p == nil {
+		if wg != nil {
+			wg.Done()
+		}
+		return
+	}
 	go func() {
-		defer wg.Done()
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("Telegram provider panicked", "error", r)
-			}
-		}()
+		if wg != nil {
+			defer wg.Done()
+		}
+		defer RecoverAndLogPanic("Telegram provider")
 
 		sendChunk := func(text string) {
 			apiURL := fmt.Sprintf(TelegramAPIEndpoint, p.Token)
@@ -208,36 +269,32 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 
 			req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(payloadBytes))
 			if err != nil {
+				LogError("Telegram request creation failed", "error", err)
 				return
 			}
+			req.Header.Set("User-Agent", DefaultUserAgent)
 			req.Header.Set("Content-Type", "application/json")
 
 			if resp, err := notifyHTTPClient.Do(req); err == nil {
 				if resp.StatusCode >= 400 {
-					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize))
 					bodyStr := string(bodyBytes)
 					if p.Token != "" {
 						bodyStr = strings.ReplaceAll(bodyStr, p.Token, "[REDACTED_TELEGRAM_TOKEN]")
 					}
-					slog.Error("Telegram delivery failed", "status", resp.StatusCode, "response", bodyStr)
-				} else {
-					_, _ = io.Copy(io.Discard, resp.Body)
+					LogError("Telegram delivery failed", "status", resp.StatusCode, "response", bodyStr)
 				}
-				_ = resp.Body.Close()
+				DrainAndClose(resp.Body, 4096)
 			} else {
 				errStr := err.Error()
 				if p.Token != "" {
 					errStr = strings.ReplaceAll(errStr, p.Token, "[REDACTED_TELEGRAM_TOKEN]")
 				}
-				slog.Error("Telegram request error", "error", errStr)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(1 * time.Second):
+				LogError("Telegram request error", "error", errStr)
 			}
 		}
 
+		var chunks []string
 		var currentChunk strings.Builder
 		currentChunk.WriteString("⚠️ <b>Domain Monitor Alerts</b>\n\n")
 
@@ -255,6 +312,9 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 				msg = strings.ReplaceAll(msg, alert.Domain, replacement)
 			}
 
+			// Clamp raw alert message so escaped content never exceeds Telegram message limit
+			msg = TruncateRunes(msg, 1000)
+
 			prefix := ""
 			if alert.Name != "" {
 				prefix = fmt.Sprintf("<b>[%s]</b> ", html.EscapeString(alert.Name))
@@ -263,7 +323,7 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 			line := fmt.Sprintf("• %s%s\n", prefix, html.EscapeString(msg))
 
 			if currentChunk.Len()+len(line) > MaxNotificationMessageLen {
-				sendChunk(currentChunk.String())
+				chunks = append(chunks, currentChunk.String())
 				currentChunk.Reset()
 				currentChunk.WriteString("⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n")
 			}
@@ -271,7 +331,20 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 		}
 
 		if currentChunk.Len() > 0 && currentChunk.String() != "⚠️ <b>Domain Monitor Alerts</b>\n\n" && currentChunk.String() != "⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n" {
-			sendChunk(currentChunk.String())
+			chunks = append(chunks, currentChunk.String())
+		}
+
+		for i, chunk := range chunks {
+			sendChunk(chunk)
+			if i < len(chunks)-1 {
+				timer := time.NewTimer(1 * time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
 		}
 	}()
 }

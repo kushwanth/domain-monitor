@@ -5,15 +5,15 @@ import (
 	"context"
 	"crypto/tls"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
-
-	"golang.org/x/net/idna"
 )
 
 // RDAPTLSConfig returns a TLS configuration compatible with both modern and legacy ccTLD
@@ -21,8 +21,8 @@ import (
 func RDAPTLSConfig() *tls.Config {
 	var ids []uint16
 	// 1. Add all secure modern cipher suites first (AES-GCM, ChaCha20-Poly1305, etc.)
-	for _, cs := range tls.CipherSuites() {
-		ids = append(ids, cs.ID)
+	for _, cipherSuite := range tls.CipherSuites() {
+		ids = append(ids, cipherSuite.ID)
 	}
 	// 2. Append legacy fallback cipher suites for older ccTLD registries
 	legacySuites := []uint16{
@@ -46,6 +46,21 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 		DialContext: (&net.Dialer{
 			Timeout:   timeout,
 			KeepAlive: 30 * time.Second,
+			Control: func(network, address string, c syscall.RawConn) error {
+				if allowInsecureRDAPURLs {
+					return nil
+				}
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					host = address
+				}
+				if ip := net.ParseIP(host); ip != nil {
+					if IsRestrictedIP(ip) {
+						return fmt.Errorf("connection to restricted IP blocked (SSRF): %s", host)
+					}
+				}
+				return nil
+			},
 		}).DialContext,
 		TLSClientConfig:       RDAPTLSConfig(),
 		TLSHandshakeTimeout:   timeout,
@@ -67,12 +82,9 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
-// GetKnownWhoisServer returns a dedicated WHOIS server for a given domain suffix if known.
-func GetKnownWhoisServer(domain string) string {
-	asciiDomain, err := idna.ToASCII(strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), ".")))
-	if err != nil {
-		asciiDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-	}
+// KnownWhoisServer returns a dedicated WHOIS server for a given domain suffix if known.
+func KnownWhoisServer(domain string) string {
+	asciiDomain := NormalizeDomainToASCIIText(domain)
 	labels := strings.Split(asciiDomain, ".")
 	for i := range labels {
 		suffix := strings.Join(labels[i:], ".")
@@ -88,6 +100,9 @@ func NewBootstrap(httpClient *http.Client) *Bootstrap {
 }
 
 func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, error) {
+	if b == nil {
+		return nil, errors.New("bootstrap client is nil")
+	}
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
 	}
@@ -95,28 +110,30 @@ func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, er
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	asciiDomain, err := idna.ToASCII(strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), ".")))
-	if err != nil {
-		asciiDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-	}
-
+	asciiDomain := NormalizeDomainToASCIIText(domain)
 	labels := strings.Split(asciiDomain, ".")
 	for i := range labels {
 		suffix := strings.Join(labels[i:], ".")
 		if urls, ok := b.services[suffix]; ok && len(urls) > 0 {
-			return urls, nil
+			return slices.Clone(urls), nil
 		}
 	}
 	return nil, fmt.Errorf("no rdap server found for domain %s", domain)
 }
 
 func (b *Bootstrap) isFresh() bool {
+	if b == nil {
+		return false
+	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.services) > 0 && time.Since(b.fetchedAt) < BootstrapTTL
 }
 
 func (b *Bootstrap) ensure(ctx context.Context) error {
+	if b == nil {
+		return errors.New("bootstrap client is nil")
+	}
 	if b.isFresh() {
 		return nil
 	}
@@ -135,7 +152,7 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 		b.mu.RUnlock()
 
 		if hasData && cacheAge <= BootstrapMaxAge {
-			slog.Warn("Failed to refresh RDAP bootstrap from IANA; falling back to cached registry", "error", err, "cache_age", cacheAge.Round(time.Minute))
+			LogWarn("Failed to refresh RDAP bootstrap from IANA; falling back to cached registry", "error", err, "cache_age", cacheAge.Round(time.Minute))
 			return nil
 		}
 		return fmt.Errorf("bootstrap registry unavailable: %w", err)
@@ -144,42 +161,48 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 }
 
 func (b *Bootstrap) fetch(ctx context.Context) error {
+	if b == nil {
+		return errors.New("bootstrap client is nil")
+	}
+	client := ResolveHTTPClient(b.http)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.url, nil)
 	if err != nil {
 		return fmt.Errorf("bootstrap request error: %w", err)
 	}
-	req.Header.Set("User-Agent", "DomainMonitor/1.0 (+https://github.com/domain-monitor)")
+	req.Header.Set("User-Agent", DefaultUserAgent)
 
-	resp, err := b.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("bootstrap fetch error: %w", err)
 	}
-	defer resp.Body.Close()
+	defer DrainAndClose(resp.Body, 4096)
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bootstrap status %d", resp.StatusCode)
 	}
 
-	var reg dnsRegistry
-	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, 8<<20), &reg); err != nil {
+	var registry dnsRegistry
+	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, MaxBootstrapResponseSize), &registry); err != nil {
 		return fmt.Errorf("bootstrap decode error: %w", err)
 	}
 
 	services := make(map[string][]string)
-	for _, svc := range reg.Services {
-		if len(svc) < 2 {
+	for _, serviceEntry := range registry.Services {
+		if len(serviceEntry) < 2 {
 			continue
 		}
 		var validURLs []string
-		for _, rawURL := range svc[1] {
-			trimmed := strings.TrimSpace(rawURL)
-			if strings.HasPrefix(trimmed, "https://") || strings.HasPrefix(trimmed, "http://") {
-				validURLs = append(validURLs, trimmed)
+		for _, rawURL := range DeduplicateNonEmptyStrings(serviceEntry[1]) {
+			if strings.HasPrefix(rawURL, "https://") || strings.HasPrefix(rawURL, "http://") {
+				validURLs = append(validURLs, rawURL)
 			}
 		}
 		if len(validURLs) > 0 {
-			for _, tld := range svc[0] {
-				services[strings.ToLower(tld)] = validURLs
+			for _, tld := range serviceEntry[0] {
+				cleanTLD := NormalizeDomain(tld)
+				if cleanTLD != "" {
+					services[cleanTLD] = validURLs
+				}
 			}
 		}
 	}
@@ -189,8 +212,9 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	}
 
 	for tld, urls := range StealthSeeds {
-		if _, ok := services[tld]; !ok {
-			services[tld] = urls
+		cleanTLD := NormalizeDomain(tld)
+		if _, ok := services[cleanTLD]; !ok {
+			services[cleanTLD] = urls
 		}
 	}
 
