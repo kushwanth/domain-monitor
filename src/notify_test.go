@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -387,8 +386,8 @@ func TestNotificationRedaction_NtfyMatchesTelegram(t *testing.T) {
 	secretDomain := "corp-secret.internal"
 	alerts := []Alert{
 		{
-			Message:  fmt.Sprintf("Raw alert containing %s and secret token", secretDomain),
-			Redacted: fmt.Sprintf("Domain %s registration expiring", secretDomain),
+			Message:  "Raw alert containing " + secretDomain + " and secret token",
+			Redacted: "Domain " + secretDomain + " registration expiring",
 			Priority: PriorityHigh,
 			Tag:      "warning",
 			Domain:   secretDomain,

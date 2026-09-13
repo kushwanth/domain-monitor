@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,8 +46,8 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   timeout,
-			KeepAlive: 30 * time.Second,
-			Control: func(network, address string, c syscall.RawConn) error {
+			KeepAlive: DefaultTCPKeepAlive,
+			Control: func(_, address string, _ syscall.RawConn) error {
 				if allowInsecureRDAPURLs {
 					return nil
 				}
@@ -56,7 +57,7 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 				}
 				if ip := net.ParseIP(host); ip != nil {
 					if IsRestrictedIP(ip) {
-						return fmt.Errorf("connection to restricted IP blocked (SSRF): %s", host)
+						return fmt.Errorf("%w: %s", ErrRestrictedIP, host)
 					}
 				}
 				return nil
@@ -71,24 +72,24 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 		Transport: transport,
 		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("stopped after 10 redirects")
+			if len(via) >= MaxRedirects {
+				return errors.New("stopped after 10 redirects")
 			}
 			if !isSafeRDAPURL(req.URL.String()) {
-				return fmt.Errorf("insecure or invalid redirect URL: %s", req.URL.String())
+				return errors.New("insecure or invalid redirect URL: " + req.URL.String())
 			}
 			return nil
 		},
 	}
 }
 
-// KnownWhoisServer returns a dedicated WHOIS server for a given domain suffix if known.
-func KnownWhoisServer(domain string) string {
+// KnownWHOISServer returns a dedicated WHOIS server for a given domain suffix if known.
+func KnownWHOISServer(domain string) string {
 	asciiDomain := NormalizeDomainToASCIIText(domain)
 	labels := strings.Split(asciiDomain, ".")
 	for i := range labels {
 		suffix := strings.Join(labels[i:], ".")
-		if server, ok := CCTLDWhoisServers[suffix]; ok {
+		if server, ok := CCTLDWHOISServers[suffix]; ok {
 			return server
 		}
 	}
@@ -101,7 +102,7 @@ func NewBootstrap(httpClient *http.Client) *Bootstrap {
 
 func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, error) {
 	if b == nil {
-		return nil, errors.New("bootstrap client is nil")
+		return nil, ErrBootstrapClientNil
 	}
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
@@ -118,7 +119,7 @@ func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, er
 			return slices.Clone(urls), nil
 		}
 	}
-	return nil, fmt.Errorf("no rdap server found for domain %s", domain)
+	return nil, errors.New("no rdap server found for domain " + domain)
 }
 
 func (b *Bootstrap) isFresh() bool {
@@ -132,7 +133,7 @@ func (b *Bootstrap) isFresh() bool {
 
 func (b *Bootstrap) ensure(ctx context.Context) error {
 	if b == nil {
-		return errors.New("bootstrap client is nil")
+		return ErrBootstrapClientNil
 	}
 	if b.isFresh() {
 		return nil
@@ -152,38 +153,38 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 		b.mu.RUnlock()
 
 		if hasData && cacheAge <= BootstrapMaxAge {
-			LogWarn("Failed to refresh RDAP bootstrap from IANA; falling back to cached registry", "error", err, "cache_age", cacheAge.Round(time.Minute))
+			LogWarn(MsgLogRDAPRefreshFailed, "error", err, "cache_age", cacheAge.Round(time.Minute))
 			return nil
 		}
-		return fmt.Errorf("bootstrap registry unavailable: %w", err)
+		return WrapError("bootstrap registry unavailable", err)
 	}
 	return nil
 }
 
 func (b *Bootstrap) fetch(ctx context.Context) error {
 	if b == nil {
-		return errors.New("bootstrap client is nil")
+		return ErrBootstrapClientNil
 	}
 	client := ResolveHTTPClient(b.http)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.url, nil)
 	if err != nil {
-		return fmt.Errorf("bootstrap request error: %w", err)
+		return WrapError("bootstrap request error", err)
 	}
-	req.Header.Set("User-Agent", DefaultUserAgent)
+	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("bootstrap fetch error: %w", err)
+		return WrapError("bootstrap fetch error", err)
 	}
-	defer DrainAndClose(resp.Body, 4096)
+	defer DrainAndClose(resp.Body, MaxBodyDrainSize)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bootstrap status %d", resp.StatusCode)
+		return errors.New("bootstrap status " + strconv.Itoa(resp.StatusCode))
 	}
 
 	var registry dnsRegistry
 	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, MaxBootstrapResponseSize), &registry); err != nil {
-		return fmt.Errorf("bootstrap decode error: %w", err)
+		return WrapError("bootstrap decode error", err)
 	}
 
 	services := make(map[string][]string)
@@ -193,7 +194,7 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 		}
 		var validURLs []string
 		for _, rawURL := range DeduplicateNonEmptyStrings(serviceEntry[1]) {
-			if strings.HasPrefix(rawURL, "https://") || strings.HasPrefix(rawURL, "http://") {
+			if strings.HasPrefix(rawURL, PrefixHTTPS) || strings.HasPrefix(rawURL, PrefixHTTP) {
 				validURLs = append(validURLs, rawURL)
 			}
 		}
@@ -208,7 +209,7 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	}
 
 	if len(services) == 0 {
-		return fmt.Errorf("empty bootstrap registry")
+		return ErrEmptyBootstrapRegistry
 	}
 
 	for tld, urls := range StealthSeeds {

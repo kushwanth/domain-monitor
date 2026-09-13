@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,13 +16,13 @@ import (
 
 var whoisTestMu sync.RWMutex
 
-func setWhoisQueryFn(fn func(string) (string, error)) {
+func setWHOISQueryFn(fn func(string) (string, error)) {
 	whoisTestMu.Lock()
 	defer whoisTestMu.Unlock()
 	whoisQueryFn = fn
 }
 
-func getWhoisQueryFn() func(string) (string, error) {
+func getWHOISQueryFn() func(string) (string, error) {
 	whoisTestMu.RLock()
 	defer whoisTestMu.RUnlock()
 	return whoisQueryFn
@@ -655,6 +654,11 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 	validateRDAPState(app2, target2, parsed2)
 	if len(app2.Notifier.Buffer) != 1 {
 		t.Errorf("Expected 1 alert when DomainTransferLocked=true and unlocked, got %d", len(app2.Notifier.Buffer))
+	} else {
+		expectedMsg := "example.com is unlocked (missing transfer prohibitions)"
+		if app2.Notifier.Buffer[0].Message != expectedMsg {
+			t.Errorf("Expected alert message %q, got %q", expectedMsg, app2.Notifier.Buffer[0].Message)
+		}
 	}
 	if parsed2.Status != StatusWarning {
 		t.Errorf("Expected StatusWarning when domain is unlocked and DomainTransferLocked=true, got %s", parsed2.Status)
@@ -689,7 +693,7 @@ func TestFlexibleDateParsing(t *testing.T) {
 		{"2026-08-13T04:00:00.000Z", "2026-08-13"},
 		{"2026-08-13 04:00:00 UTC", "2026-08-13"},
 		{"2026-08-13 04:00:00 MST", "2026-08-13"},
-		{"2026-08-13 04:00:00 JST", "2026-08-12"}, // 04:00 JST is 19:00 UTC previous day
+		{"2026-08-13 04:00:00 JST", "2026-08-12"},
 		{"2026-08-13 14:00:00 JST", "2026-08-13"},
 		{"2026-08-13 04:00:00", "2026-08-13"},
 		{"2026-08-13", "2026-08-13"},
@@ -707,6 +711,10 @@ func TestFlexibleDateParsing(t *testing.T) {
 		{`"2026-08-13" (YYYY-MM-DD)`, "2026-08-13"},
 		{"Expires on: 2026-08-13", "2026-08-13"},
 		{"Renewal Date: 2026-08-13T04:00:00Z", "2026-08-13"},
+		{"2026-08-13 15:00:00 JST", "2026-08-13T06:00:00Z"},
+		{"2026-08-13 15:00:00 EDT", "2026-08-13T19:00:00Z"},
+		{"2026-08-13 15:00:00 KST", "2026-08-13T06:00:00Z"},
+		{"2026-08-13 15:00:00 AEST", "2026-08-13T05:00:00Z"},
 	}
 
 	for _, tc := range testDates {
@@ -809,8 +817,8 @@ func TestFindRegistrarRecursively(t *testing.T) {
 	}
 }
 
-func TestFetchWhois(t *testing.T) {
-	sampleWhois := `
+func TestFetchWHOIS(t *testing.T) {
+	sampleWHOIS := `
 Domain Name: EXAMPLE.COM
 Registry Domain ID: 2336799_DOMAIN_COM-VRSN
 Registrar WHOIS Server: whois.verisign-grs.com
@@ -822,16 +830,16 @@ Name Server: A.IANA-SERVERS.NET
 Name Server: B.IANA-SERVERS.NET
 DNSSEC: unsigned
 `
-	orig := getWhoisQueryFn()
-	defer func() { setWhoisQueryFn(orig) }()
+	orig := getWHOISQueryFn()
+	defer func() { setWHOISQueryFn(orig) }()
 
-	setWhoisQueryFn(func(_ string) (string, error) {
-		return sampleWhois, nil
+	setWHOISQueryFn(func(_ string) (string, error) {
+		return sampleWHOIS, nil
 	})
 
-	state, err := fetchWhois(context.Background(), "example.com")
+	state, err := fetchWHOIS(context.Background(), "example.com")
 	if err != nil {
-		t.Fatalf("fetchWhois failed: %v", err)
+		t.Fatalf("fetchWHOIS failed: %v", err)
 	}
 
 	if state.Status != StatusOK {
@@ -847,9 +855,9 @@ DNSSEC: unsigned
 	}
 }
 
-func TestFetchWhois_AlternativeTemplates(t *testing.T) {
-	orig := getWhoisQueryFn()
-	defer func() { setWhoisQueryFn(orig) }()
+func TestFetchWHOIS_AlternativeTemplates(t *testing.T) {
+	orig := getWHOISQueryFn()
+	defer func() { setWHOISQueryFn(orig) }()
 
 	// Test ccTLD style with paid-till and nserver (e.g. RU/SU/ccTLDs)
 	whoisRu := `
@@ -861,13 +869,13 @@ org:           Example LLC
 registrar:     RU-CENTER-RU
 paid-till:     2026-09-15
 `
-	setWhoisQueryFn(func(_ string) (string, error) {
+	setWHOISQueryFn(func(_ string) (string, error) {
 		return whoisRu, nil
 	})
 
-	state, err := fetchWhois(context.Background(), "example.ru")
+	state, err := fetchWHOIS(context.Background(), "example.ru")
 	if err != nil {
-		t.Fatalf("fetchWhois failed on RU template: %v", err)
+		t.Fatalf("fetchWHOIS failed on RU template: %v", err)
 	}
 	if state.Expiration == "" || !strings.HasPrefix(state.Expiration, "2026-09-15") {
 		t.Errorf("Expected expiration 2026-09-15, got %q", state.Expiration)
@@ -897,13 +905,13 @@ paid-till:     2026-09-15
         ns1.nominet.org.uk
         ns2.nominet.org.uk
 `
-	setWhoisQueryFn(func(_ string) (string, error) {
+	setWHOISQueryFn(func(_ string) (string, error) {
 		return whoisUk, nil
 	})
 
-	stateUk, err := fetchWhois(context.Background(), "example.co.uk")
+	stateUk, err := fetchWHOIS(context.Background(), "example.co.uk")
 	if err != nil {
-		t.Fatalf("fetchWhois failed on UK template: %v", err)
+		t.Fatalf("fetchWHOIS failed on UK template: %v", err)
 	}
 	if stateUk.Expiration == "" || !strings.HasPrefix(stateUk.Expiration, "2027-08-01") {
 		t.Errorf("Expected expiration 2027-08-01, got %q", stateUk.Expiration)
@@ -920,13 +928,13 @@ paid-till:     2026-09-15
 [Name Server]                   ns1.sony.co.jp
 [Name Server]                   ns2.sony.co.jp
 `
-	setWhoisQueryFn(func(_ string) (string, error) {
+	setWHOISQueryFn(func(_ string) (string, error) {
 		return whoisJp, nil
 	})
 
-	stateJp, err := fetchWhois(context.Background(), "sony.co.jp")
+	stateJp, err := fetchWHOIS(context.Background(), "sony.co.jp")
 	if err != nil {
-		t.Fatalf("fetchWhois failed on JPRS template: %v", err)
+		t.Fatalf("fetchWHOIS failed on JPRS template: %v", err)
 	}
 	if len(stateJp.Nameservers) < 2 {
 		t.Errorf("Expected at least 2 nameservers for JPRS, got %v", stateJp.Nameservers)
@@ -936,15 +944,15 @@ paid-till:     2026-09-15
 	}
 }
 
-func TestFetchWhois_NotFound(t *testing.T) {
-	orig := getWhoisQueryFn()
-	defer func() { setWhoisQueryFn(orig) }()
+func TestFetchWHOIS_NotFound(t *testing.T) {
+	orig := getWHOISQueryFn()
+	defer func() { setWHOISQueryFn(orig) }()
 
-	setWhoisQueryFn(func(_ string) (string, error) {
+	setWHOISQueryFn(func(_ string) (string, error) {
 		return "No match for domain NOTFOUND12345.COM.", nil
 	})
 
-	_, err := fetchWhois(context.Background(), "notfound12345.com")
+	_, err := fetchWHOIS(context.Background(), "notfound12345.com")
 	if err == nil {
 		t.Fatalf("Expected error for non-existent domain, got nil")
 	}
@@ -953,10 +961,10 @@ func TestFetchWhois_NotFound(t *testing.T) {
 	}
 
 	// Test SIDN Dutch "is free" response
-	setWhoisQueryFn(func(_ string) (string, error) {
+	setWHOISQueryFn(func(_ string) (string, error) {
 		return "unregistered-dutch-test-555.nl is free\n", nil
 	})
-	_, errNl := fetchWhois(context.Background(), "unregistered-dutch-test-555.nl")
+	_, errNl := fetchWHOIS(context.Background(), "unregistered-dutch-test-555.nl")
 	if errNl == nil {
 		t.Fatalf("Expected error for SIDN is free domain, got nil")
 	}
@@ -1130,7 +1138,7 @@ func TestWHOISContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	_, err := queryWhoisWithContext(ctx, "example.com")
+	_, err := queryWHOISWithContext(ctx, "example.com")
 	if err == nil {
 		t.Errorf("Expected error from cancelled context, got nil")
 	}
@@ -1150,25 +1158,25 @@ func TestWHOISRateLimitingClassification(t *testing.T) {
 	}
 
 	for _, sample := range rateLimitSamples {
-		if !isWhoisRateLimited(sample, nil) {
+		if !isWHOISRateLimited(sample, nil) {
 			t.Errorf("Expected %q to be classified as rate limited", sample)
 		}
 	}
 
 	normalSample := "Domain Name: EXAMPLE.COM\nRegistry Expiry Date: 2028-08-13T04:00:00Z"
-	if isWhoisRateLimited(normalSample, nil) {
+	if isWHOISRateLimited(normalSample, nil) {
 		t.Errorf("Expected normal WHOIS output not to be rate limited")
 	}
 }
 
-func TestFetchWhois_Extensive(t *testing.T) {
+func TestFetchWHOIS_Extensive(t *testing.T) {
 	files, err := os.ReadDir("testdata/whois")
 	if err != nil {
 		t.Skip("testdata/whois not found, skipping extensive tests")
 	}
 
-	orig := getWhoisQueryFn()
-	defer func() { setWhoisQueryFn(orig) }()
+	orig := getWHOISQueryFn()
+	defer func() { setWHOISQueryFn(orig) }()
 
 	successCount := 0
 	totalCount := 0
@@ -1190,11 +1198,11 @@ func TestFetchWhois_Extensive(t *testing.T) {
 		}
 		content := string(contentBytes)
 
-		setWhoisQueryFn(func(_ string) (string, error) {
+		setWHOISQueryFn(func(_ string) (string, error) {
 			return content, nil
 		})
 
-		state, err := fetchWhois(context.Background(), "example"+filepath.Ext(name))
+		state, err := fetchWHOIS(context.Background(), "example"+filepath.Ext(name))
 		if err != nil {
 			t.Logf("Failed to parse %s: %v", name, err)
 			continue
@@ -1493,10 +1501,10 @@ func TestLookupSentinelsAndHelpers(t *testing.T) {
 		t.Errorf("expected empty root zone IPs, got %v", ips)
 	}
 
-	// Verify ErrWhoisRateLimited sentinel error
-	wrapped := fmt.Errorf("lookup failed: %w", ErrWhoisRateLimited)
-	if !errors.Is(wrapped, ErrWhoisRateLimited) {
-		t.Errorf("expected errors.Is(wrapped, ErrWhoisRateLimited) = true")
+	// Verify ErrWHOISRateLimited sentinel error
+	wrapped := WrapError("lookup failed", ErrWHOISRateLimited)
+	if !errors.Is(wrapped, ErrWHOISRateLimited) {
+		t.Errorf("expected errors.Is(wrapped, ErrWHOISRateLimited) = true")
 	}
 }
 
@@ -1680,7 +1688,7 @@ func TestSynthesizeTierData_RegistryIANAIDPreserved(t *testing.T) {
 
 func TestCycleInvariants_FaultIsolationOnPanic(t *testing.T) {
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Domains: []DomainConfig{
 				{Domain: "healthy1.example.com"},
 				{Domain: "panic.example.com"},
@@ -1694,7 +1702,7 @@ func TestCycleInvariants_FaultIsolationOnPanic(t *testing.T) {
 	}
 
 	state := NewCheckState()
-	for _, d := range app.Config.Domains {
+	for _, d := range app.Config().Domains {
 		if d.Domain == "panic.example.com" {
 			state.RDAP[d.Domain] = &RDAPState{
 				Status: StatusFailed,
@@ -1714,7 +1722,7 @@ func TestCycleInvariants_FaultIsolationOnPanic(t *testing.T) {
 
 func TestCycleInvariants_ZeroPendingOnTimeout(t *testing.T) {
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Domains: []DomainConfig{
 				{Domain: "unreached.example.com"},
 			},

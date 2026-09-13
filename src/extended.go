@@ -4,20 +4,20 @@ import (
 	"cmp"
 	"context"
 	jsonv2 "encoding/json/v2"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
-	"time"
 )
 
 var (
 	CTLogsPath   = DefaultCTLogsSubdir
-	ctHTTPClient = ResolveHTTPClient(&http.Client{Timeout: 10 * time.Second})
+	ctHTTPClient = ResolveHTTPClient(&http.Client{Timeout: DefaultHTTPTimeout})
 )
 
 func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, prevState *CTLogState) *CTLogState {
@@ -34,10 +34,10 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 	}
 
 	// 1. Fetch Page 1 (Forward Polling for New Certs)
-	apiURL := fmt.Sprintf("%s%s", CTLogsAPIEndpoint, target.Domain)
+	apiURL := CTLogsAPIEndpoint + target.Domain
 	respPage1, err := fetchCTPage(ctx, app, apiURL)
 	if err != nil {
-		LogError("CT logs polling failed", "domain", target.Domain, "error", err)
+		LogError(MsgLogCTLogsPollingFailed, "domain", target.Domain, "error", err)
 		return &CTLogState{
 			LatestID:         latestID,
 			BackfillCursor:   backfillCursor,
@@ -49,11 +49,11 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 
 	var newCerts []CTCert
 	isFirstRun := (latestID == "")
-	var newLatestID string = latestID
-	var page1NextCursor string = respPage1.NextCursor
+	var checkpointID string = latestID
+	var firstPageCursor string = respPage1.NextCursor
 
 	if len(respPage1.Rows) > 0 {
-		newLatestID = respPage1.Rows[0].ID
+		checkpointID = respPage1.Rows[0].ID
 
 		for _, row := range respPage1.Rows {
 			if row.ID == latestID {
@@ -64,12 +64,11 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 			if !isFirstRun {
 				issuerName := row.Issuer
 				if issuerName == "" {
-					issuerName = "Unknown CA"
+					issuerName = DefaultUnknownCA
 				}
-				msg := fmt.Sprintf(MsgAlertNewSSLCert, target.Domain, issuerName, row.Match)
-				redacted := fmt.Sprintf("New SSL Certificate issued by %s for %s.", issuerName, row.Match)
+				redacted := "New SSL Certificate issued by " + issuerName + " for " + row.Match + "."
 				if !target.SuppressAlerts {
-					app.SafeDispatch(msg, redacted, PriorityHigh, "lock", target.Domain, target.Name)
+					app.SafeDispatchf(PriorityHigh, TagLock, target.Domain, target.Name, redacted, MsgAlertNewSSLCert, target.Domain, issuerName, row.Match)
 				}
 			}
 		}
@@ -77,9 +76,9 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 
 	// Save new certs to history
 	if len(newCerts) > 0 {
-		LogInfo("Discovered new SSL certificates via CT logs", "domain", target.Domain, "count", len(newCerts))
+		LogInfo(MsgLogDiscoveredNewCerts, "domain", target.Domain, "count", len(newCerts))
 		if err := saveCertsToHistory(target.Domain, newCerts); err != nil {
-			LogError("Failed to save CT logs history", "domain", target.Domain, "error", err)
+			LogError(MsgLogSaveCTLogsFailed, "domain", target.Domain, "error", err)
 			return &CTLogState{
 				LatestID:         latestID, // Keep previous checkpoint on write failure to allow retry
 				BackfillCursor:   backfillCursor,
@@ -94,26 +93,26 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 	if !backfillComplete {
 		cursorToUse := backfillCursor
 		if cursorToUse == "" {
-			cursorToUse = page1NextCursor
+			cursorToUse = firstPageCursor
 		}
 
 		if cursorToUse != "" {
 			var backfillURL string
-			if baseParsed, pErr := url.Parse(fmt.Sprintf("%s%s", CTLogsAPIEndpoint, target.Domain)); pErr == nil {
+			if baseParsed, pErr := url.Parse(CTLogsAPIEndpoint + target.Domain); pErr == nil {
 				u := baseParsed.Clone()
 				q := u.Query()
 				q.Set("after", cursorToUse)
 				u.RawQuery = q.Encode()
 				backfillURL = u.String()
 			} else {
-				backfillURL = fmt.Sprintf("%s%s?after=%s", CTLogsAPIEndpoint, target.Domain, url.QueryEscape(cursorToUse))
+				backfillURL = CTLogsAPIEndpoint + target.Domain + "?after=" + url.QueryEscape(cursorToUse)
 			}
 
 			respBackfill, err := fetchCTPage(ctx, app, backfillURL)
 			if err != nil {
-				LogWarn("CT logs backfill failed", "domain", target.Domain, "error", err)
+				LogWarn(MsgLogCTLogsBackfillFailed, "domain", target.Domain, "error", err)
 				return &CTLogState{
-					LatestID:         newLatestID,
+					LatestID:         checkpointID,
 					BackfillCursor:   cursorToUse, // Keep old cursor to retry later
 					BackfillComplete: false,
 					Status:           StatusFailed,
@@ -123,9 +122,9 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 
 			if len(respBackfill.Rows) > 0 {
 				if err := saveCertsToHistory(target.Domain, respBackfill.Rows); err != nil {
-					LogError("Failed to save backfilled CT logs", "domain", target.Domain, "error", err)
+					LogError(MsgLogSaveBackfilledCTLogsFailed, "domain", target.Domain, "error", err)
 					return &CTLogState{
-						LatestID:         newLatestID,
+						LatestID:         checkpointID,
 						BackfillCursor:   cursorToUse, // don't advance cursor
 						BackfillComplete: false,
 						Status:           StatusFailed,
@@ -145,7 +144,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 	}
 
 	return &CTLogState{
-		LatestID:         newLatestID,
+		LatestID:         checkpointID,
 		BackfillCursor:   backfillCursor,
 		BackfillComplete: backfillComplete,
 		Status:           StatusOK,
@@ -153,38 +152,38 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 	}
 }
 
-func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPageResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if app != nil && app.Config != nil && app.Config.CTLogsAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+app.Config.CTLogsAPIKey)
+	if key := app.Config().CTLogsAPIKey; key != "" {
+		req.Header.Set(HeaderAuthorization, "Bearer "+key)
 	}
 
-	req.Header.Set("User-Agent", DefaultUserAgent)
+	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
 	resp, err := ctHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer DrainAndClose(resp.Body, 4096)
+	defer DrainAndClose(resp.Body, MaxBodyDrainSize)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, fmt.Errorf("api.ctlogs.dev rate limit exceeded")
+		return nil, ErrCTLogsRateLimited
 	} else if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize))
 		bodyStr := string(bodyBytes)
-		if app != nil && app.Config != nil && app.Config.CTLogsAPIKey != "" {
-			bodyStr = strings.ReplaceAll(bodyStr, app.Config.CTLogsAPIKey, "[REDACTED_API_KEY]")
+		if key := app.Config().CTLogsAPIKey; key != "" {
+			bodyStr = strings.ReplaceAll(bodyStr, key, RedactedAPIKeyPlaceholder)
 		}
-		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, bodyStr)
+		return nil, errors.New("API returned " + strconv.Itoa(resp.StatusCode) + ": " + bodyStr)
 	}
 
-	var ctResp CTLogsDevResponse
+	var ctResp ctLogsPageResponse
 	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, MaxCTLogsResponseSize), &ctResp); err != nil {
-		return nil, fmt.Errorf("json parse error: %w", err)
+		return nil, WrapError("json parse error", err)
 	}
 
 	return &ctResp, nil
@@ -193,25 +192,27 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*CTLogsDevR
 func saveCertsToHistory(domain string, certs []CTCert) error {
 	cleanDomain := NormalizeDomain(domain)
 	if cleanDomain == "" || !ReValidDomain.MatchString(cleanDomain) {
-		return fmt.Errorf("invalid domain for certs history: %q", domain)
+		return errors.New("invalid domain for certs history: " + strconv.Quote(domain))
 	}
-	if err := os.MkdirAll(CTLogsPath, 0775); err != nil {
+	if err := os.MkdirAll(CTLogsPath, 0750); err != nil {
 		return err
 	}
 	filePath := filepath.Join(CTLogsPath, cleanDomain+".json")
 	cleanPath := filepath.Clean(filePath)
 	if !IsSafeSubpath(CTLogsPath, cleanPath) {
-		return fmt.Errorf("invalid file path for certs history: %q", domain)
+		return errors.New("invalid file path for certs history: " + strconv.Quote(domain))
 	}
 
 	var existing []CTCert
 	if b, err := os.ReadFile(cleanPath); err == nil {
-		_ = jsonv2.Unmarshal(b, &existing)
+		if unmarshalErr := jsonv2.Unmarshal(b, &existing); unmarshalErr != nil {
+			LogWarn(MsgLogUnmarshalCTLogFailed, "domain", domain, "error", unmarshalErr)
+		}
 	}
 
 	// We create a map to deduplicate, just in case backfill overlaps or page 1 repeats
-	seen := make(map[string]bool)
-	var combined []CTCert
+	seen := make(map[string]bool, len(existing)+len(certs))
+	combined := make([]CTCert, 0, len(existing)+len(certs))
 
 	for _, cert := range existing {
 		if !seen[cert.ID] {
@@ -236,6 +237,9 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 			}
 			return cmp.Compare(b.ID, a.ID)
 		})
+		if len(combined) > MaxCTCertHistory {
+			combined = combined[:MaxCTCertHistory]
+		}
 		b, err := jsonv2.Marshal(combined)
 		if err != nil {
 			return err

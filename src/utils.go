@@ -21,6 +21,31 @@ import (
 
 // --- 1. Pointer & Map Safety Utilities ---
 
+// WrapError wraps an underlying error with a descriptive prefix message while preserving the error chain for errors.Is and errors.As.
+func WrapError(prefix string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
+}
+
+// AnyToString converts any value or panic object into a string representation safely.
+func AnyToString(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case error:
+		return val.Error()
+	case fmt.Stringer:
+		return val.String()
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
 // DerefOrDefault safely dereferences ptr if it is non-nil; otherwise it returns fallback.
 func DerefOrDefault[T any](ptr *T, fallback T) T {
 	if ptr == nil {
@@ -131,7 +156,7 @@ func TruncateRunes(s string, maxRunes int) string {
 // --- 4. HTTP Resiliency & Connection Management ---
 
 // DefaultHTTPClient provides a safe fallback HTTP client with a 10-second timeout.
-var DefaultHTTPClient = &http.Client{Timeout: 10 * time.Second}
+var DefaultHTTPClient = &http.Client{Timeout: DefaultHTTPTimeout}
 
 // ResolveHTTPClient returns client if non-nil; otherwise it returns DefaultHTTPClient.
 func ResolveHTTPClient(client *http.Client) *http.Client {
@@ -256,26 +281,26 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 
 // --- 6. Standardized Logging Utilities with Localized Timezone (No k=v syntax, No Source) ---
 
-// CleanTextHandler formats log records into human-readable lines without key=value syntax or source annotations.
-type CleanTextHandler struct {
+// ConsoleHandler formats log records into human-readable lines without key=value syntax or source annotations.
+type ConsoleHandler struct {
 	w     io.Writer
 	mu    *sync.Mutex
 	attrs []string
 }
 
-// NewCleanTextHandler creates a new CleanTextHandler writing to w.
-func NewCleanTextHandler(w io.Writer) *CleanTextHandler {
-	return &CleanTextHandler{
+// NewConsoleHandler creates a new ConsoleHandler writing to w.
+func NewConsoleHandler(w io.Writer) *ConsoleHandler {
+	return &ConsoleHandler{
 		w:  w,
 		mu: &sync.Mutex{},
 	}
 }
 
-func (h *CleanTextHandler) Enabled(_ context.Context, _ slog.Level) bool {
+func (h *ConsoleHandler) Enabled(_ context.Context, _ slog.Level) bool {
 	return true
 }
 
-func (h *CleanTextHandler) Handle(_ context.Context, r slog.Record) error {
+func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 	timestamp := r.Time.In(time.Local).Format("2006-01-02 15:04:05 MST")
 	levelStr := r.Level.String()
 
@@ -303,7 +328,7 @@ func (h *CleanTextHandler) Handle(_ context.Context, r slog.Record) error {
 	return err
 }
 
-func (h *CleanTextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+func (h *ConsoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	var formatted []string
 	for _, a := range attrs {
 		if a.Key != "" {
@@ -313,14 +338,14 @@ func (h *CleanTextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	newAttrs := make([]string, 0, len(h.attrs)+len(formatted))
 	newAttrs = append(newAttrs, h.attrs...)
 	newAttrs = append(newAttrs, formatted...)
-	return &CleanTextHandler{
+	return &ConsoleHandler{
 		w:     h.w,
 		mu:    h.mu,
 		attrs: newAttrs,
 	}
 }
 
-func (h *CleanTextHandler) WithGroup(_ string) slog.Handler {
+func (h *ConsoleHandler) WithGroup(_ string) slog.Handler {
 	return h
 }
 
@@ -331,7 +356,7 @@ func init() {
 // InitLocalizedLogger initializes the default slog logger to format timestamps
 // with the localized system timezone and clean human-readable output without key=value syntax or source annotations.
 func InitLocalizedLogger() {
-	slog.SetDefault(slog.New(NewCleanTextHandler(os.Stderr)))
+	slog.SetDefault(slog.New(NewConsoleHandler(os.Stderr)))
 }
 
 // logWithLevel logs a message at the specified level without source annotations.

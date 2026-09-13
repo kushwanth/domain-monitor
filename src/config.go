@@ -4,64 +4,66 @@ import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
-func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error) {
+// LoadConfig reads, unmarshals, normalizes, and validates the configuration file.
+// It is a pure function returning a value-based AppConfig and error, with zero runtime side effects.
+func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return AppConfig{}, err
 	}
 	if path == "" {
-		path = "config.json"
+		path = DefaultConfigFile
 	}
 
 	jsonBytes, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read config file: %w", err)
+		return AppConfig{}, WrapError("failed to read config file", err)
 	}
 
 	var rawCfg AppConfig
 	if err := jsonv2.Unmarshal(jsonBytes, &rawCfg); err != nil {
-		return nil, nil, fmt.Errorf("json unmarshal failed: %w", err)
+		return AppConfig{}, WrapError("json unmarshal failed", err)
 	}
 
 	// Override with environment variables if provided
-	if p := strings.TrimSpace(os.Getenv("PORT")); p != "" {
+	if p := strings.TrimSpace(os.Getenv(EnvPort)); p != "" {
 		rawCfg.Port = p
 	}
 	if rawCfg.Port == "" {
-		rawCfg.Port = "8080"
+		rawCfg.Port = DefaultServerPort
 	}
-	if t := strings.TrimSpace(os.Getenv("NTFY_AUTH")); t != "" {
+	if t := strings.TrimSpace(os.Getenv(EnvNtfyAuth)); t != "" {
 		if rawCfg.Notifications.Ntfy == nil {
 			rawCfg.Notifications.Ntfy = &NtfyConfig{}
 		}
 		rawCfg.Notifications.Ntfy.Auth = t
 	}
-	if t := strings.TrimSpace(os.Getenv("TELEGRAM_TOKEN")); t != "" {
+	if t := strings.TrimSpace(os.Getenv(EnvTelegramToken)); t != "" {
 		if rawCfg.Notifications.Telegram == nil {
 			rawCfg.Notifications.Telegram = &TelegramConfig{}
 		}
 		rawCfg.Notifications.Telegram.Token = t
 	}
-	if id := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")); id != "" {
+	if id := strings.TrimSpace(os.Getenv(EnvTelegramChatID)); id != "" {
 		if rawCfg.Notifications.Telegram == nil {
 			rawCfg.Notifications.Telegram = &TelegramConfig{}
 		}
 		rawCfg.Notifications.Telegram.ChatID = id
 	}
-	if k := strings.TrimSpace(os.Getenv("CTLOGS_API_KEY")); k != "" {
+	if k := strings.TrimSpace(os.Getenv(EnvCTLogsAPIKey)); k != "" {
 		rawCfg.CTLogsAPIKey = k
 	}
-	if u := strings.TrimSpace(os.Getenv("DOH_URL")); u != "" {
+	if u := strings.TrimSpace(os.Getenv(EnvDoHURL)); u != "" {
 		rawCfg.DoHURL = u
 	}
 
@@ -69,8 +71,8 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 	if len(rawCfg.Resolvers) == 0 {
 		rawCfg.Resolvers = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 	}
-	if len(rawCfg.Resolvers) > 9 {
-		return nil, nil, fmt.Errorf("configured resolvers exceed maximum limit of 9")
+	if len(rawCfg.Resolvers) > MaxResolversLimit {
+		return AppConfig{}, errors.New("configured resolvers exceed maximum limit of 9")
 	}
 
 	// 3. Schema Normalization
@@ -80,33 +82,33 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 		domainCfg := &rawCfg.Domains[i]
 		domainCfg.Domain = NormalizeDomainToASCIIText(domainCfg.Domain)
 		if domainCfg.Domain == "" {
-			return nil, nil, fmt.Errorf("domain entry at index %d has an empty domain", i)
+			return AppConfig{}, errors.New("domain entry at index " + strconv.Itoa(i) + " has an empty domain")
 		}
 		if seenDomains[domainCfg.Domain] {
-			return nil, nil, fmt.Errorf("duplicate domain %q; each domain entry must be unique", domainCfg.Domain)
+			return AppConfig{}, errors.New("duplicate domain " + strconv.Quote(domainCfg.Domain) + "; each domain entry must be unique")
 		}
 		seenDomains[domainCfg.Domain] = true
 		for j := range domainCfg.ExpectedNS {
 			nsClean := NormalizeDomainToASCIIText(domainCfg.ExpectedNS[j])
 			if nsClean == "" {
-				return nil, nil, fmt.Errorf("domain %s has an empty entry in expected_ns at index %d", domainCfg.Domain, j)
+				return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has an empty entry in expected_ns at index " + strconv.Itoa(j))
 			}
 			domainCfg.ExpectedNS[j] = nsClean
 		}
 		for j := range domainCfg.SecondaryNS {
 			nsClean := NormalizeDomainToASCIIText(domainCfg.SecondaryNS[j])
 			if nsClean == "" {
-				return nil, nil, fmt.Errorf("domain %s has an empty entry in secondary_ns at index %d", domainCfg.Domain, j)
+				return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has an empty entry in secondary_ns at index " + strconv.Itoa(j))
 			}
 			domainCfg.SecondaryNS[j] = nsClean
 		}
 
 		// Enforce Name is mandatory for domains and unique
 		if domainCfg.Name == "" {
-			return nil, nil, fmt.Errorf("domain %s is missing a mandatory 'name' field", domainCfg.Domain)
+			return AppConfig{}, errors.New("domain " + domainCfg.Domain + " is missing a mandatory 'name' field")
 		}
 		if seenDomainNames[domainCfg.Name] {
-			return nil, nil, fmt.Errorf("duplicate domain name %q; each domain must have a unique name", domainCfg.Name)
+			return AppConfig{}, errors.New("duplicate domain name " + strconv.Quote(domainCfg.Name) + "; each domain must have a unique name")
 		}
 		seenDomainNames[domainCfg.Name] = true
 
@@ -117,12 +119,12 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 		domainCfg.ExpectedRegistrarName = strings.TrimSpace(domainCfg.ExpectedRegistrarName)
 
 		if len(domainCfg.SecondaryNS) > 0 && len(domainCfg.ExpectedNS) == 0 {
-			return nil, nil, fmt.Errorf("domain %s has secondary_ns configured but no primary expected_ns configured", domainCfg.Domain)
+			return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has secondary_ns configured but no primary expected_ns configured")
 		}
 
 		if domainCfg.VerifyNSHealth {
 			if len(domainCfg.ExpectedNS) == 0 {
-				return nil, nil, fmt.Errorf("domain %s has verify_ns_health enabled but no primary expected_ns configured", domainCfg.Domain)
+				return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has verify_ns_health enabled but no primary expected_ns configured")
 			}
 			// secondary_ns is optional: if configured, secondary NS replication is checked; if omitted, secondary checks are skipped.
 		}
@@ -130,7 +132,7 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 		if domainCfg.IsDelegatedZone {
 			domainCfg.RootZone = NormalizeDomainToASCIIText(domainCfg.RootZone)
 			if domainCfg.RootZone == "" {
-				return nil, nil, fmt.Errorf("delegated domain %s is missing a mandatory 'root_zone' field", domainCfg.Domain)
+				return AppConfig{}, errors.New("delegated domain " + domainCfg.Domain + " is missing a mandatory 'root_zone' field")
 			}
 		}
 
@@ -165,14 +167,14 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 
 		if domainCfg.CheckEmailSecurity {
 			if domainCfg.MailProvider != "" && len(domainCfg.MXRecords) > 0 {
-				return nil, nil, fmt.Errorf("domain %s has both mail_provider and mx_records set; these are mutually exclusive", domainCfg.Domain)
+				return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has both mail_provider and mx_records set; these are mutually exclusive")
 			}
 			domainCfg.MailProvider = strings.ToLower(strings.TrimSpace(domainCfg.MailProvider))
 			for j := range domainCfg.MXRecords {
 				rawMX := strings.TrimSpace(domainCfg.MXRecords[j])
 				var mxClean string
-				if rawMX == "." {
-					mxClean = "."
+				if rawMX == NullMXRecord {
+					mxClean = NullMXRecord
 				} else {
 					mxClean = NormalizeDomainToASCIIText(rawMX)
 				}
@@ -190,25 +192,25 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 		dnsRecord.Hostname = NormalizeDomainToASCIIText(dnsRecord.Hostname)
 
 		if dnsRecord.Hostname == "" {
-			return nil, nil, fmt.Errorf("dns record at index %d has an empty hostname", i)
+			return AppConfig{}, errors.New("dns record at index " + strconv.Itoa(i) + " has an empty hostname")
 		}
 
 		dnsRecord.Name = strings.TrimSpace(dnsRecord.Name)
 		if dnsRecord.Name == "" {
-			return nil, nil, fmt.Errorf("dns record %s (%s) is missing a mandatory 'name' field", dnsRecord.Hostname, dnsRecord.Type)
+			return AppConfig{}, errors.New("dns record " + dnsRecord.Hostname + " (" + dnsRecord.Type + ") is missing a mandatory 'name' field")
 		}
 		if seenDNSNames[dnsRecord.Name] {
-			return nil, nil, fmt.Errorf("duplicate dns record name %q; each dns record must have a unique name", dnsRecord.Name)
+			return AppConfig{}, errors.New("duplicate dns record name " + strconv.Quote(dnsRecord.Name) + "; each dns record must have a unique name")
 		}
 		seenDNSNames[dnsRecord.Name] = true
 
 		dnsRecord.Type = strings.ToUpper(strings.TrimSpace(dnsRecord.Type))
 		if dnsRecord.Type == "" {
-			return nil, nil, fmt.Errorf("dns record %s is missing a type (e.g. A, CNAME)", dnsRecord.Hostname)
+			return AppConfig{}, errors.New("dns record " + dnsRecord.Hostname + " is missing a type (e.g. A, CNAME)")
 		}
 		if dnsRecord.SkipSSL {
 			if dnsRecord.Type != "A" && dnsRecord.Type != "AAAA" && dnsRecord.Type != "CNAME" && dnsRecord.Type != "ALIAS" && dnsRecord.Type != "IP" {
-				return nil, nil, fmt.Errorf("dns record %s (%s) has skip_ssl enabled; skip_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types", dnsRecord.Hostname, dnsRecord.Type)
+				return AppConfig{}, errors.New("dns record " + dnsRecord.Hostname + " (" + dnsRecord.Type + ") has skip_ssl enabled; skip_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types")
 			}
 		}
 
@@ -231,26 +233,26 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 			case "A":
 				if parsedIP != nil {
 					if parsedIP.To4() == nil {
-						return nil, nil, fmt.Errorf("dns record %q (%s): expected %q is an IPv6 address, but record type is A (requires IPv4)", dnsRecord.Name, dnsRecord.Hostname, rawVal)
+						return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is an IPv6 address, but record type is A (requires IPv4)")
 					}
 					cleanVal = parsedIP.String()
 				} else {
-					return nil, nil, fmt.Errorf("dns record %q (%s): expected %q is not a valid IPv4 address for type A", dnsRecord.Name, dnsRecord.Hostname, rawVal)
+					return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is not a valid IPv4 address for type A")
 				}
 			case "AAAA":
 				if parsedIP != nil {
 					if parsedIP.To4() != nil {
-						return nil, nil, fmt.Errorf("dns record %q (%s): expected %q is an IPv4 address, but record type is AAAA (requires IPv6)", dnsRecord.Name, dnsRecord.Hostname, rawVal)
+						return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is an IPv4 address, but record type is AAAA (requires IPv6)")
 					}
 					cleanVal = parsedIP.String()
 				} else {
-					return nil, nil, fmt.Errorf("dns record %q (%s): expected %q is not a valid IPv6 address for type AAAA", dnsRecord.Name, dnsRecord.Hostname, rawVal)
+					return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is not a valid IPv6 address for type AAAA")
 				}
 			case "IP":
 				if parsedIP != nil {
 					cleanVal = parsedIP.String()
 				} else {
-					return nil, nil, fmt.Errorf("dns record %q (%s): expected %q is not a valid IPv4 or IPv6 address for composite type IP", dnsRecord.Name, dnsRecord.Hostname, rawVal)
+					return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is not a valid IPv4 or IPv6 address for composite type IP")
 				}
 			case "ALIAS", "CNAME":
 				if parsedIP != nil {
@@ -270,7 +272,7 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 		}
 
 		// Sort IP arrays for deterministic canonical order
-		if dnsRecord.Type == "A" || dnsRecord.Type == "AAAA" || dnsRecord.Type == "IP" {
+		if dnsRecord.Type == RecordTypeA || dnsRecord.Type == RecordTypeAAAA || dnsRecord.Type == RecordTypeIP {
 			slices.Sort(normalizedExpected)
 		}
 
@@ -281,25 +283,94 @@ func LoadConfig(ctx context.Context, path string) (*AppState, *AppConfig, error)
 		rawCfg.DoHURL = DefaultDoHURL
 	}
 
-	app := &AppState{
-		Notifier: &NotificationManager{},
-	}
-
 	if rawCfg.LoopIntervalDays == 0 {
-		rawCfg.LoopIntervalDays = 0.25
-	} else if rawCfg.LoopIntervalDays < 0.125 {
-		LogInfo("loop_interval_days is below minimum (0.125 days / 3 hours); defaulting to 0.125", "configured", rawCfg.LoopIntervalDays)
-		rawCfg.LoopIntervalDays = 0.125
-	} else if rawCfg.LoopIntervalDays > 365 {
-		LogInfo("loop_interval_days exceeds maximum (365 days); defaulting to 365", "configured", rawCfg.LoopIntervalDays)
-		rawCfg.LoopIntervalDays = 365
+		rawCfg.LoopIntervalDays = DefaultLoopIntervalDays
+	} else if rawCfg.LoopIntervalDays < MinLoopIntervalDays {
+		LogInfo(MsgLogLoopIntervalBelowMin, "configured", rawCfg.LoopIntervalDays)
+		rawCfg.LoopIntervalDays = MinLoopIntervalDays
+	} else if rawCfg.LoopIntervalDays > MaxLoopIntervalDays {
+		LogInfo(MsgLogLoopIntervalAboveMax, "configured", rawCfg.LoopIntervalDays)
+		rawCfg.LoopIntervalDays = MaxLoopIntervalDays
 	}
-	app.LoopDuration = time.Duration(rawCfg.LoopIntervalDays * 24 * float64(time.Hour))
 
-	return app, &rawCfg, nil
+	return rawCfg, nil
 }
 
-// InitializeDependencies handles side-effects like validating notifications and resolver health checks
+// InitializeApp handles side-effects like validating notifications and resolver health checks,
+// constructing and returning a fully wired AppState. It does not mutate the provided AppConfig.
+func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
+	app := &AppState{
+		config:       cfg,
+		Notifier:     &NotificationManager{},
+		LoopDuration: time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
+	}
+
+	if cfg.Notifications.Ntfy == nil || strings.TrimSpace(cfg.Notifications.Ntfy.URL) == "" {
+		return nil, errors.New("cannot initialize dependencies: notifications.ntfy.url is mandatory (primary notification mechanism)")
+	}
+
+	var auth string
+	auth = cfg.Notifications.Ntfy.Auth
+	if auth != "" && !strings.HasPrefix(strings.ToLower(auth), "bearer ") && !strings.HasPrefix(strings.ToLower(auth), "basic ") {
+		auth = "Bearer " + auth
+	}
+
+	client := ResolveHTTPClient(&http.Client{Timeout: DefaultDNSTimeout})
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, cfg.Notifications.Ntfy.URL, nil)
+	if err != nil {
+		return nil, WrapError("failed to create ntfy request", err)
+	}
+	req.Header.Set("User-Agent", DefaultUserAgent)
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, WrapError("ntfy URL provided is unreachable", err)
+	}
+	DrainAndClose(resp.Body, MaxBodyDrainSize)
+
+	app.Notifier.Providers = append(app.Notifier.Providers, &NtfyProvider{
+		URL:  cfg.Notifications.Ntfy.URL,
+		Auth: auth,
+	})
+
+	if cfg.Notifications.Telegram != nil && cfg.Notifications.Telegram.Token != "" && cfg.Notifications.Telegram.ChatID != "" {
+		app.Notifier.Providers = append(app.Notifier.Providers, &TelegramProvider{
+			Token:  cfg.Notifications.Telegram.Token,
+			ChatID: cfg.Notifications.Telegram.ChatID,
+		})
+		LogInfo(MsgLogTelegramConfig)
+	}
+
+	var healthyResolvers []string
+	var lastResolverErr error
+	for _, resolver := range cfg.Resolvers {
+		ip := DefaultPort(resolver, DefaultDNSPort)
+		dnsClient := new(dns.Client)
+		dnsClient.Timeout = DefaultDNSTimeout
+		dnsMsg := new(dns.Msg)
+		dnsMsg.SetQuestion(dns.Fqdn("example.com"), dns.TypeA)
+		dnsMsg.RecursionDesired = true
+		if _, _, err := dnsClient.ExchangeContext(ctx, dnsMsg, ip); err != nil {
+			LogWarn(MsgLogResolverUnreachable, "resolver", resolver, "error", err)
+			lastResolverErr = err
+		} else {
+			healthyResolvers = append(healthyResolvers, resolver)
+		}
+	}
+
+	if len(healthyResolvers) == 0 {
+		return nil, WrapError("all configured resolvers failed health checks", lastResolverErr)
+	}
+
+	app.activeResolvers = healthyResolvers
+
+	return app, nil
+}
+
+// InitializeDependencies is a backward-compatible adapter for InitializeApp,
+// intended strictly for process initialization before background workers start.
 func InitializeDependencies(ctx context.Context, app *AppState, rawCfg *AppConfig) error {
 	if app == nil {
 		return errors.New("cannot initialize dependencies: app is nil")
@@ -310,72 +381,13 @@ func InitializeDependencies(ctx context.Context, app *AppState, rawCfg *AppConfi
 	if app.Notifier == nil {
 		return errors.New("cannot initialize dependencies: notifier is nil")
 	}
-	nm := app.Notifier
-
-	if rawCfg.Notifications.Ntfy == nil || strings.TrimSpace(rawCfg.Notifications.Ntfy.URL) == "" {
-		return errors.New("cannot initialize dependencies: notifications.ntfy.url is mandatory (primary notification mechanism)")
-	}
-
-	var auth string
-	auth = rawCfg.Notifications.Ntfy.Auth
-	if auth != "" && !strings.HasPrefix(strings.ToLower(auth), "bearer ") && !strings.HasPrefix(strings.ToLower(auth), "basic ") {
-		auth = "Bearer " + auth
-	}
-
-	client := ResolveHTTPClient(&http.Client{Timeout: 5 * time.Second})
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawCfg.Notifications.Ntfy.URL, nil)
+	initialized, err := InitializeApp(ctx, *rawCfg)
 	if err != nil {
-		return fmt.Errorf("failed to create ntfy request: %w", err)
+		return err
 	}
-	req.Header.Set("User-Agent", DefaultUserAgent)
-	if auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("ntfy URL provided is unreachable: %w", err)
-	}
-	DrainAndClose(resp.Body, 4096)
-
-	nm.Providers = append(nm.Providers, &NtfyProvider{
-		URL:  rawCfg.Notifications.Ntfy.URL,
-		Auth: auth,
-	})
-
-	if rawCfg.Notifications.Telegram != nil && rawCfg.Notifications.Telegram.Token != "" && rawCfg.Notifications.Telegram.ChatID != "" {
-		nm.Providers = append(nm.Providers, &TelegramProvider{
-			Token:  rawCfg.Notifications.Telegram.Token,
-			ChatID: rawCfg.Notifications.Telegram.ChatID,
-		})
-		LogInfo(MsgLogTelegramConfig)
-	}
-
-	var healthyResolvers []string
-	var lastResolverErr error
-	for _, resolver := range rawCfg.Resolvers {
-		ip := DefaultPort(resolver, "53")
-		dnsClient := new(dns.Client)
-		dnsClient.Timeout = 5 * time.Second
-		dnsMsg := new(dns.Msg)
-		dnsMsg.SetQuestion(dns.Fqdn("example.com"), dns.TypeA)
-		dnsMsg.RecursionDesired = true
-		if _, _, err := dnsClient.ExchangeContext(ctx, dnsMsg, ip); err != nil {
-			LogWarn("Configured resolver unreachable during health check", "resolver", resolver, "error", err)
-			lastResolverErr = err
-		} else {
-			healthyResolvers = append(healthyResolvers, resolver)
-		}
-	}
-
-	if len(healthyResolvers) == 0 {
-		return fmt.Errorf("all configured resolvers failed health checks: %w", lastResolverErr)
-	}
-
-	rawCfg.Resolvers = healthyResolvers
-	if auth != "" && rawCfg.Notifications.Ntfy != nil {
-		rawCfg.Notifications.Ntfy.Auth = auth
-	}
-	app.Config = rawCfg
-
+	app.config = initialized.config
+	app.activeResolvers = initialized.activeResolvers
+	app.Notifier.Providers = initialized.Notifier.Providers
+	app.LoopDuration = initialized.LoopDuration
 	return nil
 }

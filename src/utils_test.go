@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -333,7 +334,7 @@ func TestLoggingUtilities(_ *testing.T) {
 
 func TestLogUtil_CleanFormattingAndNoSource(t *testing.T) {
 	var buf bytes.Buffer
-	handler := NewCleanTextHandler(&buf)
+	handler := NewConsoleHandler(&buf)
 	oldLogger := slog.Default()
 	defer slog.SetDefault(oldLogger)
 	slog.SetDefault(slog.New(handler))
@@ -355,3 +356,47 @@ func TestLogUtil_CleanFormattingAndNoSource(t *testing.T) {
 		t.Errorf("expected log output NOT to contain k=v syntax, got: %s", output)
 	}
 }
+
+func TestWrapError(t *testing.T) {
+	if WrapError("prefix", nil) != nil {
+		t.Errorf("expected WrapError on nil to return nil")
+	}
+
+	root := errors.New("root cause")
+	wrapped := WrapError("operation failed", root)
+	if wrapped == nil {
+		t.Fatalf("expected wrapped error, got nil")
+	}
+	if !errors.Is(wrapped, root) {
+		t.Errorf("expected errors.Is(wrapped, root) to be true")
+	}
+	expectedMsg := "operation failed: root cause"
+	if wrapped.Error() != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, wrapped.Error())
+	}
+}
+
+type dummyStringer struct{}
+
+func (dummyStringer) String() string { return "dummy-string" }
+
+func TestAnyToString(t *testing.T) {
+	t.Parallel()
+
+	if got := AnyToString(nil); got != "" {
+		t.Errorf("AnyToString(nil) = %q, expected empty string", got)
+	}
+	if got := AnyToString("hello"); got != "hello" {
+		t.Errorf("AnyToString(string) = %q, expected %q", got, "hello")
+	}
+	if got := AnyToString(errors.New("custom error")); got != "custom error" {
+		t.Errorf("AnyToString(error) = %q, expected %q", got, "custom error")
+	}
+	if got := AnyToString(dummyStringer{}); got != "dummy-string" {
+		t.Errorf("AnyToString(Stringer) = %q, expected %q", got, "dummy-string")
+	}
+	if got := AnyToString(12345); got != "12345" {
+		t.Errorf("AnyToString(int) = %q, expected %q", got, "12345")
+	}
+}
+

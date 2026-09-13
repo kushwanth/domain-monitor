@@ -4,12 +4,12 @@ import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unique"
@@ -21,34 +21,35 @@ import (
 
 var (
 	allowInsecureRDAPURLs = false
-	whoisQueryFn          = defaultWhoisQuery
-	rdapBootstrap         = NewBootstrap(&http.Client{Timeout: 10 * time.Second})
+	whoisQueryFn          = defaultWHOISQuery
+	rdapBootstrap         = NewBootstrap(&http.Client{Timeout: DefaultHTTPTimeout})
 )
 
-func defaultWhoisQuery(domain string) (string, error) {
+func defaultWHOISQuery(domain string) (string, error) {
 	asciiDomain := NormalizeDomainToASCIIText(domain)
-	client := whois.NewClient().SetTimeout(10 * time.Second)
-	if knownServer := KnownWhoisServer(asciiDomain); knownServer != "" {
+	client := whois.NewClient().SetTimeout(DefaultWHOISTimeout)
+	if knownServer := KnownWHOISServer(asciiDomain); knownServer != "" {
 		return client.Whois(asciiDomain, knownServer)
 	}
 	return client.Whois(asciiDomain)
 }
 
-// queryWhoisWithContext executes a WHOIS query asynchronously, honoring ctx cancellation.
+// queryWHOISWithContext executes a WHOIS query asynchronously, honoring ctx cancellation.
 // Note: the WHOIS library (likexian/whois) does not natively support context. When ctx is
 // cancelled, the spawned goroutine continues running until the library's 10s TCP timeout
 // expires. This is a bounded leak by design — the goroutine always terminates within 10s.
-func queryWhoisWithContext(ctx context.Context, domain string, host ...string) (string, error) {
+func queryWHOISWithContext(ctx context.Context, domain string, host ...string) (string, error) {
 	asciiDomain := NormalizeDomainToASCIIText(domain)
 
 	ch := make(chan queryResult, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				ch <- queryResult{err: fmt.Errorf("whois query panicked: %v", r)}
+				LogError(MsgLogWHOISPanicked, "domain", asciiDomain, "panic", r)
+				ch <- queryResult{err: errors.New("whois query panicked")}
 			}
 		}()
-		client := whois.NewClient().SetTimeout(10 * time.Second)
+		client := whois.NewClient().SetTimeout(DefaultWHOISTimeout)
 		if len(host) > 0 && strings.TrimSpace(host[0]) != "" {
 			raw, qErr := client.Whois(asciiDomain, host[0])
 			ch <- queryResult{raw: raw, err: qErr}
@@ -66,11 +67,34 @@ func queryWhoisWithContext(ctx context.Context, domain string, host ...string) (
 	}
 }
 
+var registryDateLayouts = [...]string{
+	time.RFC3339,
+	time.RFC3339Nano,
+	"2006-01-02 15:04:05 -0700",
+	"2006-01-02 15:04:05 -07:00",
+	"2006-01-02 15:04:05 MST",
+	"2006-01-02 15:04:05",
+	"2006-01-02",
+	"02-Jan-2006 15:04:05 -0700",
+	"02-Jan-2006 15:04:05 -07:00",
+	"02-Jan-2006 15:04:05 MST",
+	"02-Jan-2006 15:04:05",
+	"02-Jan-2006",
+	"2006.01.02 15:04:05",
+	"2006.01.02",
+	"2006/01/02 15:04:05",
+	"2006/01/02",
+	"02/01/2006",
+	"02.01.2006",
+	time.UnixDate,
+	"20060102",
+}
+
 // parseFlexibleDate parses dates from diverse global registry/registrar formats and converts them to UTC RFC3339.
 func parseFlexibleDate(dateStr string) (time.Time, string, error) {
 	clean := strings.TrimSpace(dateStr)
 	if clean == "" {
-		return time.Time{}, "", fmt.Errorf("empty date string")
+		return time.Time{}, "", ErrEmptyDate
 	}
 
 	// Remove common leading prefixes like "Expires on:", "Renewal:", etc.
@@ -81,17 +105,17 @@ func parseFlexibleDate(dateStr string) (time.Time, string, error) {
 		}
 	}
 
-	// Remove trailing parenthetical notes like "(UTC)", "(YYYY-MM-DD)", "(JST)", etc.
+	// Remove trailing parenthetical notes like "(UTC)", "(YYYY-MM-DD)", etc.
 	if before, _, found := strings.Cut(clean, "("); found {
 		clean = strings.TrimSpace(before)
 	}
 	clean = strings.Trim(clean, `"' `)
 
-	// Clean known timezone abbreviations and normalize
+	// Clean known timezone abbreviations to explicit numeric offsets for UTC conversion
 	cleanNormalized := clean
-	for tz, repl := range TZReplacements {
+	for tz, offset := range TZOffsets {
 		if before, ok := strings.CutSuffix(cleanNormalized, tz); ok {
-			cleanNormalized = before + repl
+			cleanNormalized = before + offset
 			break
 		}
 	}
@@ -102,7 +126,7 @@ func parseFlexibleDate(dateStr string) (time.Time, string, error) {
 	}
 
 	for _, target := range targets {
-		for _, format := range FlexibleDateFormats {
+		for _, format := range registryDateLayouts {
 			if t, err := time.Parse(format, target); err == nil {
 				utc := t.UTC()
 				return utc, utc.Format(time.RFC3339), nil
@@ -110,7 +134,7 @@ func parseFlexibleDate(dateStr string) (time.Time, string, error) {
 		}
 	}
 
-	return time.Time{}, "", fmt.Errorf("unable to parse date format: %q", dateStr)
+	return time.Time{}, "", errors.New("unable to parse date format: " + dateStr)
 }
 
 // normalizeEPPStatus extracts canonical EPP status token from raw status strings.
@@ -143,7 +167,7 @@ func normalizeEPPStatus(raw string) string {
 	fields := strings.Fields(s)
 	var nonURLFields []string
 	for _, f := range fields {
-		if !strings.HasPrefix(strings.ToLower(f), "http://") && !strings.HasPrefix(strings.ToLower(f), "https://") {
+		if !strings.HasPrefix(strings.ToLower(f), PrefixHTTP) && !strings.HasPrefix(strings.ToLower(f), PrefixHTTPS) {
 			nonURLFields = append(nonURLFields, f)
 		}
 	}
@@ -225,17 +249,17 @@ func isTransferLocked(statuses []string) bool {
 func isDomainSuspended(statuses []string) (bool, string) {
 	for _, s := range statuses {
 		clean := NormalizeStatusToken(s)
-		if clean == "serverhold" || clean == "clienthold" || clean == "pendingdelete" || clean == "redemptionperiod" || clean == "inactive" || clean == "hold" {
+		if clean == EPPStatusServerHold || clean == EPPStatusClientHold || clean == EPPStatusPendingDelete || clean == EPPStatusRedemptionPeriod || clean == EPPStatusInactive || clean == EPPStatusHold {
 			return true, s
 		}
 	}
 	return false, ""
 }
 
-// isDomainNotFoundInWhois checks for common registrar and registry not-found responses.
-func isDomainNotFoundInWhois(text string) bool {
+// isDomainNotFoundInWHOIS checks for common registrar and registry not-found responses.
+func isDomainNotFoundInWHOIS(text string) bool {
 	lower := strings.ToLower(text)
-	for _, ind := range WhoisNotFoundIndicators {
+	for _, ind := range WHOISNotFoundIndicators {
 		if strings.Contains(lower, ind) {
 			return true
 		}
@@ -243,8 +267,8 @@ func isDomainNotFoundInWhois(text string) bool {
 	return false
 }
 
-// isWhoisRateLimited checks if a raw WHOIS output or error indicates rate limiting.
-func isWhoisRateLimited(text string, err error) bool {
+// isWHOISRateLimited checks if a raw WHOIS output or error indicates rate limiting.
+func isWHOISRateLimited(text string, err error) bool {
 	if err != nil {
 		errLower := strings.ToLower(err.Error())
 		if strings.Contains(errLower, "limit") || strings.Contains(errLower, "quota") || strings.Contains(errLower, "too many") {
@@ -252,19 +276,7 @@ func isWhoisRateLimited(text string, err error) bool {
 		}
 	}
 	lower := strings.ToLower(text)
-	indicators := []string{
-		"limit exceeded",
-		"query limit exceeded",
-		"too many requests",
-		"quota exceeded",
-		"access denied",
-		"connection reset by peer",
-		"exceeded your access quota",
-		"lookup quota exceeded",
-		"rate limit",
-		"rate-limit",
-	}
-	for _, ind := range indicators {
+	for _, ind := range WHOISRateLimitIndicators {
 		if strings.Contains(lower, ind) {
 			return true
 		}
@@ -297,7 +309,7 @@ func extractVCardText(val any) string {
 		}
 		return strings.TrimSpace(strings.Join(parts, " "))
 	default:
-		return fmt.Sprintf("%v", v)
+		return AnyToString(v)
 	}
 }
 
@@ -332,7 +344,7 @@ func findRegistrarEntity(entities []RDAPEntity) (name string, ianaID string, rel
 		isRegistrar := false
 		for _, role := range entity.Roles {
 			r := strings.ToLower(role)
-			if r == "registrar" || r == "sponsor" || r == "reseller" {
+			if r == RoleRegistrar || r == RoleSponsor || r == RoleReseller {
 				isRegistrar = true
 				break
 			}
@@ -341,18 +353,18 @@ func findRegistrarEntity(entities []RDAPEntity) (name string, ianaID string, rel
 		if isRegistrar {
 			// 1. Extract Name from VCard properties (fn, org)
 			if len(entity.VCardArray) > 0 {
-				name = extractVCardProperty(entity.VCardArray, "fn")
+				name = extractVCardProperty(entity.VCardArray, VCardPropFN)
 				if name == "" {
-					name = extractVCardProperty(entity.VCardArray, "org")
+					name = extractVCardProperty(entity.VCardArray, VCardPropOrg)
 				}
 			}
 
 			// 2. Extract IANA ID from PublicIDs
 			for _, pid := range entity.PublicIDs {
-				if strings.EqualFold(pid.Type, "iana") || strings.EqualFold(pid.Type, "iana registrar id") {
+				if strings.EqualFold(pid.Type, PublicIDTypeIANA) || strings.EqualFold(pid.Type, "iana registrar id") {
 					ianaID = strings.TrimSpace(pid.Identifier)
 					if name == "" && ianaID != "" {
-						name = fmt.Sprintf("Registrar (IANA %s)", ianaID)
+						name = "Registrar (IANA " + ianaID + ")"
 					}
 					break
 				}
@@ -365,7 +377,7 @@ func findRegistrarEntity(entities []RDAPEntity) (name string, ianaID string, rel
 
 			// 4. Extract Referral Links on the Registrar Entity (RFC 9083 / ICANN standard)
 			for _, link := range entity.Links {
-				if link.Rel == "related" || link.Rel == "alternate" || strings.Contains(link.Type, "rdap+json") {
+				if link.Rel == RelRelated || link.Rel == RelAlternate || strings.Contains(link.Type, ContentTypeRDAPJSON) {
 					if strings.HasPrefix(link.Href, "http") {
 						relURL = link.Href
 						break
@@ -414,8 +426,8 @@ func collectRDAPReferralLinks(domainInfo *RDAPDomainResponse, baseURL string) []
 		if baseURL != "" && strings.HasPrefix(href, strings.TrimRight(baseURL, "/")) {
 			return // Avoid self-referral loop
 		}
-		isRelated := link.Rel == "related" || link.Rel == "alternate"
-		isRDAPType := strings.Contains(link.Type, "rdap+json") || strings.Contains(href, "/domain/")
+		isRelated := link.Rel == RelRelated || link.Rel == RelAlternate
+		isRDAPType := strings.Contains(link.Type, ContentTypeRDAPJSON) || strings.Contains(href, "/domain/")
 		if (isRelated || isRDAPType) && !seen[href] {
 			seen[href] = true
 			candidates = append(candidates, href)
@@ -493,8 +505,8 @@ func extractRDAPDomainTier(domainInfo *RDAPDomainResponse, source string, server
 	return tier
 }
 
-// extractWhoisTier extracts a DomainTierData from raw WHOIS output.
-func extractWhoisTier(raw string, source string, server string) *DomainTierData {
+// extractWHOISTier extracts a DomainTierData from raw WHOIS output.
+func extractWHOISTier(raw string, source string, server string) *DomainTierData {
 	tier := &DomainTierData{
 		Source: source,
 		Server: server,
@@ -550,7 +562,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 
 	// Supplementary regex field extraction if missing
 	if tier.Expiration == "" {
-		if m := ReWhoisExpiry.FindStringSubmatch(raw); len(m) > 1 {
+		if m := ReWHOISExpiry.FindStringSubmatch(raw); len(m) > 1 {
 			dateStr := strings.TrimSpace(m[1])
 			if _, norm, err := parseFlexibleDate(dateStr); err == nil {
 				tier.Expiration = norm
@@ -561,7 +573,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 	}
 
 	if tier.Created == "" {
-		if m := ReWhoisCreated.FindStringSubmatch(raw); len(m) > 1 {
+		if m := ReWHOISCreated.FindStringSubmatch(raw); len(m) > 1 {
 			dateStr := strings.TrimSpace(m[1])
 			if _, norm, err := parseFlexibleDate(dateStr); err == nil {
 				tier.Created = norm
@@ -570,7 +582,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 	}
 
 	if tier.Updated == "" {
-		if m := ReWhoisUpdated.FindStringSubmatch(raw); len(m) > 1 {
+		if m := ReWHOISUpdated.FindStringSubmatch(raw); len(m) > 1 {
 			dateStr := strings.TrimSpace(m[1])
 			if _, norm, err := parseFlexibleDate(dateStr); err == nil {
 				tier.Updated = norm
@@ -579,7 +591,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 	}
 
 	if tier.Registrar == "" {
-		if m := ReWhoisRegistrar.FindStringSubmatch(raw); len(m) > 1 {
+		if m := ReWHOISRegistrar.FindStringSubmatch(raw); len(m) > 1 {
 			reg := strings.TrimSpace(m[1])
 			if !strings.EqualFold(reg, "not applicable") && !strings.EqualFold(reg, "none") {
 				tier.Registrar = reg
@@ -588,13 +600,13 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 	}
 
 	if tier.IANAID == "" {
-		if m := ReWhoisIANAID.FindStringSubmatch(raw); len(m) > 1 {
+		if m := ReWHOISIANAID.FindStringSubmatch(raw); len(m) > 1 {
 			tier.IANAID = strings.TrimSpace(m[1])
 		}
 	}
 
 	if len(tier.Nameservers) == 0 {
-		matches := ReWhoisNS.FindAllStringSubmatch(raw, -1)
+		matches := ReWHOISNS.FindAllStringSubmatch(raw, -1)
 		for _, m := range matches {
 			if len(m) > 1 {
 				ns := NormalizeDomain(m[1])
@@ -606,7 +618,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 	}
 
 	if len(tier.DomainStatus) == 0 {
-		matches := ReWhoisStatus.FindAllStringSubmatch(raw, -1)
+		matches := ReWHOISStatus.FindAllStringSubmatch(raw, -1)
 		var statuses []string
 		for _, m := range matches {
 			if len(m) > 1 {
@@ -617,7 +629,7 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 	}
 
 	if !tier.DNSSEC {
-		if m := ReWhoisDNSSEC.FindStringSubmatch(raw); len(m) > 1 {
+		if m := ReWHOISDNSSEC.FindStringSubmatch(raw); len(m) > 1 {
 			val := strings.ToLower(strings.TrimSpace(m[1]))
 			if strings.Contains(val, "signed") || strings.Contains(val, "yes") || strings.Contains(val, "active") {
 				tier.DNSSEC = true
@@ -631,6 +643,12 @@ func extractWhoisTier(raw string, source string, server string) *DomainTierData 
 // synthesizeTierData merges RegistryTier and RegistrarTier into a coherent RDAPState,
 // detecting hierarchy discrepancies like Auto-Renew Grace Period date mismatch and NS desync.
 func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*RDAPState, []string) {
+	if registry == nil && registrar == nil {
+		return &RDAPState{
+			Status: StatusFailed,
+			Error:  "no registry or registrar tier data available",
+		}, nil
+	}
 	state := &RDAPState{
 		Status:        StatusOK,
 		RegistryTier:  registry,
@@ -641,7 +659,7 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*R
 
 	// 1. Synthesize Source
 	if registry != nil && registrar != nil {
-		state.Source = fmt.Sprintf("%s+%s", registry.Source, registrar.Source)
+		state.Source = registry.Source + "+" + registrar.Source
 	} else if registry != nil {
 		state.Source = registry.Source
 	} else if registrar != nil {
@@ -667,9 +685,8 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*R
 		rarTime, _, errRar := parseFlexibleDate(registrar.Expiration)
 		if errReg == nil && errRar == nil {
 			deltaDays := math.Abs(regTime.Sub(rarTime).Hours() / 24)
-			if deltaDays > 45 {
-				disc := fmt.Sprintf("Auto-Renew Grace Period discrepancy: Registry expiration (%s) vs Registrar expiration (%s)",
-					regTime.Format("2006-01-02"), rarTime.Format("2006-01-02"))
+			if deltaDays > AutoRenewGracePeriodThresholdDays {
+				disc := "Auto-Renew Grace Period discrepancy: Registry expiration (" + regTime.Format("2006-01-02") + ") vs Registrar expiration (" + rarTime.Format("2006-01-02") + ")"
 				discrepancies = append(discrepancies, disc)
 			}
 			// Use the earlier date for alert evaluation to be conservative
@@ -715,8 +732,7 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*R
 		}
 
 		if mismatch {
-			disc := fmt.Sprintf("Nameserver desync: Registry delegation [%s] != Registrar configuration [%s]",
-				strings.Join(registry.Nameservers, ", "), strings.Join(registrar.Nameservers, ", "))
+			disc := "Nameserver desync: Registry delegation [" + strings.Join(registry.Nameservers, ", ") + "] != Registrar configuration [" + strings.Join(registrar.Nameservers, ", ") + "]"
 			discrepancies = append(discrepancies, disc)
 		}
 		// Registry delegation is authoritative for global DNS resolution
@@ -750,17 +766,17 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 	rdapState, err := fetchRDAP(ctx, httpClient, target.Domain)
 	if err != nil {
 		if errors.Is(err, ErrRDAPNotFound) {
-			LogInfo("RDAP returned 404, attempting WHOIS fallback", "domain", target.Domain)
+			LogInfo(MsgLogRDAPReturned404, "domain", target.Domain)
 		} else if errors.Is(err, ErrRDAPRateLimited) {
-			LogWarn("RDAP rate limited, falling back to WHOIS", "domain", target.Domain)
+			LogWarn(MsgLogRDAPRateLimited, "domain", target.Domain)
 		} else {
 			LogInfof(MsgLogWHOISFallback, target.Domain)
 		}
 
-		whoisState, whoisErr := fetchWhois(ctx, target.Domain)
+		whoisState, whoisErr := fetchWHOIS(ctx, target.Domain)
 		if whoisErr != nil {
 			if errors.Is(whoisErr, ErrDomainNotFound) || strings.Contains(whoisErr.Error(), "404") || strings.Contains(whoisErr.Error(), "not found") {
-				LogInfo("WHOIS reports domain is unregistered (404)", "domain", target.Domain)
+				LogInfo(MsgLogWHOISUnregistered, "domain", target.Domain)
 				return &RDAPState{
 					Status:       StatusFailed,
 					Error:        "Domain not found (404)",
@@ -773,14 +789,14 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 
 			status := StatusFailed
 			errStr := whoisErr.Error()
-			if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "i/o timeout") || strings.Contains(errStr, "no such host") || strings.Contains(errStr, "temporary failure") || isWhoisRateLimited(errStr, whoisErr) || errors.Is(whoisErr, ErrWhoisRateLimited) {
+			if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "i/o timeout") || strings.Contains(errStr, "no such host") || strings.Contains(errStr, "temporary failure") || isWHOISRateLimited(errStr, whoisErr) || errors.Is(whoisErr, ErrWHOISRateLimited) {
 				status = StatusWarning
 			}
 
 			return &RDAPState{
 				Status:       status,
-				Error:        fmt.Sprintf("RDAP: %v | WHOIS: %v", err, whoisErr),
-				ProtocolUsed: "whois_failed",
+				Error:        "RDAP: " + err.Error() + " | WHOIS: " + whoisErr.Error(),
+				ProtocolUsed: ProtocolWHOISFailed,
 			}
 		}
 
@@ -790,7 +806,7 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 
 	// Hybrid Tier Supplementation: If RDAP is thin (no registrar tier), attempt WHOIS referral supplement
 	if rdapState != nil && rdapState.RegistrarTier == nil && (rdapState.Expiration == "" || rdapState.Registrar == "") {
-		if whoisState, whoisErr := fetchWhois(ctx, target.Domain); whoisErr == nil {
+		if whoisState, whoisErr := fetchWHOIS(ctx, target.Domain); whoisErr == nil {
 			if whoisState.RegistrarTier != nil {
 				rdapState.RegistrarTier = whoisState.RegistrarTier
 			} else if whoisState.RegistryTier != nil && rdapState.RegistryTier == nil {
@@ -818,22 +834,24 @@ func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RD
 
 	urls, err := rdapBootstrap.ServersFor(ctx, asciiDomain)
 	if err != nil {
-		return nil, fmt.Errorf("no RDAP server: %w", err)
+		return nil, WrapError("no RDAP server", err)
 	}
 
-	httpClient = ResolveHTTPClient(httpClient)
+	if httpClient == nil {
+		httpClient = NewRDAPHTTPClient(DefaultHTTPTimeout)
+	}
 
 	var lastErr error
 	for _, rawBaseURL := range urls {
 		baseURL := strings.TrimRight(rawBaseURL, "/")
 		reqURL := baseURL + "/domain/" + asciiDomain
-		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		req.Header.Set("Accept", "application/rdap+json, application/json")
-		req.Header.Set("User-Agent", DefaultUserAgent)
+		req.Header.Set(HeaderAccept, AcceptRDAP)
+		req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
@@ -842,21 +860,21 @@ func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RD
 		}
 
 		if resp.StatusCode == http.StatusNotFound {
-			DrainAndClose(resp.Body, 4096)
+			DrainAndClose(resp.Body, MaxBodyDrainSize)
 			return nil, ErrRDAPNotFound
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			DrainAndClose(resp.Body, 4096)
+			DrainAndClose(resp.Body, MaxBodyDrainSize)
 			return nil, ErrRDAPRateLimited
 		}
 		if resp.StatusCode != http.StatusOK {
-			DrainAndClose(resp.Body, 4096)
-			lastErr = fmt.Errorf("rdap HTTP error: %d", resp.StatusCode)
+			DrainAndClose(resp.Body, MaxBodyDrainSize)
+			lastErr = errors.New("rdap HTTP error: " + strconv.Itoa(resp.StatusCode))
 			continue
 		}
 
 		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, MaxBootstrapResponseSize))
-		DrainAndClose(resp.Body, 4096)
+		DrainAndClose(resp.Body, MaxBodyDrainSize)
 		if err != nil {
 			lastErr = err
 			continue
@@ -868,19 +886,19 @@ func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RD
 			continue
 		}
 
-		registryTier := extractRDAPDomainTier(&domainInfo, "registry_rdap", baseURL)
+		registryTier := extractRDAPDomainTier(&domainInfo, SourceRegistryRDAP, baseURL)
 
 		var registrarTier *DomainTierData
 
 		// 1. Follow Registrar RDAP Referral Links (scans both domain links and nested entity links)
 		referralLinks := collectRDAPReferralLinks(&domainInfo, baseURL)
 		if relDomain := followRegistrarRDAPLinks(ctx, asciiDomain, referralLinks, httpClient); relDomain != nil {
-			registrarTier = extractRDAPDomainTier(relDomain, "registrar_rdap", "referral")
+			registrarTier = extractRDAPDomainTier(relDomain, SourceRegistrarRDAP, SourceReferral)
 		}
 
 		// 2. Synthesize 2-Tier State
 		state, _ := synthesizeTierData(registryTier, registrarTier)
-		state.ProtocolUsed = "rdap"
+		state.ProtocolUsed = ProtocolRDAP
 		state.QueryDurationMs = time.Since(start).Milliseconds()
 		return state, nil
 	}
@@ -888,7 +906,7 @@ func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RD
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("rdap lookup failed across all candidate servers")
+	return nil, errors.New("rdap lookup failed across all candidate servers")
 }
 
 // isSafeRDAPURL validates that candidate registrar RDAP referral URLs are safe to query,
@@ -905,7 +923,7 @@ func isSafeRDAPURL(rawURL string) bool {
 		return false
 	}
 	scheme := strings.ToLower(u.Scheme)
-	if scheme != "https" {
+	if scheme != SchemeHTTPSName {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
@@ -943,30 +961,30 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 			}
 		}
 		if !isSafeRDAPURL(targetURL) {
-			LogWarn("Skipping unsafe RDAP referral URL", "domain", domain, "url", targetURL)
+			LogWarn(MsgLogSkippingUnsafeRDAP, "domain", domain, "url", targetURL)
 			continue
 		}
-		LogInfo("Querying registrar RDAP link", "domain", domain, "url", targetURL)
-		relReq, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+		LogInfo(MsgLogQueryingRegistrarRDAP, "domain", domain, "url", targetURL)
+		relReq, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if err != nil {
 			continue
 		}
-		relReq.Header.Set("Accept", "application/rdap+json, application/json")
-		relReq.Header.Set("User-Agent", DefaultUserAgent)
+		relReq.Header.Set(HeaderAccept, AcceptRDAP)
+		relReq.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
 		relResp, err := httpClient.Do(relReq)
 		if err != nil || relResp.StatusCode != http.StatusOK {
 			if relResp != nil {
 				if relResp.StatusCode == http.StatusTooManyRequests {
-					LogWarn("Rate limited by registrar RDAP", "domain", domain)
+					LogWarn(MsgLogRateLimitedRegistrarRDAP, "domain", domain)
 				}
-				DrainAndClose(relResp.Body, 4096)
+				DrainAndClose(relResp.Body, MaxBodyDrainSize)
 			}
 			continue
 		}
 
 		bodyBytes, err := io.ReadAll(io.LimitReader(relResp.Body, MaxBootstrapResponseSize))
-		DrainAndClose(relResp.Body, 4096)
+		DrainAndClose(relResp.Body, MaxBodyDrainSize)
 		if err != nil {
 			continue
 		}
@@ -981,64 +999,64 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 	return nil
 }
 
-func fetchWhois(ctx context.Context, domain string) (*RDAPState, error) {
+func fetchWHOIS(ctx context.Context, domain string) (*RDAPState, error) {
 	start := time.Now()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	qCtx, cancel := context.WithTimeout(ctx, DefaultWHOISQueryTimeout)
 	defer cancel()
 
-	result, queryErr := queryWhoisWithContext(qCtx, domain)
+	result, queryErr := queryWHOISWithContext(qCtx, domain)
 	durationMs := time.Since(start).Milliseconds()
 
 	if queryErr != nil && result == "" {
-		return nil, fmt.Errorf("whois query failed: %w", queryErr)
+		return nil, WrapError("whois query failed", queryErr)
 	}
 
-	if isWhoisRateLimited(result, queryErr) {
-		return nil, ErrWhoisRateLimited
+	if isWHOISRateLimited(result, queryErr) {
+		return nil, ErrWHOISRateLimited
 	}
 
-	registryTier := extractWhoisTier(result, "registry_whois", "registry")
+	registryTier := extractWHOISTier(result, SourceRegistryWHOIS, "registry")
 	var registrarTier *DomainTierData
 
 	// Always follow referral server if present to guarantee cross-tier 2-tier ARGP detection
-	if m := ReWhoisReferral.FindStringSubmatch(result); len(m) > 1 {
+	if m := ReWHOISReferral.FindStringSubmatch(result); len(m) > 1 {
 		referralServer := strings.TrimSpace(m[1])
 		if referralServer != "" && !strings.Contains(referralServer, "iana") && !strings.Contains(referralServer, "internic") {
-			LogInfo("Following WHOIS referral", "domain", domain, "referral_server", referralServer)
+			LogInfo(MsgLogFollowingWHOISReferral, "domain", domain, "referral_server", referralServer)
 			refCtx, refCancel := context.WithTimeout(ctx, 10*time.Second)
 			defer refCancel()
 
-			if refResult, err := queryWhoisWithContext(refCtx, domain, referralServer); err == nil && refResult != "" && !isDomainNotFoundInWhois(refResult) {
-				registrarTier = extractWhoisTier(refResult, "registrar_whois", referralServer)
+			if refResult, err := queryWHOISWithContext(refCtx, domain, referralServer); err == nil && refResult != "" && !isDomainNotFoundInWHOIS(refResult) {
+				registrarTier = extractWHOISTier(refResult, SourceRegistrarWHOIS, referralServer)
 			}
 		}
 	}
 
 	state, _ := synthesizeTierData(registryTier, registrarTier)
-	state.ProtocolUsed = "whois"
+	state.ProtocolUsed = ProtocolWHOIS
 	state.QueryDurationMs = durationMs
 
 	// Check for domain not registered
-	if isDomainNotFoundInWhois(result) && state.Expiration == "" && len(state.Nameservers) == 0 {
+	if isDomainNotFoundInWHOIS(result) && state.Expiration == "" && len(state.Nameservers) == 0 {
 		return nil, ErrDomainNotFound
 	}
 
 	if state.Expiration == "" && state.Registrar == "" && len(state.Nameservers) == 0 && len(state.DomainStatus) == 0 {
 		if queryErr != nil {
-			return nil, fmt.Errorf("whois query failed: %w", queryErr)
+			return nil, WrapError("whois query failed", queryErr)
 		}
-		return nil, fmt.Errorf("whois parsing failed to extract required domain fields")
+		return nil, errors.New("whois parsing failed to extract required domain fields")
 	}
 
 	return state, nil
 }
 
 func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *RDAPState {
-	if parsed == nil {
-		return nil
+	if parsed == nil || target.Domain == "" {
+		return parsed
 	}
 	if parsed.Expiration != "" {
 		if t, norm, err := parseFlexibleDate(parsed.Expiration); err == nil {
@@ -1046,12 +1064,10 @@ func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *R
 			days := time.Until(t).Hours() / 24
 			if days < 0 {
 				parsed.Status = StatusFailed
-				msg := fmt.Sprintf(MsgAlertRDAPExpired, target.Domain, math.Abs(days))
-				redacted := "Domain registration has EXPIRED."
 				if !target.SuppressAlerts {
-					app.SafeDispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
+					app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedRDAPExpired, MsgAlertRDAPExpired, target.Domain, math.Abs(days))
 				}
-			} else if days <= 30 {
+			} else if days <= DefaultRDAPExpiryWarningDays {
 				priority := PriorityWarning
 				if days <= 7 {
 					priority = PriorityUrgent
@@ -1059,10 +1075,8 @@ func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *R
 				if parsed.Status == StatusOK {
 					parsed.Status = StatusWarning
 				}
-				msg := fmt.Sprintf(MsgAlertRDAPExpiry, target.Domain, days)
-				redacted := fmt.Sprintf("Domain is expiring in %.0f days.", days)
 				if !target.SuppressAlerts {
-					app.SafeDispatch(msg, redacted, priority, "warning", target.Domain, target.Name)
+					app.SafeDispatchf(priority, TagWarning, target.Domain, target.Name, "Domain is expiring in "+strconv.Itoa(int(days))+" days.", MsgAlertRDAPExpiry, target.Domain, days)
 				}
 			}
 		}
@@ -1074,10 +1088,8 @@ func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *R
 	parsed.DomainStatus = NormalizeDomainStatuses(parsed.DomainStatus)
 	if isSusp, suspStatus := isDomainSuspended(parsed.DomainStatus); isSusp {
 		parsed.Status = StatusFailed
-		msg := fmt.Sprintf(MsgAlertRDAPSuspended, target.Domain, suspStatus)
-		redacted := fmt.Sprintf("Domain suspended (Status: %s).", suspStatus)
 		if !target.SuppressAlerts {
-			app.SafeDispatch(msg, redacted, PriorityUrgent, "x", target.Domain, target.Name)
+			app.SafeDispatchf(PriorityUrgent, TagError, target.Domain, target.Name, "Domain suspended (Status: "+suspStatus+").", MsgAlertRDAPSuspended, target.Domain, suspStatus)
 		}
 	}
 
@@ -1085,10 +1097,8 @@ func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *R
 		if parsed.Status == StatusOK {
 			parsed.Status = StatusWarning
 		}
-		msg := fmt.Sprintf(MsgAlertRDAPUnlocked, target.Domain)
-		redacted := "Domain transfer lock is disabled."
 		if !target.SuppressAlerts {
-			app.SafeDispatch(msg, redacted, PriorityHigh, "unlock", target.Domain, target.Name)
+			app.SafeDispatchf(PriorityHigh, TagUnlock, target.Domain, target.Name, MsgRedactedRDAPUnlocked, MsgAlertRDAPUnlocked, target.Domain)
 		}
 	}
 
@@ -1099,11 +1109,9 @@ func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *R
 		if parsed.RegistrarIANAID != target.ExpectedRegistrarID {
 			parsed.Status = StatusFailed
 			parsed.RegistrarMismatch = true
-			parsed.ExpectedRegistrar = fmt.Sprintf("IANA %s", target.ExpectedRegistrarID)
-			msg := fmt.Sprintf(MsgAlertRDAPRegistrarIDMismatch, target.Domain, target.ExpectedRegistrarID, parsed.RegistrarIANAID)
-			redacted := fmt.Sprintf("Registrar IANA ID mismatch (expected %s).", target.ExpectedRegistrarID)
+			parsed.ExpectedRegistrar = "IANA " + target.ExpectedRegistrarID
 			if !target.SuppressAlerts {
-				app.SafeDispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
+				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, "Registrar IANA ID mismatch (expected "+target.ExpectedRegistrarID+").", MsgAlertRDAPRegistrarIDMismatch, target.Domain, target.ExpectedRegistrarID, parsed.RegistrarIANAID)
 			}
 		}
 	} else if target.ExpectedRegistrarName != "" {
@@ -1111,20 +1119,16 @@ func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *R
 			parsed.Status = StatusFailed
 			parsed.RegistrarMismatch = true
 			parsed.ExpectedRegistrar = target.ExpectedRegistrarName
-			msg := fmt.Sprintf(MsgAlertRDAPRegistrarNameMismatch, target.Domain, target.ExpectedRegistrarName, parsed.Registrar)
-			redacted := fmt.Sprintf("Registrar name mismatch (expected %s).", target.ExpectedRegistrarName)
 			if !target.SuppressAlerts {
-				app.SafeDispatch(msg, redacted, PriorityUrgent, "rotating_light", target.Domain, target.Name)
+				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, "Registrar name mismatch (expected "+target.ExpectedRegistrarName+").", MsgAlertRDAPRegistrarNameMismatch, target.Domain, target.ExpectedRegistrarName, parsed.Registrar)
 			}
 		}
 	}
 
 	// Report Hierarchy Discrepancies if detected
 	for _, discrepancy := range parsed.Discrepancies {
-		LogWarnf(MsgLogHierarchyWarn, target.Domain, discrepancy)
 		if !target.SuppressAlerts {
-			msg := fmt.Sprintf(MsgAlertRDAPDiscrepancy, target.Domain, discrepancy)
-			app.SafeDispatch(msg, discrepancy, PriorityWarning, "warning", target.Domain, target.Name)
+			app.SafeDispatchf(PriorityWarning, TagWarning, target.Domain, target.Name, discrepancy, MsgAlertRDAPDiscrepancy, target.Domain, discrepancy)
 		}
 	}
 
@@ -1166,7 +1170,7 @@ func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfi
 	r, err := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeNS, resolversToUse, rd)
 	if err != nil {
 		parsed.Status = StatusFailed
-		parsed.Error = fmt.Sprintf("Failed to query NS records: %v", err)
+		parsed.Error = "Failed to query NS records: " + err.Error()
 		return parsed
 	}
 
@@ -1227,10 +1231,8 @@ func validateDelegatedNameservers(app *AppState, target DomainConfig, nameserver
 			if parsed != nil {
 				parsed.Status = StatusFailed
 			}
-			msg := fmt.Sprintf(MsgAlertRDAPUnauthorizedNS, target.Domain, ns)
-			redacted := "Unauthorized nameserver detected."
 			if !target.SuppressAlerts {
-				app.SafeDispatch(msg, redacted, PriorityUrgent, "skull", target.Domain, target.Name)
+				app.SafeDispatchf(PriorityUrgent, TagSkull, target.Domain, target.Name, MsgRedactedRDAPUnauthorizedNS, MsgAlertRDAPUnauthorizedNS, target.Domain, ns)
 			}
 		}
 	}
@@ -1241,10 +1243,8 @@ func validateDelegatedNameservers(app *AppState, target DomainConfig, nameserver
 			if parsed != nil {
 				parsed.Status = StatusFailed
 			}
-			msg := fmt.Sprintf(MsgAlertRDAPMissingNS, target.Domain, expectedRaw)
-			redacted := "Expected nameserver is missing."
 			if !target.SuppressAlerts {
-				app.SafeDispatch(msg, redacted, PriorityHigh, "warning", target.Domain, target.Name)
+				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedRDAPMissingNS, MsgAlertRDAPMissingNS, target.Domain, expectedRaw)
 			}
 		}
 	}

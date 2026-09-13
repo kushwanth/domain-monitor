@@ -5,7 +5,9 @@ import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -117,20 +119,43 @@ type DNSTask struct {
 
 // AppState holds application configuration, notification manager, and atomic runtime state caches.
 type AppState struct {
-	Config              *AppConfig
+	config              AppConfig
+	activeResolvers     []string
 	Notifier            *NotificationManager
 	LoopDuration        time.Duration
 	PrerenderedJSON     atomic.Value
 	GlobalResolverIndex atomic.Uint32
 }
 
-// Resolvers returns the configured DNS resolvers, or safe default public resolvers
-// if app, Config, or Resolvers is nil/empty.
+// Config returns a value copy of the application configuration loaded at startup.
+// Note: While the AppConfig struct is copied by value, callers must treat slice and pointer
+// fields as read-only to preserve internal configuration integrity across cycles.
+func (a *AppState) Config() AppConfig {
+	if a == nil {
+		return AppConfig{}
+	}
+	return a.config
+}
+
+// Resolvers returns the runtime verified DNS resolvers (or configured/default fallback).
 func (a *AppState) Resolvers() []string {
-	if a != nil && a.Config != nil && len(a.Config.Resolvers) > 0 {
-		return a.Config.Resolvers
+	if a != nil && len(a.activeResolvers) > 0 {
+		return slices.Clone(a.activeResolvers)
+	}
+	if a != nil && len(a.config.Resolvers) > 0 {
+		return slices.Clone(a.config.Resolvers)
 	}
 	return []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+}
+
+// NewAppState constructs an AppState with the provided AppConfig value.
+func NewAppState(cfg AppConfig) *AppState {
+	return &AppState{
+		config:          cfg,
+		activeResolvers: slices.Clone(cfg.Resolvers),
+		Notifier:        &NotificationManager{},
+		LoopDuration:    time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
+	}
 }
 
 // SafeDispatch safely dispatches an alert via Notifier if both app and Notifier are non-nil,
@@ -148,6 +173,12 @@ func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority
 		return
 	}
 	a.Notifier.Dispatch(message, redacted, priority, tag, domain, name)
+}
+
+// SafeDispatchf formats the full alert message and safely dispatches it via Notifier.
+func (a *AppState) SafeDispatchf(priority AlertPriority, tag, domain, name, redacted, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	a.SafeDispatch(msg, redacted, priority, tag, domain, name)
 }
 
 // 3. Domain & Check Result Models
@@ -435,7 +466,7 @@ type TelegramProvider struct {
 
 // 5. External API & Response Payloads
 
-type CTLogsDevResponse struct {
+type ctLogsPageResponse struct {
 	Rows       []CTCert `json:"rows"`
 	HasNext    bool     `json:"has_next"`
 	NextCursor string   `json:"next_cursor"`
@@ -445,7 +476,7 @@ type dnsRegistry struct {
 	Services [][][]string `json:"services"`
 }
 
-type googleDoHResponse struct {
+type dohJSONResponse struct {
 	Status int  `json:"Status"`
 	AD     bool `json:"AD"`
 }

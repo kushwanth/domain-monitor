@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -322,7 +323,7 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 		}, nil
 	})
 
-	app := &AppState{Config: &AppConfig{}, Notifier: &NotificationManager{}}
+	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{}}
 	domain := "firstrun.example.com"
 	defer func() { _ = os.Remove(filepath.Join(CTLogsPath, domain+".json")) }()
 
@@ -371,7 +372,7 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 		}, nil
 	})
 
-	app := &AppState{Config: &AppConfig{}, Notifier: &NotificationManager{}}
+	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{}}
 	domain := "ratelimit.example.com"
 	defer func() { _ = os.Remove(filepath.Join(CTLogsPath, domain+".json")) }()
 
@@ -430,7 +431,7 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 func TestFetchCTPage_KeyRedaction(t *testing.T) {
 	apiKey := "SUPER_SECRET_CTLOGS_KEY"
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			CTLogsAPIKey: apiKey,
 		},
 	}
@@ -452,3 +453,40 @@ func TestFetchCTPage_KeyRedaction(t *testing.T) {
 		t.Errorf("Expected [REDACTED_API_KEY] in error message: %v", err)
 	}
 }
+
+func TestSaveCertsToHistory_CapAtMaxHistory(t *testing.T) {
+	domain := "cap-test.example.com"
+	cleanFile := filepath.Join(CTLogsPath, domain+".json")
+	defer func() { _ = os.Remove(cleanFile) }()
+
+	// Create 1,050 certs
+	certs := make([]CTCert, 1050)
+	for i := range certs {
+		certs[i] = CTCert{
+			ID:        strconv.Itoa(i + 1),
+			Match:     domain,
+			Issuer:    "Test CA",
+			NotBefore: "2026-01-01T00:00:00Z",
+			NotAfter:  "2026-04-01T00:00:00Z",
+		}
+	}
+
+	if err := saveCertsToHistory(domain, certs); err != nil {
+		t.Fatalf("saveCertsToHistory failed: %v", err)
+	}
+
+	b, err := os.ReadFile(cleanFile)
+	if err != nil {
+		t.Fatalf("failed to read written file: %v", err)
+	}
+
+	var saved []CTCert
+	if err := json.Unmarshal(b, &saved); err != nil {
+		t.Fatalf("failed to unmarshal saved certs: %v", err)
+	}
+
+	if len(saved) != MaxCTCertHistory {
+		t.Errorf("expected history capped at %d, got %d", MaxCTCertHistory, len(saved))
+	}
+}
+

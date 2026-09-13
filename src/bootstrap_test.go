@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -60,7 +61,7 @@ func TestNewRDAPHTTPClient(t *testing.T) {
 	}
 }
 
-func TestKnownWhoisServer(t *testing.T) {
+func TestKnownWHOISServer(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -71,13 +72,13 @@ func TestKnownWhoisServer(t *testing.T) {
 		{"example.com.au", "whois.auda.org.au"},
 		{"example.co.uk", "whois.nominet.uk"},
 		{"example.ru", "whois.tcinet.ru"},
-		{"example.com", ""}, // Generic TLD not in CCTLDWhoisServers
+		{"example.com", ""}, // Generic TLD not in CCTLDWHOISServers
 	}
 
 	for _, tt := range tests {
-		server := KnownWhoisServer(tt.domain)
+		server := KnownWHOISServer(tt.domain)
 		if server != tt.expected {
-			t.Errorf("KnownWhoisServer(%q) = %q, expected %q", tt.domain, server, tt.expected)
+			t.Errorf("KnownWHOISServer(%q) = %q, expected %q", tt.domain, server, tt.expected)
 		}
 	}
 }
@@ -250,6 +251,22 @@ func TestNilSafety_Bootstrap(t *testing.T) {
 	}
 	if err := nilB.fetch(context.Background()); err == nil {
 		t.Errorf("expected error from fetch on nil Bootstrap")
+	}
+}
+
+func TestNewRDAPHTTPClient_SSRFBlocked_SentinelError(t *testing.T) {
+	client := NewRDAPHTTPClient(2 * time.Second)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1:54321/domain/test", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	_, err = client.Do(req)
+	if err == nil {
+		t.Fatalf("expected request to 127.0.0.1 to be blocked, got nil error")
+	}
+	if !errors.Is(err, ErrRestrictedIP) {
+		t.Errorf("expected error to wrap ErrRestrictedIP, got: %v", err)
 	}
 }
 

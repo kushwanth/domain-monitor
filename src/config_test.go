@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -54,14 +53,14 @@ func TestLoadConfig(t *testing.T) {
 			}`,
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
-				if app.Config.Port != "9090" {
-					t.Errorf("Expected port 9090, got %s", app.Config.Port)
+				if app.Config().Port != "9090" {
+					t.Errorf("Expected port 9090, got %s", app.Config().Port)
 				}
 				if app.LoopDuration != 24*time.Hour {
 					t.Errorf("Expected 24h loop duration, got %v", app.LoopDuration)
 				}
 
-				d := app.Config.Domains[0]
+				d := app.Config().Domains[0]
 				if d.Domain != "example.com" {
 					t.Errorf("Expected domain example.com, got %s", d.Domain)
 				}
@@ -77,7 +76,7 @@ func TestLoadConfig(t *testing.T) {
 				if d.CAA.Issue[0] != "letsencrypt.org" {
 					t.Errorf("Expected issue letsencrypt.org, got %s", d.CAA.Issue[0])
 				}
-				r := app.Config.DNSRecords[0]
+				r := app.Config().DNSRecords[0]
 				if r.Hostname != "www.example.com" {
 					t.Errorf("Expected hostname www.example.com, got %s", r.Hostname)
 				}
@@ -110,7 +109,7 @@ func TestLoadConfig(t *testing.T) {
 			}`,
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
-				d1 := app.Config.Domains[0]
+				d1 := app.Config().Domains[0]
 				if len(d1.CAA.Issue) != 2 || d1.CAA.Issue[0] != "letsencrypt.org" || d1.CAA.Issue[1] != "digicert.com" {
 					t.Errorf("Expected 2 normalized issue CAs (letsencrypt.org, digicert.com), got %v", d1.CAA.Issue)
 				}
@@ -123,7 +122,7 @@ func TestLoadConfig(t *testing.T) {
 					t.Errorf("Expected issuemail to be empty non-nil slice, got %v", d1.CAA.IssueMail)
 				}
 
-				d2 := app.Config.Domains[1]
+				d2 := app.Config().Domains[1]
 				if d2.CAA.IssueWild != nil {
 					t.Errorf("Expected omitted issuewild to remain nil, got %v", d2.CAA.IssueWild)
 				}
@@ -146,7 +145,7 @@ func TestLoadConfig(t *testing.T) {
 			}`,
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
-				d := app.Config.Domains[0]
+				d := app.Config().Domains[0]
 				if len(d.MXRecords) != 1 || d.MXRecords[0] != "." {
 					t.Errorf("Expected Null MX '.' to be preserved, got %v", d.MXRecords)
 				}
@@ -214,8 +213,8 @@ func TestLoadConfig(t *testing.T) {
 			}`,
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
-				if len(app.Config.Resolvers) != 3 {
-					t.Errorf("Expected 3 resolvers, got %d", len(app.Config.Resolvers))
+				if len(app.Config().Resolvers) != 3 {
+					t.Errorf("Expected 3 resolvers, got %d", len(app.Config().Resolvers))
 				}
 			},
 		},
@@ -233,17 +232,17 @@ func TestLoadConfig(t *testing.T) {
 			},
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
-				if app.Config.Port != "8888" {
-					t.Errorf("Expected port 8888 from env, got %s", app.Config.Port)
+				if app.Config().Port != "8888" {
+					t.Errorf("Expected port 8888 from env, got %s", app.Config().Port)
 				}
-				if app.Config.Notifications.Telegram == nil || app.Config.Notifications.Telegram.Token != "test-token" {
-					t.Errorf("Expected telegram token test-token, got %+v", app.Config.Notifications.Telegram)
+				if app.Config().Notifications.Telegram == nil || app.Config().Notifications.Telegram.Token != "test-token" {
+					t.Errorf("Expected telegram token test-token, got %+v", app.Config().Notifications.Telegram)
 				}
-				if app.Config.CTLogsAPIKey != "ct-key-abc" {
-					t.Errorf("Expected ctlogs key ct-key-abc, got %s", app.Config.CTLogsAPIKey)
+				if app.Config().CTLogsAPIKey != "ct-key-abc" {
+					t.Errorf("Expected ctlogs key ct-key-abc, got %s", app.Config().CTLogsAPIKey)
 				}
-				if app.Config.DoHURL != "https://custom-doh.com/resolve" {
-					t.Errorf("Expected custom DoH URL, got %s", app.Config.DoHURL)
+				if app.Config().DoHURL != "https://custom-doh.com/resolve" {
+					t.Errorf("Expected custom DoH URL, got %s", app.Config().DoHURL)
 				}
 			},
 		},
@@ -276,8 +275,8 @@ func TestLoadConfig(t *testing.T) {
 			}`,
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
-				if len(app.Config.Domains) != 2 {
-					t.Errorf("Expected 2 domain entries, got %d", len(app.Config.Domains))
+				if len(app.Config().Domains) != 2 {
+					t.Errorf("Expected 2 domain entries, got %d", len(app.Config().Domains))
 				}
 			},
 		},
@@ -316,7 +315,7 @@ func TestLoadConfig(t *testing.T) {
 				t.Fatalf("failed to write test config file: %v", err)
 			}
 
-			app, rawCfg, err := LoadConfig(context.Background(), cfgPath)
+			cfg, err := LoadConfig(context.Background(), cfgPath)
 			if tt.expectErr {
 				if err == nil {
 					t.Fatalf("Expected error containing '%s', got nil", tt.errContains)
@@ -334,7 +333,7 @@ func TestLoadConfig(t *testing.T) {
 			}
 
 			if tt.validate != nil {
-				app.Config = rawCfg
+				app := NewAppState(cfg)
 				tt.validate(t, app)
 			}
 		})
@@ -376,8 +375,11 @@ func TestInitializeDependencies_ResolverResilience(t *testing.T) {
 	if err != nil {
 		t.Errorf("Expected InitializeDependencies to succeed with 1 healthy resolver, got error: %v", err)
 	}
-	if len(app1.Config.Resolvers) != 1 || app1.Config.Resolvers[0] != localAddr {
-		t.Errorf("Expected resolvers to contain only healthy %s, got %v", localAddr, app1.Config.Resolvers)
+	if len(app1.Resolvers()) != 1 || app1.Resolvers()[0] != localAddr {
+		t.Errorf("Expected resolvers to contain only healthy %s, got %v", localAddr, app1.Resolvers())
+	}
+	if len(rawCfg1.Resolvers) != 2 {
+		t.Errorf("Expected rawCfg1.Resolvers to remain immutable with 2 resolvers, got %d", len(rawCfg1.Resolvers))
 	}
 
 	// Scenario 2: All resolvers invalid
@@ -424,13 +426,12 @@ func TestIDNNormalizationAndAliasCase(t *testing.T) {
 		t.Fatalf("failed to write config: %v", err)
 	}
 
-	app, rawCfg, err := LoadConfig(context.Background(), cfgPath)
+	cfg, err := LoadConfig(context.Background(), cfgPath)
 	if err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
-	app.Config = rawCfg
 
-	d := app.Config.Domains[0]
+	d := cfg.Domains[0]
 	if d.Domain != "xn--mnchen-3ya.de" {
 		t.Errorf("Expected Punycode xn--mnchen-3ya.de, got %s", d.Domain)
 	}
@@ -441,7 +442,7 @@ func TestIDNNormalizationAndAliasCase(t *testing.T) {
 		t.Errorf("Expected Punycode MX mail.xn--mnchen-3ya.de, got %s", d.MXRecords[0])
 	}
 
-	r := app.Config.DNSRecords[0]
+	r := cfg.DNSRecords[0]
 	if r.Hostname != "xn--mnchen-3ya.de" {
 		t.Errorf("Expected Punycode Hostname xn--mnchen-3ya.de, got %s", r.Hostname)
 	}
@@ -470,16 +471,15 @@ func TestConfig_RegistrarBothAllowed(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(bothJSON), 0644); err != nil {
 		t.Fatalf("failed to write config: %v", err)
 	}
-	appBoth, rawCfgBoth, err := LoadConfig(context.Background(), cfgPath)
+	cfgBoth, err := LoadConfig(context.Background(), cfgPath)
 	if err != nil {
 		t.Fatalf("Expected config with both registrar fields to load successfully, got error: %v", err)
 	}
-	appBoth.Config = rawCfgBoth
-	if appBoth.Config.Domains[0].ExpectedRegistrarID != "292" {
-		t.Errorf("Expected ExpectedRegistrarID '292', got %q", appBoth.Config.Domains[0].ExpectedRegistrarID)
+	if cfgBoth.Domains[0].ExpectedRegistrarID != "292" {
+		t.Errorf("Expected ExpectedRegistrarID '292', got %q", cfgBoth.Domains[0].ExpectedRegistrarID)
 	}
-	if appBoth.Config.Domains[0].ExpectedRegistrarName != "markmonitor" {
-		t.Errorf("Expected ExpectedRegistrarName 'markmonitor', got %q", appBoth.Config.Domains[0].ExpectedRegistrarName)
+	if cfgBoth.Domains[0].ExpectedRegistrarName != "markmonitor" {
+		t.Errorf("Expected ExpectedRegistrarName 'markmonitor', got %q", cfgBoth.Domains[0].ExpectedRegistrarName)
 	}
 
 	// Only ID set -> valid
@@ -494,13 +494,12 @@ func TestConfig_RegistrarBothAllowed(t *testing.T) {
 	}`
 	cfgPathID := tmpDir + "/valid_id.json"
 	_ = os.WriteFile(cfgPathID, []byte(validIDJSON), 0644)
-	appID, rawCfgID, err := LoadConfig(context.Background(), cfgPathID)
+	cfgID, err := LoadConfig(context.Background(), cfgPathID)
 	if err != nil {
 		t.Fatalf("Expected valid config with only expected_registrar_id, got error: %v", err)
 	}
-	appID.Config = rawCfgID
-	if appID.Config.Domains[0].ExpectedRegistrarID != "292" {
-		t.Errorf("Expected ExpectedRegistrarID '292', got %q", appID.Config.Domains[0].ExpectedRegistrarID)
+	if cfgID.Domains[0].ExpectedRegistrarID != "292" {
+		t.Errorf("Expected ExpectedRegistrarID '292', got %q", cfgID.Domains[0].ExpectedRegistrarID)
 	}
 
 	// Only Name set -> valid
@@ -515,13 +514,12 @@ func TestConfig_RegistrarBothAllowed(t *testing.T) {
 	}`
 	cfgPathName := tmpDir + "/valid_name.json"
 	_ = os.WriteFile(cfgPathName, []byte(validNameJSON), 0644)
-	appName, rawCfgName, err := LoadConfig(context.Background(), cfgPathName)
+	cfgName, err := LoadConfig(context.Background(), cfgPathName)
 	if err != nil {
 		t.Fatalf("Expected valid config with only expected_registrar_name, got error: %v", err)
 	}
-	appName.Config = rawCfgName
-	if appName.Config.Domains[0].ExpectedRegistrarName != "markmonitor" {
-		t.Errorf("Expected ExpectedRegistrarName 'markmonitor', got %q", appName.Config.Domains[0].ExpectedRegistrarName)
+	if cfgName.Domains[0].ExpectedRegistrarName != "markmonitor" {
+		t.Errorf("Expected ExpectedRegistrarName 'markmonitor', got %q", cfgName.Domains[0].ExpectedRegistrarName)
 	}
 }
 
@@ -543,7 +541,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}`
 	cfgPath1 := tmpDir + "/invalid_ns_health1.json"
 	_ = os.WriteFile(cfgPath1, []byte(invalidJSON1), 0644)
-	_, _, err1 := LoadConfig(context.Background(), cfgPath1)
+	_, err1 := LoadConfig(context.Background(), cfgPath1)
 	if err1 == nil || !strings.Contains(err1.Error(), "no primary expected_ns") {
 		t.Fatalf("Expected error when verify_ns_health is enabled without expected_ns, got: %v", err1)
 	}
@@ -561,13 +559,12 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}`
 	cfgPath2 := tmpDir + "/valid_primary_only.json"
 	_ = os.WriteFile(cfgPath2, []byte(validPrimaryOnlyJSON), 0644)
-	app2, rawCfg2, err2 := LoadConfig(context.Background(), cfgPath2)
+	cfg2, err2 := LoadConfig(context.Background(), cfgPath2)
 	if err2 != nil {
 		t.Fatalf("Expected valid config when secondary_ns is omitted, got error: %v", err2)
 	}
-	app2.Config = rawCfg2
-	if len(app2.Config.Domains[0].SecondaryNS) != 0 {
-		t.Errorf("Expected 0 secondary_ns, got %v", app2.Config.Domains[0].SecondaryNS)
+	if len(cfg2.Domains[0].SecondaryNS) != 0 {
+		t.Errorf("Expected 0 secondary_ns, got %v", cfg2.Domains[0].SecondaryNS)
 	}
 
 	// 3. verify_ns_health: true with both expected_ns and secondary_ns -> valid
@@ -584,13 +581,12 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}`
 	cfgPath3 := tmpDir + "/valid_ns_health.json"
 	_ = os.WriteFile(cfgPath3, []byte(validJSON), 0644)
-	app, rawCfg, err3 := LoadConfig(context.Background(), cfgPath3)
+	cfg3, err3 := LoadConfig(context.Background(), cfgPath3)
 	if err3 != nil {
 		t.Fatalf("Expected valid config with expected_ns and secondary_ns, got error: %v", err3)
 	}
-	app.Config = rawCfg
-	if len(app.Config.Domains[0].SecondaryNS) != 1 || app.Config.Domains[0].SecondaryNS[0] != "slave.otherprovider.com" {
-		t.Errorf("Expected secondary_ns 'slave.otherprovider.com', got %v", app.Config.Domains[0].SecondaryNS)
+	if len(cfg3.Domains[0].SecondaryNS) != 1 || cfg3.Domains[0].SecondaryNS[0] != "slave.otherprovider.com" {
+		t.Errorf("Expected secondary_ns 'slave.otherprovider.com', got %v", cfg3.Domains[0].SecondaryNS)
 	}
 
 	// 4. empty entry in expected_ns -> must error
@@ -605,7 +601,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}`
 	cfgPath4 := tmpDir + "/empty_expected_ns.json"
 	_ = os.WriteFile(cfgPath4, []byte(emptyExpectedNSJSON), 0644)
-	_, _, err4 := LoadConfig(context.Background(), cfgPath4)
+	_, err4 := LoadConfig(context.Background(), cfgPath4)
 	if err4 == nil || !strings.Contains(err4.Error(), "empty entry in expected_ns") {
 		t.Fatalf("Expected error for empty entry in expected_ns, got: %v", err4)
 	}
@@ -623,7 +619,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}`
 	cfgPath5 := tmpDir + "/empty_secondary_ns.json"
 	_ = os.WriteFile(cfgPath5, []byte(emptySecondaryNSJSON), 0644)
-	_, _, err5 := LoadConfig(context.Background(), cfgPath5)
+	_, err5 := LoadConfig(context.Background(), cfgPath5)
 	if err5 == nil || !strings.Contains(err5.Error(), "empty entry in secondary_ns") {
 		t.Fatalf("Expected error for empty entry in secondary_ns, got: %v", err5)
 	}
@@ -640,7 +636,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}`
 	cfgPath6 := tmpDir + "/secondary_no_expected.json"
 	_ = os.WriteFile(cfgPath6, []byte(secondaryNoExpectedJSON), 0644)
-	_, _, err6 := LoadConfig(context.Background(), cfgPath6)
+	_, err6 := LoadConfig(context.Background(), cfgPath6)
 	if err6 == nil || !strings.Contains(err6.Error(), "no primary expected_ns configured") {
 		t.Fatalf("Expected error for secondary_ns without expected_ns, got: %v", err6)
 	}
@@ -657,27 +653,16 @@ func TestSkipSSLValidation(t *testing.T) {
 			if vt == "AAAA" {
 				expectedVal = `"2001:db8::1"`
 			}
-			cfgJSON := fmt.Sprintf(`{
-				"dns_records": [
-					{
-						"hostname": "web.example.com",
-						"name": "Web Test",
-						"type": "%s",
-						"expected": [%s],
-						"skip_ssl": true
-					}
-				]
-			}`, vt, expectedVal)
+			cfgJSON := `{"dns_records": [{"hostname": "web.example.com", "name": "Web Test", "type": "` + vt + `", "expected": [` + expectedVal + `], "skip_ssl": true}]}`
 			tmpFile := t.TempDir() + "/valid_skip_ssl.json"
 			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 				t.Fatalf("failed to write temp file: %v", err)
 			}
-			app, rawCfg, err := LoadConfig(context.Background(), tmpFile)
+			cfg, err := LoadConfig(context.Background(), tmpFile)
 			if err != nil {
 				t.Fatalf("expected valid config for skip_ssl with type %s, got error: %v", vt, err)
 			}
-			app.Config = rawCfg
-			if !app.Config.DNSRecords[0].SkipSSL {
+			if !cfg.DNSRecords[0].SkipSSL {
 				t.Errorf("expected SkipSSL to be true for %s", vt)
 			}
 		})
@@ -687,22 +672,12 @@ func TestSkipSSLValidation(t *testing.T) {
 	invalidTypes := []string{"TXT", "MX", "CAA", "NS"}
 	for _, it := range invalidTypes {
 		t.Run("Invalid_"+it, func(t *testing.T) {
-			cfgJSON := fmt.Sprintf(`{
-				"dns_records": [
-					{
-						"hostname": "record.example.com",
-						"name": "Invalid Test",
-						"type": "%s",
-						"expected": ["something"],
-						"skip_ssl": true
-					}
-				]
-			}`, it)
+			cfgJSON := `{"dns_records": [{"hostname": "record.example.com", "name": "Invalid Test", "type": "` + it + `", "expected": ["something"], "skip_ssl": true}]}`
 			tmpFile := t.TempDir() + "/invalid_skip_ssl.json"
 			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 				t.Fatalf("failed to write temp file: %v", err)
 			}
-			_, _, err := LoadConfig(context.Background(), tmpFile)
+			_, err := LoadConfig(context.Background(), tmpFile)
 			if err == nil {
 				t.Fatalf("expected validation error when skip_ssl is configured on %s, got nil", it)
 			}
@@ -728,12 +703,11 @@ func TestSkipSSLValidation(t *testing.T) {
 		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 			t.Fatalf("failed to write temp file: %v", err)
 		}
-		app, rawCfg, err := LoadConfig(context.Background(), tmpFile)
+		cfg, err := LoadConfig(context.Background(), tmpFile)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		app.Config = rawCfg
-		if app.Config.DNSRecords[0].SkipSSL {
+		if cfg.DNSRecords[0].SkipSSL {
 			t.Errorf("expected SkipSSL to default to false")
 		}
 	})
@@ -760,7 +734,7 @@ func TestConfig_DuplicateDNSRecordName(t *testing.T) {
 	if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 		t.Fatalf("failed to write temp file: %v", err)
 	}
-	_, _, err := LoadConfig(context.Background(), tmpFile)
+	_, err := LoadConfig(context.Background(), tmpFile)
 	if err == nil {
 		t.Fatalf("expected error for duplicate DNS record name, got nil")
 	}
@@ -791,16 +765,15 @@ func TestConfig_StringListExpected(t *testing.T) {
 	if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 		t.Fatalf("failed to write temp file: %v", err)
 	}
-	app, rawCfg, err := LoadConfig(context.Background(), tmpFile)
+	cfg, err := LoadConfig(context.Background(), tmpFile)
 	if err != nil {
 		t.Fatalf("failed to load config with StringList expected: %v", err)
 	}
-	app.Config = rawCfg
-	if len(app.Config.DNSRecords[0].Expected) != 1 || app.Config.DNSRecords[0].Expected[0] != "1.2.3.4" {
-		t.Errorf("expected single string parsed as slice of 1 element, got %v", app.Config.DNSRecords[0].Expected)
+	if len(cfg.DNSRecords[0].Expected) != 1 || cfg.DNSRecords[0].Expected[0] != "1.2.3.4" {
+		t.Errorf("expected single string parsed as slice of 1 element, got %v", cfg.DNSRecords[0].Expected)
 	}
-	if len(app.Config.DNSRecords[1].Expected) != 2 {
-		t.Errorf("expected slice parsed with 2 elements, got %v", app.Config.DNSRecords[1].Expected)
+	if len(cfg.DNSRecords[1].Expected) != 2 {
+		t.Errorf("expected slice parsed with 2 elements, got %v", cfg.DNSRecords[1].Expected)
 	}
 }
 
@@ -821,7 +794,7 @@ func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 			t.Fatalf("failed to write temp file: %v", err)
 		}
-		_, _, err := LoadConfig(context.Background(), tmpFile)
+		_, err := LoadConfig(context.Background(), tmpFile)
 		if err == nil || !strings.Contains(err.Error(), "requires IPv4") {
 			t.Errorf("expected error requiring IPv4, got %v", err)
 		}
@@ -843,7 +816,7 @@ func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 			t.Fatalf("failed to write temp file: %v", err)
 		}
-		_, _, err := LoadConfig(context.Background(), tmpFile)
+		_, err := LoadConfig(context.Background(), tmpFile)
 		if err == nil || !strings.Contains(err.Error(), "requires IPv6") {
 			t.Errorf("expected error requiring IPv6, got %v", err)
 		}
@@ -865,12 +838,11 @@ func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 			t.Fatalf("failed to write temp file: %v", err)
 		}
-		app, rawCfg, err := LoadConfig(context.Background(), tmpFile)
+		cfg, err := LoadConfig(context.Background(), tmpFile)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		app.Config = rawCfg
-		expected := app.Config.DNSRecords[0].Expected
+		expected := cfg.DNSRecords[0].Expected
 		// Deduplicated: 3 elements ("192.0.2.1", "198.51.100.1", "2001:db8::1")
 		if len(expected) != 3 {
 			t.Fatalf("expected 3 canonicalized elements, got %d: %v", len(expected), expected)
@@ -991,13 +963,14 @@ func TestLoadConfig_LoopIntervalClamping(t *testing.T) {
 		t.Fatalf("Failed to write test config: %v", err)
 	}
 
-	app, cfg, err := LoadConfig(context.Background(), configPath)
+	cfg, err := LoadConfig(context.Background(), configPath)
 	if err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
 	if cfg.LoopIntervalDays != 0.125 {
 		t.Errorf("expected LoopIntervalDays clamped to 0.125, got %f", cfg.LoopIntervalDays)
 	}
+	app := NewAppState(cfg)
 	expectedDur := time.Duration(0.125 * 24 * float64(time.Hour))
 	if app.LoopDuration != expectedDur {
 		t.Errorf("expected LoopDuration %v, got %v", expectedDur, app.LoopDuration)
@@ -1021,16 +994,49 @@ func TestLoadConfig_LoopIntervalMaxClamping(t *testing.T) {
 		t.Fatalf("Failed to write test config: %v", err)
 	}
 
-	app, cfg, err := LoadConfig(context.Background(), configPath)
+	cfg, err := LoadConfig(context.Background(), configPath)
 	if err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
 	if cfg.LoopIntervalDays != 365 {
 		t.Errorf("expected LoopIntervalDays clamped to 365, got %f", cfg.LoopIntervalDays)
 	}
+	app := NewAppState(cfg)
 	expectedDur := time.Duration(365 * 24 * float64(time.Hour))
 	if app.LoopDuration != expectedDur {
 		t.Errorf("expected LoopDuration %v, got %v", expectedDur, app.LoopDuration)
+	}
+}
+
+func TestConfig_CompileTimeImmutability(t *testing.T) {
+	t.Parallel()
+
+	cfg := AppConfig{
+		Port:      "8080",
+		Resolvers: []string{"1.1.1.1", "8.8.8.8"},
+		Domains: []DomainConfig{
+			{Domain: "example.com", Name: "Example"},
+		},
+	}
+	app := NewAppState(cfg)
+
+	// Verify reading via value getter
+	if app.Config().Port != "8080" {
+		t.Fatalf("expected port 8080, got %s", app.Config().Port)
+	}
+
+	// Mutating scalar fields on the returned value copy does not mutate internal state
+	copied := app.Config()
+	copied.Port = "9999"
+	if app.Config().Port != "8080" {
+		t.Errorf("expected internal config port to remain 8080, got %s", app.Config().Port)
+	}
+
+	// activeResolvers holds a cloned slice
+	res := app.Resolvers()
+	res[0] = "192.0.2.1"
+	if app.Resolvers()[0] == "192.0.2.1" {
+		t.Errorf("expected Resolvers() to return defensive clone, but internal slice was mutated")
 	}
 }
 

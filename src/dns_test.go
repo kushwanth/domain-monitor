@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -429,7 +431,7 @@ func TestSSLSentinels(t *testing.T) {
 	t.Parallel()
 
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Resolvers: testResolvers(),
 		},
 		Notifier: &NotificationManager{},
@@ -511,7 +513,7 @@ func TestDNSSEC_AuthenticatedKSKLinkage(t *testing.T) {
 	defer server.Shutdown()
 	go func() { _ = server.ActivateAndServe() }()
 
-	app := &AppState{Config: &AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
+	app := &AppState{config: AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
 	res := validateDNSSEC(context.Background(), app, "testsec.example", []string{l.LocalAddr().String()}, "")
 
 	if res.Valid {
@@ -521,7 +523,7 @@ func TestDNSSEC_AuthenticatedKSKLinkage(t *testing.T) {
 
 func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Resolvers: []string{"192.0.2.1:53"}, // Unroutable TEST-NET-1 IP
 		},
 		Notifier: &NotificationManager{},
@@ -620,7 +622,7 @@ func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Resolvers: []string{l.LocalAddr().String()},
 		},
 		Notifier: &NotificationManager{},
@@ -708,7 +710,7 @@ func TestFetchCAA_CNAMEAliasFollowing(t *testing.T) {
 	defer server.Shutdown()
 	go func() { _ = server.ActivateAndServe() }()
 
-	app := &AppState{Config: &AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
+	app := &AppState{config: AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
 	res := fetchCAA(context.Background(), app, "alias.example.com", []string{l.LocalAddr().String()})
 
 	if res.Error != "" {
@@ -749,7 +751,7 @@ func TestMultipleSameTypeDNSTasks_NoKeyCollision(t *testing.T) {
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{
-		Config:   &AppConfig{Resolvers: []string{l.LocalAddr().String()}},
+		config:   AppConfig{Resolvers: []string{l.LocalAddr().String()}},
 		Notifier: &NotificationManager{},
 	}
 	state := &CheckState{
@@ -825,7 +827,7 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{
-		Config:   &AppConfig{Resolvers: []string{l.LocalAddr().String()}},
+		config:   AppConfig{Resolvers: []string{l.LocalAddr().String()}},
 		Notifier: &NotificationManager{},
 	}
 	target := DomainConfig{
@@ -834,8 +836,7 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 		CheckEmailSecurity: true,
 	}
 
-	status := StatusOK
-	found, err := validateDMARC(context.Background(), app, target, &status)
+	found, status, err := validateDMARC(context.Background(), app, target)
 	if err != nil {
 		t.Fatalf("validateDMARC failed: %v", err)
 	}
@@ -1099,7 +1100,7 @@ func TestFetchCAA_CNAMELoopTermination(t *testing.T) {
 	defer server.Shutdown()
 	go func() { _ = server.ActivateAndServe() }()
 
-	app := &AppState{Config: &AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
+	app := &AppState{config: AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -1121,7 +1122,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 			if len(r.Question) > 0 {
 				q := r.Question[0]
 				if q.Qtype == dns.TypeSOA {
-					soaStr := fmt.Sprintf("example.com. 3600 IN SOA ns1.example.com. hostmaster.example.com. %d 7200 3600 1209600 3600", serial)
+					soaStr := "example.com. 3600 IN SOA ns1.example.com. hostmaster.example.com. " + strconv.FormatUint(uint64(serial), 10) + " 7200 3600 1209600 3600"
 					rr, _ := dns.NewRR(soaStr)
 					m.Answer = append(m.Answer, rr)
 				} else if q.Qtype == dns.TypeDNSKEY {
@@ -1152,10 +1153,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 	}
 	independentKey := &dns.DNSKEY{
 		Hdr:       dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
-		Flags:     256,
+		Flags:     257,
 		Protocol:  3,
-		Algorithm: dns.RSASHA256,
-		PublicKey: "AQAB",
+		Algorithm: dns.ECDSAP256SHA256,
+		PublicKey: "ZtsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9UxUovEsok4rA==",
 	}
 
 	// 1. Happy Path: Dumb Secondary replicates primary's exact DNSKEYs
@@ -1165,7 +1166,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
 		defer sClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Sync Domain",
@@ -1191,7 +1192,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil)
 		defer sClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Unsigned Domain",
@@ -1214,7 +1215,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Distinct key!
 		defer sClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Mismatched DNSKEY Domain",
@@ -1240,7 +1241,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Signed secondary!
 		defer sClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Unexpected DNSKEY Domain",
@@ -1266,7 +1267,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Secondary serves DNSKEY!
 		defer sClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Dumb Secondary Unsigned Violation",
@@ -1292,7 +1293,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil) // Missing DNSKEY!
 		defer sClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Missing DNSKEY Domain",
@@ -1318,7 +1319,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil) // 2026090101 < 2026090102
 		defer sClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Lagging Domain",
@@ -1341,7 +1342,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
 		defer pClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Primary Only Domain",
@@ -1377,7 +1378,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, false, nil) // AA=0!
 		defer pClose()
 
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Non-Authoritative Primary Domain",
@@ -1414,7 +1415,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		defer srv.Shutdown()
 
 		pAddr := l.LocalAddr().String()
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Missing SOA Primary Domain",
@@ -1465,7 +1466,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		defer srv.Shutdown()
 
 		pAddr := l.LocalAddr().String()
-		app := &AppState{Config: &AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "SOA In Authority Domain",
@@ -1508,7 +1509,7 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 
 	pAddr := l.LocalAddr().String()
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
 		Notifier: &NotificationManager{},
@@ -1592,7 +1593,7 @@ func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
 
 	pAddr := l.LocalAddr().String()
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
 		Notifier: &NotificationManager{},
@@ -1650,7 +1651,7 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 
 	pAddr := l.LocalAddr().String()
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
 		Notifier: &NotificationManager{},
@@ -1685,7 +1686,7 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 
 func TestDNS_ValidateRecords_MultiIPConsolidatedAlert(t *testing.T) {
 	app := &AppState{
-		Config:   &AppConfig{},
+		config:   AppConfig{},
 		Notifier: &NotificationManager{},
 	}
 
@@ -1738,7 +1739,7 @@ func TestNilSafety_AppState(t *testing.T) {
 	appNilCfg.SafeDispatch("test message", "redacted", PriorityHigh, "tag", "domain", "name")
 
 	// 3. AppState with empty Config.Resolvers
-	appEmptyRes := &AppState{Config: &AppConfig{Resolvers: []string{}}}
+	appEmptyRes := &AppState{config: AppConfig{Resolvers: []string{}}}
 	res3 := appEmptyRes.Resolvers()
 	if len(res3) == 0 {
 		t.Errorf("expected fallback resolvers for empty Resolvers slice")
@@ -1798,11 +1799,11 @@ func TestNilSafety_EvaluationsWithNilApp(t *testing.T) {
 		t.Errorf("expected non-nil EmailState")
 	}
 
-	// 6. validateMX, validateSPF, validateDMARC, validateDKIM with nil emailStatus pointer
-	_, _ = validateMX(ctx, nil, emailCfg, nil)
-	_, _ = validateSPF(ctx, nil, emailCfg, nil)
-	_, _ = validateDMARC(ctx, nil, emailCfg, nil)
-	_, _ = validateDKIM(ctx, nil, emailCfg, nil)
+	// 6. validateMX, validateSPF, validateDMARC, validateDKIM with nil app
+	_, _, _ = validateMX(ctx, nil, emailCfg)
+	_, _, _ = validateSPF(ctx, nil, emailCfg)
+	_, _, _ = validateDMARC(ctx, nil, emailCfg)
+	_, _, _ = validateDKIM(ctx, nil, emailCfg)
 
 	// 7. evaluateNSHealth with nil app
 	nsCfg := DomainConfig{
@@ -1818,7 +1819,7 @@ func TestNilSafety_EvaluationsWithNilApp(t *testing.T) {
 
 func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 	app := &AppState{
-		Config: &AppConfig{
+		config: AppConfig{
 			Resolvers: []string{"192.0.2.1:53"}, // Unreachable
 		},
 		Notifier: &NotificationManager{},
@@ -1830,8 +1831,7 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 
-	emailStatus := StatusOK
-	mxs, err := validateMX(ctx, app, target, &emailStatus)
+	mxs, _, err := validateMX(ctx, app, target)
 	if err == nil {
 		t.Fatalf("Expected error on unreachable resolver")
 	}
@@ -1848,7 +1848,7 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 
 func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
 	app := &AppState{
-		Config:   &AppConfig{},
+		config:   AppConfig{},
 		Notifier: &NotificationManager{},
 	}
 
@@ -1883,3 +1883,51 @@ func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
 		t.Errorf("expected prefix mismatch reason, got: %q", pReason)
 	}
 }
+
+func TestDNS_ResolverIndexOverflow(t *testing.T) {
+	app := &AppState{
+		config:   AppConfig{},
+		Notifier: &NotificationManager{},
+	}
+
+	resolvers := []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+	// Set index near max uint32 boundary where signed int overflow would occur on 32-bit systems
+	app.GlobalResolverIndex.Store(math.MaxUint32 - 2)
+
+	indices := make(map[int]int)
+	for range 10 {
+		startIdx := int(app.GlobalResolverIndex.Add(1) % uint32(len(resolvers)))
+		if startIdx < 0 || startIdx >= len(resolvers) {
+			t.Fatalf("startIdx %d out of bounds [0, %d)", startIdx, len(resolvers))
+		}
+		indices[startIdx]++
+	}
+
+	// Verify all resolvers are utilized in round-robin and never pinned to index 0
+	if len(indices) < len(resolvers) {
+		t.Errorf("expected round-robin across all %d resolvers, but only got %d unique indices: %v", len(resolvers), len(indices), indices)
+	}
+}
+
+func TestCheckSSLExpiryDays_ErrSSLValidationChaining(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Dial with mismatched hostname to verify ErrSSLValidation is preserved in the error chain
+	_, err = checkSSLExpiryDays(ctx, "mismatch.invalid.domain", []string{u.Host}, false)
+	if err == nil {
+		t.Fatalf("expected SSL error for mismatched hostname, got nil")
+	}
+	if !errors.Is(err, ErrSSLValidation) {
+		t.Errorf("expected error to wrap ErrSSLValidation, got: %v", err)
+	}
+}
+

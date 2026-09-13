@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"html"
 	"io"
 	"net/http"
@@ -13,7 +12,7 @@ import (
 	"time"
 )
 
-var notifyHTTPClient = ResolveHTTPClient(&http.Client{Timeout: 10 * time.Second})
+var notifyHTTPClient = ResolveHTTPClient(&http.Client{Timeout: DefaultHTTPTimeout})
 
 func (nm *NotificationManager) StartCycle() {
 	if nm == nil {
@@ -57,7 +56,7 @@ func (nm *NotificationManager) Dispatch(message, redacted string, priority Alert
 
 	InitMap(&nm.sentState)
 
-	key := fmt.Sprintf("%s|%s|%s", domain, tag, redacted)
+	key := domain + "|" + tag + "|" + redacted
 	if nm.seenThisCycle != nil {
 		nm.seenThisCycle[key] = true
 	}
@@ -125,17 +124,17 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 		defer RecoverAndLogPanic("Ntfy provider")
 
 		sendChunk := func(text string, highestPriority AlertPriority, tags []string) {
-			req, err := http.NewRequestWithContext(ctx, "POST", p.URL, strings.NewReader(strings.TrimSpace(text)))
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.URL, strings.NewReader(strings.TrimSpace(text)))
 			if err != nil {
-				LogError("Ntfy request creation failed", "error", err)
+				LogError(MsgLogNtfyRequestFailed, "error", err)
 				return
 			}
-			req.Header.Set("User-Agent", DefaultUserAgent)
+			req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 			if p.Auth != "" {
-				req.Header.Set("Authorization", p.Auth)
+				req.Header.Set(HeaderAuthorization, p.Auth)
 			}
-			req.Header.Set("Title", "Domain Monitor Alert")
-			req.Header.Set("Priority", string(highestPriority))
+			req.Header.Set(HeaderNtfyTitle, NotificationAlertTitle)
+			req.Header.Set(HeaderNtfyPriority, string(highestPriority))
 
 			// Deduplicate tags and limit to 5
 			finalTags := DeduplicateNonEmptyStrings(tags)
@@ -144,25 +143,25 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 			}
 
 			if len(finalTags) > 0 {
-				req.Header.Set("Tags", strings.Join(finalTags, ","))
+				req.Header.Set(HeaderNtfyTags, strings.Join(finalTags, ","))
 			}
 
 			if resp, err := notifyHTTPClient.Do(req); err == nil {
-				if resp.StatusCode >= 400 {
+				if resp.StatusCode >= http.StatusBadRequest {
 					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize))
 					bodyStr := string(bodyBytes)
 					if p.Auth != "" {
-						bodyStr = strings.ReplaceAll(bodyStr, p.Auth, "[REDACTED_AUTH]")
+						bodyStr = strings.ReplaceAll(bodyStr, p.Auth, RedactedAuthPlaceholder)
 					}
-					LogError("Ntfy delivery failed", "status", resp.StatusCode, "response", bodyStr)
+					LogError(MsgLogNtfyDeliveryFailed, "status", resp.StatusCode, "response", bodyStr)
 				}
-				DrainAndClose(resp.Body, 4096)
+				DrainAndClose(resp.Body, MaxBodyDrainSize)
 			} else {
 				errStr := err.Error()
 				if p.Auth != "" {
-					errStr = strings.ReplaceAll(errStr, p.Auth, "[REDACTED_AUTH]")
+					errStr = strings.ReplaceAll(errStr, p.Auth, RedactedAuthPlaceholder)
 				}
-				LogError("Ntfy request error", "error", errStr)
+				LogError(MsgLogNtfyRequestError, "error", errStr)
 			}
 		}
 
@@ -183,7 +182,7 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 			}
 
 			if alert.Domain != "" {
-				replacement := "[Hidden Domain]"
+				replacement := RedactedDomainPlaceholder
 				if alert.Name != "" {
 					replacement = alert.Name
 				}
@@ -192,7 +191,7 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 
 			prefix := ""
 			if alert.Name != "" {
-				prefix = fmt.Sprintf("[%s] ", alert.Name)
+				prefix = "[" + alert.Name + "] "
 			}
 
 			line := prefix + TruncateRunes(msg, 1000) + "\n\n"
@@ -260,37 +259,41 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 		defer RecoverAndLogPanic("Telegram provider")
 
 		sendChunk := func(text string) {
-			apiURL := fmt.Sprintf(TelegramAPIEndpoint, p.Token)
-			payloadBytes, _ := jsonv2.Marshal(map[string]any{
+			apiURL := TelegramAPIBase + p.Token + TelegramAPISendMessageSuffix
+			payloadBytes, err := jsonv2.Marshal(map[string]any{
 				"chat_id":    p.ChatID,
 				"text":       text,
-				"parse_mode": "HTML",
+				"parse_mode": TelegramParseModeHTML,
 			})
-
-			req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(payloadBytes))
 			if err != nil {
-				LogError("Telegram request creation failed", "error", err)
+				LogError(MsgLogTelegramMarshalFailed, "error", err)
 				return
 			}
-			req.Header.Set("User-Agent", DefaultUserAgent)
-			req.Header.Set("Content-Type", "application/json")
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewBuffer(payloadBytes))
+			if err != nil {
+				LogError(MsgLogTelegramRequestFailed, "error", err)
+				return
+			}
+			req.Header.Set(HeaderUserAgent, DefaultUserAgent)
+			req.Header.Set(HeaderContentType, MIMEApplicationJSON)
 
 			if resp, err := notifyHTTPClient.Do(req); err == nil {
-				if resp.StatusCode >= 400 {
+				if resp.StatusCode >= http.StatusBadRequest {
 					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize))
 					bodyStr := string(bodyBytes)
 					if p.Token != "" {
-						bodyStr = strings.ReplaceAll(bodyStr, p.Token, "[REDACTED_TELEGRAM_TOKEN]")
+						bodyStr = strings.ReplaceAll(bodyStr, p.Token, RedactedTokenPlaceholder)
 					}
-					LogError("Telegram delivery failed", "status", resp.StatusCode, "response", bodyStr)
+					LogError(MsgLogTelegramDeliveryFailed, "status", resp.StatusCode, "response", bodyStr)
 				}
-				DrainAndClose(resp.Body, 4096)
+				DrainAndClose(resp.Body, MaxBodyDrainSize)
 			} else {
 				errStr := err.Error()
 				if p.Token != "" {
-					errStr = strings.ReplaceAll(errStr, p.Token, "[REDACTED_TELEGRAM_TOKEN]")
+					errStr = strings.ReplaceAll(errStr, p.Token, RedactedTokenPlaceholder)
 				}
-				LogError("Telegram request error", "error", errStr)
+				LogError(MsgLogTelegramRequestError, "error", errStr)
 			}
 		}
 
@@ -305,7 +308,7 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 			}
 
 			if alert.Domain != "" {
-				replacement := "[Hidden Domain]"
+				replacement := RedactedDomainPlaceholder
 				if alert.Name != "" {
 					replacement = alert.Name
 				}
@@ -317,10 +320,10 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 
 			prefix := ""
 			if alert.Name != "" {
-				prefix = fmt.Sprintf("<b>[%s]</b> ", html.EscapeString(alert.Name))
+				prefix = "<b>[" + html.EscapeString(alert.Name) + "]</b> "
 			}
 
-			line := fmt.Sprintf("• %s%s\n", prefix, html.EscapeString(msg))
+			line := "• " + prefix + html.EscapeString(msg) + "\n"
 
 			if currentChunk.Len()+len(line) > MaxNotificationMessageLen {
 				chunks = append(chunks, currentChunk.String())
