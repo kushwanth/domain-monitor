@@ -6,6 +6,7 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"sync"
@@ -18,7 +19,7 @@ type StringList []string
 
 func (s *StringList) UnmarshalJSON(data []byte) error {
 	if s == nil {
-		return errors.New("nil StringList receiver")
+		return errors.New(MsgErrNilStringListReceiver)
 	}
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -49,6 +50,9 @@ type CheckStatus string
 // AlertPriority defines the urgency level of a notification alert
 type AlertPriority string
 
+// AlertTag defines the visual badge or emoji category for an alert
+type AlertTag = string
+
 // 2. Configuration Models
 
 type CAAConfig struct {
@@ -77,11 +81,11 @@ type AppConfig struct {
 	DataDir          string         `json:"data_dir,omitempty"`
 	LoopIntervalDays float64        `json:"loop_interval_days"`
 	Notifications    Notifications  `json:"notifications"`
-	Resolvers     []string       `json:"resolvers"`
-	DoHURL        string         `json:"doh_url,omitempty"`
-	CTLogsAPIKey  string         `json:"ctlogs_api_key,omitempty"`
-	Domains       []DomainConfig `json:"domains"`
-	DNSRecords    []DNSTask      `json:"dns_records"`
+	Resolvers        []string       `json:"resolvers"`
+	DoHURL           string         `json:"doh_url,omitempty"`
+	CTLogsAPIKey     string         `json:"ctlogs_api_key,omitempty"`
+	Domains          []DomainConfig `json:"domains"`
+	DNSRecords       []DNSTask      `json:"dns_records"`
 }
 
 type DomainConfig struct {
@@ -93,6 +97,8 @@ type DomainConfig struct {
 	SecondaryNS           []string   `json:"secondary_ns,omitempty"`
 	ExpectedRegistrarID   string     `json:"expected_registrar_id,omitempty"`
 	ExpectedRegistrarName string     `json:"expected_registrar_name,omitempty"`
+	AllowExpiry           bool       `json:"allow_expiry,omitempty"`
+	RenewalPrice          float64    `json:"renewal_price,omitempty"`
 	DomainTransferLocked  bool       `json:"domain_transfer_locked,omitempty"`
 	VerifyNSHealth        bool       `json:"verify_ns_health,omitempty"`
 	CheckEmailSecurity    bool       `json:"check_email_security"`
@@ -122,6 +128,7 @@ type AppState struct {
 	config              AppConfig
 	activeResolvers     []string
 	Notifier            *NotificationManager
+	Pricing             *PricingManager
 	LoopDuration        time.Duration
 	PrerenderedJSON     atomic.Value
 	GlobalResolverIndex atomic.Uint32
@@ -145,7 +152,7 @@ func (a *AppState) Resolvers() []string {
 	if a != nil && len(a.config.Resolvers) > 0 {
 		return slices.Clone(a.config.Resolvers)
 	}
-	return []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+	return slices.Clone(DefaultResolvers())
 }
 
 // NewAppState constructs an AppState with the provided AppConfig value.
@@ -260,6 +267,8 @@ type RDAPState struct {
 	Nameservers       []string        `json:"nameservers,omitempty"`
 	DomainStatus      []string        `json:"domain_status,omitempty"`
 	DNSSEC            bool            `json:"dnssec,omitempty"`
+	RenewalPrice      float64         `json:"renewal_price,omitempty"`
+	AllowExpiry       bool            `json:"allow_expiry,omitempty"`
 	Error             string          `json:"error,omitempty"`
 	IsDelegatedZone   bool            `json:"is_delegated_zone,omitempty"`
 	Source            string          `json:"source,omitempty"`
@@ -496,4 +505,41 @@ type Bootstrap struct {
 	fetchMu   sync.Mutex
 	services  map[string][]string
 	fetchedAt time.Time
+}
+
+// DotSweepTLD represents individual TLD pricing returned by DotSweep.
+type DotSweepTLD struct {
+	TLD          string  `json:"tld"`
+	Registration float64 `json:"registration,omitempty"`
+	Renewal      float64 `json:"renewal,omitempty"`
+	Vendor       string  `json:"vendor,omitempty"`
+}
+
+// DotSweepResponse represents the root JSON payload from DotSweep.
+type DotSweepResponse struct {
+	TLDs []DotSweepTLD `json:"tlds"`
+}
+
+// PricingManager manages TLD renewal pricing cache and scheduled upstream fetching.
+type PricingManager struct {
+	http      *http.Client
+	url       string
+	mu        sync.RWMutex
+	fetchMu   sync.Mutex
+	prices    map[string]float64
+	fetchedAt time.Time
+}
+
+// ConsoleHandler formats log records into human-readable lines without key=value syntax or source annotations.
+type ConsoleHandler struct {
+	w     io.Writer
+	mu    *sync.Mutex
+	attrs []string
+}
+
+// ChunkData represents a chunk of alert notifications.
+type ChunkData struct {
+	text     string
+	priority AlertPriority
+	tags     []string
 }

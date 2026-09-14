@@ -86,7 +86,6 @@ func TestRDAPValidation(t *testing.T) {
 				Notifier: &NotificationManager{},
 			}
 
-
 			target := DomainConfig{
 				Domain:      "example.com",
 				Name:        "Example",
@@ -388,7 +387,6 @@ func TestValidateRDAPStateAlertsAndStatus(t *testing.T) {
 		Notifier: &NotificationManager{},
 	}
 
-
 	target := DomainConfig{
 		Domain:         "example.com",
 		Name:           "Example Domain",
@@ -428,7 +426,6 @@ func TestValidateRDAPState_SuppressAlertsStoresSnapshot(t *testing.T) {
 	app := &AppState{
 		Notifier: &NotificationManager{},
 	}
-
 
 	target := DomainConfig{
 		Domain:         "suppressed.example.com",
@@ -1577,10 +1574,10 @@ func TestValidateRDAPState_ExpiryWarning(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name           string
-		daysFromNow    float64
-		wantStatus     CheckStatus
-		wantPriority   AlertPriority
+		name         string
+		daysFromNow  float64
+		wantStatus   CheckStatus
+		wantPriority AlertPriority
 	}{
 		{"6 days left - urgent", 6, StatusWarning, PriorityUrgent},
 		{"7 days left - urgent boundary", 7, StatusWarning, PriorityUrgent},
@@ -1752,7 +1749,3 @@ func TestCycleInvariants_ZeroPendingOnTimeout(t *testing.T) {
 		t.Fatalf("expected 0 invariant errors after timeout resolution to StatusFailed, got: %v", resolvedErrs)
 	}
 }
-
-
-
-

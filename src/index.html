@@ -556,6 +556,9 @@
       <div class="nav-item" onclick="switchView('certs')" id="nav-certs">Certificates</div>
       <div class="nav-item" onclick="switchView('nshealth')" id="nav-nshealth" style="display: none;">Nameservers</div>
     </div>
+    <div id="renewal-pricing" style="display: none; margin-bottom: 12px; font-size: 0.85rem; font-weight: 600; text-align: center; color: var(--text-main);">
+      Min. Renewal Cost: $<span id="total-renewal-cost">0.00</span>/yr
+    </div>
     <div id="last-updated"
       style="margin-bottom: 16px; font-size: 0.75rem; color: var(--text-muted); text-align: center;"></div>
     <div class="theme-toggle" onclick="toggleTheme()">
@@ -858,6 +861,25 @@
       }
     }
 
+    function updateRenewalPricing() {
+      if (!appState || !appState.rdap_checks) return;
+      let total = 0;
+      Object.values(appState.rdap_checks).forEach(c => {
+        if (c && c.renewal_price) total += c.renewal_price;
+      });
+      const el = document.getElementById('total-renewal-cost');
+      if (el) el.innerText = total.toFixed(2);
+      
+      const container = document.getElementById('renewal-pricing');
+      if (container) {
+        if (total > 0) {
+          container.style.display = 'block';
+        } else {
+          container.style.display = 'none';
+        }
+      }
+    }
+
     async function pollState() {
       try {
         const res = await fetch('/api/state');
@@ -868,6 +890,7 @@
           if (data.last_updated !== appState.last_updated) {
             appState = data;
             updateHeaderTimestamps();
+            updateRenewalPricing();
             updateNavVisibility();
             if (currentView === 'domains') {
               renderDomains();

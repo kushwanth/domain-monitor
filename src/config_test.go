@@ -642,8 +642,6 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}
 }
 
-
-
 func TestSkipSSLValidation(t *testing.T) {
 	// 1. Valid record types that can have SSL: A, AAAA, CNAME, ALIAS, IP
 	validTypes := []string{"A", "AAAA", "CNAME", "ALIAS", "IP"}
@@ -853,8 +851,6 @@ func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 	})
 }
 
-
-
 func TestNilSafety_CheckState(t *testing.T) {
 	// 1. Nil receiver should not panic
 	var nilCS *CheckState
@@ -1039,5 +1035,3 @@ func TestConfig_CompileTimeImmutability(t *testing.T) {
 		t.Errorf("expected Resolvers() to return defensive clone, but internal slice was mutated")
 	}
 }
-
-

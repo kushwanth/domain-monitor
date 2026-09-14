@@ -4,8 +4,8 @@ import (
 	"context"
 	_ "embed"
 	jsonv2 "encoding/json/v2"
-	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -39,14 +39,14 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 func serveCTLogFile(w http.ResponseWriter, domain string) {
 	domain = NormalizeDomain(domain)
 	if domain == "" || !ReValidDomain.MatchString(domain) {
-		http.Error(w, `{"error": "invalid domain"}`, http.StatusBadRequest)
+		http.Error(w, JSONResponseInvalidDomain, http.StatusBadRequest)
 		return
 	}
 
 	filePath := filepath.Join(CTLogsPath, domain+".json")
 	cleanPath := filepath.Clean(filePath)
 	if !IsSafeSubpath(CTLogsPath, cleanPath) {
-		http.Error(w, `{"error": "invalid domain"}`, http.StatusBadRequest)
+		http.Error(w, JSONResponseInvalidDomain, http.StatusBadRequest)
 		return
 	}
 
@@ -57,13 +57,13 @@ func serveCTLogFile(w http.ResponseWriter, domain string) {
 		if !os.IsNotExist(err) {
 			LogWarn(MsgLogReadCTLogFailed, "domain", domain, "path", cleanPath, "error", err)
 		}
-		_, _ = w.Write([]byte("[]"))
+		_, _ = w.Write([]byte(JSONResponseEmptyArray))
 		return
 	}
 	defer f.Close()
 
 	if fi, err := f.Stat(); err != nil || fi.Size() == 0 {
-		_, _ = w.Write([]byte("[]"))
+		_, _ = w.Write([]byte(JSONResponseEmptyArray))
 		return
 	}
 
@@ -86,12 +86,12 @@ func NewCheckState() *CheckState {
 func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(RouteHealth, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(JSONResponseStatusOK))
 	})
 
-	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(RouteAPIState, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
 		w.Header().Set(HeaderCacheControl, CacheControlNoCache)
 		if app != nil {
@@ -100,17 +100,17 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 				return
 			}
 		}
-		_, _ = w.Write([]byte(`{"status":"initializing"}`))
+		_, _ = w.Write([]byte(JSONResponseStatusInit))
 	})
 
-	mux.HandleFunc("GET /api/certs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(RouteAPICerts, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		serveCTLogFile(w, r.URL.Query().Get("domain"))
+		serveCTLogFile(w, r.URL.Query().Get(ParamDomain))
 	})
 
-	mux.HandleFunc("GET /api/ctlogs/{domain}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(RouteAPICTLogs, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		serveCTLogFile(w, r.PathValue("domain"))
+		serveCTLogFile(w, r.PathValue(ParamDomain))
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -132,8 +132,8 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 		Handler:             securityHeadersMiddleware(mux),
 		ReadTimeout:         DefaultDNSTimeout,
 		WriteTimeout:        DefaultHTTPTimeout,
-		IdleTimeout:         120 * time.Second,
-		MaxHeaderValueCount: 100,
+		IdleTimeout:         DefaultIdleTimeout,
+		MaxHeaderValueCount: DefaultMaxHeaderValueCount,
 	}
 
 	errChan := make(chan error, 1)
@@ -147,8 +147,6 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 
 	return server, errChan
 }
-
-const defaultMaxConcurrency = 8
 
 // logStateTransitions logs changes in check status across cycles in deterministic sorted order.
 func logStateTransitions[T comparable](checkName, targetKey string, current map[string]T, getStatus func(T) CheckStatus, prev map[string]CheckStatus) {
@@ -182,7 +180,7 @@ func runMonitoringCycle(
 	prevDNSStatus map[string]CheckStatus,
 	prevEmailStatus map[string]CheckStatus,
 ) *CheckState {
-	defer RecoverAndLogPanic("Monitoring cycle")
+	defer RecoverAndLogPanic(NameOpMonitoringCycle)
 
 	cycleStart := time.Now()
 
@@ -248,7 +246,7 @@ func runMonitoringCycle(
 	// 1. Dispatch DNS Records
 	dnsResults := make([]DNSResult, len(dnsRecords))
 	gDNS, _ := errgroup.WithContext(cycleCtx)
-	gDNS.SetLimit(min(len(dnsRecords), defaultMaxConcurrency))
+	gDNS.SetLimit(min(len(dnsRecords), DefaultMaxConcurrency))
 	for i, dnsTask := range dnsRecords {
 		record := dnsTask
 		index := i
@@ -264,7 +262,7 @@ func runMonitoringCycle(
 							Type:     record.Type,
 							Expected: record.Expected,
 							Status:   StatusFailed,
-							Error:    "internal check panic: " + AnyToString(r),
+							Error:    fmt.Sprintf(MsgErrInternalDNSCheckPanic, AnyToString(r)),
 							SkipSSL:  record.SkipSSL,
 							SSLDays:  SSLDaysNotApplicable,
 						},
@@ -281,7 +279,7 @@ func runMonitoringCycle(
 	// 2. Dispatch Fast Domain Checks (Email, DNSSEC, CAA, NS Health, NS Delegation)
 	domainResults := make([]DomainResult, len(domains))
 	gDomains, _ := errgroup.WithContext(cycleCtx)
-	gDomains.SetLimit(min(len(domains), defaultMaxConcurrency))
+	gDomains.SetLimit(min(len(domains), DefaultMaxConcurrency))
 
 	for i, domainConfig := range domains {
 		domain := domainConfig
@@ -327,7 +325,7 @@ func runMonitoringCycle(
 
 	// RDAP pipeline: evaluates non-delegated zones with 10s token bucket
 	gRateLimitedChecks.Go(func() error {
-		defer RecoverAndLogPanic("RDAP check worker")
+		defer RecoverAndLogPanic(NameOpRDAPCheckWorker)
 		for i, domainConfig := range domains {
 			if domainConfig.IsDelegatedZone {
 				continue
@@ -337,7 +335,7 @@ func runMonitoringCycle(
 					if !domains[j].IsDelegatedZone && rdapResults[j] == nil {
 						rdapResults[j] = &RDAPState{
 							Status: StatusFailed,
-							Error:  "check timed out or canceled",
+							Error:  MsgErrCheckTimeoutOrCanceled,
 						}
 					}
 				}
@@ -349,7 +347,7 @@ func runMonitoringCycle(
 						LogError(MsgLogPanicRDAP, "domain", domainConfig.Domain, "panic", r)
 						rdapResults[i] = &RDAPState{
 							Status: StatusFailed,
-							Error:  "internal rdap check panic: " + AnyToString(r),
+							Error:  fmt.Sprintf(MsgErrInternalRDAPCheckPanic, AnyToString(r)),
 						}
 					}
 				}()
@@ -361,7 +359,7 @@ func runMonitoringCycle(
 
 	// CT Logs pipeline: evaluates monitored domains with 5s token bucket
 	gRateLimitedChecks.Go(func() error {
-		defer RecoverAndLogPanic("CT logs worker")
+		defer RecoverAndLogPanic(NameOpCTLogsWorker)
 		for i, domainConfig := range domains {
 			if !domainConfig.MonitorCTLogs {
 				continue
@@ -371,7 +369,7 @@ func runMonitoringCycle(
 					if domains[j].MonitorCTLogs && ctResults[j] == nil {
 						ctResults[j] = &CTLogState{
 							Status: StatusFailed,
-							Error:  "check timed out or canceled",
+							Error:  MsgErrCheckTimeoutOrCanceled,
 						}
 					}
 				}
@@ -383,7 +381,7 @@ func runMonitoringCycle(
 						LogError(MsgLogPanicCTLogs, "domain", domainConfig.Domain, "panic", r)
 						ctResults[i] = &CTLogState{
 							Status: StatusFailed,
-							Error:  "internal ct logs panic: " + AnyToString(r),
+							Error:  fmt.Sprintf(MsgErrInternalCTLogsPanic, AnyToString(r)),
 						}
 					}
 				}()
@@ -433,10 +431,12 @@ func runMonitoringCycle(
 		}
 	}
 
+	computePortfolioPricing(cycleCtx, app, loopState, app.Pricing)
+
 	// 5. State transition logging
-	logStateTransitions("RDAP", "domain", loopState.RDAP, func(s *RDAPState) CheckStatus { return s.Status }, prevRDAPStatus)
-	logStateTransitions("DNS", "record", loopState.DNS, func(s *DNSState) CheckStatus { return s.Status }, prevDNSStatus)
-	logStateTransitions("Email", "domain", loopState.Email, func(s *EmailState) CheckStatus { return s.Status }, prevEmailStatus)
+	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, loopState.RDAP, func(s *RDAPState) CheckStatus { return s.Status }, prevRDAPStatus)
+	logStateTransitions(CheckTypeDNS, TargetKeyRecord, loopState.DNS, func(s *DNSState) CheckStatus { return s.Status }, prevDNSStatus)
+	logStateTransitions(CheckTypeEmail, TargetKeyDomain, loopState.Email, func(s *EmailState) CheckStatus { return s.Status }, prevEmailStatus)
 
 	// 6. Dispatch notifications with dedicated timeout
 	if app != nil && app.Notifier != nil {
@@ -479,40 +479,40 @@ func ValidateCycleInvariants(app *AppState, state *CheckState) []error {
 		d := domainCfg.Domain
 		rdap, ok := state.RDAP[d]
 		if !ok || rdap == nil {
-			errs = append(errs, errors.New("domain "+d+": missing RDAP/delegation state"))
+			errs = append(errs, fmt.Errorf(MsgErrInvariantMissingRDAP, d))
 		} else if rdap.Status == StatusPending {
-			errs = append(errs, errors.New("domain "+d+": RDAP/delegation check remained in pending status"))
+			errs = append(errs, fmt.Errorf(MsgErrInvariantPendingRDAP, d))
 		}
 
 		if domainCfg.CheckEmailSecurity {
 			if email, ok := state.Email[d]; !ok || email == nil {
-				errs = append(errs, errors.New("domain "+d+": missing email security state"))
+				errs = append(errs, fmt.Errorf(MsgErrInvariantMissingEmail, d))
 			}
 		}
 
 		if domainCfg.DNSSEC {
 			if dnssec, ok := state.DNSSEC[d]; !ok || dnssec == nil {
-				errs = append(errs, errors.New("domain "+d+": missing DNSSEC state"))
+				errs = append(errs, fmt.Errorf(MsgErrInvariantMissingDNSSEC, d))
 			}
 		}
 
 		if domainCfg.CAA != nil {
 			if caa, ok := state.CAA[d]; !ok || caa == nil {
-				errs = append(errs, errors.New("domain "+d+": missing CAA state"))
+				errs = append(errs, fmt.Errorf(MsgErrInvariantMissingCAA, d))
 			}
 		}
 
 		if domainCfg.VerifyNSHealth && len(domainCfg.ExpectedNS) > 0 {
 			if nsHealth, ok := state.NSHealth[d]; !ok || nsHealth == nil {
-				errs = append(errs, errors.New("domain "+d+": missing nameserver health state"))
+				errs = append(errs, fmt.Errorf(MsgErrInvariantMissingNSHealth, d))
 			}
 		}
 
 		if domainCfg.MonitorCTLogs {
 			if ctLog, ok := state.CTLogs[d]; !ok || ctLog == nil {
-				errs = append(errs, errors.New("domain "+d+": missing CT logs state"))
+				errs = append(errs, fmt.Errorf(MsgErrInvariantMissingCTLogs, d))
 			} else if ctLog.Status == StatusPending {
-				errs = append(errs, errors.New("domain "+d+": CT logs remained in pending status"))
+				errs = append(errs, fmt.Errorf(MsgErrInvariantPendingCTLogs, d))
 			}
 		}
 	}
@@ -521,9 +521,9 @@ func ValidateCycleInvariants(app *AppState, state *CheckState) []error {
 		name := dnsRecord.Name
 		dnsState, ok := state.DNS[name]
 		if !ok || dnsState == nil {
-			errs = append(errs, errors.New("dns record "+name+": missing DNS state"))
+			errs = append(errs, fmt.Errorf(MsgErrInvariantMissingDNS, name))
 		} else if dnsState.Status == StatusPending {
-			errs = append(errs, errors.New("dns record "+name+": remained in pending status"))
+			errs = append(errs, fmt.Errorf(MsgErrInvariantPendingDNS, name))
 		}
 	}
 
@@ -532,8 +532,8 @@ func ValidateCycleInvariants(app *AppState, state *CheckState) []error {
 
 func main() {
 	var configPath string
-	flag.StringVar(&configPath, "config", "", "Path to the JSON config file")
-	flag.StringVar(&configPath, "c", "", "Path to the JSON config file (shorthand)")
+	flag.StringVar(&configPath, FlagConfig, "", FlagConfigUsage)
+	flag.StringVar(&configPath, FlagConfigShort, "", FlagConfigShortUsage)
 	flag.Parse()
 
 	if configPath == "" {
@@ -560,23 +560,21 @@ func main() {
 	}
 	if dataDir == "" {
 		dataDir = DefaultDataDir
-		if _, err := os.Stat("/app"); os.IsNotExist(err) {
+		if _, err := os.Stat(DirContainerApp); os.IsNotExist(err) {
 			dataDir = DefaultLocalDataDir
 		}
 	}
 	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		LogWarn(MsgLogDataDirEnsureFailed, "path", dataDir, "error", err)
 	}
-	CTLogsPath = filepath.Join(dataDir, "ct_logs")
+	CTLogsPath = filepath.Join(dataDir, DefaultCTLogsSubdir)
 	if err := os.MkdirAll(CTLogsPath, 0750); err != nil {
 		LogWarn(MsgLogCTLogsDirEnsureFailed, "path", CTLogsPath, "error", err)
 	}
-	ctStatePath := filepath.Join(dataDir, "ct_state.json")
+	ctStatePath := filepath.Join(dataDir, DefaultCTStateFileName)
 
 	rdapHTTPClient := NewRDAPHTTPClient(10 * time.Second)
 	LogInfof(MsgLogStartup, len(app.Config().Domains), len(app.Config().DNSRecords))
-
-
 
 	// Pre-render initial application state immediately so GET / and GET /api/state
 	// are instantly available upon process startup.
@@ -621,7 +619,7 @@ func main() {
 				app.Notifier.Wait()
 			}
 		}()
-		defer RecoverAndLogPanic("Monitoring engine")
+		defer RecoverAndLogPanic(NameOpMonitoringEngine)
 
 		ctLogPersist := make(map[string]*CTLogState)
 		prevRDAPStatus := make(map[string]CheckStatus)

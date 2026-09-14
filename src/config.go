@@ -4,6 +4,7 @@ import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -27,12 +28,12 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 
 	jsonBytes, err := os.ReadFile(path)
 	if err != nil {
-		return AppConfig{}, WrapError("failed to read config file", err)
+		return AppConfig{}, WrapError(MsgErrFailedToReadConfig, err)
 	}
 
 	var rawCfg AppConfig
 	if err := jsonv2.Unmarshal(jsonBytes, &rawCfg); err != nil {
-		return AppConfig{}, WrapError("json unmarshal failed", err)
+		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
 
 	// Override with environment variables if provided
@@ -69,10 +70,10 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 
 	// Defaults that do not require side-effects
 	if len(rawCfg.Resolvers) == 0 {
-		rawCfg.Resolvers = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+		rawCfg.Resolvers = DefaultResolvers()
 	}
 	if len(rawCfg.Resolvers) > MaxResolversLimit {
-		return AppConfig{}, errors.New("configured resolvers exceed maximum limit of 9")
+		return AppConfig{}, errors.New(MsgErrResolversExceedLimit)
 	}
 
 	// 3. Schema Normalization
@@ -82,33 +83,33 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 		domainCfg := &rawCfg.Domains[i]
 		domainCfg.Domain = NormalizeDomainToASCIIText(domainCfg.Domain)
 		if domainCfg.Domain == "" {
-			return AppConfig{}, errors.New("domain entry at index " + strconv.Itoa(i) + " has an empty domain")
+			return AppConfig{}, fmt.Errorf(MsgErrDomainEmptyDomain, i)
 		}
 		if seenDomains[domainCfg.Domain] {
-			return AppConfig{}, errors.New("duplicate domain " + strconv.Quote(domainCfg.Domain) + "; each domain entry must be unique")
+			return AppConfig{}, fmt.Errorf(MsgErrDuplicateDomain, strconv.Quote(domainCfg.Domain))
 		}
 		seenDomains[domainCfg.Domain] = true
 		for j := range domainCfg.ExpectedNS {
 			nsClean := NormalizeDomainToASCIIText(domainCfg.ExpectedNS[j])
 			if nsClean == "" {
-				return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has an empty entry in expected_ns at index " + strconv.Itoa(j))
+				return AppConfig{}, fmt.Errorf(MsgErrDomainEmptyExpectedNS, domainCfg.Domain, j)
 			}
 			domainCfg.ExpectedNS[j] = nsClean
 		}
 		for j := range domainCfg.SecondaryNS {
 			nsClean := NormalizeDomainToASCIIText(domainCfg.SecondaryNS[j])
 			if nsClean == "" {
-				return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has an empty entry in secondary_ns at index " + strconv.Itoa(j))
+				return AppConfig{}, fmt.Errorf(MsgErrDomainEmptySecondaryNS, domainCfg.Domain, j)
 			}
 			domainCfg.SecondaryNS[j] = nsClean
 		}
 
 		// Enforce Name is mandatory for domains and unique
 		if domainCfg.Name == "" {
-			return AppConfig{}, errors.New("domain " + domainCfg.Domain + " is missing a mandatory 'name' field")
+			return AppConfig{}, fmt.Errorf(MsgErrDomainMissingName, domainCfg.Domain)
 		}
 		if seenDomainNames[domainCfg.Name] {
-			return AppConfig{}, errors.New("duplicate domain name " + strconv.Quote(domainCfg.Name) + "; each domain must have a unique name")
+			return AppConfig{}, fmt.Errorf(MsgErrDuplicateDomainName, strconv.Quote(domainCfg.Name))
 		}
 		seenDomainNames[domainCfg.Name] = true
 
@@ -118,13 +119,17 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 		domainCfg.ExpectedRegistrarID = strings.TrimSpace(domainCfg.ExpectedRegistrarID)
 		domainCfg.ExpectedRegistrarName = strings.TrimSpace(domainCfg.ExpectedRegistrarName)
 
+		if domainCfg.RenewalPrice < 0 {
+			return AppConfig{}, fmt.Errorf(MsgErrDomainNegativeRenewalPrice, domainCfg.Domain)
+		}
+
 		if len(domainCfg.SecondaryNS) > 0 && len(domainCfg.ExpectedNS) == 0 {
-			return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has secondary_ns configured but no primary expected_ns configured")
+			return AppConfig{}, fmt.Errorf(MsgErrSecondaryNSWithoutPrimary, domainCfg.Domain)
 		}
 
 		if domainCfg.VerifyNSHealth {
 			if len(domainCfg.ExpectedNS) == 0 {
-				return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has verify_ns_health enabled but no primary expected_ns configured")
+				return AppConfig{}, fmt.Errorf(MsgErrVerifyNSHealthWithoutPrimary, domainCfg.Domain)
 			}
 			// secondary_ns is optional: if configured, secondary NS replication is checked; if omitted, secondary checks are skipped.
 		}
@@ -132,7 +137,7 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 		if domainCfg.IsDelegatedZone {
 			domainCfg.RootZone = NormalizeDomainToASCIIText(domainCfg.RootZone)
 			if domainCfg.RootZone == "" {
-				return AppConfig{}, errors.New("delegated domain " + domainCfg.Domain + " is missing a mandatory 'root_zone' field")
+				return AppConfig{}, fmt.Errorf(MsgErrDelegatedMissingRootZone, domainCfg.Domain)
 			}
 		}
 
@@ -144,7 +149,7 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 				var res []string
 				for _, item := range list {
 					val := parseCAAIssuer(item)
-					if val != "" && val != ";" {
+					if val != "" && val != CAAIssuerDenyAll {
 						res = append(res, val)
 					}
 				}
@@ -167,7 +172,7 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 
 		if domainCfg.CheckEmailSecurity {
 			if domainCfg.MailProvider != "" && len(domainCfg.MXRecords) > 0 {
-				return AppConfig{}, errors.New("domain " + domainCfg.Domain + " has both mail_provider and mx_records set; these are mutually exclusive")
+				return AppConfig{}, fmt.Errorf(MsgErrMailProviderAndMXMutuallyExclusive, domainCfg.Domain)
 			}
 			domainCfg.MailProvider = strings.ToLower(strings.TrimSpace(domainCfg.MailProvider))
 			for j := range domainCfg.MXRecords {
@@ -192,25 +197,25 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 		dnsRecord.Hostname = NormalizeDomainToASCIIText(dnsRecord.Hostname)
 
 		if dnsRecord.Hostname == "" {
-			return AppConfig{}, errors.New("dns record at index " + strconv.Itoa(i) + " has an empty hostname")
+			return AppConfig{}, fmt.Errorf(MsgErrDNSEmptyHostname, i)
 		}
 
 		dnsRecord.Name = strings.TrimSpace(dnsRecord.Name)
 		if dnsRecord.Name == "" {
-			return AppConfig{}, errors.New("dns record " + dnsRecord.Hostname + " (" + dnsRecord.Type + ") is missing a mandatory 'name' field")
+			return AppConfig{}, fmt.Errorf(MsgErrDNSMissingName, dnsRecord.Hostname, dnsRecord.Type)
 		}
 		if seenDNSNames[dnsRecord.Name] {
-			return AppConfig{}, errors.New("duplicate dns record name " + strconv.Quote(dnsRecord.Name) + "; each dns record must have a unique name")
+			return AppConfig{}, fmt.Errorf(MsgErrDuplicateDNSName, strconv.Quote(dnsRecord.Name))
 		}
 		seenDNSNames[dnsRecord.Name] = true
 
 		dnsRecord.Type = strings.ToUpper(strings.TrimSpace(dnsRecord.Type))
 		if dnsRecord.Type == "" {
-			return AppConfig{}, errors.New("dns record " + dnsRecord.Hostname + " is missing a type (e.g. A, CNAME)")
+			return AppConfig{}, fmt.Errorf(MsgErrDNSMissingType, dnsRecord.Hostname)
 		}
 		if dnsRecord.SkipSSL {
-			if dnsRecord.Type != "A" && dnsRecord.Type != "AAAA" && dnsRecord.Type != "CNAME" && dnsRecord.Type != "ALIAS" && dnsRecord.Type != "IP" {
-				return AppConfig{}, errors.New("dns record " + dnsRecord.Hostname + " (" + dnsRecord.Type + ") has skip_ssl enabled; skip_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types")
+			if dnsRecord.Type != RecordTypeA && dnsRecord.Type != RecordTypeAAAA && dnsRecord.Type != RecordTypeCNAME && dnsRecord.Type != RecordTypeALIAS && dnsRecord.Type != RecordTypeIP {
+				return AppConfig{}, fmt.Errorf(MsgErrSkipSSLNotApplicable, dnsRecord.Hostname, dnsRecord.Type)
 			}
 		}
 
@@ -220,48 +225,48 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 			if cleanVal == "" {
 				continue
 			}
-			if strings.HasPrefix(strings.ToLower(cleanVal), "alias:") {
-				cleanVal = strings.TrimSpace(cleanVal[6:])
+			if strings.HasPrefix(strings.ToLower(cleanVal), PrefixAlias) {
+				cleanVal = strings.TrimSpace(cleanVal[len(PrefixAlias):])
 			}
-			if dnsRecord.Type != "TXT" {
+			if dnsRecord.Type != RecordTypeTXT {
 				cleanVal = strings.ToLower(cleanVal)
 			}
 
 			// Validate and normalize according to record type
 			parsedIP := net.ParseIP(cleanVal)
 			switch dnsRecord.Type {
-			case "A":
+			case RecordTypeA:
 				if parsedIP != nil {
 					if parsedIP.To4() == nil {
-						return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is an IPv6 address, but record type is A (requires IPv4)")
+						return AppConfig{}, fmt.Errorf(MsgErrExpectedIPv6ForTypeA, strconv.Quote(dnsRecord.Name), dnsRecord.Hostname, strconv.Quote(rawVal))
 					}
 					cleanVal = parsedIP.String()
 				} else {
-					return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is not a valid IPv4 address for type A")
+					return AppConfig{}, fmt.Errorf(MsgErrExpectedNotValidIPv4, strconv.Quote(dnsRecord.Name), dnsRecord.Hostname, strconv.Quote(rawVal))
 				}
-			case "AAAA":
+			case RecordTypeAAAA:
 				if parsedIP != nil {
 					if parsedIP.To4() != nil {
-						return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is an IPv4 address, but record type is AAAA (requires IPv6)")
+						return AppConfig{}, fmt.Errorf(MsgErrExpectedIPv4ForTypeAAAA, strconv.Quote(dnsRecord.Name), dnsRecord.Hostname, strconv.Quote(rawVal))
 					}
 					cleanVal = parsedIP.String()
 				} else {
-					return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is not a valid IPv6 address for type AAAA")
+					return AppConfig{}, fmt.Errorf(MsgErrExpectedNotValidIPv6, strconv.Quote(dnsRecord.Name), dnsRecord.Hostname, strconv.Quote(rawVal))
 				}
-			case "IP":
+			case RecordTypeIP:
 				if parsedIP != nil {
 					cleanVal = parsedIP.String()
 				} else {
-					return AppConfig{}, errors.New("dns record " + strconv.Quote(dnsRecord.Name) + " (" + dnsRecord.Hostname + "): expected " + strconv.Quote(rawVal) + " is not a valid IPv4 or IPv6 address for composite type IP")
+					return AppConfig{}, fmt.Errorf(MsgErrExpectedNotValidIP, strconv.Quote(dnsRecord.Name), dnsRecord.Hostname, strconv.Quote(rawVal))
 				}
-			case "ALIAS", "CNAME":
+			case RecordTypeALIAS, RecordTypeCNAME:
 				if parsedIP != nil {
 					cleanVal = parsedIP.String()
 				} else {
 					cleanVal = NormalizeDomainToASCIIText(cleanVal)
 				}
 			default:
-				if dnsRecord.Type != "TXT" {
+				if dnsRecord.Type != RecordTypeTXT {
 					cleanVal = NormalizeDomainToASCIIText(cleanVal)
 				}
 			}
@@ -306,27 +311,27 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 	}
 
 	if cfg.Notifications.Ntfy == nil || strings.TrimSpace(cfg.Notifications.Ntfy.URL) == "" {
-		return nil, errors.New("cannot initialize dependencies: notifications.ntfy.url is mandatory (primary notification mechanism)")
+		return nil, errors.New(MsgErrNtfyURLMandatory)
 	}
 
 	var auth string
 	auth = cfg.Notifications.Ntfy.Auth
-	if auth != "" && !strings.HasPrefix(strings.ToLower(auth), "bearer ") && !strings.HasPrefix(strings.ToLower(auth), "basic ") {
-		auth = "Bearer " + auth
+	if auth != "" && !strings.HasPrefix(strings.ToLower(auth), strings.ToLower(PrefixBearer)) && !strings.HasPrefix(strings.ToLower(auth), strings.ToLower(PrefixBasic)) {
+		auth = PrefixBearer + auth
 	}
 
 	client := ResolveHTTPClient(&http.Client{Timeout: DefaultDNSTimeout})
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, cfg.Notifications.Ntfy.URL, nil)
 	if err != nil {
-		return nil, WrapError("failed to create ntfy request", err)
+		return nil, WrapError(MsgErrFailedCreateNtfyRequest, err)
 	}
-	req.Header.Set("User-Agent", DefaultUserAgent)
+	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 	if auth != "" {
-		req.Header.Set("Authorization", auth)
+		req.Header.Set(HeaderAuthorization, auth)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, WrapError("ntfy URL provided is unreachable", err)
+		return nil, WrapError(MsgErrNtfyURLUnreachable, err)
 	}
 	DrainAndClose(resp.Body, MaxBodyDrainSize)
 
@@ -350,7 +355,7 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 		dnsClient := new(dns.Client)
 		dnsClient.Timeout = DefaultDNSTimeout
 		dnsMsg := new(dns.Msg)
-		dnsMsg.SetQuestion(dns.Fqdn("example.com"), dns.TypeA)
+		dnsMsg.SetQuestion(dns.Fqdn(TestFqdn), dns.TypeA)
 		dnsMsg.RecursionDesired = true
 		if _, _, err := dnsClient.ExchangeContext(ctx, dnsMsg, ip); err != nil {
 			LogWarn(MsgLogResolverUnreachable, "resolver", resolver, "error", err)
@@ -361,7 +366,7 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 	}
 
 	if len(healthyResolvers) == 0 {
-		return nil, WrapError("all configured resolvers failed health checks", lastResolverErr)
+		return nil, WrapError(MsgErrAllResolversFailed, lastResolverErr)
 	}
 
 	app.activeResolvers = healthyResolvers
@@ -373,13 +378,13 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 // intended strictly for process initialization before background workers start.
 func InitializeDependencies(ctx context.Context, app *AppState, rawCfg *AppConfig) error {
 	if app == nil {
-		return errors.New("cannot initialize dependencies: app is nil")
+		return errors.New(MsgErrInitAppNil)
 	}
 	if rawCfg == nil {
-		return errors.New("cannot initialize dependencies: config is nil")
+		return errors.New(MsgErrInitConfigNil)
 	}
 	if app.Notifier == nil {
-		return errors.New("cannot initialize dependencies: notifier is nil")
+		return errors.New(MsgErrInitNotifierNil)
 	}
 	initialized, err := InitializeApp(ctx, *rawCfg)
 	if err != nil {

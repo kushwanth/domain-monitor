@@ -269,4 +269,3 @@ func TestNewRDAPHTTPClient_SSRFBlocked_SentinelError(t *testing.T) {
 		t.Errorf("expected error to wrap ErrRestrictedIP, got: %v", err)
 	}
 }
-

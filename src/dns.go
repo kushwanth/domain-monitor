@@ -23,9 +23,9 @@ var dohHTTPClient = ResolveHTTPClient(&http.Client{Timeout: DefaultDNSTimeout})
 
 func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
 	dialHost := hostname
-	if strings.HasPrefix(dialHost, "*.") {
+	if strings.HasPrefix(dialHost, PrefixWildcard) {
 		// Replace *. with www. to ensure a valid FQDN is used for DNS resolution and SNI
-		dialHost = strings.Replace(dialHost, "*.", "www.", 1)
+		dialHost = strings.Replace(dialHost, PrefixWildcard, PrefixWWW, 1)
 	}
 
 	targets := []string{}
@@ -36,12 +36,12 @@ func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acce
 				targets = append(targets, clean)
 			}
 		} else if net.ParseIP(clean) != nil {
-			targets = append(targets, DefaultPort(clean, "443"))
+			targets = append(targets, DefaultPort(clean, DefaultHTTPSPort))
 		}
 	}
 
 	if len(targets) == 0 {
-		targets = []string{DefaultPort(dialHost, "443")}
+		targets = []string{DefaultPort(dialHost, DefaultHTTPSPort)}
 	}
 
 	minDays := 999999
@@ -61,7 +61,7 @@ func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acce
 					}
 					cert := cs.PeerCertificates[0]
 					if err := cert.VerifyHostname(dialHost); err != nil {
-						return fmt.Errorf("%w: invalid for %s on %s: %v", ErrSSLValidation, dialHost, targetAddr, err)
+						return fmt.Errorf(MsgErrSSLInvalid, ErrSSLValidation, dialHost, targetAddr, err)
 					}
 					if !acceptSelfSigned {
 						opts := x509.VerifyOptions{
@@ -76,7 +76,7 @@ func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acce
 							if errors.As(err, &invalidErr) && invalidErr.Reason == x509.Expired {
 								return nil // Allow expired to pass handshake to measure negative days
 							}
-							return fmt.Errorf("%w: certificate validation failed for %s on %s: %v", ErrSSLValidation, dialHost, targetAddr, err)
+							return fmt.Errorf(MsgErrSSLCertValidationFailed, ErrSSLValidation, dialHost, targetAddr, err)
 						}
 					}
 					return nil
@@ -89,21 +89,21 @@ func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acce
 			continue
 		}
 		if conn == nil {
-			lastErr = errors.New("nil connection returned for " + targetAddr)
+			lastErr = fmt.Errorf(MsgErrNilConnection, targetAddr)
 			continue
 		}
 
 		tlsConn, ok := conn.(*tls.Conn)
 		if !ok {
 			_ = conn.Close()
-			lastErr = errors.New("unexpected non-TLS connection for " + targetAddr)
+			lastErr = fmt.Errorf(MsgErrNonTLSConnection, targetAddr)
 			continue
 		}
 		state := tlsConn.ConnectionState()
 		_ = conn.Close()
 
 		if len(state.PeerCertificates) == 0 {
-			lastErr = errors.New("no peer certificates found for " + targetAddr)
+			lastErr = fmt.Errorf(MsgErrNoPeerCertsFound, targetAddr)
 			continue
 		}
 
@@ -176,36 +176,36 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			lastErr = WrapError("lookup "+hostname+" on "+ip, err)
+			lastErr = WrapError(fmt.Sprintf(MsgPrefixLookupOn, hostname, ip), err)
 			continue
 		}
 
 		if r == nil {
-			lastErr = errors.New("lookup " + hostname + " on " + ip + ": empty response")
+			lastErr = fmt.Errorf(MsgErrLookupEmptyResponse, hostname, ip)
 			continue
 		}
 
 		// Verify question section echoes request per RFC 5452 Section 4
 		if len(r.Question) == 0 || !strings.EqualFold(r.Question[0].Name, fqdn) || r.Question[0].Qtype != qtype {
-			lastErr = errors.New("lookup " + hostname + " on " + ip + ": response question mismatch or missing")
+			lastErr = fmt.Errorf(MsgErrLookupQuestionMismatch, hostname, ip)
 			continue
 		}
 
 		if r.Rcode != dns.RcodeSuccess {
 			if r.Rcode == dns.RcodeNameError {
 				// NXDOMAIN is authoritative — do not retry on other resolvers
-				return nil, WrapError("lookup "+hostname+" on "+ip, ErrNXDOMAIN)
+				return nil, WrapError(fmt.Sprintf(MsgPrefixLookupOn, hostname, ip), ErrNXDOMAIN)
 			}
 			if r.Rcode == dns.RcodeServerFailure {
-				lastErr = WrapError("lookup "+hostname+" on "+ip+" ("+dns.RcodeToString[r.Rcode]+")", ErrSERVFAIL)
+				lastErr = WrapError(fmt.Sprintf(MsgPrefixLookupOnWithRcode, hostname, ip, dns.RcodeToString[r.Rcode]), ErrSERVFAIL)
 				continue
 			}
 			// REFUSED, NOTIMP, FORMERR are server-specific failures — retry next resolver
 			if r.Rcode == dns.RcodeRefused || r.Rcode == dns.RcodeNotImplemented || r.Rcode == dns.RcodeFormatError {
-				lastErr = errors.New("lookup " + hostname + " on " + ip + ": server error (" + dns.RcodeToString[r.Rcode] + ")")
+				lastErr = fmt.Errorf(MsgErrLookupServerError, hostname, ip, dns.RcodeToString[r.Rcode])
 				continue
 			}
-			return nil, errors.New("lookup " + hostname + " on " + ip + ": server returned error code " + strconv.Itoa(r.Rcode))
+			return nil, fmt.Errorf(MsgErrLookupServerErrorCode, hostname, ip, r.Rcode)
 		}
 
 		return r, nil
@@ -274,7 +274,7 @@ func queryCAARecords(ctx context.Context, app *AppState, hostname string, resolv
 		return nil, err
 	}
 	if r == nil {
-		return nil, errors.New("empty dns response")
+		return nil, ErrEmptyDNSResponse
 	}
 
 	var entries []CAAEntry
@@ -324,7 +324,7 @@ func queryIPRecords(ctx context.Context, app *AppState, hostname string, resolve
 		found = append(found, aaaaRecords...)
 	}
 	if aErr != nil && aaaaErr != nil {
-		return found, WrapError("lookup failed for A and AAAA", errors.Join(aErr, aaaaErr))
+		return found, WrapError(MsgErrLookupFailedAandAAAA, errors.Join(aErr, aaaaErr))
 	}
 	return found, nil
 }
@@ -336,7 +336,7 @@ func evaluateCAA(ctx context.Context, app *AppState, target DomainConfig) *CAARe
 
 	res := fetchCAA(ctx, app, target.Domain, app.Resolvers())
 	if res == nil {
-		return &CAAResult{Valid: false, Error: "failed to query CAA"}
+		return &CAAResult{Valid: false, Error: MsgErrFailedToQueryCAA}
 	}
 
 	if res.Error != "" {
@@ -392,7 +392,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 		if len(live) == 0 {
 			// In DNS, absence of CAA records means any CA can issue certs by default
 			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, "Missing "+tag+" deny-all record (';').", MsgAlertCAAMissing, tag, target.Domain)
+				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAADenyAllMissing, tag), MsgAlertCAAMissing, tag, target.Domain)
 			}
 			res.Valid = false
 			return
@@ -401,7 +401,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 		for liveCA := range live {
 			if liveCA != CAADenyAll {
 				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, "Unauthorized CA '"+liveCA+"' in "+tag+" (expected deny all).", MsgAlertCAAUnauthorized, liveCA, tag, target.Domain)
+					app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAUnauthorizedDeny, liveCA, tag), MsgAlertCAAUnauthorized, liveCA, tag, target.Domain)
 				}
 				res.UnknownCAs = append(res.UnknownCAs, liveCA)
 				res.Valid = false
@@ -418,7 +418,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 
 	if len(live) == 0 {
 		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, "Missing "+tag+" records.", MsgAlertCAAMissing, tag, target.Domain)
+			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAMissing, tag), MsgAlertCAAMissing, tag, target.Domain)
 		}
 		res.Valid = false
 		return
@@ -428,7 +428,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 	for _, exp := range expected {
 		if !live[exp] {
 			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, "Expected CA '"+exp+"' missing in "+tag+".", MsgAlertCAAExpectedNA, exp, tag, target.Domain)
+				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAExpectedMissing, exp, tag), MsgAlertCAAExpectedNA, exp, tag, target.Domain)
 			}
 			res.Valid = false
 		}
@@ -438,7 +438,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 	for liveCA := range live {
 		if !expectedMap[liveCA] {
 			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, "Unauthorized CA '"+liveCA+"' in "+tag+".", MsgAlertCAAUnauthorized, liveCA, tag, target.Domain)
+				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAUnauthorized, liveCA, tag), MsgAlertCAAUnauthorized, liveCA, tag, target.Domain)
 			}
 			res.UnknownCAs = append(res.UnknownCAs, liveCA)
 			res.Valid = false
@@ -450,7 +450,7 @@ func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []str
 	res := &CAAResult{}
 	currentDomain := NormalizeDomain(domain)
 	if currentDomain == "" {
-		res.Error = "invalid empty domain for CAA"
+		res.Error = MsgErrInvalidEmptyDomainCAA
 		return res
 	}
 
@@ -462,7 +462,7 @@ func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []str
 			if errors.Is(err, ErrNXDOMAIN) {
 				entries = nil
 			} else {
-				res.Error = "Failed to query CAA for " + currentDomain + ": " + err.Error()
+				res.Error = fmt.Sprintf(MsgErrFailedToQueryCAAPattern, currentDomain, err.Error())
 				return res
 			}
 		}
@@ -470,11 +470,11 @@ func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []str
 		if len(entries) > 0 {
 			for _, entry := range entries {
 				switch entry.Tag {
-				case "issue":
+				case CAATagIssue:
 					res.Issue = append(res.Issue, entry.Value)
-				case "issuewild":
+				case CAATagIssueWild:
 					res.IssueWild = append(res.IssueWild, entry.Value)
-				case "issuemail":
+				case CAATagIssueMail:
 					res.IssueMail = append(res.IssueMail, entry.Value)
 				}
 			}
@@ -510,7 +510,7 @@ func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []str
 
 func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers []string, dohURLTemplate string) *DNSSECResult {
 	res := &DNSSECResult{
-		Source: "local+doh",
+		Source: DNSSECSourceLocalDoH,
 	}
 
 	fqdn := dns.Fqdn(domain)
@@ -519,7 +519,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	dsResp, err := queryDNSMsg(ctx, app, domain, dns.TypeDS, resolvers)
 	if err != nil {
 		res.Valid = false
-		res.Error = "DS query failed: " + err.Error()
+		res.Error = fmt.Sprintf(MsgErrDSQueryFailed, err.Error())
 		return res
 	}
 
@@ -537,7 +537,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	keyResp, err := queryDNSMsg(ctx, app, domain, dns.TypeDNSKEY, resolvers)
 	if err != nil {
 		res.Valid = false
-		res.Error = "DNSKEY query failed: " + err.Error()
+		res.Error = fmt.Sprintf(MsgErrDNSKEYQueryFailed, err.Error())
 		return res
 	}
 
@@ -554,7 +554,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 
 				algoStr := dns.AlgorithmToString[key.Algorithm]
 				if algoStr == "" {
-					algoStr = "ALGO_" + strconv.Itoa(int(key.Algorithm))
+					algoStr = PrefixAlgo + strconv.Itoa(int(key.Algorithm))
 				}
 
 				found := slices.Contains(res.Algorithms, algoStr)
@@ -586,12 +586,12 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	}
 
 	if len(dsRecords) > 0 && len(dnskeyRecords) > 0 && !res.DSMatchesDNSKEY {
-		res.Error = "DS record does not match any DNSKEY"
+		res.Error = MsgErrDSRecordDoesNotMatchDNSKEY
 	}
 
 	// 4. Validate RRSIG covering DNSKEY RRset using DS-authenticated KSK (RFC 4035 Section 5.3)
 	if len(rrsigRecords) > 0 && len(rrset) > 0 {
-		const dnssecClockSkew = int64(300) // 5 minutes clock skew tolerance per RFC 4035 Section 5.3.1
+
 		keysToVerify := authenticatedKSKs
 		if len(keysToVerify) == 0 && len(dsRecords) == 0 {
 			keysToVerify = dnskeyRecords // Fallback for unsigned delegation or trust anchor testing
@@ -606,16 +606,16 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 							now := time.Now().Unix()
 							inception := int64(sig.Inception)
 							expiration := int64(sig.Expiration)
-							if (inception <= now+dnssecClockSkew) && (now <= expiration+dnssecClockSkew) {
+							if (inception <= now+DNSSECClockSkew) && (now <= expiration+DNSSECClockSkew) {
 								res.RRSIGValid = true
 								res.Error = "" // Clear any stale error from previous iteration
 								expiryStr := dns.TimeToString(sig.Expiration)
-								if et, parseErr := time.Parse("20060102150405", expiryStr); parseErr == nil {
+								if et, parseErr := time.Parse(LayoutCompactDateTime, expiryStr); parseErr == nil {
 									res.RRSIGExpiry = et.UTC().Format(time.RFC3339)
 								}
 								break
 							}
-							res.Error = "RRSIG is expired or not yet valid"
+							res.Error = MsgErrRRSIGExpiredOrNotYetValid
 						}
 					}
 				}
@@ -631,22 +631,22 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 		dohURL := dohURLTemplate
 		if u, parseErr := url.Parse(dohURLTemplate); parseErr == nil {
 			q := u.Query()
-			q.Set("name", domain)
-			q.Set("type", "DNSKEY")
-			q.Set("do", "1")
+			q.Set(ParamName, domain)
+			q.Set(ParamType, RecordTypeDNSKEY)
+			q.Set(ParamDO, ParamDOValue)
 			u.RawQuery = q.Encode()
 			dohURL = u.String()
 		} else {
-			dohURL = dohURLTemplate + "?name=" + url.QueryEscape(domain) + "&type=DNSKEY&do=1"
+			dohURL = dohURLTemplate + fmt.Sprintf(DoHQueryTemplate, url.QueryEscape(domain))
 		}
 
-		dohReq, reqErr := http.NewRequestWithContext(ctx, "GET", dohURL, nil)
+		dohReq, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, dohURL, nil)
 
 		if reqErr != nil {
 			res.Source = DNSSECSourceLocalOnly
 		} else {
-			dohReq.Header.Set("Accept", "application/dns-json")
-			dohReq.Header.Set("User-Agent", DefaultUserAgent)
+			dohReq.Header.Set(HeaderAccept, MIMEDNSJSON)
+			dohReq.Header.Set(HeaderUserAgent, DefaultUserAgent)
 			dohResp, err := dohHTTPClient.Do(dohReq)
 
 			if err != nil || dohResp.StatusCode != http.StatusOK {
@@ -683,12 +683,12 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 		} else if res.Source == DNSSECSourceLocalOnly {
 			res.Valid = true
 			if res.Error == "" {
-				res.Error = "Local DNSSEC records verified; upstream DoH chain integrity unavailable"
+				res.Error = MsgErrDNSSECLocalVerifiedDoHUnavailable
 			}
 		} else {
 			res.Valid = false
 			if res.Error == "" {
-				res.Error = "Upstream validating resolver returned AD=false (chain broken)"
+				res.Error = MsgErrDNSSECUpstreamChainBroken
 			}
 		}
 	} else if !res.HasDS && !res.HasDNSKEY {
@@ -697,7 +697,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	} else {
 		res.Valid = false
 		if res.Error == "" {
-			res.Error = "DNSSEC Validation Failed"
+			res.Error = MsgErrDNSSECValidationFailed
 		}
 	}
 
@@ -716,7 +716,7 @@ func evaluateDNSSEC(ctx context.Context, app *AppState, target DomainConfig) *DN
 
 	res := validateDNSSEC(ctx, app, target.Domain, app.Resolvers(), dohURL)
 	if res == nil {
-		return &DNSSECResult{Valid: false, Source: DNSSECSourceLocalOnly, Error: "validateDNSSEC returned nil"}
+		return &DNSSECResult{Valid: false, Source: DNSSECSourceLocalOnly, Error: MsgErrValidateDNSSECNil}
 	}
 
 	if !res.Valid && !target.SuppressAlerts {
@@ -745,7 +745,7 @@ func evaluateDNS(ctx context.Context, app *AppState, target DNSTask) *DNSState {
 	foundRecords, err := resolveTarget(ctx, app, target)
 
 	if err != nil {
-		app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, "DNS Resolution Failed for "+target.Hostname+" ("+target.Type+").", MsgAlertDNSFailed, target.Hostname, target.Type)
+		app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, fmt.Sprintf(MsgRedactedDNSResolutionFailed, target.Hostname, target.Type), MsgAlertDNSFailed, target.Hostname, target.Type)
 
 		return &DNSState{
 			Hostname: target.Hostname,
@@ -863,7 +863,7 @@ func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string
 			}
 		}
 	} else {
-		err = errors.New("unsupported DNS type: " + target.Type)
+		err = fmt.Errorf(MsgErrUnsupportedDNSType, target.Type)
 	}
 
 	// Resilient Fallback mechanism
@@ -917,10 +917,10 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 				}
 			}
 			if !matched {
-				redacted := "Mismatch on " + target.Hostname + " (" + target.Type + "). Prefix not found."
+				redacted := fmt.Sprintf(MsgRedactedDNSMismatchPrefix, target.Hostname, target.Type)
 				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSMismatch, target.Hostname, target.Type, expected, strings.Join(foundRecords, ", "))
 				allMatch = false
-				mismatchReasons = append(mismatchReasons, "prefix \""+expected+"\" not found in ["+strings.Join(foundRecords, ", ")+"]")
+				mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonPrefixNotFound, expected, strings.Join(foundRecords, ", ")))
 			}
 		}
 		return allMatch, strings.Join(mismatchReasons, "; ")
@@ -937,10 +937,10 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 				}
 			}
 			if !matched {
-				redacted := "Mismatch on " + target.Hostname + " (" + target.Type + "). Expected substring not found."
+				redacted := fmt.Sprintf(MsgRedactedDNSMismatchSubstring, target.Hostname, target.Type)
 				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSMismatch, target.Hostname, target.Type, expected, strings.Join(foundRecords, ", "))
 				allMatch = false
-				mismatchReasons = append(mismatchReasons, "substring \""+expected+"\" not found in ["+strings.Join(foundRecords, ", ")+"]")
+				mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonSubstringNotFound, expected, strings.Join(foundRecords, ", ")))
 			}
 		}
 		return allMatch, strings.Join(mismatchReasons, "; ")
@@ -954,9 +954,9 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 			}
 		}
 		if !matched {
-			redacted := "Mismatch on " + target.Hostname + " (" + target.Type + "). None of expected values matched."
+			redacted := fmt.Sprintf(MsgRedactedDNSMismatchAnyOf, target.Hostname, target.Type)
 			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSMismatch, target.Hostname, target.Type, strings.Join(target.Expected, " OR "), strings.Join(foundRecords, ", "))
-			return false, "none of expected [" + strings.Join(target.Expected, " OR ") + "] matched found [" + strings.Join(foundRecords, ", ") + "]"
+			return false, fmt.Sprintf(MsgReasonNoneMatched, strings.Join(target.Expected, " OR "), strings.Join(foundRecords, ", "))
 		}
 		return true, ""
 
@@ -971,9 +971,9 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 			}
 		}
 		if len(missing) > 0 {
-			redacted := "Mismatch on " + target.Hostname + " (" + target.Type + "). Values aren't mapped as expected."
+			redacted := fmt.Sprintf(MsgRedactedDNSMismatchExact, target.Hostname, target.Type)
 			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSMismatch, target.Hostname, target.Type, strings.Join(missing, ", "), strings.Join(foundRecords, ", "))
-			mismatchReasons = append(mismatchReasons, "missing expected records: "+strings.Join(missing, ", "))
+			mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonMissingRecords, strings.Join(missing, ", ")))
 		}
 
 		var unauthorized []string
@@ -984,9 +984,9 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 			}
 		}
 		if len(unauthorized) > 0 {
-			redacted := "Unauthorized record found on " + target.Hostname + " (" + target.Type + ")."
+			redacted := fmt.Sprintf(MsgRedactedDNSUnauthorized, target.Hostname, target.Type)
 			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSUnauthorized, target.Hostname, target.Type, strings.Join(unauthorized, ", "), strings.Join(target.Expected, ", "))
-			mismatchReasons = append(mismatchReasons, "unauthorized records: "+strings.Join(unauthorized, ", "))
+			mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonUnauthorizedRecords, strings.Join(unauthorized, ", ")))
 		}
 		return allMatch, strings.Join(mismatchReasons, "; ")
 	}
@@ -1010,7 +1010,7 @@ func validateCertificate(ctx context.Context, app *AppState, target DNSTask, fou
 		var ipErr error
 		sslIPs, ipErr = queryIPRecords(ctx, app, target.Hostname, resolversToUse)
 		if ipErr != nil {
-			LogWarn("Failed to resolve IPs for SSL certificate check", "hostname", target.Hostname, "error", ipErr)
+			LogWarn(MsgLogSSLResolveIPsFailed, "hostname", target.Hostname, "error", ipErr)
 		}
 	} else {
 		sslIPs = foundRecords
@@ -1029,7 +1029,7 @@ func validateCertificate(ctx context.Context, app *AppState, target DNSTask, fou
 	if days < 0 {
 		app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, MsgRedactedSSLExpired, MsgAlertSSLExpired, target.Hostname, days)
 	} else if days <= DefaultSSLExpiryWarningDays {
-		app.SafeDispatchf(PriorityHigh, TagWarning, target.Hostname, target.Name, "SSL Certificate expires in "+strconv.Itoa(int(days))+" days.", MsgAlertSSLExpiry, target.Hostname, days)
+		app.SafeDispatchf(PriorityHigh, TagWarning, target.Hostname, target.Name, fmt.Sprintf(MsgRedactedSSLExpires, int(days)), MsgAlertSSLExpiry, target.Hostname, days)
 	}
 	return days
 }
@@ -1065,13 +1065,13 @@ func evaluateEmailSecurity(ctx context.Context, app *AppState, target DomainConf
 
 	var errs []string
 	if spfErr != nil {
-		errs = append(errs, "SPF lookup error: "+spfErr.Error())
+		errs = append(errs, fmt.Sprintf(MsgErrSPFLookupError, spfErr.Error()))
 	}
 	if dmarcErr != nil {
-		errs = append(errs, "DMARC lookup error: "+dmarcErr.Error())
+		errs = append(errs, fmt.Sprintf(MsgErrDMARCLookupError, dmarcErr.Error()))
 	}
 	if dkimErr != nil {
-		errs = append(errs, "DKIM lookup error: "+dkimErr.Error())
+		errs = append(errs, fmt.Sprintf(MsgErrDKIMLookupError, dkimErr.Error()))
 	}
 	if len(errs) > 0 && emailStatus == StatusOK {
 		emailStatus = StatusWarning
@@ -1095,7 +1095,7 @@ func validateMX(ctx context.Context, app *AppState, target DomainConfig) ([]stri
 	mxs, err := queryDNS(ctx, app, target.Domain, dns.TypeMX, app.Resolvers())
 	if err != nil {
 		if !errors.Is(err, ErrNXDOMAIN) {
-			return nil, StatusFailed, WrapError("MX query error", err)
+			return nil, StatusFailed, WrapError(MsgErrMXQueryError, err)
 		}
 		// NXDOMAIN is authoritatively non-existent
 		mxs = nil
@@ -1104,7 +1104,7 @@ func validateMX(ctx context.Context, app *AppState, target DomainConfig) ([]stri
 		if !target.SuppressAlerts {
 			app.SafeDispatchf(PriorityUrgent, TagEnvelope, target.Domain, target.Name, MsgRedactedEmailNoMX, MsgAlertEmailNoMX, target.Domain)
 		}
-		return nil, StatusFailed, errors.New("no MX records found")
+		return nil, StatusFailed, errors.New(MsgErrNoMXRecordsFound)
 	}
 
 	var liveMXs []string
@@ -1327,17 +1327,17 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 	resolveTargetIP := func(nsName string) (string, error) {
 		host, port, err := net.SplitHostPort(DefaultPort(nsName, DefaultDNSPort))
 		if err != nil {
-			return "", WrapError("invalid nameserver address "+nsName, err)
+			return "", WrapError(fmt.Sprintf(MsgErrInvalidNSAddress, nsName), err)
 		}
 		if net.ParseIP(host) != nil {
 			return net.JoinHostPort(host, port), nil
 		}
 		ips, err := queryIPRecords(ctx, app, host, app.Resolvers())
 		if err != nil {
-			return "", WrapError("failed to resolve IP", err)
+			return "", WrapError(MsgErrFailedToResolveIP, err)
 		}
 		if len(ips) == 0 {
-			return "", errors.New("no IP records found for host " + host)
+			return "", fmt.Errorf(MsgErrNoIPRecordsForHost, host)
 		}
 		return net.JoinHostPort(ips[0], port), nil
 	}
@@ -1361,7 +1361,7 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 
 	primarySOAMsg, pSOAErr := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeSOA, []string{primaryIP}, false)
 	if pSOAErr != nil || primarySOAMsg == nil {
-		primarySrv.Error = "SOA lookup failed: " + pSOAErr.Error()
+		primarySrv.Error = fmt.Sprintf(MsgErrSOALookupFailed, pSOAErr.Error())
 		res.Valid = false
 		res.Servers = append(res.Servers, primarySrv)
 		if !target.SuppressAlerts {
@@ -1372,7 +1372,7 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 
 	primarySrv.Authoritative = primarySOAMsg.Authoritative
 	if !primarySrv.Authoritative {
-		primarySrv.Error = "Primary nameserver not authoritative (AA flag missing)"
+		primarySrv.Error = MsgErrPrimaryNSNotAuthoritative
 		res.Valid = false
 		if !target.SuppressAlerts {
 			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSNonAuthoritative, MsgAlertNSNonAuthoritative, primaryNS, target.Domain)
@@ -1398,7 +1398,7 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 		}
 	}
 	if !primaryFoundSOA {
-		primarySrv.Error = "No SOA record returned in answer or authority sections"
+		primarySrv.Error = MsgErrNoSOARecordReturned
 		res.Valid = false
 		if !target.SuppressAlerts {
 			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSMissingSOA, MsgAlertNSMissingSOA, primaryNS, target.Domain)
@@ -1455,7 +1455,7 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 
 		secSOAMsg, secSOAErr := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeSOA, []string{secIP}, false)
 		if secSOAErr != nil || secSOAMsg == nil {
-			secSrv.Error = "SOA lookup failed: " + secSOAErr.Error()
+			secSrv.Error = fmt.Sprintf(MsgErrSOALookupFailed, secSOAErr.Error())
 			res.Valid = false
 			res.Servers = append(res.Servers, secSrv)
 			if !target.SuppressAlerts {
@@ -1466,7 +1466,7 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 
 		secSrv.Authoritative = secSOAMsg.Authoritative
 		if !secSrv.Authoritative {
-			secSrv.Error = "Secondary nameserver not authoritative (AA flag missing)"
+			secSrv.Error = MsgErrSecondaryNSNotAuthoritative
 			res.Valid = false
 			if !target.SuppressAlerts {
 				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSNonAuthoritative, MsgAlertNSNonAuthoritative, secNS, target.Domain)
@@ -1492,7 +1492,7 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 			}
 		}
 		if !secFoundSOA {
-			secSrv.Error = "No SOA record returned in answer or authority sections"
+			secSrv.Error = MsgErrNoSOARecordReturned
 			res.Valid = false
 			if !target.SuppressAlerts {
 				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSMissingSOA, MsgAlertNSMissingSOA, secNS, target.Domain)

@@ -28,8 +28,6 @@ func TestDerefOrDefault(t *testing.T) {
 	}
 }
 
-
-
 func TestInitMap(t *testing.T) {
 	t.Parallel()
 
@@ -57,9 +55,6 @@ func TestInitMap(t *testing.T) {
 		t.Errorf("InitMap mutated existing map contents")
 	}
 }
-
-
-
 
 func TestCopyMap(t *testing.T) {
 	t.Parallel()
@@ -122,7 +117,6 @@ func TestNormalizeDomainToASCIIText(t *testing.T) {
 		}
 	}
 }
-
 
 func TestDeduplicateSlice(t *testing.T) {
 	t.Parallel()
@@ -262,7 +256,6 @@ func TestAtomicWriteFile(t *testing.T) {
 	}
 }
 
-
 func TestTruncateRunes(t *testing.T) {
 	t.Parallel()
 
@@ -399,4 +392,3 @@ func TestAnyToString(t *testing.T) {
 		t.Errorf("AnyToString(int) = %q, expected %q", got, "12345")
 	}
 }
-

@@ -1930,4 +1930,3 @@ func TestCheckSSLExpiryDays_ErrSSLValidationChaining(t *testing.T) {
 		t.Errorf("expected error to wrap ErrSSLValidation, got: %v", err)
 	}
 }
-

@@ -13,11 +13,12 @@
       "domain": "example.com",
       "name": "Example Prod Domain",
       "expected_ns": [
-        "a.iana-servers.net"
-      ],
-      "secondary_ns": [
+        "a.iana-servers.net",
         "b.iana-servers.net"
       ],
+      "expected_registrar_id": "292",
+      "renewal_price": 0,
+      "allow_expiry": false,
       "verify_ns_health": true,
       "domain_transfer_locked": true,
       "check_email_security": false,
@@ -44,6 +45,7 @@
     {
       "domain": "example.net",
       "name": "Example Net Main",
+      "renewal_price": 199.50,
       "expected_ns": ["a.iana-servers.net"],
       "secondary_ns": ["b.iana-servers.net"],
       "verify_ns_health": true,

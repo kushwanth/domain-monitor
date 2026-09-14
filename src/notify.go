@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	jsonv2 "encoding/json/v2"
+	"fmt"
 	"html"
 	"io"
 	"net/http"
@@ -121,7 +122,7 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 		if wg != nil {
 			defer wg.Done()
 		}
-		defer RecoverAndLogPanic("Ntfy provider")
+		defer RecoverAndLogPanic(NameNtfyProvider)
 
 		sendChunk := func(text string, highestPriority AlertPriority, tags []string) {
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.URL, strings.NewReader(strings.TrimSpace(text)))
@@ -143,7 +144,7 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 			}
 
 			if len(finalTags) > 0 {
-				req.Header.Set(HeaderNtfyTags, strings.Join(finalTags, ","))
+				req.Header.Set(HeaderNtfyTags, strings.Join(finalTags, TagSeparator))
 			}
 
 			if resp, err := notifyHTTPClient.Do(req); err == nil {
@@ -165,12 +166,7 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 			}
 		}
 
-		type chunkData struct {
-			text     string
-			priority AlertPriority
-			tags     []string
-		}
-		var chunks []chunkData
+		var chunks []ChunkData
 		var currentChunk strings.Builder
 		highestPriority := PriorityDefault
 		var currentTags []string
@@ -191,13 +187,13 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 
 			prefix := ""
 			if alert.Name != "" {
-				prefix = "[" + alert.Name + "] "
+				prefix = fmt.Sprintf(NtfyPrefixFormat, alert.Name)
 			}
 
-			line := prefix + TruncateRunes(msg, 1000) + "\n\n"
+			line := prefix + TruncateRunes(msg, 1000) + AlertChunkSeparator
 
 			if currentChunk.Len()+len(line) > MaxNotificationMessageLen {
-				chunks = append(chunks, chunkData{
+				chunks = append(chunks, ChunkData{
 					text:     currentChunk.String(),
 					priority: highestPriority,
 					tags:     currentTags,
@@ -221,7 +217,7 @@ func (p *NtfyProvider) Send(ctx context.Context, alerts []Alert, wg *sync.WaitGr
 		}
 
 		if currentChunk.Len() > 0 {
-			chunks = append(chunks, chunkData{
+			chunks = append(chunks, ChunkData{
 				text:     currentChunk.String(),
 				priority: highestPriority,
 				tags:     currentTags,
@@ -256,14 +252,14 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 		if wg != nil {
 			defer wg.Done()
 		}
-		defer RecoverAndLogPanic("Telegram provider")
+		defer RecoverAndLogPanic(NameTelegramProvider)
 
 		sendChunk := func(text string) {
 			apiURL := TelegramAPIBase + p.Token + TelegramAPISendMessageSuffix
 			payloadBytes, err := jsonv2.Marshal(map[string]any{
-				"chat_id":    p.ChatID,
-				"text":       text,
-				"parse_mode": TelegramParseModeHTML,
+				FieldChatID:    p.ChatID,
+				FieldText:      text,
+				FieldParseMode: TelegramParseModeHTML,
 			})
 			if err != nil {
 				LogError(MsgLogTelegramMarshalFailed, "error", err)
@@ -299,7 +295,7 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 
 		var chunks []string
 		var currentChunk strings.Builder
-		currentChunk.WriteString("⚠️ <b>Domain Monitor Alerts</b>\n\n")
+		currentChunk.WriteString(TelegramAlertHeader)
 
 		for _, alert := range alerts {
 			msg := alert.Redacted
@@ -320,20 +316,20 @@ func (p *TelegramProvider) Send(ctx context.Context, alerts []Alert, wg *sync.Wa
 
 			prefix := ""
 			if alert.Name != "" {
-				prefix = "<b>[" + html.EscapeString(alert.Name) + "]</b> "
+				prefix = fmt.Sprintf(TelegramPrefixFormat, html.EscapeString(alert.Name))
 			}
 
-			line := "• " + prefix + html.EscapeString(msg) + "\n"
+			line := fmt.Sprintf(TelegramLineFormat, prefix, html.EscapeString(msg))
 
 			if currentChunk.Len()+len(line) > MaxNotificationMessageLen {
 				chunks = append(chunks, currentChunk.String())
 				currentChunk.Reset()
-				currentChunk.WriteString("⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n")
+				currentChunk.WriteString(TelegramAlertHeaderCont)
 			}
 			currentChunk.WriteString(line)
 		}
 
-		if currentChunk.Len() > 0 && currentChunk.String() != "⚠️ <b>Domain Monitor Alerts</b>\n\n" && currentChunk.String() != "⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n" {
+		if currentChunk.Len() > 0 && currentChunk.String() != TelegramAlertHeader && currentChunk.String() != TelegramAlertHeaderCont {
 			chunks = append(chunks, currentChunk.String())
 		}
 

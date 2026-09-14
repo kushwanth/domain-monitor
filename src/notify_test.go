@@ -434,5 +434,3 @@ func TestNotificationShutdown_FlushDelivery(t *testing.T) {
 		t.Errorf("expected buffer to be emptied after flush, got %d", len(nm.Buffer))
 	}
 }
-
-

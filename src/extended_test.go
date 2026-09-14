@@ -489,4 +489,3 @@ func TestSaveCertsToHistory_CapAtMaxHistory(t *testing.T) {
 		t.Errorf("expected history capped at %d, got %d", MaxCTCertHistory, len(saved))
 	}
 }
-

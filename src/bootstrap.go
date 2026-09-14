@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -73,10 +72,10 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= MaxRedirects {
-				return errors.New("stopped after 10 redirects")
+				return errors.New(MsgErrStoppedAfterRedirects)
 			}
 			if !isSafeRDAPURL(req.URL.String()) {
-				return errors.New("insecure or invalid redirect URL: " + req.URL.String())
+				return fmt.Errorf(MsgErrInsecureRedirectURL, req.URL.String())
 			}
 			return nil
 		},
@@ -119,7 +118,7 @@ func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, er
 			return slices.Clone(urls), nil
 		}
 	}
-	return nil, errors.New("no rdap server found for domain " + domain)
+	return nil, fmt.Errorf(MsgErrNoRDAPServerForDomain, domain)
 }
 
 func (b *Bootstrap) isFresh() bool {
@@ -156,7 +155,7 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 			LogWarn(MsgLogRDAPRefreshFailed, "error", err, "cache_age", cacheAge.Round(time.Minute))
 			return nil
 		}
-		return WrapError("bootstrap registry unavailable", err)
+		return WrapError(MsgErrBootstrapRegistryUnavailable, err)
 	}
 	return nil
 }
@@ -168,23 +167,23 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	client := ResolveHTTPClient(b.http)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.url, nil)
 	if err != nil {
-		return WrapError("bootstrap request error", err)
+		return WrapError(MsgErrBootstrapRequestError, err)
 	}
 	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return WrapError("bootstrap fetch error", err)
+		return WrapError(MsgErrBootstrapFetchError, err)
 	}
 	defer DrainAndClose(resp.Body, MaxBodyDrainSize)
 
 	if resp.StatusCode != http.StatusOK {
-		return errors.New("bootstrap status " + strconv.Itoa(resp.StatusCode))
+		return fmt.Errorf(MsgErrBootstrapStatus, resp.StatusCode)
 	}
 
 	var registry dnsRegistry
 	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, MaxBootstrapResponseSize), &registry); err != nil {
-		return WrapError("bootstrap decode error", err)
+		return WrapError(MsgErrBootstrapDecodeError, err)
 	}
 
 	services := make(map[string][]string)

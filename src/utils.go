@@ -137,7 +137,7 @@ func DeduplicateNonEmptyStrings(items []string) []string {
 // the enclosing function/goroutine to terminate gracefully.
 func RecoverAndLogPanic(op string) {
 	if r := recover(); r != nil {
-		LogError("Recovered from unexpected panic", "operation", op, "panic", r)
+		LogError(MsgLogRecoveredPanic, "operation", op, "panic", r)
 	}
 }
 
@@ -281,13 +281,6 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 
 // --- 6. Standardized Logging Utilities with Localized Timezone (No k=v syntax, No Source) ---
 
-// ConsoleHandler formats log records into human-readable lines without key=value syntax or source annotations.
-type ConsoleHandler struct {
-	w     io.Writer
-	mu    *sync.Mutex
-	attrs []string
-}
-
 // NewConsoleHandler creates a new ConsoleHandler writing to w.
 func NewConsoleHandler(w io.Writer) *ConsoleHandler {
 	return &ConsoleHandler{
@@ -301,7 +294,7 @@ func (h *ConsoleHandler) Enabled(_ context.Context, _ slog.Level) bool {
 }
 
 func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
-	timestamp := r.Time.In(time.Local).Format("2006-01-02 15:04:05 MST")
+	timestamp := r.Time.In(time.Local).Format(DefaultLogTimeFormat)
 	levelStr := r.Level.String()
 
 	var attrs []string
@@ -310,16 +303,16 @@ func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 	}
 	r.Attrs(func(a slog.Attr) bool {
 		if a.Key != "" {
-			attrs = append(attrs, fmt.Sprintf("%s: %v", a.Key, a.Value.Any()))
+			attrs = append(attrs, fmt.Sprintf(LogFormatAttr, a.Key, a.Value.Any()))
 		}
 		return true
 	})
 
 	var line string
 	if len(attrs) > 0 {
-		line = fmt.Sprintf("%s [%s] %s (%s)\n", timestamp, levelStr, r.Message, strings.Join(attrs, ", "))
+		line = fmt.Sprintf(LogFormatLineWithAttrs, timestamp, levelStr, r.Message, strings.Join(attrs, ", "))
 	} else {
-		line = fmt.Sprintf("%s [%s] %s\n", timestamp, levelStr, r.Message)
+		line = fmt.Sprintf(LogFormatLineNoAttrs, timestamp, levelStr, r.Message)
 	}
 
 	h.mu.Lock()
@@ -332,7 +325,7 @@ func (h *ConsoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	var formatted []string
 	for _, a := range attrs {
 		if a.Key != "" {
-			formatted = append(formatted, fmt.Sprintf("%s: %v", a.Key, a.Value.Any()))
+			formatted = append(formatted, fmt.Sprintf(LogFormatAttr, a.Key, a.Value.Any()))
 		}
 	}
 	newAttrs := make([]string, 0, len(h.attrs)+len(formatted))

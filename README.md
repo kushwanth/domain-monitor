@@ -96,6 +96,8 @@ The daemon is configured entirely via a standard JSON file (`config.json`).
 | `caa` | object | No | CAA validation policy (`issue`, `issuewild`, `issuemail`). |
 | `expected_registrar_id` | string | No | Expected IANA Registrar ID (e.g. `"292"`). |
 | `domain_transfer_locked` | bool | No | Alert if the domain transfer lock is missing. |
+| `renewal_price` | float | No | Manual renewal price override (e.g. for premium domains or custom contracts). If omitted or `0`, standard renewal pricing is resolved automatically via the private DotSweep TLD catalog. |
+| `allow_expiry` | bool | No | If `true`, suppresses expiration warnings and excludes domain from renewal pricing calculations. |
 | `verify_ns_health` | bool | No | Queries primary/secondary NS for reachability and SOA consistency. |
 | `accept_self_signed` | bool | No | Allows self-signed certificates during TLS expiration checks. |
 | `suppress_alerts` | bool | No | Mutes notification alerts for this domain. |
@@ -140,6 +142,18 @@ The daemon provides an embedded Web UI and JSON API:
 *   **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
 *   **`GET /api/state`:** Real-time JSON snapshot of the full monitoring evaluation state.
 *   **`GET /api/certs?domain=example.com`:** Certificate Transparency history for a domain.
+
+---
+
+## Domain Renewal Pricing & Privacy
+
+The daemon tracks estimated annual domain renewal costs for your portfolio:
+
+* **Automatic Standard TLD Pricing**: Standard domain extensions (e.g., `.com`, `.org`, `.co.uk`) are automatically priced using the open [DotSweep](https://dotsweep.com/tlds) TLD catalog.
+* **100% Private Architecture**: The daemon queries `https://dotsweep.com/tlds` to download the public TLD pricing catalog. It makes a plain GET request with zero parameters—**no domain names, no TLD lists, and no registrar identities are ever sent over the network**. All matching against your domains is performed 100% locally in-memory.
+* **Anti-DDoS & In-Memory Caching**: Upstream catalog responses are cached in-memory with a 24-hour TTL (`PricingCacheTTL`), preventing excessive upstream requests even with frequent monitoring intervals. If DotSweep experiences temporary outages, the cache gracefully falls back to existing data without interruption.
+* **Premium Domains & Custom Overrides**: Because premium domains have custom registry-set renewal prices that cannot be inferred from standard TLD rates, you can specify `renewal_price` in `config.json` (e.g., `"renewal_price": 250.00`). If `renewal_price > 0`, that manual amount is used directly and external queries are bypassed entirely. If `renewal_price` is omitted or `0`, standard pricing is applied.
+
 
 ---
 

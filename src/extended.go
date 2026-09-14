@@ -4,7 +4,7 @@ import (
 	"cmp"
 	"context"
 	jsonv2 "encoding/json/v2"
-	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -66,7 +66,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 				if issuerName == "" {
 					issuerName = DefaultUnknownCA
 				}
-				redacted := "New SSL Certificate issued by " + issuerName + " for " + row.Match + "."
+				redacted := fmt.Sprintf(MsgRedactedNewSSLCert, issuerName, row.Match)
 				if !target.SuppressAlerts {
 					app.SafeDispatchf(PriorityHigh, TagLock, target.Domain, target.Name, redacted, MsgAlertNewSSLCert, target.Domain, issuerName, row.Match)
 				}
@@ -84,7 +84,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 				BackfillCursor:   backfillCursor,
 				BackfillComplete: backfillComplete,
 				Status:           StatusFailed,
-				Error:            "History save failed: " + err.Error(),
+				Error:            fmt.Sprintf(MsgErrHistorySaveFailed, err.Error()),
 			}
 		}
 	}
@@ -101,11 +101,11 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 			if baseParsed, pErr := url.Parse(CTLogsAPIEndpoint + target.Domain); pErr == nil {
 				u := baseParsed.Clone()
 				q := u.Query()
-				q.Set("after", cursorToUse)
+				q.Set(ParamAfter, cursorToUse)
 				u.RawQuery = q.Encode()
 				backfillURL = u.String()
 			} else {
-				backfillURL = CTLogsAPIEndpoint + target.Domain + "?after=" + url.QueryEscape(cursorToUse)
+				backfillURL = CTLogsAPIEndpoint + target.Domain + PrefixParamAfter + url.QueryEscape(cursorToUse)
 			}
 
 			respBackfill, err := fetchCTPage(ctx, app, backfillURL)
@@ -116,7 +116,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 					BackfillCursor:   cursorToUse, // Keep old cursor to retry later
 					BackfillComplete: false,
 					Status:           StatusFailed,
-					Error:            "Backfill error: " + err.Error(),
+					Error:            fmt.Sprintf(MsgErrBackfillError, err.Error()),
 				}
 			}
 
@@ -128,7 +128,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 						BackfillCursor:   cursorToUse, // don't advance cursor
 						BackfillComplete: false,
 						Status:           StatusFailed,
-						Error:            "Backfill save failed: " + err.Error(),
+						Error:            fmt.Sprintf(MsgErrBackfillSaveFailed, err.Error()),
 					}
 				}
 			}
@@ -159,7 +159,7 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPage
 	}
 
 	if key := app.Config().CTLogsAPIKey; key != "" {
-		req.Header.Set(HeaderAuthorization, "Bearer "+key)
+		req.Header.Set(HeaderAuthorization, PrefixBearer+key)
 	}
 
 	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
@@ -178,12 +178,12 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPage
 		if key := app.Config().CTLogsAPIKey; key != "" {
 			bodyStr = strings.ReplaceAll(bodyStr, key, RedactedAPIKeyPlaceholder)
 		}
-		return nil, errors.New("API returned " + strconv.Itoa(resp.StatusCode) + ": " + bodyStr)
+		return nil, fmt.Errorf(MsgErrAPIReturnedStatus, resp.StatusCode, bodyStr)
 	}
 
 	var ctResp ctLogsPageResponse
 	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, MaxCTLogsResponseSize), &ctResp); err != nil {
-		return nil, WrapError("json parse error", err)
+		return nil, WrapError(MsgErrJSONParse, err)
 	}
 
 	return &ctResp, nil
@@ -192,7 +192,7 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPage
 func saveCertsToHistory(domain string, certs []CTCert) error {
 	cleanDomain := NormalizeDomain(domain)
 	if cleanDomain == "" || !ReValidDomain.MatchString(cleanDomain) {
-		return errors.New("invalid domain for certs history: " + strconv.Quote(domain))
+		return fmt.Errorf(MsgErrInvalidDomainCertsHistory, strconv.Quote(domain))
 	}
 	if err := os.MkdirAll(CTLogsPath, 0750); err != nil {
 		return err
@@ -200,7 +200,7 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 	filePath := filepath.Join(CTLogsPath, cleanDomain+".json")
 	cleanPath := filepath.Clean(filePath)
 	if !IsSafeSubpath(CTLogsPath, cleanPath) {
-		return errors.New("invalid file path for certs history: " + strconv.Quote(domain))
+		return fmt.Errorf(MsgErrInvalidFilePathCertsHistory, strconv.Quote(domain))
 	}
 
 	var existing []CTCert

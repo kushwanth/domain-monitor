@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"regexp"
+	"slices"
 	"time"
 
 	"github.com/miekg/dns"
@@ -22,15 +23,19 @@ const (
 	MaxBootstrapResponseSize   = 8 << 20  // 8 MB
 	MaxCTLogsResponseSize      = 16 << 20 // 16 MB
 	MaxNotificationPayloadSize = 1 << 20  // 1 MB
+	MaxPricingResponseSize     = 5 << 20  // 5 MB
 )
 
 // Standard Timeouts & Intervals
 const (
-	DefaultDNSTimeout          = 5 * time.Second
-	DefaultHTTPTimeout         = 10 * time.Second
-	DefaultWHOISTimeout        = 10 * time.Second
-	DefaultWHOISQueryTimeout   = 15 * time.Second
-	DefaultTCPKeepAlive        = 30 * time.Second
+	DefaultDNSTimeout         = 5 * time.Second
+	DefaultHTTPTimeout        = 10 * time.Second
+	DefaultPricingHTTPTimeout = 15 * time.Second
+	PricingCacheTTL           = 24 * time.Hour
+	PricingMaxStaleAge        = 7 * 24 * time.Hour
+	DefaultWHOISTimeout       = 10 * time.Second
+	DefaultWHOISQueryTimeout  = 15 * time.Second
+	DefaultTCPKeepAlive       = 30 * time.Second
 )
 
 // System Thresholds & Limits
@@ -59,6 +64,11 @@ const (
 	EnvTelegramToken  = "TELEGRAM_TOKEN"
 	EnvTelegramChatID = "TELEGRAM_CHAT_ID"
 	EnvCTLogsAPIKey   = "CTLOGS_API_KEY"
+)
+
+// HTTP Constants
+const (
+	DotSweepAPIEndpoint = "https://dotsweep.com/tlds"
 )
 
 // HTTP Headers & Media Types
@@ -104,18 +114,16 @@ const (
 
 // External API Endpoints
 const (
-	BootstrapURL        = "https://data.iana.org/rdap/dns.json"
-	BootstrapTTL        = 24 * time.Hour
-	BootstrapMaxAge     = 72 * time.Hour
-	CTLogsAPIEndpoint   = "https://api.ctlogs.dev/v1/subdomains/"
+	BootstrapURL                 = "https://data.iana.org/rdap/dns.json"
+	BootstrapTTL                 = 24 * time.Hour
+	BootstrapMaxAge              = 72 * time.Hour
+	CTLogsAPIEndpoint            = "https://api.ctlogs.dev/v1/subdomains/"
 	TelegramAPIEndpoint          = "https://api.telegram.org/bot%s/sendMessage"
 	TelegramAPIBase              = "https://api.telegram.org/bot"
 	TelegramAPISendMessageSuffix = "/sendMessage"
 )
 
 // Notification Alert Tags (Icons / Emojis)
-type AlertTag = string
-
 const (
 	TagRotatingLight AlertTag = "rotating_light"
 	TagWarning       AlertTag = "warning"
@@ -171,6 +179,7 @@ const (
 	DNSSECSourceLocal       = "local"
 	DNSSECSourceDoH         = "doh"
 	DNSSECSourceDoHFallback = "doh_fallback"
+	DNSSECSourceLocalDoH    = "local+doh"
 )
 
 // Protocols
@@ -178,6 +187,7 @@ const (
 	ProtocolRDAP        = "rdap"
 	ProtocolWHOIS       = "whois"
 	ProtocolWHOISFailed = "whois_failed"
+	ProtocolHybrid      = "hybrid"
 )
 
 // RDAP & WHOIS Data Sources
@@ -187,7 +197,10 @@ const (
 	SourceRegistryWHOIS  = "registry_whois"
 	SourceRegistrarWHOIS = "registrar_whois"
 	SourceWHOIS          = "whois"
+	SourceWHOIS404       = "whois_404"
 	SourceReferral       = "referral"
+	SourceRegistry       = "registry"
+	SourceDNSDelegation  = "dns_delegation"
 )
 
 // RDAP Roles, Link Relations & VCard Properties
@@ -650,9 +663,21 @@ const (
 	MsgLogShutdownComplete = "Daemon shutdown complete."
 
 	// Internal Operational Logs
-	MsgLogNtfyRequestFailed          = "Ntfy request creation failed"
-	MsgLogNtfyDeliveryFailed         = "Ntfy delivery failed"
-	MsgLogNtfyRequestError           = "Ntfy request error"
+	MsgLogNtfyRequestFailed     = "Ntfy request creation failed"
+	MsgLogNtfyDeliveryFailed    = "Ntfy delivery failed"
+	MsgLogNtfyRequestError      = "Ntfy request error"
+	MsgErrTelegramChatIDMissing = "telegram chat_id is missing, cannot send notifications"
+	MsgErrTelegramTokenMissing  = "telegram token is missing, cannot send notifications"
+	MsgErrNoProvidersConfigured = "no notification providers configured"
+
+	MsgErrDotSweepFetchFailed        = "dotsweep pricing request failed"
+	MsgErrDotSweepParseError         = "dotsweep json parse error"
+	MsgErrDotSweepNoData             = "no tld pricing data in dotsweep response"
+	MsgLogDotSweepFetchFailed        = "Failed to fetch TLD renewal pricing from DotSweep"
+	MsgLogPricingFetchFailed         = "Failed to resolve portfolio renewal pricing"
+	MsgErrPricingManagerNil          = "pricing manager is nil"
+	MsgErrDomainNegativeRenewalPrice = "domain %s: renewal_price cannot be negative"
+
 	MsgLogTelegramMarshalFailed      = "Telegram payload marshal failed"
 	MsgLogTelegramRequestFailed      = "Telegram request creation failed"
 	MsgLogTelegramDeliveryFailed     = "Telegram delivery failed"
@@ -694,3 +719,267 @@ const (
 	MsgLogSaveBackfilledCTLogsFailed = "Failed to save backfilled CT logs"
 	MsgLogUnmarshalCTLogFailed       = "Failed to unmarshal existing CT log history; continuing with empty list"
 )
+
+// Extracted Constants
+const (
+	JSONResponseInvalidDomain = `{"error": "invalid domain"}`
+	JSONResponseStatusOK      = `{"status":"ok"}`
+	JSONResponseStatusInit    = `{"status":"initializing"}`
+	JSONResponseEmptyArray    = `[]`
+	DefaultMaxConcurrency     = 8
+	DNSSECClockSkew           = int64(300)
+)
+
+// HTTP Routes & Query Params
+const (
+	RouteHealth    = "GET /health"
+	RouteAPIState  = "GET /api/state"
+	RouteAPICerts  = "GET /api/certs"
+	RouteAPICTLogs = "GET /api/ctlogs/{domain}"
+	ParamDomain      = "domain"
+	ParamName        = "name"
+	ParamType        = "type"
+	ParamDO          = "do"
+	ParamDOValue     = "1"
+	ParamAfter       = "after"
+	ParamRegistrars  = "registrars"
+	RecordTypeDNSKEY = "DNSKEY"
+	FieldChatID      = "chat_id"
+	FieldText        = "text"
+	FieldParseMode   = "parse_mode"
+	FieldCacheAge    = "cache_age"
+	FieldError       = "error"
+	MIMEDNSJSON      = "application/dns-json"
+	DoHQueryTemplate = "?name=%s&type=DNSKEY&do=1"
+	PathRDAPDomain   = "/domain/"
+)
+
+// Server Defaults & Subdirectories
+const (
+	DefaultIdleTimeout         = 120 * time.Second
+	DefaultMaxHeaderValueCount = 100
+	DefaultCTStateFileName     = "ct_state.json"
+	DefaultLogTimeFormat       = "2006-01-02 15:04:05 MST"
+	DefaultHTTPSPort           = "443"
+	TestFqdn                   = "example.com"
+	DirContainerApp            = "/app"
+	CAAIssuerDenyAll           = ";"
+	LayoutCompactDateTime      = "20060102150405"
+)
+
+// Default DNS Resolvers
+var defaultResolvers = [...]string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+
+// DefaultResolvers returns a defensive copy of the default DNS resolver addresses.
+func DefaultResolvers() []string {
+	return slices.Clone(defaultResolvers[:]);
+}
+
+// Common Prefixes
+const (
+	PrefixBearer     = "Bearer "
+	PrefixBasic      = "Basic "
+	PrefixAlias      = "alias:"
+	PrefixWildcard   = "*."
+	PrefixWWW        = "www."
+	PrefixAlgo       = "ALGO_"
+	PrefixParamAfter = "?after="
+)
+
+// Delimiters & Separators
+const (
+	SeparatorErrorPipe = " | "
+)
+
+// Provider & Component Names
+const (
+	NameNtfyProvider       = "Ntfy provider"
+	NameTelegramProvider   = "Telegram provider"
+	NameOpMonitoringCycle  = "Monitoring cycle"
+	NameOpRDAPCheckWorker  = "RDAP check worker"
+	NameOpCTLogsWorker     = "CT logs worker"
+	NameOpMonitoringEngine = "Monitoring engine"
+	CheckTypeRDAP          = "RDAP"
+	CheckTypeDNS           = "DNS"
+	CheckTypeEmail         = "Email"
+	TargetKeyDomain        = "domain"
+	TargetKeyRecord        = "record"
+	FlagConfig             = "config"
+	FlagConfigShort        = "c"
+	FlagConfigUsage        = "Path to the JSON config file"
+	FlagConfigShortUsage   = "Path to the JSON config file (shorthand)"
+)
+
+// Notification Formatting & Delimiters
+const (
+	TelegramAlertHeader     = "⚠️ <b>Domain Monitor Alerts</b>\n\n"
+	TelegramAlertHeaderCont = "⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n"
+	TelegramBullet          = "• "
+	TelegramPrefixFormat    = "<b>[%s]</b> "
+	TelegramLineFormat      = "• %s%s\n"
+	NtfyPrefixFormat        = "[%s] "
+	TagSeparator            = ","
+	AlertChunkSeparator     = "\n\n"
+)
+
+// Logging Formats
+const (
+	LogFormatLineWithAttrs = "%s [%s] %s (%s)\n"
+	LogFormatLineNoAttrs   = "%s [%s] %s\n"
+	LogFormatAttr          = "%s: %v"
+	MsgLogRecoveredPanic   = "Recovered from unexpected panic"
+)
+
+// DNS Evaluation Reasons & Redacted Message Templates
+const (
+	MsgRedactedDNSMismatchPrefix    = "Mismatch on %s (%s). Prefix not found."
+	MsgRedactedDNSMismatchSubstring = "Mismatch on %s (%s). Expected substring not found."
+	MsgRedactedDNSMismatchAnyOf     = "Mismatch on %s (%s). None of expected values matched."
+	MsgRedactedDNSMismatchExact     = "Mismatch on %s (%s). Values aren't mapped as expected."
+	MsgRedactedDNSUnauthorized      = "Unauthorized record found on %s (%s)."
+
+	MsgReasonPrefixNotFound      = "prefix \"%s\" not found in [%s]"
+	MsgReasonSubstringNotFound   = "substring \"%s\" not found in [%s]"
+	MsgReasonNoneMatched         = "none of expected [%s] matched found [%s]"
+	MsgReasonMissingRecords      = "missing expected records: %s"
+	MsgReasonUnauthorizedRecords = "unauthorized records: %s"
+)
+
+// Cycle Invariant Error Messages
+const (
+	MsgErrInvariantMissingRDAP     = "domain %s: missing RDAP/delegation state"
+	MsgErrInvariantPendingRDAP     = "domain %s: RDAP/delegation check remained in pending status"
+	MsgErrInvariantMissingEmail    = "domain %s: missing email security state"
+	MsgErrInvariantMissingDNSSEC   = "domain %s: missing DNSSEC state"
+	MsgErrInvariantMissingCAA      = "domain %s: missing CAA state"
+	MsgErrInvariantMissingNSHealth = "domain %s: missing nameserver health state"
+	MsgErrInvariantMissingCTLogs   = "domain %s: missing CT logs state"
+	MsgErrInvariantPendingCTLogs   = "domain %s: CT logs remained in pending status"
+	MsgErrInvariantMissingDNS      = "dns record %s: missing DNS state"
+	MsgErrInvariantPendingDNS      = "dns record %s: remained in pending status"
+)
+
+// Worker, Network & Internal Error Messages
+const (
+	MsgErrInternalDNSCheckPanic              = "internal check panic: %s"
+	MsgErrInternalRDAPCheckPanic             = "internal rdap check panic: %s"
+	MsgErrInternalCTLogsPanic                = "internal ct logs panic: %s"
+	MsgErrCheckTimeoutOrCanceled             = "check timed out or canceled"
+	MsgErrNilConnection                      = "nil connection returned for %s"
+	MsgErrNonTLSConnection                   = "unexpected non-TLS connection for %s"
+	MsgErrNoPeerCertsFound                   = "no peer certificates found for %s"
+	MsgErrLookupEmptyResponse                = "lookup %s on %s: empty response"
+	MsgErrLookupQuestionMismatch             = "lookup %s on %s: response question mismatch or missing"
+	MsgErrLookupServerError                  = "lookup %s on %s: server error (%s)"
+	MsgErrLookupServerErrorCode              = "lookup %s on %s: server returned error code %d"
+	MsgErrNoIPRecordsForHost                 = "no IP records found for host %s"
+	MsgErrUnsupportedDNSType                 = "unsupported DNS type: %s"
+	MsgErrNoMXRecordsFound                   = "no MX records found"
+	MsgErrFailedToQueryNSRecords             = "Failed to query NS records: %s"
+	MsgErrUnableToParseDate                  = "unable to parse date format: %s"
+	MsgErrRDAPHTTPError                      = "rdap HTTP error: %d"
+	MsgErrRDAPLookupFailedAllCandidates      = "rdap lookup failed across all candidate servers"
+	MsgErrWHOISParsingFailed                 = "whois parsing failed to extract required domain fields"
+	MsgErrWHOISPanicked                      = "whois query panicked"
+	MsgErrHistorySaveFailed                  = "History save failed: %s"
+	MsgErrBackfillError                      = "Backfill error: %s"
+	MsgErrBackfillSaveFailed                 = "Backfill save failed: %s"
+	MsgErrAPIReturnedStatus                  = "API returned %d: %s"
+	MsgErrJSONParse                          = "json parse error"
+	MsgErrInvalidDomainCertsHistory          = "invalid domain for certs history: %s"
+	MsgErrInvalidFilePathCertsHistory        = "invalid file path for certs history: %s"
+	MsgErrStoppedAfterRedirects              = "stopped after 10 redirects"
+	MsgErrInsecureRedirectURL                = "insecure or invalid redirect URL: %s"
+	MsgErrNoRDAPServerForDomain              = "no rdap server found for domain %s"
+	MsgErrBootstrapRegistryUnavailable       = "bootstrap registry unavailable"
+	MsgErrBootstrapRequestError              = "bootstrap request error"
+	MsgErrBootstrapFetchError                = "bootstrap fetch error"
+	MsgErrBootstrapStatus                    = "bootstrap status %d"
+	MsgErrBootstrapDecodeError               = "bootstrap decode error"
+	MsgErrFailedToReadConfig                 = "failed to read config file"
+	MsgErrJSONUnmarshalFailed                = "json unmarshal failed"
+	MsgErrResolversExceedLimit               = "configured resolvers exceed maximum limit of 9"
+	MsgErrDomainEmptyDomain                  = "domain entry at index %d has an empty domain"
+	MsgErrDuplicateDomain                    = "duplicate domain %s; each domain entry must be unique"
+	MsgErrDomainEmptyExpectedNS              = "domain %s has an empty entry in expected_ns at index %d"
+	MsgErrDomainEmptySecondaryNS             = "domain %s has an empty entry in secondary_ns at index %d"
+	MsgErrDomainMissingName                  = "domain %s is missing a mandatory 'name' field"
+	MsgErrDuplicateDomainName                = "duplicate domain name %s; each domain must have a unique name"
+	MsgErrSecondaryNSWithoutPrimary          = "domain %s has secondary_ns configured but no primary expected_ns configured"
+	MsgErrVerifyNSHealthWithoutPrimary       = "domain %s has verify_ns_health enabled but no primary expected_ns configured"
+	MsgErrDelegatedMissingRootZone           = "delegated domain %s is missing a mandatory 'root_zone' field"
+	MsgErrMailProviderAndMXMutuallyExclusive = "domain %s has both mail_provider and mx_records set; these are mutually exclusive"
+	MsgErrDNSEmptyHostname                   = "dns record at index %d has an empty hostname"
+	MsgErrDNSMissingName                     = "dns record %s (%s) is missing a mandatory 'name' field"
+	MsgErrDuplicateDNSName                   = "duplicate dns record name %s; each dns record must have a unique name"
+	MsgErrDNSMissingType                     = "dns record %s is missing a type (e.g. A, CNAME)"
+	MsgErrSkipSSLNotApplicable               = "dns record %s (%s) has skip_ssl enabled; skip_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types"
+	MsgErrExpectedIPv6ForTypeA               = "dns record %s (%s): expected %s is an IPv6 address, but record type is A (requires IPv4)"
+	MsgErrExpectedNotValidIPv4               = "dns record %s (%s): expected %s is not a valid IPv4 address for type A"
+	MsgErrExpectedIPv4ForTypeAAAA            = "dns record %s (%s): expected %s is an IPv4 address, but record type is AAAA (requires IPv6)"
+	MsgErrExpectedNotValidIPv6               = "dns record %s (%s): expected %s is not a valid IPv6 address for type AAAA"
+	MsgErrExpectedNotValidIP                 = "dns record %s (%s): expected %s is not a valid IPv4 or IPv6 address for composite type IP"
+	MsgErrNtfyURLMandatory                   = "cannot initialize dependencies: notifications.ntfy.url is mandatory (primary notification mechanism)"
+	MsgErrFailedCreateNtfyRequest            = "failed to create ntfy request"
+	MsgErrNtfyURLUnreachable                 = "ntfy URL provided is unreachable"
+	MsgErrAllResolversFailed                 = "all configured resolvers failed health checks"
+	MsgErrInitAppNil                         = "cannot initialize dependencies: app is nil"
+	MsgErrInitConfigNil                      = "cannot initialize dependencies: config is nil"
+	MsgErrInitNotifierNil                    = "cannot initialize dependencies: notifier is nil"
+	MsgErrSSLInvalid              = "%w: invalid for %s on %s: %v"
+	MsgErrSSLCertValidationFailed = "%w: certificate validation failed for %s on %s: %v"
+	MsgErrNilStringListReceiver              = "nil StringList receiver"
+	MsgPrefixLookupOn                        = "lookup %s on %s"
+	MsgPrefixLookupOnWithRcode               = "lookup %s on %s (%s)"
+	MsgErrLookupFailedAandAAAA               = "lookup failed for A and AAAA"
+	MsgErrMXQueryError                       = "MX query error"
+	MsgErrInvalidNSAddress                   = "invalid nameserver address %s"
+	MsgErrFailedToResolveIP                  = "failed to resolve IP"
+	MsgErrNoRDAPServer                       = "no RDAP server"
+	MsgErrWHOISQueryFailed                   = "whois query failed"
+	MsgErrFailedToQueryCAA                   = "failed to query CAA"
+	MsgErrInvalidEmptyDomainCAA              = "invalid empty domain for CAA"
+	MsgErrFailedToQueryCAAPattern            = "Failed to query CAA for %s: %s"
+	MsgErrDSQueryFailed                      = "DS query failed: %s"
+	MsgErrDNSKEYQueryFailed                  = "DNSKEY query failed: %s"
+	MsgErrDSRecordDoesNotMatchDNSKEY         = "DS record does not match any DNSKEY"
+	MsgErrRRSIGExpiredOrNotYetValid          = "RRSIG is expired or not yet valid"
+	MsgErrDNSSECLocalVerifiedDoHUnavailable  = "Local DNSSEC records verified; upstream DoH chain integrity unavailable"
+	MsgErrDNSSECUpstreamChainBroken          = "Upstream validating resolver returned AD=false (chain broken)"
+	MsgErrDNSSECValidationFailed             = "DNSSEC Validation Failed"
+	MsgErrValidateDNSSECNil                  = "validateDNSSEC returned nil"
+	MsgErrSPFLookupError                     = "SPF lookup error: %s"
+	MsgErrDMARCLookupError                   = "DMARC lookup error: %s"
+	MsgErrDKIMLookupError                    = "DKIM lookup error: %s"
+	MsgLogSSLResolveIPsFailed                = "Failed to resolve IPs for SSL certificate check"
+	MsgErrSOALookupFailed                    = "SOA lookup failed: %s"
+	MsgErrPrimaryNSNotAuthoritative          = "Primary nameserver not authoritative (AA flag missing)"
+	MsgErrSecondaryNSNotAuthoritative        = "Secondary nameserver not authoritative (AA flag missing)"
+	MsgErrNoSOARecordReturned                = "No SOA record returned in answer or authority sections"
+	MsgErrDomainNotFound404                  = "Domain not found (404)"
+	MsgErrRDAPAndWHOIS                       = "RDAP: %s | WHOIS: %s"
+)
+
+// RegistryDateLayouts specifies supported WHOIS/RDAP date format layouts for parseFlexibleDate.
+var RegistryDateLayouts = [...]string{
+	time.RFC3339,
+	time.RFC3339Nano,
+	"2006-01-02 15:04:05 -0700",
+	"2006-01-02 15:04:05 -07:00",
+	"2006-01-02 15:04:05 MST",
+	"2006-01-02 15:04:05",
+	"2006-01-02",
+	"02-Jan-2006 15:04:05 -0700",
+	"02-Jan-2006 15:04:05 -07:00",
+	"02-Jan-2006 15:04:05 MST",
+	"02-Jan-2006 15:04:05",
+	"02-Jan-2006",
+	"2006.01.02 15:04:05",
+	"2006.01.02",
+	"2006/01/02 15:04:05",
+	"2006/01/02",
+	"02/01/2006",
+	"02.01.2006",
+	time.UnixDate,
+	"20060102",
+}
