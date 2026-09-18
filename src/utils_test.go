@@ -118,25 +118,7 @@ func TestNormalizeDomainToASCIIText(t *testing.T) {
 	}
 }
 
-func TestDeduplicateSlice(t *testing.T) {
-	t.Parallel()
 
-	if got := DeduplicateSlice[int](nil); got != nil {
-		t.Errorf("DeduplicateSlice(nil) expected nil, got %v", got)
-	}
-
-	items := []string{"apple", "banana", "apple", "orange", "banana"}
-	expected := []string{"apple", "banana", "orange"}
-	got := DeduplicateSlice(items)
-	if len(got) != len(expected) {
-		t.Fatalf("DeduplicateSlice len = %d, expected %d", len(got), len(expected))
-	}
-	for i := range expected {
-		if got[i] != expected[i] {
-			t.Errorf("DeduplicateSlice[%d] = %q, expected %q", i, got[i], expected[i])
-		}
-	}
-}
 
 func TestDeduplicateNonEmptyStrings(t *testing.T) {
 	t.Parallel()

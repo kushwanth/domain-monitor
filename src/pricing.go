@@ -134,7 +134,7 @@ func (p *PricingManager) GetPrice(tld string) (float64, bool) {
 
 // extractTLD resolves the public suffix/TLD of a domain name using the public suffix list.
 func extractTLD(domain string) string {
-	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	domain = NormalizeDomain(domain)
 	ps, _ := publicsuffix.PublicSuffix(domain)
 	if ps != "" {
 		return ps

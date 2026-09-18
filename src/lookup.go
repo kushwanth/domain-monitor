@@ -45,7 +45,7 @@ func queryWHOISWithContext(ctx context.Context, domain string, host ...string) (
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				LogError(MsgLogWHOISPanicked, "domain", asciiDomain, "panic", r)
+				LogError(MsgLogWHOISPanicked, FieldDomain, asciiDomain, FieldPanic, r)
 				ch <- queryResult{err: errors.New(MsgErrWHOISPanicked)}
 			}
 		}()
@@ -623,7 +623,7 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*R
 	if registry == nil && registrar == nil {
 		return &RDAPState{
 			Status: StatusFailed,
-			Error:  "no registry or registrar tier data available",
+			Error:  MsgErrNoTierData,
 		}, nil
 	}
 	state := &RDAPState{
@@ -743,9 +743,9 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 	rdapState, err := fetchRDAP(ctx, httpClient, target.Domain)
 	if err != nil {
 		if errors.Is(err, ErrRDAPNotFound) {
-			LogInfo(MsgLogRDAPReturned404, "domain", target.Domain)
+			LogInfo(MsgLogRDAPReturned404, FieldDomain, target.Domain)
 		} else if errors.Is(err, ErrRDAPRateLimited) {
-			LogWarn(MsgLogRDAPRateLimited, "domain", target.Domain)
+			LogWarn(MsgLogRDAPRateLimited, FieldDomain, target.Domain)
 		} else {
 			LogInfof(MsgLogWHOISFallback, target.Domain)
 		}
@@ -753,7 +753,7 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 		whoisState, whoisErr := fetchWHOIS(ctx, target.Domain)
 		if whoisErr != nil {
 			if errors.Is(whoisErr, ErrDomainNotFound) || strings.Contains(whoisErr.Error(), "404") || strings.Contains(whoisErr.Error(), "not found") {
-				LogInfo(MsgLogWHOISUnregistered, "domain", target.Domain)
+				LogInfo(MsgLogWHOISUnregistered, FieldDomain, target.Domain)
 				return &RDAPState{
 					Status:       StatusFailed,
 					Error:        MsgErrDomainNotFound404,
@@ -915,10 +915,31 @@ func isSafeRDAPURL(rawURL string) bool {
 	return true
 }
 
+// isSafeWHOISServer validates that a WHOIS referral server address is safe to query,
+// preventing SSRF against loopback, private, link-local, multicast, or cloud metadata endpoints.
+func isSafeWHOISServer(server string) bool {
+	clean := strings.TrimSpace(server)
+	if clean == "" {
+		return false
+	}
+	host := clean
+	if h, _, err := net.SplitHostPort(clean); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !IsRestrictedIP(ip)
+	}
+	return ReValidDomain.MatchString(host)
+}
+
 func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client *http.Client) *RDAPDomainResponse {
 	httpClient := client
 	if httpClient == nil {
-		httpClient = NewRDAPHTTPClient(6 * time.Second)
+		httpClient = NewRDAPHTTPClient(DefaultReferralRDAPTimeout)
 	}
 
 	for _, rawHref := range links {
@@ -938,10 +959,10 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 			}
 		}
 		if !isSafeRDAPURL(targetURL) {
-			LogWarn(MsgLogSkippingUnsafeRDAP, "domain", domain, "url", targetURL)
+			LogWarn(MsgLogSkippingUnsafeRDAP, FieldDomain, domain, FieldURL, targetURL)
 			continue
 		}
-		LogInfo(MsgLogQueryingRegistrarRDAP, "domain", domain, "url", targetURL)
+		LogInfo(MsgLogQueryingRegistrarRDAP, FieldDomain, domain, FieldURL, targetURL)
 		relReq, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if err != nil {
 			continue
@@ -953,7 +974,7 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 		if err != nil || relResp.StatusCode != http.StatusOK {
 			if relResp != nil {
 				if relResp.StatusCode == http.StatusTooManyRequests {
-					LogWarn(MsgLogRateLimitedRegistrarRDAP, "domain", domain)
+					LogWarn(MsgLogRateLimitedRegistrarRDAP, FieldDomain, domain)
 				}
 				DrainAndClose(relResp.Body, MaxBodyDrainSize)
 			}
@@ -981,19 +1002,40 @@ func fetchWHOIS(ctx context.Context, domain string) (*RDAPState, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	qCtx, cancel := context.WithTimeout(ctx, DefaultWHOISQueryTimeout)
-	defer cancel()
 
-	result, queryErr := queryWHOISWithContext(qCtx, domain)
+	var result string
+	var queryErr error
+	var attempts int
+
+	for attempts = 1; attempts <= 3; attempts++ {
+		qCtx, cancel := context.WithTimeout(ctx, DefaultWHOISQueryTimeout)
+		result, queryErr = queryWHOISWithContext(qCtx, domain)
+		cancel()
+
+		if queryErr != nil && result == "" {
+			return nil, WrapError(MsgErrWHOISQueryFailed, queryErr)
+		}
+
+		if !isWHOISRateLimited(result, queryErr) {
+			break
+		}
+
+		if attempts < 3 {
+			backoff := time.Duration(attempts*2) * time.Second
+			LogWarn(MsgLogWHOISRateLimitedRetry, FieldDomain, domain, FieldAttempt, attempts, FieldRetryIn, backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		} else {
+			return nil, ErrWHOISRateLimited
+		}
+	}
+
 	durationMs := time.Since(start).Milliseconds()
-
-	if queryErr != nil && result == "" {
-		return nil, WrapError(MsgErrWHOISQueryFailed, queryErr)
-	}
-
-	if isWHOISRateLimited(result, queryErr) {
-		return nil, ErrWHOISRateLimited
-	}
 
 	registryTier := extractWHOISTier(result, SourceRegistryWHOIS, SourceRegistry)
 	var registrarTier *DomainTierData
@@ -1002,12 +1044,16 @@ func fetchWHOIS(ctx context.Context, domain string) (*RDAPState, error) {
 	if m := ReWHOISReferral.FindStringSubmatch(result); len(m) > 1 {
 		referralServer := strings.TrimSpace(m[1])
 		if referralServer != "" && !strings.Contains(referralServer, "iana") && !strings.Contains(referralServer, "internic") {
-			LogInfo(MsgLogFollowingWHOISReferral, "domain", domain, "referral_server", referralServer)
-			refCtx, refCancel := context.WithTimeout(ctx, 10*time.Second)
-			defer refCancel()
+			if !isSafeWHOISServer(referralServer) {
+				LogWarn(MsgLogSkippingUnsafeRDAP, FieldDomain, domain, FieldReferralServer, referralServer)
+			} else {
+				LogInfo(MsgLogFollowingWHOISReferral, FieldDomain, domain, FieldReferralServer, referralServer)
+				refCtx, refCancel := context.WithTimeout(ctx, DefaultHTTPTimeout)
+				defer refCancel()
 
-			if refResult, err := queryWHOISWithContext(refCtx, domain, referralServer); err == nil && refResult != "" && !isDomainNotFoundInWHOIS(refResult) {
-				registrarTier = extractWHOISTier(refResult, SourceRegistrarWHOIS, referralServer)
+				if refResult, err := queryWHOISWithContext(refCtx, domain, referralServer); err == nil && refResult != "" && !isDomainNotFoundInWHOIS(refResult) {
+					registrarTier = extractWHOISTier(refResult, SourceRegistrarWHOIS, referralServer)
+				}
 			}
 		}
 	}
@@ -1035,6 +1081,7 @@ func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *R
 	if parsed == nil || target.Domain == "" {
 		return parsed
 	}
+	parsed.AllowExpiry = target.AllowExpiry
 	if parsed.Expiration != "" {
 		if t, norm, err := parseFlexibleDate(parsed.Expiration); err == nil {
 			parsed.Expiration = norm
@@ -1136,6 +1183,7 @@ func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfi
 		Status:          StatusOK,
 		IsDelegatedZone: true,
 		Source:          SourceDNSDelegation,
+		AllowExpiry:     target.AllowExpiry,
 	}
 
 	resolversToUse := app.Resolvers()

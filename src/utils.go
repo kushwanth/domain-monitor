@@ -93,22 +93,7 @@ func NormalizeDomainToASCIIText(domain string) string {
 	return cleaned
 }
 
-// DeduplicateSlice returns a new slice containing unique elements from items,
-// preserving the original insertion order.
-func DeduplicateSlice[T comparable](items []T) []T {
-	if len(items) == 0 {
-		return nil
-	}
-	seen := make(map[T]struct{}, len(items))
-	result := make([]T, 0, len(items))
-	for _, item := range items {
-		if _, exists := seen[item]; !exists {
-			seen[item] = struct{}{}
-			result = append(result, item)
-		}
-	}
-	return result
-}
+
 
 // DeduplicateNonEmptyStrings trims each string in items, filters out empty strings,
 // and deduplicates the remainder while preserving order.
@@ -249,7 +234,7 @@ func IsSafeSubpath(baseDir, targetPath string) bool {
 // atomically renames it into place, preventing partial file corruption on process termination.
 func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	tmp, err := os.CreateTemp(dir, TempFilePattern)
 	if err != nil {
 		return err
 	}

@@ -19,7 +19,6 @@ const (
 	DefaultDoHURL              = "https://dns.google/resolve"
 	DefaultCTLogsSubdir        = "ct_logs"
 	DefaultUserAgent           = "DomainMonitor/1.0 (+https://github.com/domain-monitor)"
-	MaxNotificationMessageLen  = 3500
 	MaxBootstrapResponseSize   = 8 << 20  // 8 MB
 	MaxCTLogsResponseSize      = 16 << 20 // 16 MB
 	MaxNotificationPayloadSize = 1 << 20  // 1 MB
@@ -28,20 +27,28 @@ const (
 
 // Standard Timeouts & Intervals
 const (
-	DefaultDNSTimeout         = 5 * time.Second
-	DefaultHTTPTimeout        = 10 * time.Second
-	DefaultPricingHTTPTimeout = 15 * time.Second
-	PricingCacheTTL           = 24 * time.Hour
-	PricingMaxStaleAge        = 7 * 24 * time.Hour
-	DefaultWHOISTimeout       = 10 * time.Second
-	DefaultWHOISQueryTimeout  = 15 * time.Second
-	DefaultTCPKeepAlive       = 30 * time.Second
+	DefaultDNSTimeout           = 5 * time.Second
+	DefaultHTTPTimeout          = 10 * time.Second
+	DefaultPricingHTTPTimeout   = 15 * time.Second
+	PricingCacheTTL             = 24 * time.Hour
+	PricingMaxStaleAge          = 7 * 24 * time.Hour
+	DefaultWHOISTimeout         = 10 * time.Second
+	DefaultWHOISQueryTimeout    = 15 * time.Second
+	DefaultTCPKeepAlive         = 30 * time.Second
+	ShutdownTimeout             = 5 * time.Second
+	DefaultLoopDurationFallback = 6 * time.Hour
+	RDAPRateLimitInterval       = 10 * time.Second
+	CTLogsRateLimitInterval     = 5 * time.Second
+	DefaultReferralRDAPTimeout  = 6 * time.Second
+	DefaultAlertCooldown        = 24 * time.Hour
 )
 
 // System Thresholds & Limits
 const (
 	MaxRedirects                      = 10
 	MaxResolversLimit                 = 9
+	MaxNotificationTags               = 5
+	MaxCNAMEAliasTraversals           = 5
 	DefaultSSLExpiryWarningDays       = 14
 	DefaultRDAPExpiryWarningDays      = 30
 	AutoRenewGracePeriodThresholdDays = 45.0
@@ -50,7 +57,12 @@ const (
 	MaxLoopIntervalDays               = 365.0
 	MaxCTCertHistory                  = 1000
 	MaxBodyDrainSize                  = 4096
+	MaxAlertMessageRunes              = 1000
+	MaxSSLDaysSentinel                = 999999
 	HoursPerDay                       = 24
+	DirPermDefault                    = 0750
+	FilePermSecret                    = 0600
+	FilePermPublic                    = 0644
 )
 
 // Environment Variable Keys
@@ -188,6 +200,7 @@ const (
 	ProtocolWHOIS       = "whois"
 	ProtocolWHOISFailed = "whois_failed"
 	ProtocolHybrid      = "hybrid"
+	ProtocolTCP         = "tcp"
 )
 
 // RDAP & WHOIS Data Sources
@@ -677,6 +690,7 @@ const (
 	MsgLogPricingFetchFailed         = "Failed to resolve portfolio renewal pricing"
 	MsgErrPricingManagerNil          = "pricing manager is nil"
 	MsgErrDomainNegativeRenewalPrice = "domain %s: renewal_price cannot be negative"
+	MsgErrNoTierData                 = "no registry or registrar tier data available"
 
 	MsgLogTelegramMarshalFailed      = "Telegram payload marshal failed"
 	MsgLogTelegramRequestFailed      = "Telegram request creation failed"
@@ -686,6 +700,7 @@ const (
 	MsgLogWHOISPanicked              = "WHOIS query panicked"
 	MsgLogRDAPReturned404            = "RDAP returned 404, attempting WHOIS fallback"
 	MsgLogRDAPRateLimited            = "RDAP rate limited, falling back to WHOIS"
+	MsgLogWHOISRateLimitedRetry      = "WHOIS query rate limited, retrying"
 	MsgLogWHOISUnregistered          = "WHOIS reports domain is unregistered (404)"
 	MsgLogSkippingUnsafeRDAP         = "Skipping unsafe RDAP referral URL"
 	MsgLogQueryingRegistrarRDAP      = "Querying registrar RDAP link"
@@ -701,7 +716,6 @@ const (
 	MsgLogPanicDomainWorker          = "Recovered from unexpected panic in Domain check worker"
 	MsgLogPanicRDAP                  = "Recovered from unexpected panic in RDAP evaluation"
 	MsgLogPanicCTLogs                = "Recovered from unexpected panic in CT logs evaluation"
-	MsgLogCycleInvariantViolation    = "Cycle invariant violation detected"
 	MsgLogWriteCTStateFailed         = "Failed to write ct_state.json"
 	MsgLogMonitoringCycleCompleted   = "Monitoring cycle completed"
 	MsgLogConfigError                = "Configuration error"
@@ -726,16 +740,16 @@ const (
 	JSONResponseStatusOK      = `{"status":"ok"}`
 	JSONResponseStatusInit    = `{"status":"initializing"}`
 	JSONResponseEmptyArray    = `[]`
-	DefaultMaxConcurrency     = 8
+	DefaultMaxConcurrency     = 32
 	DNSSECClockSkew           = int64(300)
 )
 
 // HTTP Routes & Query Params
 const (
-	RouteHealth    = "GET /health"
-	RouteAPIState  = "GET /api/state"
-	RouteAPICerts  = "GET /api/certs"
-	RouteAPICTLogs = "GET /api/ctlogs/{domain}"
+	RouteHealth      = "GET /health"
+	RouteAPIState    = "GET /api/state"
+	RouteAPICerts    = "GET /api/certs"
+	RouteAPICTLogs   = "GET /api/ctlogs/{domain}"
 	ParamDomain      = "domain"
 	ParamName        = "name"
 	ParamType        = "type"
@@ -743,15 +757,37 @@ const (
 	ParamDOValue     = "1"
 	ParamAfter       = "after"
 	ParamRegistrars  = "registrars"
-	RecordTypeDNSKEY = "DNSKEY"
-	FieldChatID      = "chat_id"
-	FieldText        = "text"
-	FieldParseMode   = "parse_mode"
-	FieldCacheAge    = "cache_age"
-	FieldError       = "error"
-	MIMEDNSJSON      = "application/dns-json"
-	DoHQueryTemplate = "?name=%s&type=DNSKEY&do=1"
-	PathRDAPDomain   = "/domain/"
+	RecordTypeDNSKEY        = "DNSKEY"
+	FieldChatID             = "chat_id"
+	FieldText               = "text"
+	FieldParseMode          = "parse_mode"
+	FieldCacheAge           = "cache_age"
+	FieldError              = "error"
+	FieldDomain             = "domain"
+	FieldPriority           = "priority"
+	FieldTag                = "tag"
+	FieldPanic              = "panic"
+	FieldOperation          = "operation"
+	FieldPath               = "path"
+	FieldCount              = "count"
+	FieldStatus             = "status"
+	FieldResponse           = "response"
+	FieldResolver           = "resolver"
+	FieldRecord             = "record"
+	FieldURL                = "url"
+	FieldReferralServer     = "referral_server"
+	FieldDurationMS         = "duration_ms"
+	FieldDomainsChecked     = "domains_checked"
+	FieldDNSRecordsChecked  = "dns_records_checked"
+	FieldPrev               = "prev"
+	FieldCurrent            = "current"
+	FieldCheck              = "check"
+	FieldAttempt            = "attempt"
+	FieldRetryIn            = "retry_in"
+	FieldConfigured         = "configured"
+	MIMEDNSJSON             = "application/dns-json"
+	DoHQueryTemplate        = "?name=%s&type=DNSKEY&do=1"
+	PathRDAPDomain          = "/domain/"
 )
 
 // Server Defaults & Subdirectories
@@ -765,6 +801,7 @@ const (
 	DirContainerApp            = "/app"
 	CAAIssuerDenyAll           = ";"
 	LayoutCompactDateTime      = "20060102150405"
+	TempFilePattern            = ".tmp-*"
 )
 
 // Default DNS Resolvers
@@ -772,7 +809,7 @@ var defaultResolvers = [...]string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 
 // DefaultResolvers returns a defensive copy of the default DNS resolver addresses.
 func DefaultResolvers() []string {
-	return slices.Clone(defaultResolvers[:]);
+	return slices.Clone(defaultResolvers[:])
 }
 
 // Common Prefixes
@@ -845,20 +882,6 @@ const (
 	MsgReasonUnauthorizedRecords = "unauthorized records: %s"
 )
 
-// Cycle Invariant Error Messages
-const (
-	MsgErrInvariantMissingRDAP     = "domain %s: missing RDAP/delegation state"
-	MsgErrInvariantPendingRDAP     = "domain %s: RDAP/delegation check remained in pending status"
-	MsgErrInvariantMissingEmail    = "domain %s: missing email security state"
-	MsgErrInvariantMissingDNSSEC   = "domain %s: missing DNSSEC state"
-	MsgErrInvariantMissingCAA      = "domain %s: missing CAA state"
-	MsgErrInvariantMissingNSHealth = "domain %s: missing nameserver health state"
-	MsgErrInvariantMissingCTLogs   = "domain %s: missing CT logs state"
-	MsgErrInvariantPendingCTLogs   = "domain %s: CT logs remained in pending status"
-	MsgErrInvariantMissingDNS      = "dns record %s: missing DNS state"
-	MsgErrInvariantPendingDNS      = "dns record %s: remained in pending status"
-)
-
 // Worker, Network & Internal Error Messages
 const (
 	MsgErrInternalDNSCheckPanic              = "internal check panic: %s"
@@ -926,8 +949,8 @@ const (
 	MsgErrInitAppNil                         = "cannot initialize dependencies: app is nil"
 	MsgErrInitConfigNil                      = "cannot initialize dependencies: config is nil"
 	MsgErrInitNotifierNil                    = "cannot initialize dependencies: notifier is nil"
-	MsgErrSSLInvalid              = "%w: invalid for %s on %s: %v"
-	MsgErrSSLCertValidationFailed = "%w: certificate validation failed for %s on %s: %v"
+	MsgErrSSLInvalid                         = "%w: invalid for %s on %s: %v"
+	MsgErrSSLCertValidationFailed            = "%w: certificate validation failed for %s on %s: %v"
 	MsgErrNilStringListReceiver              = "nil StringList receiver"
 	MsgPrefixLookupOn                        = "lookup %s on %s"
 	MsgPrefixLookupOnWithRcode               = "lookup %s on %s (%s)"
@@ -964,6 +987,8 @@ const (
 var RegistryDateLayouts = [...]string{
 	time.RFC3339,
 	time.RFC3339Nano,
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04:05.999999999",
 	"2006-01-02 15:04:05 -0700",
 	"2006-01-02 15:04:05 -07:00",
 	"2006-01-02 15:04:05 MST",

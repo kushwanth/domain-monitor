@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -59,7 +59,8 @@ func TestPricingManager_FetchAndAntiDDoS(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount.Add(1)
 		w.Header().Set(HeaderContentType, "application/json")
-		_ = json.NewEncoder(w).Encode(mockResponse)
+		out, _ := jsonv2.Marshal(mockResponse)
+		_, _ = w.Write(out)
 	}))
 	defer server.Close()
 
@@ -140,7 +141,8 @@ func TestComputePortfolioPricing(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderContentType, "application/json")
-		_ = json.NewEncoder(w).Encode(mockResponse)
+		out, _ := jsonv2.Marshal(mockResponse)
+		_, _ = w.Write(out)
 	}))
 	defer server.Close()
 
@@ -306,4 +308,3 @@ func BenchmarkComputePortfolioPricing(b *testing.B) {
 		computePortfolioPricing(ctx, app, loopState, pm)
 	}
 }
-

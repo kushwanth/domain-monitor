@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +15,7 @@ import (
 )
 
 func init() {
-	CTLogsPath = filepath.Join(os.TempDir(), "ct_logs_test")
+	SetCTLogsPath(filepath.Join(os.TempDir(), "ct_logs_test"))
 }
 
 func TestEmailMXVerification(t *testing.T) {
@@ -142,7 +142,7 @@ func TestSaveCertsToHistory(t *testing.T) {
 	tmpDir := t.TempDir()
 	domain := "test-example-" + filepath.Base(tmpDir) + ".com"
 	defer func() {
-		_ = os.Remove(filepath.Join(CTLogsPath, domain+".json"))
+		_ = os.Remove(filepath.Join(GetCTLogsPath(), domain+".json"))
 	}()
 
 	certs1 := []CTCert{
@@ -164,14 +164,14 @@ func TestSaveCertsToHistory(t *testing.T) {
 	}
 
 	// Verify deduplicated combined file
-	savedFile := filepath.Join(CTLogsPath, domain+".json")
+	savedFile := filepath.Join(GetCTLogsPath(), domain+".json")
 	b, err := os.ReadFile(savedFile)
 	if err != nil {
 		t.Fatalf("Failed to read saved certs file: %v", err)
 	}
 
 	var combined []CTCert
-	if err := json.Unmarshal(b, &combined); err != nil {
+	if err := jsonv2.Unmarshal(b, &combined); err != nil {
 		t.Fatalf("Failed to unmarshal certs: %v", err)
 	}
 
@@ -323,9 +323,9 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 		}, nil
 	})
 
-	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{}}
+	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}}
 	domain := "firstrun.example.com"
-	defer func() { _ = os.Remove(filepath.Join(CTLogsPath, domain+".json")) }()
+	defer func() { _ = os.Remove(filepath.Join(GetCTLogsPath(), domain+".json")) }()
 
 	target := DomainConfig{
 		Domain:         domain,
@@ -335,8 +335,8 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 	saved := evaluateCTLogs(context.Background(), app, target, nil)
 
 	// First run must not emit notifications for existing cert baseline
-	if len(app.Notifier.Buffer) != 0 {
-		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(app.Notifier.Buffer))
+	if len(app.Notifier.TestBuffer) != 0 {
+		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(app.Notifier.TestBuffer))
 	}
 
 	if saved == nil {
@@ -372,9 +372,9 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 		}, nil
 	})
 
-	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{}}
+	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}}
 	domain := "ratelimit.example.com"
-	defer func() { _ = os.Remove(filepath.Join(CTLogsPath, domain+".json")) }()
+	defer func() { _ = os.Remove(filepath.Join(GetCTLogsPath(), domain+".json")) }()
 
 	target := DomainConfig{
 		Domain:         domain,
@@ -456,7 +456,7 @@ func TestFetchCTPage_KeyRedaction(t *testing.T) {
 
 func TestSaveCertsToHistory_CapAtMaxHistory(t *testing.T) {
 	domain := "cap-test.example.com"
-	cleanFile := filepath.Join(CTLogsPath, domain+".json")
+	cleanFile := filepath.Join(GetCTLogsPath(), domain+".json")
 	defer func() { _ = os.Remove(cleanFile) }()
 
 	// Create 1,050 certs
@@ -481,7 +481,7 @@ func TestSaveCertsToHistory_CapAtMaxHistory(t *testing.T) {
 	}
 
 	var saved []CTCert
-	if err := json.Unmarshal(b, &saved); err != nil {
+	if err := jsonv2.Unmarshal(b, &saved); err != nil {
 		t.Fatalf("failed to unmarshal saved certs: %v", err)
 	}
 

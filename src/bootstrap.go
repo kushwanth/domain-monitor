@@ -56,7 +56,7 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 				}
 				if ip := net.ParseIP(host); ip != nil {
 					if IsRestrictedIP(ip) {
-						return fmt.Errorf("%w: %s", ErrRestrictedIP, host)
+						return WrapError(host, ErrRestrictedIP)
 					}
 				}
 				return nil

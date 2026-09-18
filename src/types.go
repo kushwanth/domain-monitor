@@ -51,7 +51,7 @@ type CheckStatus string
 type AlertPriority string
 
 // AlertTag defines the visual badge or emoji category for an alert
-type AlertTag = string
+type AlertTag string
 
 // 2. Configuration Models
 
@@ -161,13 +161,14 @@ func NewAppState(cfg AppConfig) *AppState {
 		config:          cfg,
 		activeResolvers: slices.Clone(cfg.Resolvers),
 		Notifier:        &NotificationManager{},
+		Pricing:         NewPricingManager(nil),
 		LoopDuration:    time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
 	}
 }
 
 // SafeDispatch safely dispatches an alert via Notifier if both app and Notifier are non-nil,
 // while always logging the alert message.
-func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority, tag, domain, name string) {
+func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
 	if a == nil || a.Notifier == nil {
 		switch priority {
 		case PriorityUrgent, PriorityHigh:
@@ -183,7 +184,7 @@ func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority
 }
 
 // SafeDispatchf formats the full alert message and safely dispatches it via Notifier.
-func (a *AppState) SafeDispatchf(priority AlertPriority, tag, domain, name, redacted, format string, args ...any) {
+func (a *AppState) SafeDispatchf(priority AlertPriority, tag AlertTag, domain, name, redacted, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	a.SafeDispatch(msg, redacted, priority, tag, domain, name)
 }
@@ -396,6 +397,19 @@ type DNSResult struct {
 	State *DNSState
 }
 
+// NewCheckState returns a fresh CheckState with all maps initialized.
+func NewCheckState() *CheckState {
+	return &CheckState{
+		RDAP:     make(map[string]*RDAPState),
+		DNS:      make(map[string]*DNSState),
+		Email:    make(map[string]*EmailState),
+		CAA:      make(map[string]*CAAResult),
+		DNSSEC:   make(map[string]*DNSSECResult),
+		CTLogs:   make(map[string]*CTLogState),
+		NSHealth: make(map[string]*NSHealthResult),
+	}
+}
+
 func (c *CheckState) ExportCTLogs() map[string]*CTLogState {
 	if c == nil {
 		return make(map[string]*CTLogState)
@@ -443,24 +457,25 @@ type Alert struct {
 	Message  string
 	Redacted string
 	Priority AlertPriority
-	Tag      string
+	Tag      AlertTag
 	Domain   string
 	Name     string
 }
 
 // NotificationProvider interface allows expansion to Ntfy, Telegram, Slack, etc.
 type NotificationProvider interface {
-	Send(ctx context.Context, alerts []Alert, wg *sync.WaitGroup)
+	Send(ctx context.Context, alert Alert)
 }
 
 // NotificationManager handles broadcasting to all configured notification providers.
 type NotificationManager struct {
-	Providers     []NotificationProvider
-	Buffer        []Alert
-	mu            sync.Mutex
-	wg            sync.WaitGroup
-	sentState     map[string]time.Time
-	seenThisCycle map[string]bool
+	Providers []NotificationProvider
+	mu        sync.Mutex
+	sentState map[string]time.Time
+
+	// TestMode captures dispatched alerts into TestBuffer for unit testing without leaking memory in production.
+	TestMode   bool
+	TestBuffer []Alert
 }
 
 type NtfyProvider struct {
@@ -537,9 +552,3 @@ type ConsoleHandler struct {
 	attrs []string
 }
 
-// ChunkData represents a chunk of alert notifications.
-type ChunkData struct {
-	text     string
-	priority AlertPriority
-	tags     []string
-}

@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -107,7 +107,8 @@ func TestBootstrapFetchAndResolution(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ianaData)
+		out, _ := jsonv2.Marshal(ianaData)
+		_, _ = w.Write(out)
 	}))
 	defer server.Close()
 
@@ -200,7 +201,8 @@ func TestBootstrapConcurrentColdStart(t *testing.T) {
 		countMu.Unlock()
 		time.Sleep(20 * time.Millisecond) // Artificial latency
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ianaData)
+		out, _ := jsonv2.Marshal(ianaData)
+		_, _ = w.Write(out)
 	}))
 	defer server.Close()
 

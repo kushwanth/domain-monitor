@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,7 +45,7 @@ func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acce
 		targets = []string{DefaultPort(dialHost, DefaultHTTPSPort)}
 	}
 
-	minDays := 999999
+	minDays := MaxSSLDaysSentinel
 	hasDays := false
 	var lastErr error
 	successCount := 0
@@ -108,17 +109,7 @@ func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acce
 		}
 
 		cert := state.PeerCertificates[0]
-		now := time.Now()
-		var days int
-		if now.After(cert.NotAfter) {
-			// Expired: ensure strictly negative integer
-			days = int(time.Until(cert.NotAfter).Hours()/24) - 1
-			if days >= 0 {
-				days = -1
-			}
-		} else {
-			days = int(time.Until(cert.NotAfter).Hours() / 24)
-		}
+		days := int(math.Floor(time.Until(cert.NotAfter).Hours() / 24))
 		if !hasDays || days < minDays {
 			minDays = days
 			hasDays = true
@@ -153,22 +144,25 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 	}
 
 	var lastErr error
+	dnsClient := new(dns.Client)
+	dnsClient.Timeout = DefaultDNSTimeout
+	dnsMsg := new(dns.Msg)
+	fqdn := dns.Fqdn(hostname)
+	dnsMsg.SetQuestion(fqdn, qtype)
+	dnsMsg.SetEdns0(MaxBodyDrainSize, true)
+	dnsMsg.RecursionDesired = recursionDesired
+
 	for attempt := range resolvers {
 		idx := (startIdx + attempt) % len(resolvers)
 		ip := DefaultPort(resolvers[idx], DefaultDNSPort)
 
-		dnsClient := new(dns.Client)
-		dnsClient.Timeout = DefaultDNSTimeout
-
-		dnsMsg := new(dns.Msg)
-		fqdn := dns.Fqdn(hostname)
-		dnsMsg.SetQuestion(fqdn, qtype)
-		dnsMsg.SetEdns0(MaxBodyDrainSize, true)
-		dnsMsg.RecursionDesired = recursionDesired
+		// Reset Net to UDP before each retry in case a previous attempt used TCP
+		dnsClient.Net = ""
+		dnsMsg.Id = 0
 
 		r, _, err := dnsClient.ExchangeContext(ctx, dnsMsg, ip)
 		if err == nil && r != nil && r.Truncated {
-			dnsClient.Net = "tcp"
+			dnsClient.Net = ProtocolTCP
 			r, _, err = dnsClient.ExchangeContext(ctx, dnsMsg, ip)
 		}
 
@@ -403,7 +397,9 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 				if !target.SuppressAlerts {
 					app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAUnauthorizedDeny, liveCA, tag), MsgAlertCAAUnauthorized, liveCA, tag, target.Domain)
 				}
-				res.UnknownCAs = append(res.UnknownCAs, liveCA)
+				if !slices.Contains(res.UnknownCAs, liveCA) {
+					res.UnknownCAs = append(res.UnknownCAs, liveCA)
+				}
 				res.Valid = false
 			}
 		}
@@ -440,71 +436,78 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 			if !target.SuppressAlerts {
 				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAUnauthorized, liveCA, tag), MsgAlertCAAUnauthorized, liveCA, tag, target.Domain)
 			}
-			res.UnknownCAs = append(res.UnknownCAs, liveCA)
+			if !slices.Contains(res.UnknownCAs, liveCA) {
+				res.UnknownCAs = append(res.UnknownCAs, liveCA)
+			}
 			res.Valid = false
 		}
 	}
 }
 
-func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []string) *CAAResult {
-	res := &CAAResult{}
-	currentDomain := NormalizeDomain(domain)
-	if currentDomain == "" {
-		res.Error = MsgErrInvalidEmptyDomainCAA
+func fetchCAANode(ctx context.Context, app *AppState, domain string, resolvers []string, visitedAliases map[string]bool) *CAAResult {
+	entries, err := queryCAARecords(ctx, app, domain, resolvers)
+	if err != nil && !errors.Is(err, ErrNXDOMAIN) {
+		return &CAAResult{Error: fmt.Sprintf(MsgErrFailedToQueryCAAPattern, domain, err.Error())}
+	}
+
+	if len(entries) > 0 {
+		res := &CAAResult{}
+		for _, entry := range entries {
+			switch entry.Tag {
+			case CAATagIssue:
+				res.Issue = append(res.Issue, entry.Value)
+			case CAATagIssueWild:
+				res.IssueWild = append(res.IssueWild, entry.Value)
+			case CAATagIssueMail:
+				res.IssueMail = append(res.IssueMail, entry.Value)
+			}
+		}
 		return res
 	}
 
-	visitedAliases := make(map[string]bool)
+	// Check for CNAME alias traversal per RFC 8659 Section 3
+	if !visitedAliases[domain] && len(visitedAliases) < MaxCNAMEAliasTraversals {
+		visitedAliases[domain] = true
+		cnames, cErr := queryDNS(ctx, app, domain, dns.TypeCNAME, resolvers)
+		if cErr == nil && len(cnames) > 0 {
+			target := NormalizeDomain(cnames[0])
+			if target != "" && !visitedAliases[target] {
+				// Follow the alias and climb its tree. If the alias tree yields no records,
+				// it returns nil, allowing the original domain's tree climbing to resume.
+				return fetchCAATree(ctx, app, target, resolvers, visitedAliases)
+			}
+		}
+	}
+	return nil
+}
 
+func fetchCAATree(ctx context.Context, app *AppState, domain string, resolvers []string, visitedAliases map[string]bool) *CAAResult {
+	currentDomain := domain
 	for {
-		entries, err := queryCAARecords(ctx, app, currentDomain, resolvers)
-		if err != nil {
-			if errors.Is(err, ErrNXDOMAIN) {
-				entries = nil
-			} else {
-				res.Error = fmt.Sprintf(MsgErrFailedToQueryCAAPattern, currentDomain, err.Error())
-				return res
-			}
-		}
-
-		if len(entries) > 0 {
-			for _, entry := range entries {
-				switch entry.Tag {
-				case CAATagIssue:
-					res.Issue = append(res.Issue, entry.Value)
-				case CAATagIssueWild:
-					res.IssueWild = append(res.IssueWild, entry.Value)
-				case CAATagIssueMail:
-					res.IssueMail = append(res.IssueMail, entry.Value)
-				}
-			}
+		if res := fetchCAANode(ctx, app, currentDomain, resolvers, visitedAliases); res != nil {
 			return res
-		}
-
-		// Check for CNAME alias traversal per RFC 8659 Section 3
-		if !visitedAliases[currentDomain] && len(visitedAliases) < 5 {
-			visitedAliases[currentDomain] = true
-			cnames, cErr := queryDNS(ctx, app, currentDomain, dns.TypeCNAME, resolvers)
-			if cErr == nil && len(cnames) > 0 {
-				target := NormalizeDomain(cnames[0])
-				if target != "" && !visitedAliases[target] {
-					currentDomain = target
-					continue
-				}
-			}
 		}
 
 		// Tree climbing: strip leftmost label
 		_, parent, found := strings.Cut(currentDomain, ".")
-		if !found {
-			break // Reached top-level label
-		}
-		if parent == "" || !strings.Contains(parent, ".") {
+		if !found || parent == "" || !strings.Contains(parent, ".") {
 			break // Stop at TLD or single label
 		}
 		currentDomain = parent
 	}
+	return nil
+}
 
+func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []string) *CAAResult {
+	currentDomain := NormalizeDomain(domain)
+	if currentDomain == "" {
+		return &CAAResult{Error: MsgErrInvalidEmptyDomainCAA}
+	}
+
+	res := fetchCAATree(ctx, app, currentDomain, resolvers, make(map[string]bool))
+	if res == nil {
+		return &CAAResult{}
+	}
 	return res
 }
 
@@ -771,6 +774,19 @@ func evaluateDNS(ctx context.Context, app *AppState, target DNSTask) *DNSState {
 		recordErr = mismatchReason
 	}
 
+	if sslDays == SSLDaysError || (sslDays != SSLDaysNotApplicable && sslDays < 0) {
+		status = StatusFailed
+		if recordErr == "" {
+			recordErr = "SSL validation failed or certificate expired"
+		} else {
+			recordErr += " | SSL validation failed or certificate expired"
+		}
+	} else if sslDays != SSLDaysNotApplicable && sslDays <= DefaultSSLExpiryWarningDays {
+		if status == StatusOK {
+			status = StatusWarning
+		}
+	}
+
 	return &DNSState{
 		Hostname: target.Hostname,
 		Name:     target.Name,
@@ -1010,7 +1026,7 @@ func validateCertificate(ctx context.Context, app *AppState, target DNSTask, fou
 		var ipErr error
 		sslIPs, ipErr = queryIPRecords(ctx, app, target.Hostname, resolversToUse)
 		if ipErr != nil {
-			LogWarn(MsgLogSSLResolveIPsFailed, "hostname", target.Hostname, "error", ipErr)
+			LogWarn(MsgLogSSLResolveIPsFailed, FieldDomain, target.Hostname, FieldError, ipErr)
 		}
 	} else {
 		sslIPs = foundRecords
@@ -1158,7 +1174,7 @@ func isProviderMXSafe(liveMXs []string, provider string) (isSafe bool, knownProv
 	}
 
 	for _, mx := range liveMXs {
-		mxLower := strings.ToLower(strings.TrimSuffix(mx, "."))
+		mxLower := NormalizeDomain(mx)
 		matched := false
 		for _, sfx := range suffixes {
 			if mxLower == sfx || strings.HasSuffix(mxLower, "."+sfx) {
@@ -1308,10 +1324,102 @@ func validateDKIM(ctx context.Context, app *AppState, target DomainConfig) ([]st
 	return validDkims, derivedStatus, lookupErr
 }
 
-// evaluateNSHealth validates primary authoritative nameserver health (expected_ns[0]) directly (RD=0)
-// for reachability, authoritative answer (AA flag), and SOA serial. If secondary_ns is configured, it also validates
-// secondary reachability, AA flag, SOA serial synchronization, and dumb secondary DNSSEC consistency
-// (strictly enforcing that secondary nameservers either do not use DNSSEC or replicate the primary's exact DNSKEYs).
+func checkSingleNameserver(ctx context.Context, app *AppState, nsName string, isPrimary bool, target DomainConfig) (NSHealthServerResult, uint32, bool, []string, error) {
+	srv := NSHealthServerResult{
+		Nameserver: nsName,
+		IsPrimary:  isPrimary,
+	}
+
+	host, port, err := net.SplitHostPort(DefaultPort(nsName, DefaultDNSPort))
+	if err != nil {
+		err = WrapError(fmt.Sprintf(MsgErrInvalidNSAddress, nsName), err)
+		srv.Error = err.Error()
+		return srv, 0, false, nil, err
+	}
+	
+	var ip string
+	if net.ParseIP(host) != nil {
+		ip = net.JoinHostPort(host, port)
+	} else {
+		ips, ipErr := queryIPRecords(ctx, app, host, app.Resolvers())
+		if ipErr != nil {
+			ipErr = WrapError(MsgErrFailedToResolveIP, ipErr)
+			srv.Error = ipErr.Error()
+			return srv, 0, false, nil, ipErr
+		}
+		if len(ips) == 0 {
+			ipErr = fmt.Errorf(MsgErrNoIPRecordsForHost, host)
+			srv.Error = ipErr.Error()
+			return srv, 0, false, nil, ipErr
+		}
+		ip = net.JoinHostPort(ips[0], port)
+	}
+
+	soaMsg, soaErr := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeSOA, []string{ip}, false)
+	if soaErr != nil || soaMsg == nil {
+		if soaErr == nil {
+			soaErr = fmt.Errorf("nil SOA response")
+		}
+		err = fmt.Errorf(MsgErrSOALookupFailed, soaErr.Error())
+		srv.Error = err.Error()
+		return srv, 0, false, nil, err
+	}
+
+	srv.Authoritative = soaMsg.Authoritative
+	if !srv.Authoritative {
+		if isPrimary {
+			err = fmt.Errorf(MsgErrPrimaryNSNotAuthoritative)
+		} else {
+			err = fmt.Errorf(MsgErrSecondaryNSNotAuthoritative)
+		}
+		srv.Error = err.Error()
+	}
+
+	var serial uint32
+	var foundSOA bool
+	for _, ans := range soaMsg.Answer {
+		if soa, ok := ans.(*dns.SOA); ok {
+			serial = soa.Serial
+			foundSOA = true
+			break
+		}
+	}
+	if !foundSOA {
+		for _, nsRec := range soaMsg.Ns {
+			if soa, ok := nsRec.(*dns.SOA); ok {
+				serial = soa.Serial
+				foundSOA = true
+				break
+			}
+		}
+	}
+	if !foundSOA {
+		soaMissingErr := fmt.Errorf(MsgErrNoSOARecordReturned)
+		if srv.Error == "" {
+			srv.Error = soaMissingErr.Error()
+		}
+		if err == nil {
+			err = soaMissingErr
+		}
+	}
+	srv.SOASerial = serial
+
+	var dnskeys []string
+	if dnskeyMsg, _ := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeDNSKEY, []string{ip}, false); dnskeyMsg != nil {
+		for _, rr := range dnskeyMsg.Answer {
+			if dnskey, ok := rr.(*dns.DNSKEY); ok {
+				fps := strconv.Itoa(int(dnskey.Flags)) + "-" + strconv.Itoa(int(dnskey.Protocol)) + "-" + strconv.Itoa(int(dnskey.Algorithm)) + "-" + dnskey.PublicKey
+				dnskeys = append(dnskeys, fps)
+			}
+		}
+		if len(dnskeys) > 0 {
+			slices.Sort(dnskeys)
+			srv.HasDNSKEY = true
+		}
+	}
+	return srv, serial, foundSOA, dnskeys, err
+}
+
 func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *NSHealthResult {
 	if !target.VerifyNSHealth || len(target.ExpectedNS) == 0 {
 		return nil
@@ -1324,183 +1432,45 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 		Servers: make([]NSHealthServerResult, 0, 1+len(target.SecondaryNS)),
 	}
 
-	resolveTargetIP := func(nsName string) (string, error) {
-		host, port, err := net.SplitHostPort(DefaultPort(nsName, DefaultDNSPort))
-		if err != nil {
-			return "", WrapError(fmt.Sprintf(MsgErrInvalidNSAddress, nsName), err)
-		}
-		if net.ParseIP(host) != nil {
-			return net.JoinHostPort(host, port), nil
-		}
-		ips, err := queryIPRecords(ctx, app, host, app.Resolvers())
-		if err != nil {
-			return "", WrapError(MsgErrFailedToResolveIP, err)
-		}
-		if len(ips) == 0 {
-			return "", fmt.Errorf(MsgErrNoIPRecordsForHost, host)
-		}
-		return net.JoinHostPort(ips[0], port), nil
-	}
-
-	// 1. Query Primary Nameserver
-	primaryIP, pErr := resolveTargetIP(primaryNS)
-	primarySrv := NSHealthServerResult{
-		Nameserver: primaryNS,
-		IsPrimary:  true,
-	}
-
+	primarySrv, primarySerial, primaryFoundSOA, primaryDNSKEYs, pErr := checkSingleNameserver(ctx, app, primaryNS, true, target)
+	
 	if pErr != nil {
-		primarySrv.Error = pErr.Error()
-		res.Valid = false
-		res.Servers = append(res.Servers, primarySrv)
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSUnreachablePrimary, MsgAlertNSUnreachable, primaryNS, target.Domain, pErr)
-		}
-		return res
-	}
-
-	primarySOAMsg, pSOAErr := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeSOA, []string{primaryIP}, false)
-	if pSOAErr != nil || primarySOAMsg == nil {
-		primarySrv.Error = fmt.Sprintf(MsgErrSOALookupFailed, pSOAErr.Error())
-		res.Valid = false
-		res.Servers = append(res.Servers, primarySrv)
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSUnreachablePrimary, MsgAlertNSUnreachable, primaryNS, target.Domain, pSOAErr)
-		}
-		return res
-	}
-
-	primarySrv.Authoritative = primarySOAMsg.Authoritative
-	if !primarySrv.Authoritative {
-		primarySrv.Error = MsgErrPrimaryNSNotAuthoritative
 		res.Valid = false
 		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSNonAuthoritative, MsgAlertNSNonAuthoritative, primaryNS, target.Domain)
-		}
-	}
-
-	var primarySerial uint32
-	var primaryFoundSOA bool
-	for _, ans := range primarySOAMsg.Answer {
-		if soa, ok := ans.(*dns.SOA); ok {
-			primarySerial = soa.Serial
-			primaryFoundSOA = true
-			break
-		}
-	}
-	if !primaryFoundSOA {
-		for _, nsRec := range primarySOAMsg.Ns {
-			if soa, ok := nsRec.(*dns.SOA); ok {
-				primarySerial = soa.Serial
-				primaryFoundSOA = true
-				break
+			errStr := pErr.Error()
+			if strings.Contains(errStr, "resolve IP") || strings.Contains(errStr, "invalid nameserver") || strings.Contains(errStr, "SOA lookup failed") || strings.Contains(errStr, "no IP records") {
+				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSUnreachablePrimary, MsgAlertNSUnreachable, primaryNS, target.Domain, pErr)
+			} else if !primarySrv.Authoritative {
+				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSNonAuthoritative, MsgAlertNSNonAuthoritative, primaryNS, target.Domain)
+			} else if !primaryFoundSOA {
+				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSMissingSOA, MsgAlertNSMissingSOA, primaryNS, target.Domain)
 			}
-		}
-	}
-	if !primaryFoundSOA {
-		primarySrv.Error = MsgErrNoSOARecordReturned
-		res.Valid = false
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSMissingSOA, MsgAlertNSMissingSOA, primaryNS, target.Domain)
-		}
-	}
-	primarySrv.SOASerial = primarySerial
-
-	extractDNSKEYFingerprints := func(msg *dns.Msg) []string {
-		if msg == nil {
-			return nil
-		}
-		var fps []string
-		for _, rr := range msg.Answer {
-			if dnskey, ok := rr.(*dns.DNSKEY); ok {
-				fps = append(fps, strconv.Itoa(int(dnskey.Flags))+"-"+strconv.Itoa(int(dnskey.Protocol))+"-"+strconv.Itoa(int(dnskey.Algorithm))+"-"+dnskey.PublicKey)
-			}
-		}
-		slices.Sort(fps)
-		return fps
-	}
-
-	var primaryDNSKEYs []string
-	if dnskeyMsg, _ := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeDNSKEY, []string{primaryIP}, false); dnskeyMsg != nil {
-		primaryDNSKEYs = extractDNSKEYFingerprints(dnskeyMsg)
-		if len(primaryDNSKEYs) > 0 {
-			primarySrv.HasDNSKEY = true
 		}
 	}
 	primarySrv.DNSKEYMatch = true
-
 	res.Servers = append(res.Servers, primarySrv)
 
-	// Validate each configured secondary nameserver
 	for _, secNS := range target.SecondaryNS {
 		secNS = strings.TrimSpace(secNS)
 		if secNS == "" {
 			continue
 		}
-		secSrv := NSHealthServerResult{
-			Nameserver: secNS,
-			IsPrimary:  false,
-		}
 
-		secIP, sErr := resolveTargetIP(secNS)
+		secSrv, secSerial, secFoundSOA, secDNSKEYs, sErr := checkSingleNameserver(ctx, app, secNS, false, target)
 		if sErr != nil {
-			secSrv.Error = sErr.Error()
-			res.Valid = false
-			res.Servers = append(res.Servers, secSrv)
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSUnreachableSecondary, MsgAlertNSUnreachable, secNS, target.Domain, sErr)
-			}
-			continue
-		}
-
-		secSOAMsg, secSOAErr := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeSOA, []string{secIP}, false)
-		if secSOAErr != nil || secSOAMsg == nil {
-			secSrv.Error = fmt.Sprintf(MsgErrSOALookupFailed, secSOAErr.Error())
-			res.Valid = false
-			res.Servers = append(res.Servers, secSrv)
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSUnreachableSecondary, MsgAlertNSUnreachable, secNS, target.Domain, secSOAErr)
-			}
-			continue
-		}
-
-		secSrv.Authoritative = secSOAMsg.Authoritative
-		if !secSrv.Authoritative {
-			secSrv.Error = MsgErrSecondaryNSNotAuthoritative
 			res.Valid = false
 			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSNonAuthoritative, MsgAlertNSNonAuthoritative, secNS, target.Domain)
-			}
-		}
-
-		var secSerial uint32
-		var secFoundSOA bool
-		for _, ans := range secSOAMsg.Answer {
-			if soa, ok := ans.(*dns.SOA); ok {
-				secSerial = soa.Serial
-				secFoundSOA = true
-				break
-			}
-		}
-		if !secFoundSOA {
-			for _, nsRec := range secSOAMsg.Ns {
-				if soa, ok := nsRec.(*dns.SOA); ok {
-					secSerial = soa.Serial
-					secFoundSOA = true
-					break
+				errStr := sErr.Error()
+				if strings.Contains(errStr, "resolve IP") || strings.Contains(errStr, "invalid nameserver") || strings.Contains(errStr, "SOA lookup failed") || strings.Contains(errStr, "no IP records") {
+					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSUnreachableSecondary, MsgAlertNSUnreachable, secNS, target.Domain, sErr)
+				} else if !secSrv.Authoritative {
+					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSNonAuthoritative, MsgAlertNSNonAuthoritative, secNS, target.Domain)
+				} else if !secFoundSOA {
+					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSMissingSOA, MsgAlertNSMissingSOA, secNS, target.Domain)
 				}
 			}
 		}
-		if !secFoundSOA {
-			secSrv.Error = MsgErrNoSOARecordReturned
-			res.Valid = false
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSMissingSOA, MsgAlertNSMissingSOA, secNS, target.Domain)
-			}
-		}
-		secSrv.SOASerial = secSerial
 
-		// Compare SOA serials between Primary and Secondary
 		if primaryFoundSOA && secFoundSOA {
 			if secSerial < primarySerial {
 				res.Valid = false
@@ -1512,17 +1482,6 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 				if !target.SuppressAlerts {
 					app.SafeDispatchf(PriorityWarning, TagWarning, target.Domain, target.Name, MsgRedactedNSSOADiffers, MsgAlertNSSOAMismatch, secNS, secSerial, primaryNS, primarySerial, target.Domain)
 				}
-			}
-		}
-
-		// Dumb secondary DNSKEY verification:
-		// A dumb secondary must either be unsigned (no DNSKEYs) or strictly replicate the primary's exact DNSKEYs.
-		// Independent signing / multi-signer setups where the secondary has its own keys are rejected.
-		var secDNSKEYs []string
-		if dnskeyMsg, _ := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeDNSKEY, []string{secIP}, false); dnskeyMsg != nil {
-			secDNSKEYs = extractDNSKEYFingerprints(dnskeyMsg)
-			if len(secDNSKEYs) > 0 {
-				secSrv.HasDNSKEY = true
 			}
 		}
 
@@ -1543,14 +1502,12 @@ func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *
 				secSrv.DNSKEYMatch = true
 			}
 		} else if len(secDNSKEYs) > 0 {
-			// Primary is unsigned, but secondary serves DNSKEYs!
 			res.Valid = false
 			secSrv.DNSKEYMatch = false
 			if !target.SuppressAlerts {
 				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSDNSKEYUnexpected, MsgAlertNSDNSKEYUnexpected, secNS, target.Domain)
 			}
 		} else {
-			// Both unsigned
 			secSrv.DNSKEYMatch = true
 		}
 

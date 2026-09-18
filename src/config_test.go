@@ -340,7 +340,7 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
-func TestInitializeDependencies_ResolverResilience(t *testing.T) {
+func TestInitializeApp_ResolverResilience(t *testing.T) {
 	mux := dns.NewServeMux()
 	mux.HandleFunc("example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
@@ -367,13 +367,12 @@ func TestInitializeDependencies_ResolverResilience(t *testing.T) {
 			Ntfy: &NtfyConfig{URL: "https://ntfy.sh/test_topic"},
 		},
 	}
-	app1 := &AppState{Notifier: &NotificationManager{}}
 	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 
-	err = InitializeDependencies(ctx, app1, rawCfg1)
+	app1, err := InitializeApp(ctx, *rawCfg1)
 	if err != nil {
-		t.Errorf("Expected InitializeDependencies to succeed with 1 healthy resolver, got error: %v", err)
+		t.Errorf("Expected InitializeApp to succeed with 1 healthy resolver, got error: %v", err)
 	}
 	if len(app1.Resolvers()) != 1 || app1.Resolvers()[0] != localAddr {
 		t.Errorf("Expected resolvers to contain only healthy %s, got %v", localAddr, app1.Resolvers())
@@ -389,11 +388,10 @@ func TestInitializeDependencies_ResolverResilience(t *testing.T) {
 			Ntfy: &NtfyConfig{URL: "https://ntfy.sh/test_topic"},
 		},
 	}
-	app2 := &AppState{Notifier: &NotificationManager{}}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel2()
 
-	err2 := InitializeDependencies(ctx2, app2, rawCfg2)
+	_, err2 := InitializeApp(ctx2, *rawCfg2)
 	if err2 == nil {
 		t.Errorf("Expected error when all resolvers fail health check, got nil")
 	}
@@ -897,49 +895,6 @@ func TestNilSafety_StringList(t *testing.T) {
 	if err := nilSL.UnmarshalJSON([]byte(`"test"`)); err == nil {
 		t.Errorf("expected error from nil StringList receiver")
 	}
-}
-
-// TestInitializeDependencies_NilGuards verifies that InitializeDependencies returns
-// descriptive errors instead of panicking when called with nil app or nil config.
-func TestInitializeDependencies_NilGuards(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	t.Run("nil app", func(t *testing.T) {
-		t.Parallel()
-		err := InitializeDependencies(ctx, nil, &AppConfig{})
-		if err == nil {
-			t.Fatal("expected error when app is nil, got nil")
-		}
-		if !strings.Contains(err.Error(), "app is nil") {
-			t.Errorf("expected 'app is nil' in error, got: %v", err)
-		}
-	})
-
-	t.Run("nil config", func(t *testing.T) {
-		t.Parallel()
-		app := &AppState{Notifier: &NotificationManager{}}
-		err := InitializeDependencies(ctx, app, nil)
-		if err == nil {
-			t.Fatal("expected error when config is nil, got nil")
-		}
-		if !strings.Contains(err.Error(), "config is nil") {
-			t.Errorf("expected 'config is nil' in error, got: %v", err)
-		}
-	})
-
-	t.Run("nil notifier", func(t *testing.T) {
-		t.Parallel()
-		app := &AppState{Notifier: nil}
-		err := InitializeDependencies(ctx, app, &AppConfig{})
-		if err == nil {
-			t.Fatal("expected error when notifier is nil, got nil")
-		}
-		if !strings.Contains(err.Error(), "notifier is nil") {
-			t.Errorf("expected 'notifier is nil' in error, got: %v", err)
-		}
-	})
 }
 
 // TestLoadConfig_LoopIntervalClamping verifies that loop_interval_days below 0.125

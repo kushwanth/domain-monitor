@@ -1068,6 +1068,9 @@
       const domainDataList = [];
       const sortedDomains = Array.from(allDomains).sort((a, b) => a.localeCompare(b));
 
+      const activeCards = [];
+      const letGoCards = [];
+
       for (const domain of sortedDomains) {
         const rdapState = rdapChecks[domain] || {};
         const emailState = emailChecks[domain] || {};
@@ -1148,6 +1151,12 @@
           }
         } else if (rdapState.status === 'pending') {
           statusClass = 'unknown';
+        }
+
+        if (rdapState.allow_expiry) {
+          statusClass = 'unknown';
+          statusText = 'Let Go';
+          badges = [{ label: 'allow_expiry', cls: 'warning' }];
         }
 
         let labelsHtml = '';
@@ -1388,8 +1397,21 @@
             ${nsHealthHtml}
           </div>
         `;
-        container.appendChild(card);
+        if (rdapState.allow_expiry) {
+          letGoCards.push(card);
+        } else {
+          activeCards.push(card);
+        }
       } // end of for loop
+
+      activeCards.forEach(card => container.appendChild(card));
+
+      if (letGoCards.length > 0) {
+        const letGoHeader = document.createElement('div');
+        letGoHeader.innerHTML = '<h3 style="margin: 32px 0 16px 0; padding-bottom: 8px; border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 1.1rem;">Domains Being Let Go</h3>';
+        container.appendChild(letGoHeader);
+        letGoCards.forEach(card => container.appendChild(card));
+      }
 
       if (currentView === 'domains') {
         renderStats(allDomains.size, healthyCount, issueCount, expiringCount, 0, 0);

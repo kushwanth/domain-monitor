@@ -136,7 +136,7 @@ func TestValidateCAATag(t *testing.T) {
 	t.Parallel()
 
 	app := &AppState{
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 
 	tests := []struct {
@@ -372,7 +372,7 @@ func TestValidateRecords_MatchTypes(t *testing.T) {
 	t.Parallel()
 
 	app := &AppState{
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 
 	// 1. Prefix match (e.g. SPF TXT records where other TXT records exist)
@@ -434,7 +434,7 @@ func TestSSLSentinels(t *testing.T) {
 		config: AppConfig{
 			Resolvers: testResolvers(),
 		},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 
 	// 1. Non-SSL record type should return SSLDaysNotApplicable (-9999)
@@ -526,7 +526,7 @@ func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 		config: AppConfig{
 			Resolvers: []string{"192.0.2.1:53"}, // Unroutable TEST-NET-1 IP
 		},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 	target := DomainConfig{
 		Domain:             "unreachable-domain.com",
@@ -537,7 +537,7 @@ func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 	defer cancel()
 	savedState := evaluateEmailSecurity(ctx, app, target)
 
-	for _, alert := range app.Notifier.Buffer {
+	for _, alert := range app.Notifier.TestBuffer {
 		if strings.Contains(alert.Message, "Missing SPF") || strings.Contains(alert.Message, "Missing DMARC") {
 			t.Errorf("Unexpected false alert on DNS lookup error: %s", alert.Message)
 		}
@@ -625,7 +625,7 @@ func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
 		config: AppConfig{
 			Resolvers: []string{l.LocalAddr().String()},
 		},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 	target := DomainConfig{
 		Domain:             "example.com",
@@ -752,7 +752,7 @@ func TestMultipleSameTypeDNSTasks_NoKeyCollision(t *testing.T) {
 
 	app := &AppState{
 		config:   AppConfig{Resolvers: []string{l.LocalAddr().String()}},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 	state := &CheckState{
 		DNS: make(map[string]*DNSState),
@@ -828,7 +828,7 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 
 	app := &AppState{
 		config:   AppConfig{Resolvers: []string{l.LocalAddr().String()}},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 	target := DomainConfig{
 		Domain:             "api.example.com",
@@ -846,8 +846,8 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 	if status != StatusOK {
 		t.Errorf("Expected StatusOK, got %s", status)
 	}
-	if len(app.Notifier.Buffer) > 0 {
-		t.Errorf("Unexpected false positive alert dispatched: %+v", app.Notifier.Buffer)
+	if len(app.Notifier.TestBuffer) > 0 {
+		t.Errorf("Unexpected false positive alert dispatched: %+v", app.Notifier.TestBuffer)
 	}
 }
 
@@ -924,7 +924,7 @@ func TestValidateRecords_EmptyExpectedWithLiveRecords(t *testing.T) {
 	t.Parallel()
 
 	app := &AppState{
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 
 	task := DNSTask{
@@ -940,17 +940,17 @@ func TestValidateRecords_EmptyExpectedWithLiveRecords(t *testing.T) {
 	if validateRecords(app, task, liveRecords) {
 		t.Errorf("Expected validateRecords to return false when live records exist for empty expected list, got true")
 	}
-	if len(app.Notifier.Buffer) == 0 {
+	if len(app.Notifier.TestBuffer) == 0 {
 		t.Errorf("Expected unauthorized alert in notifier buffer, got empty buffer")
 	}
 
 	// 2. When no live records exist, exact match must succeed
-	app.Notifier.Buffer = nil
+	app.Notifier.TestBuffer = nil
 	if !validateRecords(app, task, []string{}) {
 		t.Errorf("Expected validateRecords to return true when no live records exist for empty expected list, got false")
 	}
-	if len(app.Notifier.Buffer) > 0 {
-		t.Errorf("Expected zero alerts when no live records exist, got %+v", app.Notifier.Buffer)
+	if len(app.Notifier.TestBuffer) > 0 {
+		t.Errorf("Expected zero alerts when no live records exist, got %+v", app.Notifier.TestBuffer)
 	}
 }
 
@@ -1166,7 +1166,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Sync Domain",
@@ -1180,8 +1180,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || !res.Valid {
 			t.Fatalf("Expected valid NSHealth for identical replicated DNSKEY")
 		}
-		if len(app.Notifier.Buffer) != 0 {
-			t.Errorf("Expected 0 alerts on healthy NS, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 0 {
+			t.Errorf("Expected 0 alerts on healthy NS, got %d", len(app.Notifier.TestBuffer))
 		}
 	})
 
@@ -1192,7 +1192,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil)
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Unsigned Domain",
@@ -1215,7 +1215,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Distinct key!
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Mismatched DNSKEY Domain",
@@ -1229,8 +1229,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid when secondary uses its own DNSKEYs")
 		}
-		if len(app.Notifier.Buffer) != 1 {
-			t.Errorf("Expected 1 alert for DNSKEY mismatch, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 1 {
+			t.Errorf("Expected 1 alert for DNSKEY mismatch, got %d", len(app.Notifier.TestBuffer))
 		}
 	})
 
@@ -1241,7 +1241,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Signed secondary!
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Unexpected DNSKEY Domain",
@@ -1255,8 +1255,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid when secondary serves unexpected DNSKEY")
 		}
-		if len(app.Notifier.Buffer) != 1 {
-			t.Errorf("Expected 1 alert for unexpected DNSKEY, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 1 {
+			t.Errorf("Expected 1 alert for unexpected DNSKEY, got %d", len(app.Notifier.TestBuffer))
 		}
 	})
 
@@ -1267,7 +1267,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Secondary serves DNSKEY!
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Dumb Secondary Unsigned Violation",
@@ -1281,8 +1281,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid when secondary serves DNSKEY even if DNSSEC=false")
 		}
-		if len(app.Notifier.Buffer) != 1 {
-			t.Errorf("Expected 1 alert for unexpected DNSKEY, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 1 {
+			t.Errorf("Expected 1 alert for unexpected DNSKEY, got %d", len(app.Notifier.TestBuffer))
 		}
 	})
 
@@ -1293,7 +1293,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil) // Missing DNSKEY!
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Missing DNSKEY Domain",
@@ -1307,8 +1307,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid on missing DNSKEY")
 		}
-		if len(app.Notifier.Buffer) != 1 {
-			t.Errorf("Expected 1 alert for missing DNSKEY, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 1 {
+			t.Errorf("Expected 1 alert for missing DNSKEY, got %d", len(app.Notifier.TestBuffer))
 		}
 	})
 
@@ -1319,7 +1319,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil) // 2026090101 < 2026090102
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Lagging Domain",
@@ -1332,8 +1332,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || res.Valid {
 			t.Errorf("Expected NSHealth to be invalid on secondary SOA lag")
 		}
-		if len(app.Notifier.Buffer) != 1 {
-			t.Errorf("Expected 1 alert for secondary SOA lag, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 1 {
+			t.Errorf("Expected 1 alert for secondary SOA lag, got %d", len(app.Notifier.TestBuffer))
 		}
 	})
 
@@ -1342,7 +1342,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
 		defer pClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Primary Only Domain",
@@ -1368,8 +1368,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res.Servers[0].SOASerial != 2026090101 {
 			t.Errorf("Expected SOA serial 2026090101, got %d", res.Servers[0].SOASerial)
 		}
-		if len(app.Notifier.Buffer) != 0 {
-			t.Errorf("Expected 0 alerts for healthy primary-only NS, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 0 {
+			t.Errorf("Expected 0 alerts for healthy primary-only NS, got %d", len(app.Notifier.TestBuffer))
 		}
 	})
 
@@ -1378,7 +1378,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, false, nil) // AA=0!
 		defer pClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Non-Authoritative Primary Domain",
@@ -1391,8 +1391,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || res.Valid {
 			t.Fatalf("Expected NSHealth to be invalid when primary is not authoritative")
 		}
-		if len(app.Notifier.Buffer) != 1 {
-			t.Errorf("Expected 1 alert for non-authoritative primary, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 1 {
+			t.Errorf("Expected 1 alert for non-authoritative primary, got %d", len(app.Notifier.TestBuffer))
 		}
 	})
 
@@ -1415,7 +1415,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		defer srv.Shutdown()
 
 		pAddr := l.LocalAddr().String()
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Missing SOA Primary Domain",
@@ -1427,8 +1427,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || res.Valid {
 			t.Fatalf("Expected NSHealth to be invalid when primary returns no SOA")
 		}
-		if len(app.Notifier.Buffer) != 1 {
-			t.Errorf("Expected 1 alert for missing SOA, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 1 {
+			t.Errorf("Expected 1 alert for missing SOA, got %d", len(app.Notifier.TestBuffer))
 		}
 		if res.Servers[0].Error != "No SOA record returned in answer or authority sections" {
 			t.Errorf("Expected specific missing SOA error, got %q", res.Servers[0].Error)
@@ -1466,7 +1466,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		defer srv.Shutdown()
 
 		pAddr := l.LocalAddr().String()
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "SOA In Authority Domain",
@@ -1478,8 +1478,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if res == nil || !res.Valid {
 			t.Fatalf("Expected NSHealth to be valid when primary returns SOA in Ns section, got invalid")
 		}
-		if len(app.Notifier.Buffer) != 0 {
-			t.Errorf("Expected 0 alerts for valid SOA in Ns section, got %d", len(app.Notifier.Buffer))
+		if len(app.Notifier.TestBuffer) != 0 {
+			t.Errorf("Expected 0 alerts for valid SOA in Ns section, got %d", len(app.Notifier.TestBuffer))
 		}
 		if res.Servers[0].SOASerial != 2026090501 {
 			t.Errorf("Expected SOA serial 2026090501, got %d", res.Servers[0].SOASerial)
@@ -1512,7 +1512,7 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 
 	state := &CheckState{
@@ -1596,7 +1596,7 @@ func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
 		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 	state := &CheckState{
 		DNS: make(map[string]*DNSState),
@@ -1654,7 +1654,7 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 	state := &CheckState{
 		DNS: make(map[string]*DNSState),
@@ -1687,7 +1687,7 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 func TestDNS_ValidateRecords_MultiIPConsolidatedAlert(t *testing.T) {
 	app := &AppState{
 		config:   AppConfig{},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 
 	task := DNSTask{
@@ -1706,16 +1706,16 @@ func TestDNS_ValidateRecords_MultiIPConsolidatedAlert(t *testing.T) {
 	}
 
 	// Expected exactly 2 consolidated alerts: 1 missing, 1 unauthorized (NOT 4 individual alerts)
-	if len(app.Notifier.Buffer) != 2 {
-		t.Fatalf("expected 2 consolidated alerts, got %d: %+v", len(app.Notifier.Buffer), app.Notifier.Buffer)
+	if len(app.Notifier.TestBuffer) != 2 {
+		t.Fatalf("expected 2 consolidated alerts, got %d: %+v", len(app.Notifier.TestBuffer), app.Notifier.TestBuffer)
 	}
 
-	missingAlert := app.Notifier.Buffer[0]
+	missingAlert := app.Notifier.TestBuffer[0]
 	if !strings.Contains(missingAlert.Message, "192.0.2.1, 192.0.2.2") {
 		t.Errorf("expected missing alert to join missing IPs, got: %s", missingAlert.Message)
 	}
 
-	unauthAlert := app.Notifier.Buffer[1]
+	unauthAlert := app.Notifier.TestBuffer[1]
 	if !strings.Contains(unauthAlert.Message, "198.51.100.1, 198.51.100.2") {
 		t.Errorf("expected unauthorized alert to join unauth IPs, got: %s", unauthAlert.Message)
 	}
@@ -1822,7 +1822,7 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 		config: AppConfig{
 			Resolvers: []string{"192.0.2.1:53"}, // Unreachable
 		},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 	target := DomainConfig{
 		Domain:             "transient-error.example.com",
@@ -1839,7 +1839,7 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 		t.Errorf("Expected 0 MX records on error, got %v", mxs)
 	}
 	// Must NOT alert "No MX records found. Email delivery is broken." on transient network failure
-	for _, alert := range app.Notifier.Buffer {
+	for _, alert := range app.Notifier.TestBuffer {
 		if strings.Contains(alert.Message, "No MX records found") || strings.Contains(alert.Redacted, "No MX records found") {
 			t.Errorf("Unexpected false alarm on transient query error: %+v", alert)
 		}
@@ -1849,7 +1849,7 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
 	app := &AppState{
 		config:   AppConfig{},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 
 	task := DNSTask{
@@ -1887,7 +1887,7 @@ func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
 func TestDNS_ResolverIndexOverflow(t *testing.T) {
 	app := &AppState{
 		config:   AppConfig{},
-		Notifier: &NotificationManager{},
+		Notifier: &NotificationManager{TestMode: true},
 	}
 
 	resolvers := []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}

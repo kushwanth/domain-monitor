@@ -13,12 +13,28 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var (
-	CTLogsPath   = DefaultCTLogsSubdir
+	ctLogsMu     sync.RWMutex
+	ctLogsPath   = DefaultCTLogsSubdir
 	ctHTTPClient = ResolveHTTPClient(&http.Client{Timeout: DefaultHTTPTimeout})
 )
+
+// GetCTLogsPath safely returns the current CT logs directory path.
+func GetCTLogsPath() string {
+	ctLogsMu.RLock()
+	defer ctLogsMu.RUnlock()
+	return ctLogsPath
+}
+
+// SetCTLogsPath safely updates the current CT logs directory path.
+func SetCTLogsPath(p string) {
+	ctLogsMu.Lock()
+	defer ctLogsMu.Unlock()
+	ctLogsPath = p
+}
 
 func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, prevState *CTLogState) *CTLogState {
 	if !target.MonitorCTLogs {
@@ -37,7 +53,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 	apiURL := CTLogsAPIEndpoint + target.Domain
 	respPage1, err := fetchCTPage(ctx, app, apiURL)
 	if err != nil {
-		LogError(MsgLogCTLogsPollingFailed, "domain", target.Domain, "error", err)
+		LogError(MsgLogCTLogsPollingFailed, FieldDomain, target.Domain, FieldError, err)
 		return &CTLogState{
 			LatestID:         latestID,
 			BackfillCursor:   backfillCursor,
@@ -76,9 +92,9 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 
 	// Save new certs to history
 	if len(newCerts) > 0 {
-		LogInfo(MsgLogDiscoveredNewCerts, "domain", target.Domain, "count", len(newCerts))
+		LogInfo(MsgLogDiscoveredNewCerts, FieldDomain, target.Domain, FieldCount, len(newCerts))
 		if err := saveCertsToHistory(target.Domain, newCerts); err != nil {
-			LogError(MsgLogSaveCTLogsFailed, "domain", target.Domain, "error", err)
+			LogError(MsgLogSaveCTLogsFailed, FieldDomain, target.Domain, FieldError, err)
 			return &CTLogState{
 				LatestID:         latestID, // Keep previous checkpoint on write failure to allow retry
 				BackfillCursor:   backfillCursor,
@@ -110,7 +126,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 
 			respBackfill, err := fetchCTPage(ctx, app, backfillURL)
 			if err != nil {
-				LogWarn(MsgLogCTLogsBackfillFailed, "domain", target.Domain, "error", err)
+				LogWarn(MsgLogCTLogsBackfillFailed, FieldDomain, target.Domain, FieldError, err)
 				return &CTLogState{
 					LatestID:         checkpointID,
 					BackfillCursor:   cursorToUse, // Keep old cursor to retry later
@@ -122,7 +138,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 
 			if len(respBackfill.Rows) > 0 {
 				if err := saveCertsToHistory(target.Domain, respBackfill.Rows); err != nil {
-					LogError(MsgLogSaveBackfilledCTLogsFailed, "domain", target.Domain, "error", err)
+					LogError(MsgLogSaveBackfilledCTLogsFailed, FieldDomain, target.Domain, FieldError, err)
 					return &CTLogState{
 						LatestID:         checkpointID,
 						BackfillCursor:   cursorToUse, // don't advance cursor
@@ -194,19 +210,20 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 	if cleanDomain == "" || !ReValidDomain.MatchString(cleanDomain) {
 		return fmt.Errorf(MsgErrInvalidDomainCertsHistory, strconv.Quote(domain))
 	}
-	if err := os.MkdirAll(CTLogsPath, 0750); err != nil {
+	logsPath := GetCTLogsPath()
+	if err := os.MkdirAll(logsPath, DirPermDefault); err != nil {
 		return err
 	}
-	filePath := filepath.Join(CTLogsPath, cleanDomain+".json")
+	filePath := filepath.Join(logsPath, cleanDomain+".json")
 	cleanPath := filepath.Clean(filePath)
-	if !IsSafeSubpath(CTLogsPath, cleanPath) {
+	if !IsSafeSubpath(logsPath, cleanPath) {
 		return fmt.Errorf(MsgErrInvalidFilePathCertsHistory, strconv.Quote(domain))
 	}
 
 	var existing []CTCert
 	if b, err := os.ReadFile(cleanPath); err == nil {
 		if unmarshalErr := jsonv2.Unmarshal(b, &existing); unmarshalErr != nil {
-			LogWarn(MsgLogUnmarshalCTLogFailed, "domain", domain, "error", unmarshalErr)
+			LogWarn(MsgLogUnmarshalCTLogFailed, FieldDomain, domain, FieldError, unmarshalErr)
 		}
 	}
 
@@ -244,7 +261,7 @@ func saveCertsToHistory(domain string, certs []CTCert) error {
 		if err != nil {
 			return err
 		}
-		return AtomicWriteFile(cleanPath, b, 0644)
+		return AtomicWriteFile(cleanPath, b, FilePermPublic)
 	}
 	return nil
 }
