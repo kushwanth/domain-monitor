@@ -4,6 +4,7 @@ import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/miekg/dns"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var whoisTestMu sync.RWMutex
@@ -93,13 +98,13 @@ func TestRDAPValidation(t *testing.T) {
 				SecondaryNS: tt.secondaryNS,
 			}
 
-			parsed := &RDAPState{
+			parsed := RDAPState{
 				Status:       StatusOK,
 				Nameservers:  tt.liveNS,
 				DomainStatus: []string{"clientTransferProhibited"},
 			}
 
-			validateRDAPState(app, target, parsed)
+			parsed = validateRDAPState(app, target, parsed)
 
 			unauthAlert := false
 			missingAlert := false
@@ -395,7 +400,7 @@ func TestValidateRDAPStateAlertsAndStatus(t *testing.T) {
 	}
 
 	// Case 1: Active domain with matching NS and lock
-	parsed1 := &RDAPState{
+	parsed1 := RDAPState{
 		Status:       StatusOK,
 		Nameservers:  []string{"ns1.example.com", "ns2.example.com"},
 		DomainStatus: []string{"clientTransferProhibited"},
@@ -408,7 +413,7 @@ func TestValidateRDAPStateAlertsAndStatus(t *testing.T) {
 	}
 
 	// Case 2: Suspended domain (serverHold) -> Status should be StatusFailed
-	parsed2 := &RDAPState{
+	parsed2 := RDAPState{
 		Status:       StatusOK,
 		Nameservers:  []string{"ns1.example.com", "ns2.example.com"},
 		DomainStatus: []string{"serverHold"},
@@ -435,7 +440,7 @@ func TestValidateRDAPState_SuppressAlertsStoresSnapshot(t *testing.T) {
 	}
 
 	// Multiple alertable conditions: expired in 2 days, missing NS, serverHold
-	parsed := &RDAPState{
+	parsed := RDAPState{
 		Status:       StatusOK,
 		Nameservers:  []string{"unauthorized.ns.com"},
 		DomainStatus: []string{"serverHold"},
@@ -444,7 +449,7 @@ func TestValidateRDAPState_SuppressAlertsStoresSnapshot(t *testing.T) {
 
 	saved := validateRDAPState(app, target, parsed)
 
-	if saved == nil {
+	if saved.Status == "" {
 		t.Fatalf("Expected state snapshot to be saved even when alerts are suppressed")
 	}
 	if saved.Status != StatusFailed {
@@ -466,13 +471,13 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		Name:                "Test Domain",
 		ExpectedRegistrarID: "292",
 	}
-	parsed1 := &RDAPState{
+	parsed1 := RDAPState{
 		Status:          StatusOK,
 		Registrar:       "MarkMonitor Inc.",
 		RegistrarIANAID: "292",
 		DomainStatus:    []string{"clientTransferProhibited"},
 	}
-	validateRDAPState(app1, target1, parsed1)
+	parsed1 = validateRDAPState(app1, target1, parsed1)
 	if parsed1.Status != StatusOK {
 		t.Errorf("Expected StatusOK on matching IANA ID, got %s", parsed1.Status)
 	}
@@ -490,13 +495,13 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		Name:                "Test Domain",
 		ExpectedRegistrarID: "292",
 	}
-	parsed2 := &RDAPState{
+	parsed2 := RDAPState{
 		Status:          StatusOK,
 		Registrar:       "Other Registrar LLC",
 		RegistrarIANAID: "146",
 		DomainStatus:    []string{"clientTransferProhibited"},
 	}
-	validateRDAPState(app2, target2, parsed2)
+	parsed2 = validateRDAPState(app2, target2, parsed2)
 	if parsed2.Status != StatusFailed {
 		t.Errorf("Expected StatusFailed on IANA ID mismatch, got %s", parsed2.Status)
 	}
@@ -518,12 +523,12 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		Name:                  "Test Domain",
 		ExpectedRegistrarName: "markmonitor",
 	}
-	parsed3 := &RDAPState{
+	parsed3 := RDAPState{
 		Status:       StatusOK,
 		Registrar:    "MarkMonitor, Inc.",
 		DomainStatus: []string{"clientTransferProhibited"},
 	}
-	validateRDAPState(app3, target3, parsed3)
+	parsed3 = validateRDAPState(app3, target3, parsed3)
 	if parsed3.Status != StatusOK {
 		t.Errorf("Expected StatusOK on matching registrar name, got %s", parsed3.Status)
 	}
@@ -541,12 +546,12 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		Name:                  "Test Domain",
 		ExpectedRegistrarName: "markmonitor",
 	}
-	parsed4 := &RDAPState{
+	parsed4 := RDAPState{
 		Status:       StatusOK,
 		Registrar:    "GoDaddy.com, LLC",
 		DomainStatus: []string{"clientTransferProhibited"},
 	}
-	validateRDAPState(app4, target4, parsed4)
+	parsed4 = validateRDAPState(app4, target4, parsed4)
 	if parsed4.Status != StatusFailed {
 		t.Errorf("Expected StatusFailed on registrar name mismatch, got %s", parsed4.Status)
 	}
@@ -569,13 +574,13 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		ExpectedRegistrarID:   "292",
 		ExpectedRegistrarName: "godaddy", // Name would mismatch, but ID 292 matches!
 	}
-	parsed5 := &RDAPState{
+	parsed5 := RDAPState{
 		Status:          StatusOK,
 		Registrar:       "MarkMonitor Inc.",
 		RegistrarIANAID: "292",
 		DomainStatus:    []string{"clientTransferProhibited"},
 	}
-	validateRDAPState(app5, target5, parsed5)
+	parsed5 = validateRDAPState(app5, target5, parsed5)
 	if parsed5.Status != StatusOK {
 		t.Errorf("Expected StatusOK when prioritized IANA ID matches, got %s", parsed5.Status)
 	}
@@ -595,13 +600,13 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		ExpectedRegistrarID:   "999",         // ID mismatches
 		ExpectedRegistrarName: "markmonitor", // Name matches
 	}
-	parsed6 := &RDAPState{
+	parsed6 := RDAPState{
 		Status:          StatusOK,
 		Registrar:       "MarkMonitor Inc.",
 		RegistrarIANAID: "292",
 		DomainStatus:    []string{"clientTransferProhibited"},
 	}
-	validateRDAPState(app6, target6, parsed6)
+	parsed6 = validateRDAPState(app6, target6, parsed6)
 	if parsed6.Status != StatusFailed {
 		t.Errorf("Expected StatusFailed because prioritized IANA ID mismatched, got %s", parsed6.Status)
 	}
@@ -627,11 +632,11 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 		Name:                 "Test Domain",
 		DomainTransferLocked: false,
 	}
-	parsed1 := &RDAPState{
+	parsed1 := RDAPState{
 		Status:       StatusOK,
 		DomainStatus: []string{"ok"}, // Not locked
 	}
-	validateRDAPState(app1, target1, parsed1)
+	parsed1 = validateRDAPState(app1, target1, parsed1)
 	if len(app1.Notifier.TestBuffer) != 0 {
 		t.Errorf("Expected 0 alerts when DomainTransferLocked=false, got %d", len(app1.Notifier.TestBuffer))
 	}
@@ -644,11 +649,11 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 		Name:                 "Test Domain",
 		DomainTransferLocked: true,
 	}
-	parsed2 := &RDAPState{
+	parsed2 := RDAPState{
 		Status:       StatusOK,
 		DomainStatus: []string{"ok"}, // Not locked
 	}
-	validateRDAPState(app2, target2, parsed2)
+	parsed2 = validateRDAPState(app2, target2, parsed2)
 	if len(app2.Notifier.TestBuffer) != 1 {
 		t.Errorf("Expected 1 alert when DomainTransferLocked=true and unlocked, got %d", len(app2.Notifier.TestBuffer))
 	} else {
@@ -669,11 +674,11 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 		Name:                 "Test Domain",
 		DomainTransferLocked: true,
 	}
-	parsed3 := &RDAPState{
+	parsed3 := RDAPState{
 		Status:       StatusOK,
 		DomainStatus: []string{"clientTransferProhibited"},
 	}
-	validateRDAPState(app3, target3, parsed3)
+	parsed3 = validateRDAPState(app3, target3, parsed3)
 	if len(app3.Notifier.TestBuffer) != 0 {
 		t.Errorf("Expected 0 alerts when DomainTransferLocked=true and domain is locked, got %d", len(app3.Notifier.TestBuffer))
 	}
@@ -834,7 +839,7 @@ DNSSEC: unsigned
 		return sampleWHOIS, nil
 	})
 
-	state, err := fetchWHOIS(context.Background(), "example.com")
+	state, err := fetchWHOIS(context.Background(), nil, "example.com")
 	if err != nil {
 		t.Fatalf("fetchWHOIS failed: %v", err)
 	}
@@ -870,7 +875,7 @@ paid-till:     2026-09-15
 		return whoisRu, nil
 	})
 
-	state, err := fetchWHOIS(context.Background(), "example.ru")
+	state, err := fetchWHOIS(context.Background(), nil, "example.ru")
 	if err != nil {
 		t.Fatalf("fetchWHOIS failed on RU template: %v", err)
 	}
@@ -906,7 +911,7 @@ paid-till:     2026-09-15
 		return whoisUk, nil
 	})
 
-	stateUk, err := fetchWHOIS(context.Background(), "example.co.uk")
+	stateUk, err := fetchWHOIS(context.Background(), nil, "example.co.uk")
 	if err != nil {
 		t.Fatalf("fetchWHOIS failed on UK template: %v", err)
 	}
@@ -929,7 +934,7 @@ paid-till:     2026-09-15
 		return whoisJp, nil
 	})
 
-	stateJp, err := fetchWHOIS(context.Background(), "sony.co.jp")
+	stateJp, err := fetchWHOIS(context.Background(), nil, "sony.co.jp")
 	if err != nil {
 		t.Fatalf("fetchWHOIS failed on JPRS template: %v", err)
 	}
@@ -949,7 +954,7 @@ func TestFetchWHOIS_NotFound(t *testing.T) {
 		return "No match for domain NOTFOUND12345.COM.", nil
 	})
 
-	_, err := fetchWHOIS(context.Background(), "notfound12345.com")
+	_, err := fetchWHOIS(context.Background(), nil, "notfound12345.com")
 	if err == nil {
 		t.Fatalf("Expected error for non-existent domain, got nil")
 	}
@@ -961,7 +966,7 @@ func TestFetchWHOIS_NotFound(t *testing.T) {
 	setWHOISQueryFn(func(_ string) (string, error) {
 		return "unregistered-dutch-test-555.nl is free\n", nil
 	})
-	_, errNl := fetchWHOIS(context.Background(), "unregistered-dutch-test-555.nl")
+	_, errNl := fetchWHOIS(context.Background(), nil, "unregistered-dutch-test-555.nl")
 	if errNl == nil {
 		t.Fatalf("Expected error for SIDN is free domain, got nil")
 	}
@@ -1135,7 +1140,7 @@ func TestWHOISContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	_, err := queryWHOISWithContext(ctx, "example.com")
+	_, err := queryWHOISWithContext(ctx, nil, "example.com")
 	if err == nil {
 		t.Errorf("Expected error from cancelled context, got nil")
 	}
@@ -1199,7 +1204,7 @@ func TestFetchWHOIS_Extensive(t *testing.T) {
 			return content, nil
 		})
 
-		state, err := fetchWHOIS(context.Background(), "example"+filepath.Ext(name))
+		state, err := fetchWHOIS(context.Background(), nil, "example"+filepath.Ext(name))
 		if err != nil {
 			t.Logf("Failed to parse %s: %v", name, err)
 			continue
@@ -1477,9 +1482,9 @@ func TestNilSafety_LookupGuards(t *testing.T) {
 		t.Errorf("expected nil tier from nil domainInfo")
 	}
 
-	// 3. validateRDAPState with nil parsed
-	if res := validateRDAPState(nil, DomainConfig{}, nil); res != nil {
-		t.Errorf("expected nil result from nil parsed RDAPState")
+	// 3. validateRDAPState with empty parsed
+	if res := validateRDAPState(nil, DomainConfig{}, RDAPState{}); res.Status != "" {
+		t.Errorf("expected empty result from empty parsed RDAPState")
 	}
 }
 
@@ -1517,7 +1522,7 @@ func TestValidateRDAPState_ExpiredDomain(t *testing.T) {
 
 	// Expiration 10 days in the past
 	expired := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	parsed := &RDAPState{
+	parsed := RDAPState{
 		Status:     StatusOK,
 		Expiration: expired,
 	}
@@ -1575,7 +1580,7 @@ func TestValidateRDAPState_ExpiryWarning(t *testing.T) {
 
 			app := &AppState{Notifier: &NotificationManager{TestMode: true}}
 			expiry := time.Now().Add(time.Duration(tt.daysFromNow * float64(24*time.Hour))).UTC().Format(time.RFC3339)
-			parsed := &RDAPState{
+			parsed := RDAPState{
 				Status:     StatusOK,
 				Expiration: expiry,
 			}
@@ -1642,4 +1647,132 @@ func TestSynthesizeTierData_RegistryIANAIDPreserved(t *testing.T) {
 	if state.RegistrarIANAID != "292" {
 		t.Errorf("Expected RegistrarIANAID '292' from registry tier, got %q", state.RegistrarIANAID)
 	}
+}
+
+func TestEvaluateRDAP(t *testing.T) {
+	app := &AppState{
+		Notifier: &NotificationManager{TestMode: true},
+	}
+	target := DomainConfig{
+		Domain:     "example.com",
+		ExpectedNS: []string{"ns1.example.com"},
+	}
+
+	// Fast fail because RDAP needs a bootstrap server
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Create a mock server that returns 404 for RDAP to test the WHOIS fallback
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	// Temporarily override rdapBootstrap
+	oldBootstrap := rdapBootstrap
+	defer func() { rdapBootstrap = oldBootstrap }()
+
+	rdapBootstrap = &Bootstrap{
+		url:  server.URL,
+		http: server.Client(),
+		services: map[string][]string{
+			"com": {server.URL + "/"},
+		},
+		fetchedAt: time.Now(),
+	}
+
+	state := evaluateRDAP(ctx, server.Client(), app, target)
+	require.NotNil(t, state)
+}
+
+func TestFetchRDAP(t *testing.T) {
+	ctx := context.Background()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{ "rdapConformance": [ "rdap_level_0" ], "handle": "123" }`))
+	}))
+	defer server.Close()
+
+	oldBootstrap := rdapBootstrap
+	defer func() { rdapBootstrap = oldBootstrap }()
+
+	rdapBootstrap = &Bootstrap{
+		url:  server.URL,
+		http: server.Client(),
+		services: map[string][]string{
+			"com": {server.URL + "/"},
+		},
+		fetchedAt: time.Now(),
+	}
+
+	state, err := fetchRDAP(ctx, server.Client(), "example.com")
+	assert.NoError(t, err)
+	assert.NotNil(t, state)
+}
+
+func TestEvaluateNSDelegation(t *testing.T) {
+	app := &AppState{
+		Notifier: &NotificationManager{TestMode: true},
+	}
+	target := DomainConfig{
+		Domain:     "example.com",
+		ExpectedNS: []string{"ns1.example.com", "ns2.example.com"},
+	}
+
+	state := evaluateNSDelegation(context.Background(), app, target)
+	require.NotNil(t, state)
+}
+
+func TestEvaluateRDAP_MockedPaths(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	ctx := context.Background()
+
+	origRDAP := fetchRDAPFn
+	defer func() { fetchRDAPFn = origRDAP }()
+	origWHOIS := fetchWHOISFn
+	defer func() { fetchWHOISFn = origWHOIS }()
+
+	// Test RDAP fallback to WHOIS on rate limit
+	fetchRDAPFn = func(ctx context.Context, httpClient HTTPClient, domain string) (RDAPState, error) {
+		return RDAPState{}, ErrRDAPRateLimited
+	}
+
+	fetchWHOISFn = func(ctx context.Context, app *AppState, domain string) (RDAPState, error) {
+		return RDAPState{Status: StatusOK}, nil
+	}
+
+	res := evaluateRDAP(ctx, nil, app, DomainConfig{Domain: "example.com"})
+	assert.Equal(t, StatusOK, res.Status)
+
+	// Test WHOIS fallback Not Found
+	fetchWHOISFn = func(ctx context.Context, app *AppState, domain string) (RDAPState, error) {
+		return RDAPState{}, ErrDomainNotFound
+	}
+	res = evaluateRDAP(ctx, nil, app, DomainConfig{Domain: "example.com"})
+	assert.Equal(t, StatusFailed, res.Status)
+}
+
+func TestResolveRootZoneResolvers_MockedPaths(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	ctx := context.Background()
+
+	orig := queryDNSMsgFn
+	defer func() { queryDNSMsgFn = orig }()
+
+	queryDNSMsgFn = func(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) (*dns.Msg, error) {
+		m := new(dns.Msg)
+		if qtype == dns.TypeNS {
+			m.Answer = append(m.Answer, &dns.NS{Hdr: dns.RR_Header{Name: hostname, Rrtype: dns.TypeNS}, Ns: "ns1.tld."})
+			return m, nil
+		}
+		if qtype == dns.TypeA {
+			m.Answer = append(m.Answer, &dns.A{Hdr: dns.RR_Header{Name: "ns1.tld.", Rrtype: dns.TypeA}, A: net.ParseIP("1.2.3.4")})
+			return m, nil
+		}
+		return nil, errors.New("mock error")
+	}
+
+	res := resolveRootZoneResolvers(ctx, app, "com", []string{"1.1.1.1"})
+	assert.Contains(t, res, "1.2.3.4")
 }

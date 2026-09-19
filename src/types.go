@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 // StringList is a slice of strings that unmarshals from either a single JSON string or an array of strings.
@@ -123,6 +125,21 @@ type DNSTask struct {
 	SkipSSL          bool       `json:"skip_ssl,omitempty"`
 }
 
+// HTTPClient defines an interface for executing HTTP requests, allowing for mocking in tests.
+type HTTPClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+// DNSResolver defines an interface for executing DNS queries, allowing for mocking in tests.
+type DNSResolver interface {
+	ExchangeContext(ctx context.Context, m *dns.Msg, a string) (r *dns.Msg, rtt time.Duration, err error)
+}
+
+// WHOISClient defines an interface for executing WHOIS queries, allowing for mocking in tests.
+type WHOISClient interface {
+	Query(ctx context.Context, domain, server string) (string, error)
+}
+
 // AppState holds application configuration, notification manager, and atomic runtime state caches.
 type AppState struct {
 	config              AppConfig
@@ -132,6 +149,10 @@ type AppState struct {
 	LoopDuration        time.Duration
 	PrerenderedJSON     atomic.Value
 	GlobalResolverIndex atomic.Uint32
+
+	HTTPClient  HTTPClient
+	DNSClient   DNSResolver
+	WHOISClient WHOISClient
 }
 
 // Config returns a value copy of the application configuration loaded at startup.
@@ -288,7 +309,7 @@ type DNSState struct {
 	Expected []string    `json:"expected"`
 	Status   CheckStatus `json:"status"`
 	Found    []string    `json:"found,omitempty"`
-	SSLDays  int         `json:"ssl_days,omitempty"`
+	SSLDays  *int        `json:"ssl_days,omitempty"`
 	SkipSSL  bool        `json:"skip_ssl,omitempty"`
 	Error    string      `json:"error,omitempty"`
 }
@@ -369,57 +390,57 @@ type NSHealthResult struct {
 
 // CheckState coordinates the per-cycle aggregated state across all checks.
 type CheckState struct {
-	RDAP        map[string]*RDAPState      `json:"rdap_checks"`
-	DNS         map[string]*DNSState       `json:"dns_checks"`
-	Email       map[string]*EmailState     `json:"email_checks"`
-	CAA         map[string]*CAAResult      `json:"caa_checks,omitempty"`
-	DNSSEC      map[string]*DNSSECResult   `json:"dnssec_checks,omitempty"`
-	CTLogs      map[string]*CTLogState     `json:"ct_logs,omitempty"`
-	NSHealth    map[string]*NSHealthResult `json:"ns_health,omitempty"`
-	LastUpdated string                     `json:"last_updated"`
-	NextRefresh string                     `json:"next_refresh"`
+	RDAP        map[string]RDAPState      `json:"rdap_checks"`
+	DNS         map[string]DNSState       `json:"dns_checks"`
+	Email       map[string]EmailState     `json:"email_checks"`
+	CAA         map[string]CAAResult      `json:"caa_checks,omitempty"`
+	DNSSEC      map[string]DNSSECResult   `json:"dnssec_checks,omitempty"`
+	CTLogs      map[string]CTLogState     `json:"ct_logs,omitempty"`
+	NSHealth    map[string]NSHealthResult `json:"ns_health,omitempty"`
+	LastUpdated string                    `json:"last_updated"`
+	NextRefresh string                    `json:"next_refresh"`
 }
 
 // DomainResult holds the evaluation results for a single domain.
 type DomainResult struct {
 	Domain   string
-	RDAP     *RDAPState
-	Email    *EmailState
-	CAA      *CAAResult
-	DNSSEC   *DNSSECResult
-	CTLogs   *CTLogState
-	NSHealth *NSHealthResult
+	RDAP     RDAPState
+	Email    EmailState
+	CAA      CAAResult
+	DNSSEC   DNSSECResult
+	CTLogs   CTLogState
+	NSHealth NSHealthResult
 }
 
 // DNSResult holds the evaluation result for a single DNS task.
 type DNSResult struct {
 	Name  string
-	State *DNSState
+	State DNSState
 }
 
 // NewCheckState returns a fresh CheckState with all maps initialized.
 func NewCheckState() *CheckState {
 	return &CheckState{
-		RDAP:     make(map[string]*RDAPState),
-		DNS:      make(map[string]*DNSState),
-		Email:    make(map[string]*EmailState),
-		CAA:      make(map[string]*CAAResult),
-		DNSSEC:   make(map[string]*DNSSECResult),
-		CTLogs:   make(map[string]*CTLogState),
-		NSHealth: make(map[string]*NSHealthResult),
+		RDAP:     make(map[string]RDAPState),
+		DNS:      make(map[string]DNSState),
+		Email:    make(map[string]EmailState),
+		CAA:      make(map[string]CAAResult),
+		DNSSEC:   make(map[string]DNSSECResult),
+		CTLogs:   make(map[string]CTLogState),
+		NSHealth: make(map[string]NSHealthResult),
 	}
 }
 
-func (c *CheckState) ExportCTLogs() map[string]*CTLogState {
+func (c *CheckState) ExportCTLogs() map[string]CTLogState {
 	if c == nil {
-		return make(map[string]*CTLogState)
+		return make(map[string]CTLogState)
 	}
 	return CopyMap(c.CTLogs)
 }
 
 // ApplyDNSResult safely incorporates an individual DNS check result into the state.
 func (c *CheckState) ApplyDNSResult(res DNSResult) {
-	if c == nil || res.State == nil || res.Name == "" {
+	if c == nil || res.State.Status == "" || res.Name == "" {
 		return
 	}
 	InitMap(&c.DNS)[res.Name] = res.State
@@ -430,22 +451,30 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 	if c == nil || res.Domain == "" {
 		return
 	}
-	if res.RDAP != nil {
+	if res.RDAP.Status != "" {
 		InitMap(&c.RDAP)[res.Domain] = res.RDAP
 	}
-	if res.Email != nil {
+	if res.Email.Status != "" {
 		InitMap(&c.Email)[res.Domain] = res.Email
 	}
-	if res.CAA != nil {
+	// CAAResult has Valid (bool) instead of CheckStatus. Use a specific check if empty.
+	// We can check if Status or Error is set, but CAA uses Valid. Actually, CAAResult doesn't have Status.
+	// Let's check Issue != nil or Valid is true to determine if it ran.
+	// If CAA wasn't checked, its struct is zero-valued.
+	// Actually, we can check a simple string field that is always populated when it runs, like Source (wait, CAA has no source).
+	// Or we can add an `Enabled` bool or check if `res.CAA` is non-zero.
+	// Wait, CAA check will always populate `Valid` or `Error`. So if `Valid` is false and `Error` is empty, it might be uninitialized.
+	// Let's add an explicit `Ran` bool or just assume if it has Valid || Error != "" or issues.
+	if res.CAA.Valid || res.CAA.Error != "" || len(res.CAA.Issue) > 0 {
 		InitMap(&c.CAA)[res.Domain] = res.CAA
 	}
-	if res.DNSSEC != nil {
+	if res.DNSSEC.Source != "" || res.DNSSEC.Error != "" || res.DNSSEC.Valid {
 		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
 	}
-	if res.CTLogs != nil {
+	if res.CTLogs.Status != "" {
 		InitMap(&c.CTLogs)[res.Domain] = res.CTLogs
 	}
-	if res.NSHealth != nil {
+	if res.NSHealth.Primary != "" || res.NSHealth.Error != "" || res.NSHealth.Valid {
 		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
 	}
 }
@@ -462,30 +491,21 @@ type Alert struct {
 	Name     string
 }
 
-// NotificationProvider interface allows expansion to Ntfy, Telegram, Slack, etc.
-type NotificationProvider interface {
-	Send(ctx context.Context, alert Alert)
-}
-
-// NotificationManager handles broadcasting to all configured notification providers.
+// NotificationManager handles sending alerts sequentially using a background worker.
 type NotificationManager struct {
-	Providers []NotificationProvider
+	NtfyURL        string
+	NtfyAuth       string
+	TelegramToken  string
+	TelegramChatID string
+
 	mu        sync.Mutex
 	sentState map[string]time.Time
+
+	alertChan chan Alert
 
 	// TestMode captures dispatched alerts into TestBuffer for unit testing without leaking memory in production.
 	TestMode   bool
 	TestBuffer []Alert
-}
-
-type NtfyProvider struct {
-	URL  string
-	Auth string
-}
-
-type TelegramProvider struct {
-	Token  string
-	ChatID string
 }
 
 // 5. External API & Response Payloads
@@ -551,4 +571,3 @@ type ConsoleHandler struct {
 	mu    *sync.Mutex
 	attrs []string
 }
-

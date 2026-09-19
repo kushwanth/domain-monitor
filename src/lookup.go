@@ -38,7 +38,7 @@ func defaultWHOISQuery(domain string) (string, error) {
 // Note: the WHOIS library (likexian/whois) does not natively support context. When ctx is
 // cancelled, the spawned goroutine continues running until the library's 10s TCP timeout
 // expires. This is a bounded leak by design — the goroutine always terminates within 10s.
-func queryWHOISWithContext(ctx context.Context, domain string, host ...string) (string, error) {
+func queryWHOISWithContext(ctx context.Context, app *AppState, domain string, host ...string) (string, error) {
 	asciiDomain := NormalizeDomainToASCIIText(domain)
 
 	ch := make(chan queryResult, 1)
@@ -49,14 +49,26 @@ func queryWHOISWithContext(ctx context.Context, domain string, host ...string) (
 				ch <- queryResult{err: errors.New(MsgErrWHOISPanicked)}
 			}
 		}()
-		client := whois.NewClient().SetTimeout(DefaultWHOISTimeout)
-		if len(host) > 0 && strings.TrimSpace(host[0]) != "" {
-			raw, qErr := client.Whois(asciiDomain, host[0])
-			ch <- queryResult{raw: raw, err: qErr}
-		} else {
-			raw, qErr := whoisQueryFn(asciiDomain)
-			ch <- queryResult{raw: raw, err: qErr}
+
+		server := ""
+		if len(host) > 0 {
+			server = strings.TrimSpace(host[0])
 		}
+
+		var raw string
+		var qErr error
+
+		if app != nil && app.WHOISClient != nil {
+			raw, qErr = app.WHOISClient.Query(ctx, asciiDomain, server)
+		} else {
+			// fallback if WHOISClient not provided
+			if server != "" {
+				raw, qErr = whois.NewClient().SetTimeout(DefaultWHOISTimeout).Whois(asciiDomain, server)
+			} else {
+				raw, qErr = whoisQueryFn(asciiDomain)
+			}
+		}
+		ch <- queryResult{raw: raw, err: qErr}
 	}()
 
 	select {
@@ -619,14 +631,14 @@ func extractWHOISTier(raw string, source string, server string) *DomainTierData 
 
 // synthesizeTierData merges RegistryTier and RegistrarTier into a coherent RDAPState,
 // detecting hierarchy discrepancies like Auto-Renew Grace Period date mismatch and NS desync.
-func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*RDAPState, []string) {
+func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RDAPState, []string) {
 	if registry == nil && registrar == nil {
-		return &RDAPState{
+		return RDAPState{
 			Status: StatusFailed,
 			Error:  MsgErrNoTierData,
 		}, nil
 	}
-	state := &RDAPState{
+	state := RDAPState{
 		Status:        StatusOK,
 		RegistryTier:  registry,
 		RegistrarTier: registrar,
@@ -739,8 +751,8 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (*R
 	return state, discrepancies
 }
 
-func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, target DomainConfig) *RDAPState {
-	rdapState, err := fetchRDAP(ctx, httpClient, target.Domain)
+func evaluateRDAP(ctx context.Context, httpClient HTTPClient, app *AppState, target DomainConfig) RDAPState {
+	rdapState, err := fetchRDAPFn(ctx, httpClient, target.Domain)
 	if err != nil {
 		if errors.Is(err, ErrRDAPNotFound) {
 			LogInfo(MsgLogRDAPReturned404, FieldDomain, target.Domain)
@@ -750,11 +762,11 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 			LogInfof(MsgLogWHOISFallback, target.Domain)
 		}
 
-		whoisState, whoisErr := fetchWHOIS(ctx, target.Domain)
+		whoisState, whoisErr := fetchWHOISFn(ctx, app, target.Domain)
 		if whoisErr != nil {
 			if errors.Is(whoisErr, ErrDomainNotFound) || strings.Contains(whoisErr.Error(), "404") || strings.Contains(whoisErr.Error(), "not found") {
 				LogInfo(MsgLogWHOISUnregistered, FieldDomain, target.Domain)
-				return &RDAPState{
+				return RDAPState{
 					Status:       StatusFailed,
 					Error:        MsgErrDomainNotFound404,
 					Source:       SourceWHOIS404,
@@ -770,7 +782,7 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 				status = StatusWarning
 			}
 
-			return &RDAPState{
+			return RDAPState{
 				Status:       status,
 				Error:        fmt.Sprintf(MsgErrRDAPAndWHOIS, err.Error(), whoisErr.Error()),
 				ProtocolUsed: ProtocolWHOISFailed,
@@ -782,8 +794,8 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 	}
 
 	// Hybrid Tier Supplementation: If RDAP is thin (no registrar tier), attempt WHOIS referral supplement
-	if rdapState != nil && rdapState.RegistrarTier == nil && (rdapState.Expiration == "" || rdapState.Registrar == "") {
-		if whoisState, whoisErr := fetchWHOIS(ctx, target.Domain); whoisErr == nil {
+	if rdapState.Status != "" && rdapState.RegistrarTier == nil && (rdapState.Expiration == "" || rdapState.Registrar == "") {
+		if whoisState, whoisErr := fetchWHOIS(ctx, app, target.Domain); whoisErr == nil {
 			if whoisState.RegistrarTier != nil {
 				rdapState.RegistrarTier = whoisState.RegistrarTier
 			} else if whoisState.RegistryTier != nil && rdapState.RegistryTier == nil {
@@ -805,13 +817,16 @@ func evaluateRDAP(ctx context.Context, httpClient *http.Client, app *AppState, t
 	return validateRDAPState(app, target, rdapState)
 }
 
-func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RDAPState, error) {
+// fetchRDAPFn is a variable to allow mocking in tests
+var fetchRDAPFn = fetchRDAP
+
+func fetchRDAP(ctx context.Context, httpClient HTTPClient, domain string) (RDAPState, error) {
 	start := time.Now()
 	asciiDomain := NormalizeDomainToASCIIText(domain)
 
 	urls, err := rdapBootstrap.ServersFor(ctx, asciiDomain)
 	if err != nil {
-		return nil, WrapError(MsgErrNoRDAPServer, err)
+		return RDAPState{}, WrapError(MsgErrNoRDAPServer, err)
 	}
 
 	if httpClient == nil {
@@ -838,11 +853,11 @@ func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RD
 
 		if resp.StatusCode == http.StatusNotFound {
 			DrainAndClose(resp.Body, MaxBodyDrainSize)
-			return nil, ErrRDAPNotFound
+			return RDAPState{}, ErrRDAPNotFound
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			DrainAndClose(resp.Body, MaxBodyDrainSize)
-			return nil, ErrRDAPRateLimited
+			return RDAPState{}, ErrRDAPRateLimited
 		}
 		if resp.StatusCode != http.StatusOK {
 			DrainAndClose(resp.Body, MaxBodyDrainSize)
@@ -881,9 +896,9 @@ func fetchRDAP(ctx context.Context, httpClient *http.Client, domain string) (*RD
 	}
 
 	if lastErr != nil {
-		return nil, lastErr
+		return RDAPState{}, lastErr
 	}
-	return nil, errors.New(MsgErrRDAPLookupFailedAllCandidates)
+	return RDAPState{}, errors.New(MsgErrRDAPLookupFailedAllCandidates)
 }
 
 // isSafeRDAPURL validates that candidate registrar RDAP referral URLs are safe to query,
@@ -936,7 +951,7 @@ func isSafeWHOISServer(server string) bool {
 	return ReValidDomain.MatchString(host)
 }
 
-func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client *http.Client) *RDAPDomainResponse {
+func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client HTTPClient) *RDAPDomainResponse {
 	httpClient := client
 	if httpClient == nil {
 		httpClient = NewRDAPHTTPClient(DefaultReferralRDAPTimeout)
@@ -997,7 +1012,10 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 	return nil
 }
 
-func fetchWHOIS(ctx context.Context, domain string) (*RDAPState, error) {
+// fetchWHOISFn is a variable to allow mocking in tests
+var fetchWHOISFn = fetchWHOIS
+
+func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPState, error) {
 	start := time.Now()
 	if ctx == nil {
 		ctx = context.Background()
@@ -1009,11 +1027,11 @@ func fetchWHOIS(ctx context.Context, domain string) (*RDAPState, error) {
 
 	for attempts = 1; attempts <= 3; attempts++ {
 		qCtx, cancel := context.WithTimeout(ctx, DefaultWHOISQueryTimeout)
-		result, queryErr = queryWHOISWithContext(qCtx, domain)
+		result, queryErr = queryWHOISWithContext(qCtx, app, domain)
 		cancel()
 
 		if queryErr != nil && result == "" {
-			return nil, WrapError(MsgErrWHOISQueryFailed, queryErr)
+			return RDAPState{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
 		}
 
 		if !isWHOISRateLimited(result, queryErr) {
@@ -1027,11 +1045,11 @@ func fetchWHOIS(ctx context.Context, domain string) (*RDAPState, error) {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return nil, ctx.Err()
+				return RDAPState{}, ctx.Err()
 			case <-timer.C:
 			}
 		} else {
-			return nil, ErrWHOISRateLimited
+			return RDAPState{}, ErrWHOISRateLimited
 		}
 	}
 
@@ -1051,7 +1069,7 @@ func fetchWHOIS(ctx context.Context, domain string) (*RDAPState, error) {
 				refCtx, refCancel := context.WithTimeout(ctx, DefaultHTTPTimeout)
 				defer refCancel()
 
-				if refResult, err := queryWHOISWithContext(refCtx, domain, referralServer); err == nil && refResult != "" && !isDomainNotFoundInWHOIS(refResult) {
+				if refResult, err := queryWHOISWithContext(refCtx, app, domain, referralServer); err == nil && refResult != "" && !isDomainNotFoundInWHOIS(refResult) {
 					registrarTier = extractWHOISTier(refResult, SourceRegistrarWHOIS, referralServer)
 				}
 			}
@@ -1064,21 +1082,21 @@ func fetchWHOIS(ctx context.Context, domain string) (*RDAPState, error) {
 
 	// Check for domain not registered
 	if isDomainNotFoundInWHOIS(result) && state.Expiration == "" && len(state.Nameservers) == 0 {
-		return nil, ErrDomainNotFound
+		return RDAPState{}, ErrDomainNotFound
 	}
 
 	if state.Expiration == "" && state.Registrar == "" && len(state.Nameservers) == 0 && len(state.DomainStatus) == 0 {
 		if queryErr != nil {
-			return nil, WrapError(MsgErrWHOISQueryFailed, queryErr)
+			return RDAPState{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
 		}
-		return nil, errors.New(MsgErrWHOISParsingFailed)
+		return RDAPState{}, errors.New(MsgErrWHOISParsingFailed)
 	}
 
 	return state, nil
 }
 
-func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *RDAPState {
-	if parsed == nil || target.Domain == "" {
+func validateRDAPState(app *AppState, target DomainConfig, parsed RDAPState) RDAPState {
+	if target.Domain == "" || parsed.Status == "" {
 		return parsed
 	}
 	parsed.AllowExpiry = target.AllowExpiry
@@ -1106,7 +1124,7 @@ func validateRDAPState(app *AppState, target DomainConfig, parsed *RDAPState) *R
 		}
 	}
 
-	validateDelegatedNameservers(app, target, parsed.Nameservers, parsed)
+	validateDelegatedNameservers(app, target, parsed.Nameservers, &parsed)
 
 	// Status & Suspension evaluation
 	parsed.DomainStatus = NormalizeDomainStatuses(parsed.DomainStatus)
@@ -1178,8 +1196,8 @@ func resolveRootZoneResolvers(ctx context.Context, app *AppState, rootZone strin
 	return rootIPs
 }
 
-func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfig) *RDAPState {
-	parsed := &RDAPState{
+func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfig) RDAPState {
+	parsed := RDAPState{
 		Status:          StatusOK,
 		IsDelegatedZone: true,
 		Source:          SourceDNSDelegation,
@@ -1196,7 +1214,7 @@ func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfi
 		}
 	}
 
-	r, err := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeNS, resolversToUse, rd)
+	r, err := queryDNSMsgWithRDFn(ctx, app, target.Domain, dns.TypeNS, resolversToUse, rd)
 	if err != nil {
 		parsed.Status = StatusFailed
 		parsed.Error = fmt.Sprintf(MsgErrFailedToQueryNSRecords, err.Error())
@@ -1225,7 +1243,7 @@ func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfi
 		parsed.Nameservers = append(parsed.Nameservers, NormalizeDomain(ns))
 	}
 
-	validateDelegatedNameservers(app, target, parsed.Nameservers, parsed)
+	validateDelegatedNameservers(app, target, parsed.Nameservers, &parsed)
 
 	return parsed
 }

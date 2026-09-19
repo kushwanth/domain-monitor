@@ -37,7 +37,7 @@ func (p *PricingManager) isFresh() bool {
 
 func (p *PricingManager) ensure(ctx context.Context) error {
 	if p == nil {
-		return errors.New(MsgErrPricingManagerNil)
+		return ErrPricingManagerNil
 	}
 	if p.isFresh() {
 		return nil
@@ -72,7 +72,7 @@ func normalizeTLD(tld string) string {
 
 func (p *PricingManager) fetch(ctx context.Context) error {
 	if p == nil {
-		return errors.New(MsgErrPricingManagerNil)
+		return ErrPricingManagerNil
 	}
 	client := ResolveHTTPClient(p.http)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
@@ -160,11 +160,12 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 			continue
 		}
 		state, exists := loopState.RDAP[domainCfg.Domain]
-		if !exists || state == nil {
+		if !exists || state.Status == "" {
 			continue
 		}
 		if domainCfg.RenewalPrice > 0 {
 			state.RenewalPrice = domainCfg.RenewalPrice
+			loopState.RDAP[domainCfg.Domain] = state
 		} else {
 			needsTLDPricing = true
 		}
@@ -188,12 +189,13 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 			continue
 		}
 		state, exists := loopState.RDAP[domainCfg.Domain]
-		if !exists || state == nil {
+		if !exists || state.Status == "" {
 			continue
 		}
 		tld := extractTLD(domainCfg.Domain)
 		if price, ok := pm.GetPrice(tld); ok && price > 0 {
 			state.RenewalPrice = price
+			loopState.RDAP[domainCfg.Domain] = state
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestDerefOrDefault(t *testing.T) {
@@ -117,8 +120,6 @@ func TestNormalizeDomainToASCIIText(t *testing.T) {
 		}
 	}
 }
-
-
 
 func TestDeduplicateNonEmptyStrings(t *testing.T) {
 	t.Parallel()
@@ -373,4 +374,40 @@ func TestAnyToString(t *testing.T) {
 	if got := AnyToString(12345); got != "12345" {
 		t.Errorf("AnyToString(int) = %q, expected %q", got, "12345")
 	}
+}
+
+func TestAtomicWriteFile_Coverage(t *testing.T) {
+	err := AtomicWriteFile("/invalid/path/that/does/not/exist", []byte("test"), 0644)
+	assert.Error(t, err)
+}
+
+func TestIsRestrictedIP(t *testing.T) {
+	assert.True(t, IsRestrictedIP(net.ParseIP("127.0.0.1")))
+	assert.True(t, IsRestrictedIP(net.ParseIP("10.0.0.1")))
+	assert.True(t, IsRestrictedIP(net.ParseIP("192.168.1.1")))
+	assert.False(t, IsRestrictedIP(net.ParseIP("93.184.216.34")))
+}
+
+func TestCustomLoggerMethods(t *testing.T) {
+	handler := NewConsoleHandler(os.Stdout)
+
+	h2 := handler.WithAttrs([]slog.Attr{slog.String("foo", "bar")})
+	assert.NotNil(t, h2)
+
+	h3 := handler.WithGroup("test_group")
+	assert.NotNil(t, h3)
+}
+
+func TestLogStateTransitions(t *testing.T) {
+	prev := make(map[string]CheckStatus)
+	current := map[string]RDAPState{
+		"example.com": {Status: StatusFailed},
+	}
+
+	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, current, func(s RDAPState) CheckStatus { return s.Status }, prev)
+
+	tmp := current["example.com"]
+	tmp.Status = StatusOK
+	current["example.com"] = tmp
+	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, current, func(s RDAPState) CheckStatus { return s.Status }, prev)
 }

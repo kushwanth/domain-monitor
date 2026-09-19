@@ -1,0 +1,22 @@
+linters:
+  enable:
+    - errcheck
+    - staticcheck
+    - gosec
+    - gocyclo
+    - govet
+    - gocritic
+    - ineffassign
+    - unused
+  disable-all: true
+
+linters-settings:
+  gocyclo:
+    min-complexity: 15
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+run:
+  timeout: 5m
+  tests: true

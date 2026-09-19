@@ -206,3 +206,22 @@ This project maintains strict testing standards, including table-driven unit tes
 *   [**likexian/whois**](https://github.com/likexian/whois) & [**likexian/whois-parser**](https://github.com/likexian/whois-parser): Raw port-43 WHOIS transport and schema parser.
 *   [**miekg/dns**](https://github.com/miekg/dns): DNS wire protocol and cryptographic DNSSEC verification library for Go.
 *   [**api.ctlogs.dev**](https://api.ctlogs.dev): Certificate Transparency search API.
+---
+
+## Development & Testing
+
+This project leverages a zero-overhead **Dependency Injection (DI)** architecture to achieve high test coverage without relying on flaky live network calls or running background test servers. 
+Network-bound functions (like DNS resolution, RDAP lookups) are injected as function pointers on the `AppState`, allowing deterministic offline mocking in tests.
+
+To run the test suite:
+```bash
+go test -v -race ./src/...
+```
+
+### CI/CD Pipeline
+The project uses a unified GitHub Actions pipeline (`.github/workflows/build-and-push.yml`) that strictly enforces:
+- `golangci-lint` for code quality.
+- Unit testing with the `-race` detector.
+- A minimum test coverage threshold (currently 83%).
+
+The pipeline will absolutely block the building and pushing of the Docker image to GHCR if any tests or linters fail.

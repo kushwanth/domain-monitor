@@ -332,14 +332,14 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 		MonitorCTLogs:  true,
 		SuppressAlerts: false,
 	}
-	saved := evaluateCTLogs(context.Background(), app, target, nil)
+	saved := evaluateCTLogs(context.Background(), app, target, CTLogState{})
 
 	// First run must not emit notifications for existing cert baseline
 	if len(app.Notifier.TestBuffer) != 0 {
 		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(app.Notifier.TestBuffer))
 	}
 
-	if saved == nil {
+	if saved.Status == "" {
 		t.Fatalf("Expected CTLogState to be saved")
 	}
 	if saved.LatestID != "cert-first-1" {
@@ -382,7 +382,7 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 		SuppressAlerts: false,
 	}
 	savedCursor := "cursor-prior-checkpoint"
-	existing := &CTLogState{
+	existing := CTLogState{
 		LatestID:         "cert-existing-1",
 		BackfillCursor:   savedCursor,
 		BackfillComplete: false,
@@ -391,7 +391,7 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 
 	res := evaluateCTLogs(context.Background(), app, target, existing)
 
-	if res == nil {
+	if res.Status == "" {
 		t.Fatalf("Expected CTLogState to be present")
 	}
 	if res.BackfillComplete {

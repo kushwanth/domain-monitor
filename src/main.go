@@ -142,14 +142,13 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 }
 
 // logStateTransitions logs changes in check status across cycles in deterministic sorted order.
-func logStateTransitions[T comparable](checkName, targetKey string, current map[string]T, getStatus func(T) CheckStatus, prev map[string]CheckStatus) {
-	var zero T
+func logStateTransitions[T any](checkName, targetKey string, current map[string]T, getStatus func(T) CheckStatus, prev map[string]CheckStatus) {
 	for _, k := range slices.Sorted(maps.Keys(current)) {
 		item := current[k]
-		if item == zero {
+		currStatus := getStatus(item)
+		if currStatus == "" {
 			continue
 		}
-		currStatus := getStatus(item)
 		if prevStatus, ok := prev[k]; ok && prevStatus != currStatus {
 			LogInfo(MsgLogStateTransition, FieldCheck, checkName, targetKey, k, FieldPrev, prevStatus, FieldCurrent, currStatus)
 		}
@@ -175,7 +174,7 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 					LogError(MsgLogPanicDNSWorker, FieldRecord, record.Name, FieldPanic, r)
 					dnsResults[index] = DNSResult{
 						Name: record.Name,
-						State: &DNSState{
+						State: DNSState{
 							Hostname: record.Hostname,
 							Name:     record.Name,
 							Type:     record.Type,
@@ -183,7 +182,6 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 							Status:   StatusFailed,
 							Error:    fmt.Sprintf(MsgErrInternalDNSCheckPanic, AnyToString(r)),
 							SkipSSL:  record.SkipSSL,
-							SSLDays:  SSLDaysNotApplicable,
 						},
 					}
 				}
@@ -247,13 +245,13 @@ func executeRateLimitedChecks(
 	app *AppState,
 	domains []DomainConfig,
 	rdapHTTPClient *http.Client,
-	ctLogPersist map[string]*CTLogState,
-) ([]*RDAPState, []*CTLogState) {
+	ctLogPersist map[string]CTLogState,
+) ([]RDAPState, []CTLogState) {
 	rdapLimiter := rate.NewLimiter(rate.Every(RDAPRateLimitInterval), 1)
 	ctLimiter := rate.NewLimiter(rate.Every(CTLogsRateLimitInterval), 1)
 
-	rdapResults := make([]*RDAPState, len(domains))
-	ctResults := make([]*CTLogState, len(domains))
+	rdapResults := make([]RDAPState, len(domains))
+	ctResults := make([]CTLogState, len(domains))
 
 	gRateLimitedChecks, _ := errgroup.WithContext(ctx)
 
@@ -266,8 +264,8 @@ func executeRateLimitedChecks(
 			}
 			if err := rdapLimiter.Wait(ctx); err != nil {
 				for j := i; j < len(domains); j++ {
-					if !domains[j].IsDelegatedZone && rdapResults[j] == nil {
-						rdapResults[j] = &RDAPState{
+					if !domains[j].IsDelegatedZone && rdapResults[j].Status == "" {
+						rdapResults[j] = RDAPState{
 							Status: StatusFailed,
 							Error:  MsgErrCheckTimeoutOrCanceled,
 						}
@@ -279,7 +277,7 @@ func executeRateLimitedChecks(
 				defer func() {
 					if r := recover(); r != nil {
 						LogError(MsgLogPanicRDAP, FieldDomain, domainConfig.Domain, FieldPanic, r)
-						rdapResults[i] = &RDAPState{
+						rdapResults[i] = RDAPState{
 							Status: StatusFailed,
 							Error:  fmt.Sprintf(MsgErrInternalRDAPCheckPanic, AnyToString(r)),
 						}
@@ -300,8 +298,8 @@ func executeRateLimitedChecks(
 			}
 			if err := ctLimiter.Wait(ctx); err != nil {
 				for j := i; j < len(domains); j++ {
-					if domains[j].MonitorCTLogs && ctResults[j] == nil {
-						ctResults[j] = &CTLogState{
+					if domains[j].MonitorCTLogs && ctResults[j].Status == "" {
+						ctResults[j] = CTLogState{
 							Status: StatusFailed,
 							Error:  MsgErrCheckTimeoutOrCanceled,
 						}
@@ -313,7 +311,7 @@ func executeRateLimitedChecks(
 				defer func() {
 					if r := recover(); r != nil {
 						LogError(MsgLogPanicCTLogs, FieldDomain, domainConfig.Domain, FieldPanic, r)
-						ctResults[i] = &CTLogState{
+						ctResults[i] = CTLogState{
 							Status: StatusFailed,
 							Error:  fmt.Sprintf(MsgErrInternalCTLogsPanic, AnyToString(r)),
 						}
@@ -335,7 +333,7 @@ func runMonitoringCycle(
 	app *AppState,
 	rdapHTTPClient *http.Client,
 	ctStatePath string,
-	ctLogPersist map[string]*CTLogState,
+	ctLogPersist map[string]CTLogState,
 	prevRDAPStatus map[string]CheckStatus,
 	prevDNSStatus map[string]CheckStatus,
 	prevEmailStatus map[string]CheckStatus,
@@ -367,7 +365,7 @@ func runMonitoringCycle(
 	loopState := NewCheckState()
 
 	if ctLogPersist == nil {
-		ctLogPersist = make(map[string]*CTLogState)
+		ctLogPersist = make(map[string]CTLogState)
 	}
 	if prevRDAPStatus == nil {
 		prevRDAPStatus = make(map[string]CheckStatus)
@@ -385,10 +383,10 @@ func runMonitoringCycle(
 	}
 
 	for k, v := range ctLogPersist {
-		if !activeDomains[k] || v == nil {
+		if !activeDomains[k] || v.Status == "" {
 			continue
 		}
-		loopState.CTLogs[k] = &CTLogState{
+		loopState.CTLogs[k] = CTLogState{
 			LatestID:         v.LatestID,
 			BackfillCursor:   v.BackfillCursor,
 			BackfillComplete: v.BackfillComplete,
@@ -396,7 +394,7 @@ func runMonitoringCycle(
 	}
 
 	for _, domainCfg := range domains {
-		loopState.RDAP[domainCfg.Domain] = &RDAPState{Status: StatusPending}
+		loopState.RDAP[domainCfg.Domain] = RDAPState{Status: StatusPending}
 	}
 
 	// 1. Dispatch DNS Records
@@ -409,10 +407,10 @@ func runMonitoringCycle(
 	rdapResults, ctResults := executeRateLimitedChecks(cycleCtx, app, domains, rdapHTTPClient, ctLogPersist)
 
 	for i := range domains {
-		if rdapResults[i] != nil {
+		if rdapResults[i].Status != "" {
 			domainResults[i].RDAP = rdapResults[i]
 		}
-		if ctResults[i] != nil {
+		if ctResults[i].Status != "" {
 			domainResults[i].CTLogs = ctResults[i]
 		}
 	}
@@ -442,9 +440,9 @@ func runMonitoringCycle(
 	computePortfolioPricing(cycleCtx, app, loopState, app.Pricing)
 
 	// 5. State transition logging
-	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, loopState.RDAP, func(s *RDAPState) CheckStatus { return s.Status }, prevRDAPStatus)
-	logStateTransitions(CheckTypeDNS, TargetKeyRecord, loopState.DNS, func(s *DNSState) CheckStatus { return s.Status }, prevDNSStatus)
-	logStateTransitions(CheckTypeEmail, TargetKeyDomain, loopState.Email, func(s *EmailState) CheckStatus { return s.Status }, prevEmailStatus)
+	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, loopState.RDAP, func(s RDAPState) CheckStatus { return s.Status }, prevRDAPStatus)
+	logStateTransitions(CheckTypeDNS, TargetKeyRecord, loopState.DNS, func(s DNSState) CheckStatus { return s.Status }, prevDNSStatus)
+	logStateTransitions(CheckTypeEmail, TargetKeyDomain, loopState.Email, func(s EmailState) CheckStatus { return s.Status }, prevEmailStatus)
 
 	// 7. Update timestamps and pre-render atomic JSON cache
 	loopState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
@@ -516,23 +514,22 @@ func main() {
 	// are instantly available upon process startup.
 	initialState := NewCheckState()
 	for _, domainCfg := range app.Config().Domains {
-		initialState.RDAP[domainCfg.Domain] = &RDAPState{Status: StatusPending}
+		initialState.RDAP[domainCfg.Domain] = RDAPState{Status: StatusPending}
 		if domainCfg.VerifyNSHealth && len(domainCfg.ExpectedNS) > 0 {
-			initialState.NSHealth[domainCfg.Domain] = &NSHealthResult{
+			initialState.NSHealth[domainCfg.Domain] = NSHealthResult{
 				Primary: domainCfg.ExpectedNS[0],
 			}
 		}
 	}
 	for _, dnsRecord := range app.Config().DNSRecords {
 		key := dnsRecord.Name
-		initialState.DNS[key] = &DNSState{
+		initialState.DNS[key] = DNSState{
 			Hostname: dnsRecord.Hostname,
 			Name:     dnsRecord.Name,
 			Type:     dnsRecord.Type,
 			Expected: dnsRecord.Expected,
 			Status:   StatusPending,
 			SkipSSL:  dnsRecord.SkipSSL,
-			SSLDays:  SSLDaysNotApplicable,
 		}
 	}
 	initialState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
@@ -549,7 +546,7 @@ func main() {
 		defer close(engineDone)
 		defer RecoverAndLogPanic(NameOpMonitoringEngine)
 
-		ctLogPersist := make(map[string]*CTLogState)
+		ctLogPersist := make(map[string]CTLogState)
 		prevRDAPStatus := make(map[string]CheckStatus)
 		prevDNSStatus := make(map[string]CheckStatus)
 		prevEmailStatus := make(map[string]CheckStatus)

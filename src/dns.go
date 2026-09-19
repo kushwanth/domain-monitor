@@ -124,15 +124,20 @@ func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acce
 	return minDays, nil
 }
 
+// queryDNSMsgFn is a variable to allow mocking in tests
+var queryDNSMsgFn = queryDNSMsg
+
 // queryDNSMsg queries the given resolvers for the specified hostname and record type using miekg/dns.
 // It retries on network errors and SERVFAIL using the next resolver in round-robin order.
 func queryDNSMsg(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) (*dns.Msg, error) {
-	return queryDNSMsgWithRD(ctx, app, hostname, qtype, resolvers, true)
+	return queryDNSMsgWithRDFn(ctx, app, hostname, qtype, resolvers, true)
 }
 
 // queryDNSMsgWithRD queries the given resolvers with explicit recursionDesired configuration.
 // The "RD" acronym corresponds directly to the RFC 1035 wire-format header bit (Recursion Desired),
 // which is set to false (RD=0) when querying authoritative nameservers directly.
+var queryDNSMsgWithRDFn = queryDNSMsgWithRD
+
 func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string, recursionDesired bool) (*dns.Msg, error) {
 	if len(resolvers) == 0 {
 		return nil, ErrNoResolvers
@@ -160,10 +165,17 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 		dnsClient.Net = ""
 		dnsMsg.Id = 0
 
-		r, _, err := dnsClient.ExchangeContext(ctx, dnsMsg, ip)
-		if err == nil && r != nil && r.Truncated {
-			dnsClient.Net = ProtocolTCP
+		var r *dns.Msg
+		var err error
+
+		if app != nil && app.DNSClient != nil {
+			r, _, err = app.DNSClient.ExchangeContext(ctx, dnsMsg, ip)
+		} else {
 			r, _, err = dnsClient.ExchangeContext(ctx, dnsMsg, ip)
+			if err == nil && r != nil && r.Truncated {
+				dnsClient.Net = ProtocolTCP
+				r, _, err = dnsClient.ExchangeContext(ctx, dnsMsg, ip)
+			}
 		}
 
 		if err != nil {
@@ -211,7 +223,7 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 // queryDNS queries the given resolvers and returns parsed string results.
 // It bypasses the OS resolver completely and forces a direct UDP/TCP connection to the provided IP.
 func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) ([]string, error) {
-	r, err := queryDNSMsg(ctx, app, hostname, qtype, resolvers)
+	r, err := queryDNSMsgFn(ctx, app, hostname, qtype, resolvers)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +275,7 @@ func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16,
 // queryCAARecords queries CAA records and returns structured entries
 // instead of raw string representations that require brittle re-parsing.
 func queryCAARecords(ctx context.Context, app *AppState, hostname string, resolvers []string) ([]CAAEntry, error) {
-	r, err := queryDNSMsg(ctx, app, hostname, dns.TypeCAA, resolvers)
+	r, err := queryDNSMsgFn(ctx, app, hostname, dns.TypeCAA, resolvers)
 	if err != nil {
 		return nil, err
 	}
@@ -323,14 +335,14 @@ func queryIPRecords(ctx context.Context, app *AppState, hostname string, resolve
 	return found, nil
 }
 
-func evaluateCAA(ctx context.Context, app *AppState, target DomainConfig) *CAAResult {
+func evaluateCAA(ctx context.Context, app *AppState, target DomainConfig) CAAResult {
 	if target.CAA == nil {
-		return nil
+		return CAAResult{}
 	}
 
-	res := fetchCAA(ctx, app, target.Domain, app.Resolvers())
-	if res == nil {
-		return &CAAResult{Valid: false, Error: MsgErrFailedToQueryCAA}
+	res, found := fetchCAAFn(ctx, app, target.Domain, app.Resolvers())
+	if !found {
+		return CAAResult{Valid: false, Error: MsgErrFailedToQueryCAA}
 	}
 
 	if res.Error != "" {
@@ -362,23 +374,23 @@ func evaluateCAA(ctx context.Context, app *AppState, target DomainConfig) *CAARe
 
 	// Validate 'issue' if configured
 	if target.CAA.Issue != nil {
-		validateCAATag(app, target, CAATagIssue, target.CAA.Issue, liveIssue, res)
+		res = validateCAATag(app, target, CAATagIssue, target.CAA.Issue, liveIssue, res)
 	}
 	// Validate 'issuewild' if configured
 	if target.CAA.IssueWild != nil {
-		validateCAATag(app, target, CAATagIssueWild, target.CAA.IssueWild, liveIssueWild, res)
+		res = validateCAATag(app, target, CAATagIssueWild, target.CAA.IssueWild, liveIssueWild, res)
 	}
 	// Validate 'issuemail' if configured
 	if target.CAA.IssueMail != nil {
-		validateCAATag(app, target, CAATagIssueMail, target.CAA.IssueMail, liveIssueMail, res)
+		res = validateCAATag(app, target, CAATagIssueMail, target.CAA.IssueMail, liveIssueMail, res)
 	}
 
 	return res
 }
 
-func validateCAATag(app *AppState, target DomainConfig, tag string, expected []string, live map[string]bool, res *CAAResult) {
-	if expected == nil || res == nil {
-		return
+func validateCAATag(app *AppState, target DomainConfig, tag string, expected []string, live map[string]bool, res CAAResult) CAAResult {
+	if expected == nil {
+		return res
 	}
 
 	// 1. Explicit Deny-All (empty slice / no CAs authorized)
@@ -389,7 +401,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAADenyAllMissing, tag), MsgAlertCAAMissing, tag, target.Domain)
 			}
 			res.Valid = false
-			return
+			return res
 		}
 
 		for liveCA := range live {
@@ -403,7 +415,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 				res.Valid = false
 			}
 		}
-		return
+		return res
 	}
 
 	// 2. Specific CAs expected
@@ -417,7 +429,7 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAMissing, tag), MsgAlertCAAMissing, tag, target.Domain)
 		}
 		res.Valid = false
-		return
+		return res
 	}
 
 	// Check for missing expected CAs
@@ -442,16 +454,17 @@ func validateCAATag(app *AppState, target DomainConfig, tag string, expected []s
 			res.Valid = false
 		}
 	}
+	return res
 }
 
-func fetchCAANode(ctx context.Context, app *AppState, domain string, resolvers []string, visitedAliases map[string]bool) *CAAResult {
+func fetchCAANode(ctx context.Context, app *AppState, domain string, resolvers []string, visitedAliases map[string]bool) (CAAResult, bool) {
 	entries, err := queryCAARecords(ctx, app, domain, resolvers)
 	if err != nil && !errors.Is(err, ErrNXDOMAIN) {
-		return &CAAResult{Error: fmt.Sprintf(MsgErrFailedToQueryCAAPattern, domain, err.Error())}
+		return CAAResult{Error: fmt.Sprintf(MsgErrFailedToQueryCAAPattern, domain, err.Error())}, true
 	}
 
 	if len(entries) > 0 {
-		res := &CAAResult{}
+		res := CAAResult{}
 		for _, entry := range entries {
 			switch entry.Tag {
 			case CAATagIssue:
@@ -462,7 +475,7 @@ func fetchCAANode(ctx context.Context, app *AppState, domain string, resolvers [
 				res.IssueMail = append(res.IssueMail, entry.Value)
 			}
 		}
-		return res
+		return res, true
 	}
 
 	// Check for CNAME alias traversal per RFC 8659 Section 3
@@ -478,14 +491,14 @@ func fetchCAANode(ctx context.Context, app *AppState, domain string, resolvers [
 			}
 		}
 	}
-	return nil
+	return CAAResult{}, false
 }
 
-func fetchCAATree(ctx context.Context, app *AppState, domain string, resolvers []string, visitedAliases map[string]bool) *CAAResult {
+func fetchCAATree(ctx context.Context, app *AppState, domain string, resolvers []string, visitedAliases map[string]bool) (CAAResult, bool) {
 	currentDomain := domain
 	for {
-		if res := fetchCAANode(ctx, app, currentDomain, resolvers, visitedAliases); res != nil {
-			return res
+		if res, found := fetchCAANode(ctx, app, currentDomain, resolvers, visitedAliases); found {
+			return res, true
 		}
 
 		// Tree climbing: strip leftmost label
@@ -495,31 +508,32 @@ func fetchCAATree(ctx context.Context, app *AppState, domain string, resolvers [
 		}
 		currentDomain = parent
 	}
-	return nil
+	return CAAResult{}, false
 }
 
-func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []string) *CAAResult {
+func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []string) (CAAResult, bool) {
 	currentDomain := NormalizeDomain(domain)
 	if currentDomain == "" {
-		return &CAAResult{Error: MsgErrInvalidEmptyDomainCAA}
+		return CAAResult{Error: MsgErrInvalidEmptyDomainCAA}, true
 	}
-
-	res := fetchCAATree(ctx, app, currentDomain, resolvers, make(map[string]bool))
-	if res == nil {
-		return &CAAResult{}
-	}
-	return res
+	return fetchCAATree(ctx, app, currentDomain, resolvers, make(map[string]bool))
 }
 
-func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers []string, dohURLTemplate string) *DNSSECResult {
-	res := &DNSSECResult{
+// fetchCAAFn is a variable to allow mocking in tests
+var fetchCAAFn = fetchCAA
+
+// validateDNSSECFn is a variable to allow mocking in tests
+var validateDNSSECFn = validateDNSSEC
+
+func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers []string, dohURLTemplate string) DNSSECResult {
+	res := DNSSECResult{
 		Source: DNSSECSourceLocalDoH,
 	}
 
 	fqdn := dns.Fqdn(domain)
 
 	// 1. Query DS
-	dsResp, err := queryDNSMsg(ctx, app, domain, dns.TypeDS, resolvers)
+	dsResp, err := queryDNSMsgFn(ctx, app, domain, dns.TypeDS, resolvers)
 	if err != nil {
 		res.Valid = false
 		res.Error = fmt.Sprintf(MsgErrDSQueryFailed, err.Error())
@@ -537,7 +551,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	}
 
 	// 2. Query DNSKEY
-	keyResp, err := queryDNSMsg(ctx, app, domain, dns.TypeDNSKEY, resolvers)
+	keyResp, err := queryDNSMsgFn(ctx, app, domain, dns.TypeDNSKEY, resolvers)
 	if err != nil {
 		res.Valid = false
 		res.Error = fmt.Sprintf(MsgErrDNSKEYQueryFailed, err.Error())
@@ -707,9 +721,9 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	return res
 }
 
-func evaluateDNSSEC(ctx context.Context, app *AppState, target DomainConfig) *DNSSECResult {
+func evaluateDNSSEC(ctx context.Context, app *AppState, target DomainConfig) DNSSECResult {
 	if !target.DNSSEC {
-		return nil
+		return DNSSECResult{}
 	}
 
 	dohURL := DefaultDoHURL
@@ -717,9 +731,9 @@ func evaluateDNSSEC(ctx context.Context, app *AppState, target DomainConfig) *DN
 		dohURL = app.Config().DoHURL
 	}
 
-	res := validateDNSSEC(ctx, app, target.Domain, app.Resolvers(), dohURL)
-	if res == nil {
-		return &DNSSECResult{Valid: false, Source: DNSSECSourceLocalOnly, Error: MsgErrValidateDNSSECNil}
+	res := validateDNSSECFn(ctx, app, target.Domain, app.Resolvers(), dohURL)
+	if res.Source == "" {
+		return DNSSECResult{Valid: false, Source: DNSSECSourceLocalOnly, Error: MsgErrValidateDNSSECNil}
 	}
 
 	if !res.Valid && !target.SuppressAlerts {
@@ -743,20 +757,22 @@ func evaluateDNSSEC(ctx context.Context, app *AppState, target DomainConfig) *DN
 	return res
 }
 
+// evaluateDNSFn is a variable to allow mocking in tests
+var evaluateDNSFn = evaluateDNS
+
 // evaluateDNS orchestrates the resolution and validation of a DNS task
-func evaluateDNS(ctx context.Context, app *AppState, target DNSTask) *DNSState {
-	foundRecords, err := resolveTarget(ctx, app, target)
+func evaluateDNS(ctx context.Context, app *AppState, target DNSTask) DNSState {
+	foundRecords, err := resolveTargetFn(ctx, app, target)
 
 	if err != nil {
 		app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, fmt.Sprintf(MsgRedactedDNSResolutionFailed, target.Hostname, target.Type), MsgAlertDNSFailed, target.Hostname, target.Type)
 
-		return &DNSState{
+		return DNSState{
 			Hostname: target.Hostname,
 			Name:     target.Name,
 			Type:     target.Type,
 			Expected: target.Expected,
 			Status:   StatusFailed,
-			SSLDays:  SSLDaysNotApplicable,
 			Error:    err.Error(),
 		}
 	}
@@ -787,18 +803,27 @@ func evaluateDNS(ctx context.Context, app *AppState, target DNSTask) *DNSState {
 		}
 	}
 
-	return &DNSState{
+	var sslDaysPtr *int
+	if sslDays != SSLDaysNotApplicable && sslDays != SSLDaysError {
+		d := sslDays // create copy for pointer
+		sslDaysPtr = &d
+	}
+
+	return DNSState{
 		Hostname: target.Hostname,
 		Name:     target.Name,
 		Type:     target.Type,
 		Expected: target.Expected,
 		Status:   status,
 		Found:    foundRecords,
-		SSLDays:  sslDays,
+		SSLDays:  sslDaysPtr,
 		SkipSSL:  target.SkipSSL,
 		Error:    recordErr,
 	}
 }
+
+// resolveTargetFn is a variable to allow mocking in tests
+var resolveTargetFn = resolveTarget
 
 func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string, error) {
 	resolvers := app.Resolvers()
@@ -1050,15 +1075,15 @@ func validateCertificate(ctx context.Context, app *AppState, target DNSTask, fou
 	return days
 }
 
-func evaluateEmailSecurity(ctx context.Context, app *AppState, target DomainConfig) *EmailState {
+func evaluateEmailSecurity(ctx context.Context, app *AppState, target DomainConfig) EmailState {
 	if !target.CheckEmailSecurity {
-		return nil
+		return EmailState{}
 	}
 
 	emailStatus := StatusOK
 	liveMXs, mxStatus, err := validateMX(ctx, app, target)
 	if err != nil {
-		return &EmailState{Status: StatusFailed, Error: err.Error()}
+		return EmailState{Status: StatusFailed, Error: err.Error()}
 	}
 	if mxStatus != StatusOK {
 		emailStatus = mxStatus
@@ -1095,7 +1120,7 @@ func evaluateEmailSecurity(ctx context.Context, app *AppState, target DomainConf
 
 	hasDKIMExpected := (target.MailProvider != "" && len(ProviderDKIMMap[target.MailProvider]) > 0) || len(target.DKIMSelectors) > 0
 
-	return &EmailState{
+	return EmailState{
 		Status:       emailStatus,
 		Provider:     target.MailProvider,
 		SPF:          foundSPF,
@@ -1336,7 +1361,7 @@ func checkSingleNameserver(ctx context.Context, app *AppState, nsName string, is
 		srv.Error = err.Error()
 		return srv, 0, false, nil, err
 	}
-	
+
 	var ip string
 	if net.ParseIP(host) != nil {
 		ip = net.JoinHostPort(host, port)
@@ -1355,7 +1380,7 @@ func checkSingleNameserver(ctx context.Context, app *AppState, nsName string, is
 		ip = net.JoinHostPort(ips[0], port)
 	}
 
-	soaMsg, soaErr := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeSOA, []string{ip}, false)
+	soaMsg, soaErr := queryDNSMsgWithRDFn(ctx, app, target.Domain, dns.TypeSOA, []string{ip}, false)
 	if soaErr != nil || soaMsg == nil {
 		if soaErr == nil {
 			soaErr = fmt.Errorf("nil SOA response")
@@ -1405,7 +1430,7 @@ func checkSingleNameserver(ctx context.Context, app *AppState, nsName string, is
 	srv.SOASerial = serial
 
 	var dnskeys []string
-	if dnskeyMsg, _ := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeDNSKEY, []string{ip}, false); dnskeyMsg != nil {
+	if dnskeyMsg, _ := queryDNSMsgWithRDFn(ctx, app, target.Domain, dns.TypeDNSKEY, []string{ip}, false); dnskeyMsg != nil {
 		for _, rr := range dnskeyMsg.Answer {
 			if dnskey, ok := rr.(*dns.DNSKEY); ok {
 				fps := strconv.Itoa(int(dnskey.Flags)) + "-" + strconv.Itoa(int(dnskey.Protocol)) + "-" + strconv.Itoa(int(dnskey.Algorithm)) + "-" + dnskey.PublicKey
@@ -1420,20 +1445,20 @@ func checkSingleNameserver(ctx context.Context, app *AppState, nsName string, is
 	return srv, serial, foundSOA, dnskeys, err
 }
 
-func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) *NSHealthResult {
+func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) NSHealthResult {
 	if !target.VerifyNSHealth || len(target.ExpectedNS) == 0 {
-		return nil
+		return NSHealthResult{}
 	}
 
 	primaryNS := target.ExpectedNS[0]
-	res := &NSHealthResult{
+	res := NSHealthResult{
 		Valid:   true,
 		Primary: primaryNS,
 		Servers: make([]NSHealthServerResult, 0, 1+len(target.SecondaryNS)),
 	}
 
 	primarySrv, primarySerial, primaryFoundSOA, primaryDNSKEYs, pErr := checkSingleNameserver(ctx, app, primaryNS, true, target)
-	
+
 	if pErr != nil {
 		res.Valid = false
 		if !target.SuppressAlerts {

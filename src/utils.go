@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 	"unicode"
-	"unicode/utf8"
 
 	"golang.org/x/net/idna"
 )
@@ -131,11 +130,14 @@ func TruncateRunes(s string, maxRunes int) string {
 	if maxRunes <= 0 {
 		return ""
 	}
-	if utf8.RuneCountInString(s) <= maxRunes {
-		return s
+	count := 0
+	for i := range s {
+		if count == maxRunes {
+			return s[:i]
+		}
+		count++
 	}
-	runes := []rune(s)
-	return string(runes[:maxRunes])
+	return s
 }
 
 // --- 4. HTTP Resiliency & Connection Management ---

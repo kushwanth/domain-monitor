@@ -5,6 +5,10 @@
   "notifications": {
     "ntfy": {
       "url": "https://ntfy.sh/example_domain_monitor_topic"
+    },
+    "telegram": {
+      "token": "INVALID_TOKEN_FOR_TESTING",
+      "chat_id": "123456789"
     }
   },
   "resolvers": ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"],
@@ -27,7 +31,7 @@
       "caa": {
         "issue": ["letsencrypt.org", "digicert.com"]
       },
-      "suppress_alerts": true
+      "suppress_alerts": false
     },
     {
       "domain": "api.example.com",
@@ -83,7 +87,7 @@
     }
   ],
   "dns_records": [
-    { "hostname": "example.com", "name": "Example A", "type": "A", "expected": ["93.184.215.14"] },
+    { "hostname": "example.com", "name": "Example A", "type": "A", "expected": ["1.1.1.1"] },
     { "hostname": "example.com", "name": "Example AAAA", "type": "AAAA", "expected": ["2606:2800:21f:cb07:6820:80da:af6b:8b2c"] },
     { "hostname": "www.example.com", "name": "Example WWW", "type": "A", "expected": ["93.184.215.14"] },
     { "hostname": "example.net", "name": "Example Net A", "type": "A", "expected": ["93.184.215.14"] },

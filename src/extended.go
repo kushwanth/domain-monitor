@@ -36,14 +36,14 @@ func SetCTLogsPath(p string) {
 	ctLogsPath = p
 }
 
-func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, prevState *CTLogState) *CTLogState {
+func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, prevState CTLogState) CTLogState {
 	if !target.MonitorCTLogs {
-		return nil
+		return CTLogState{}
 	}
 
 	var latestID, backfillCursor string
 	var backfillComplete bool
-	if prevState != nil {
+	if prevState.LatestID != "" || prevState.BackfillCursor != "" || prevState.Status != "" {
 		latestID = prevState.LatestID
 		backfillCursor = prevState.BackfillCursor
 		backfillComplete = prevState.BackfillComplete
@@ -54,7 +54,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 	respPage1, err := fetchCTPage(ctx, app, apiURL)
 	if err != nil {
 		LogError(MsgLogCTLogsPollingFailed, FieldDomain, target.Domain, FieldError, err)
-		return &CTLogState{
+		return CTLogState{
 			LatestID:         latestID,
 			BackfillCursor:   backfillCursor,
 			BackfillComplete: backfillComplete,
@@ -95,7 +95,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 		LogInfo(MsgLogDiscoveredNewCerts, FieldDomain, target.Domain, FieldCount, len(newCerts))
 		if err := saveCertsToHistory(target.Domain, newCerts); err != nil {
 			LogError(MsgLogSaveCTLogsFailed, FieldDomain, target.Domain, FieldError, err)
-			return &CTLogState{
+			return CTLogState{
 				LatestID:         latestID, // Keep previous checkpoint on write failure to allow retry
 				BackfillCursor:   backfillCursor,
 				BackfillComplete: backfillComplete,
@@ -127,7 +127,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 			respBackfill, err := fetchCTPage(ctx, app, backfillURL)
 			if err != nil {
 				LogWarn(MsgLogCTLogsBackfillFailed, FieldDomain, target.Domain, FieldError, err)
-				return &CTLogState{
+				return CTLogState{
 					LatestID:         checkpointID,
 					BackfillCursor:   cursorToUse, // Keep old cursor to retry later
 					BackfillComplete: false,
@@ -139,7 +139,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 			if len(respBackfill.Rows) > 0 {
 				if err := saveCertsToHistory(target.Domain, respBackfill.Rows); err != nil {
 					LogError(MsgLogSaveBackfilledCTLogsFailed, FieldDomain, target.Domain, FieldError, err)
-					return &CTLogState{
+					return CTLogState{
 						LatestID:         checkpointID,
 						BackfillCursor:   cursorToUse, // don't advance cursor
 						BackfillComplete: false,
@@ -159,7 +159,7 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 		}
 	}
 
-	return &CTLogState{
+	return CTLogState{
 		LatestID:         checkpointID,
 		BackfillCursor:   backfillCursor,
 		BackfillComplete: backfillComplete,

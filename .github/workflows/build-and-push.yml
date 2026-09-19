@@ -2,6 +2,7 @@ name: CI/CD
 run-name: ${{ github.event.head_commit.message || github.ref_name }}
 on:
   push:
+    branches: [ "main" ]
     tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ "main" ]
@@ -11,16 +12,36 @@ env:
 
 jobs:
   test:
-    name: Run Tests
+    name: Run Tests & Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.27.1'
+          
+      - name: Install dependencies
+        run: go mod download
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.61.0
+
       - name: Run Unit Tests
-        run: go test ./src/... -v -race
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Enforce Test Coverage Threshold
+        run: |
+          MIN_COVERAGE=83.0
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print substr($3, 1, length($3)-1)}')
+          if (( $(echo "$COVERAGE < $MIN_COVERAGE" | bc -l) )); then
+            echo "Test coverage ($COVERAGE%) is below the minimum threshold ($MIN_COVERAGE%)"
+            exit 1
+          fi
+          echo "Test coverage ($COVERAGE%) meets the threshold ($MIN_COVERAGE%)"
 
   build-and-push:
     name: Build Container Image

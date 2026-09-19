@@ -337,16 +337,14 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 	}
 	DrainAndClose(resp.Body, MaxBodyDrainSize)
 
-	app.Notifier.Providers = append(app.Notifier.Providers, &NtfyProvider{
-		URL:  cfg.Notifications.Ntfy.URL,
-		Auth: auth,
-	})
+	app.Notifier.NtfyURL = cfg.Notifications.Ntfy.URL
+	app.Notifier.NtfyAuth = auth
+	app.Notifier.alertChan = make(chan Alert, 1000)
+	go app.Notifier.workerLoop()
 
 	if cfg.Notifications.Telegram != nil && cfg.Notifications.Telegram.Token != "" && cfg.Notifications.Telegram.ChatID != "" {
-		app.Notifier.Providers = append(app.Notifier.Providers, &TelegramProvider{
-			Token:  cfg.Notifications.Telegram.Token,
-			ChatID: cfg.Notifications.Telegram.ChatID,
-		})
+		app.Notifier.TelegramToken = cfg.Notifications.Telegram.Token
+		app.Notifier.TelegramChatID = cfg.Notifications.Telegram.ChatID
 		LogInfo(MsgLogTelegramConfig)
 	}
 

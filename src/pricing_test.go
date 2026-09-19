@@ -178,27 +178,27 @@ func TestComputePortfolioPricing(t *testing.T) {
 	}
 
 	loopState := &CheckState{
-		RDAP: map[string]*RDAPState{
-			"standard.com": {},
-			"premium.com":  {},
-			"expiring.com": {},
+		RDAP: map[string]RDAPState{
+			"standard.com": {Status: StatusOK},
+			"premium.com":  {Status: StatusOK},
+			"expiring.com": {Status: StatusOK},
 		},
 	}
 
 	computePortfolioPricing(context.Background(), app, loopState, pm)
 
 	// Verify standard domain got DotSweep pricing
-	if state := loopState.RDAP["standard.com"]; state == nil || state.RenewalPrice != 11.08 {
+	if state := loopState.RDAP["standard.com"]; state.Status == "" || state.RenewalPrice != 11.08 {
 		t.Errorf("Expected standard.com renewal price 11.08, got %+v", state)
 	}
 
 	// Verify premium domain used explicit renewal_price override
-	if state := loopState.RDAP["premium.com"]; state == nil || state.RenewalPrice != 299.99 {
+	if state := loopState.RDAP["premium.com"]; state.Status == "" || state.RenewalPrice != 299.99 {
 		t.Errorf("Expected premium.com renewal price 299.99, got %+v", state)
 	}
 
 	// Verify expiring domain has no renewal price assigned
-	if state := loopState.RDAP["expiring.com"]; state == nil || state.RenewalPrice != 0 {
+	if state := loopState.RDAP["expiring.com"]; state.Status == "" || state.RenewalPrice != 0 {
 		t.Errorf("Expected expiring.com renewal price to be 0, got %+v", state)
 	}
 }
@@ -292,7 +292,7 @@ func BenchmarkComputePortfolioPricing(b *testing.B) {
 	}
 
 	loopState := &CheckState{
-		RDAP: map[string]*RDAPState{
+		RDAP: map[string]RDAPState{
 			"domain1.com":   {},
 			"domain2.net":   {},
 			"domain3.org":   {},

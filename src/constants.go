@@ -280,6 +280,7 @@ var (
 	ErrEmptyDate              = errors.New("empty date string")
 	ErrEmptyBootstrapRegistry = errors.New("empty bootstrap registry")
 	ErrCTLogsRateLimited      = errors.New("api.ctlogs.dev rate limit exceeded")
+	ErrPricingManagerNil      = errors.New(MsgErrPricingManagerNil)
 )
 
 // DNSTypeMap maps record type string names to miekg/dns uint16 type constants.

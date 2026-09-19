@@ -852,8 +852,8 @@ func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 func TestNilSafety_CheckState(t *testing.T) {
 	// 1. Nil receiver should not panic
 	var nilCS *CheckState
-	nilCS.ApplyDNSResult(DNSResult{Name: "test", State: &DNSState{}})
-	nilCS.ApplyDomainResult(DomainResult{Domain: "example.com", RDAP: &RDAPState{}})
+	nilCS.ApplyDNSResult(DNSResult{Name: "test", State: DNSState{}})
+	nilCS.ApplyDomainResult(DomainResult{Domain: "example.com", RDAP: RDAPState{}})
 	logs := nilCS.ExportCTLogs()
 	if logs == nil {
 		t.Errorf("expected non-nil empty map from ExportCTLogs on nil CheckState")
@@ -861,32 +861,42 @@ func TestNilSafety_CheckState(t *testing.T) {
 
 	// 2. Uninitialized inner maps should be lazily initialized without panicking
 	emptyCS := &CheckState{}
-	emptyCS.ApplyDNSResult(DNSResult{Name: "test.example.com", State: &DNSState{Hostname: "test.example.com"}})
-	if emptyCS.DNS == nil || emptyCS.DNS["test.example.com"] == nil {
-		t.Errorf("expected DNS map to be lazily initialized")
+	emptyCS.ApplyDNSResult(DNSResult{Name: "test.example.com", State: DNSState{Hostname: "test.example.com", Status: StatusOK}})
+	if dnsState, ok := emptyCS.DNS["test.example.com"]; !ok || dnsState.Hostname == "" {
+		t.Errorf("expected DNS result to be safely applied to empty CheckState")
 	}
 
 	emptyCS.ApplyDomainResult(DomainResult{
 		Domain:   "example.com",
-		RDAP:     &RDAPState{Status: StatusOK},
-		Email:    &EmailState{Status: StatusOK},
-		CAA:      &CAAResult{Valid: true},
-		DNSSEC:   &DNSSECResult{Valid: true},
-		CTLogs:   &CTLogState{Status: StatusOK},
-		NSHealth: &NSHealthResult{Valid: true},
+		RDAP:     RDAPState{Status: StatusOK},
+		Email:    EmailState{Status: StatusOK},
+		CAA:      CAAResult{Valid: true},
+		DNSSEC:   DNSSECResult{Valid: true},
+		CTLogs:   CTLogState{Status: StatusOK},
+		NSHealth: NSHealthResult{Valid: true},
 	})
-	if emptyCS.RDAP["example.com"] == nil ||
-		emptyCS.Email["example.com"] == nil ||
-		emptyCS.CAA["example.com"] == nil ||
-		emptyCS.DNSSEC["example.com"] == nil ||
-		emptyCS.CTLogs["example.com"] == nil ||
-		emptyCS.NSHealth["example.com"] == nil {
-		t.Errorf("expected all check maps to be lazily initialized")
+	if rdap, ok := emptyCS.RDAP["example.com"]; !ok || rdap.Status == "" {
+		t.Errorf("expected RDAP result applied")
+	}
+	if email, ok := emptyCS.Email["example.com"]; !ok || email.Status == "" {
+		t.Errorf("expected Email result applied")
+	}
+	if caa, ok := emptyCS.CAA["example.com"]; !ok || !caa.Valid {
+		t.Errorf("expected CAA result applied")
+	}
+	if dnssec, ok := emptyCS.DNSSEC["example.com"]; !ok || !dnssec.Valid {
+		t.Errorf("expected DNSSEC result applied")
+	}
+	if ctLogs, ok := emptyCS.CTLogs["example.com"]; !ok || ctLogs.Status == "" {
+		t.Errorf("expected CTLogs result applied")
+	}
+	if nsHealth, ok := emptyCS.NSHealth["example.com"]; !ok || !nsHealth.Valid {
+		t.Errorf("expected NSHealth result applied")
 	}
 
 	exported := emptyCS.ExportCTLogs()
-	if exported["example.com"] == nil {
-		t.Errorf("expected exported CT logs to include example.com")
+	if c, ok := exported["example.com"]; !ok || c.Status == "" {
+		t.Errorf("expected ExportCTLogs to return cloned maps")
 	}
 }
 
