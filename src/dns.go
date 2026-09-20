@@ -20,7 +20,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-var dohHTTPClient = ResolveHTTPClient(&http.Client{Timeout: DefaultDNSTimeout})
 
 func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
 	dialHost := hostname
@@ -664,7 +663,14 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 		} else {
 			dohReq.Header.Set(HeaderAccept, MIMEDNSJSON)
 			dohReq.Header.Set(HeaderUserAgent, DefaultUserAgent)
-			dohResp, err := dohHTTPClient.Do(dohReq)
+			
+			var client HTTPClient
+			if app != nil {
+				client = app.HTTPClient
+			}
+			client = ResolveHTTPClient(client)
+			
+			dohResp, err := client.Do(dohReq)
 
 			if err != nil || dohResp.StatusCode != http.StatusOK {
 				if dohResp != nil {

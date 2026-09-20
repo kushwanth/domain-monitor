@@ -534,7 +534,7 @@ type queryResult struct {
 
 // Bootstrap manages IANA RDAP bootstrap registry caches and queries.
 type Bootstrap struct {
-	http      *http.Client
+	http      HTTPClient
 	url       string
 	mu        sync.RWMutex
 	fetchMu   sync.Mutex
@@ -557,7 +557,7 @@ type DotSweepResponse struct {
 
 // PricingManager manages TLD renewal pricing cache and scheduled upstream fetching.
 type PricingManager struct {
-	http      *http.Client
+	http      HTTPClient
 	url       string
 	mu        sync.RWMutex
 	fetchMu   sync.Mutex

@@ -795,7 +795,7 @@ func evaluateRDAP(ctx context.Context, httpClient HTTPClient, app *AppState, tar
 
 	// Hybrid Tier Supplementation: If RDAP is thin (no registrar tier), attempt WHOIS referral supplement
 	if rdapState.Status != "" && rdapState.RegistrarTier == nil && (rdapState.Expiration == "" || rdapState.Registrar == "") {
-		if whoisState, whoisErr := fetchWHOIS(ctx, app, target.Domain); whoisErr == nil {
+		if whoisState, whoisErr := fetchWHOISFn(ctx, app, target.Domain); whoisErr == nil {
 			if whoisState.RegistrarTier != nil {
 				rdapState.RegistrarTier = whoisState.RegistrarTier
 			} else if whoisState.RegistryTier != nil && rdapState.RegistryTier == nil {

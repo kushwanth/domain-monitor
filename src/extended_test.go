@@ -311,19 +311,18 @@ func (m mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
-	origTransport := ctHTTPClient.Transport
-	defer func() { ctHTTPClient.Transport = origTransport }()
+	mockClient := &http.Client{
+		Transport: mockRoundTripper(func(_ *http.Request) (*http.Response, error) {
+			payload := `{"rows":[{"id":"cert-first-1","match":"firstrun.example.com","issuer":"Let's Encrypt"}],"has_next":false,"next_cursor":""}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString(payload)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
 
-	ctHTTPClient.Transport = mockRoundTripper(func(_ *http.Request) (*http.Response, error) {
-		payload := `{"rows":[{"id":"cert-first-1","match":"firstrun.example.com","issuer":"Let's Encrypt"}],"has_next":false,"next_cursor":""}`
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(bytes.NewBufferString(payload)),
-			Header:     make(http.Header),
-		}, nil
-	})
-
-	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}}
+	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}, HTTPClient: mockClient}
 	domain := "firstrun.example.com"
 	defer func() { _ = os.Remove(filepath.Join(GetCTLogsPath(), domain+".json")) }()
 
@@ -351,28 +350,26 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 }
 
 func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
-	origTransport := ctHTTPClient.Transport
-	defer func() { ctHTTPClient.Transport = origTransport }()
-
-	// Backfill request returns 429 Too Many Requests
-	ctHTTPClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
-		if strings.Contains(req.URL.RawQuery, "after=") {
+	mockClient := &http.Client{
+		Transport: mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.RawQuery, "after=") {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(bytes.NewBufferString("Too Many Requests")),
+					Header:     make(http.Header),
+				}, nil
+			}
+			// Page 1 succeeds with next_cursor
+			payload := `{"rows":[{"id":"cert-existing-1","match":"ratelimit.example.com","issuer":"CA"}],"has_next":true,"next_cursor":"page1-cursor"}`
 			return &http.Response{
-				StatusCode: http.StatusTooManyRequests,
-				Body:       io.NopCloser(bytes.NewBufferString("Too Many Requests")),
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString(payload)),
 				Header:     make(http.Header),
 			}, nil
-		}
-		// Page 1 succeeds with next_cursor
-		payload := `{"rows":[{"id":"cert-existing-1","match":"ratelimit.example.com","issuer":"CA"}],"has_next":true,"next_cursor":"page1-cursor"}`
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(bytes.NewBufferString(payload)),
-			Header:     make(http.Header),
-		}, nil
-	})
+		}),
+	}
 
-	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}}
+	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}, HTTPClient: mockClient}
 	domain := "ratelimit.example.com"
 	defer func() { _ = os.Remove(filepath.Join(GetCTLogsPath(), domain+".json")) }()
 

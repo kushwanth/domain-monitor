@@ -19,7 +19,6 @@ import (
 var (
 	ctLogsMu     sync.RWMutex
 	ctLogsPath   = DefaultCTLogsSubdir
-	ctHTTPClient = ResolveHTTPClient(&http.Client{Timeout: DefaultHTTPTimeout})
 )
 
 // GetCTLogsPath safely returns the current CT logs directory path.
@@ -180,7 +179,13 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPage
 
 	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
-	resp, err := ctHTTPClient.Do(req)
+	var client HTTPClient
+	if app != nil {
+		client = app.HTTPClient
+	}
+	client = ResolveHTTPClient(client)
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
