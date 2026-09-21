@@ -870,10 +870,10 @@ func TestNilSafety_CheckState(t *testing.T) {
 		Domain:   "example.com",
 		RDAP:     RDAPState{Status: StatusOK},
 		Email:    EmailState{Status: StatusOK},
-		CAA:      CAAResult{Valid: true},
-		DNSSEC:   DNSSECResult{Valid: true},
+		CAA:      CAAResult{Valid: true, Status: StatusOK},
+		DNSSEC:   DNSSECResult{Valid: true, Status: StatusOK},
 		CTLogs:   CTLogState{Status: StatusOK},
-		NSHealth: NSHealthResult{Valid: true},
+		NSHealth: NSHealthResult{Valid: true, Status: StatusOK},
 	})
 	if rdap, ok := emptyCS.RDAP["example.com"]; !ok || rdap.Status == "" {
 		t.Errorf("expected RDAP result applied")

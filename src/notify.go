@@ -14,16 +14,41 @@ import (
 
 var notifyHTTPClient = ResolveHTTPClient(&http.Client{Timeout: DefaultHTTPTimeout})
 
+func maxPriority(batch []Alert) AlertPriority {
+	hasHigh := false
+	hasWarning := false
+	for _, a := range batch {
+		if a.Priority == PriorityUrgent {
+			return PriorityUrgent
+		}
+		if a.Priority == PriorityHigh {
+			hasHigh = true
+		} else if a.Priority == PriorityWarning {
+			hasWarning = true
+		}
+	}
+	if hasHigh {
+		return PriorityHigh
+	}
+	if hasWarning {
+		return PriorityWarning
+	}
+	return PriorityDefault
+}
+
 func (nm *NotificationManager) workerLoop() {
 	if nm.alertChan == nil {
 		return
 	}
-	for alert := range nm.alertChan {
+	for batch := range nm.alertChan {
+		if len(batch) == 0 {
+			continue
+		}
 		if nm.NtfyURL != "" {
-			nm.sendNtfyWithRetry(alert)
+			nm.sendNtfyBatchWithRetry(batch)
 		}
 		if nm.TelegramToken != "" {
-			nm.sendTelegramWithRetry(alert)
+			nm.sendTelegramBatchWithRetry(batch)
 		}
 	}
 }
@@ -75,21 +100,35 @@ func (nm *NotificationManager) Dispatch(message, redacted string, priority Alert
 	}
 	nm.mu.Unlock()
 
-	if nm.alertChan != nil {
+	nm.batchMu.Lock()
+	nm.alertBatch = append(nm.alertBatch, alert)
+	nm.batchMu.Unlock()
+}
+
+func (nm *NotificationManager) Flush() {
+	if nm == nil {
+		return
+	}
+	nm.batchMu.Lock()
+	batch := nm.alertBatch
+	nm.alertBatch = nil
+	nm.batchMu.Unlock()
+
+	if len(batch) > 0 && nm.alertChan != nil {
 		select {
-		case nm.alertChan <- alert:
+		case nm.alertChan <- batch:
 		default:
-			LogError("alert channel full, dropping alert", FieldDomain, domain)
+			LogError("alert channel full, dropping alert batch", "count", len(batch))
 		}
 	}
 }
 
-func (nm *NotificationManager) sendNtfyWithRetry(alert Alert) {
+func (nm *NotificationManager) sendNtfyBatchWithRetry(batch []Alert) {
 	maxRetries := 3
 	backoff := 1 * time.Second
 
 	for i := 0; i < maxRetries; i++ {
-		success := nm.sendNtfy(alert)
+		success := nm.sendNtfyBatch(batch)
 		if success {
 			return
 		}
@@ -98,34 +137,42 @@ func (nm *NotificationManager) sendNtfyWithRetry(alert Alert) {
 			backoff *= 2
 		}
 	}
-	LogError("Ntfy notification failed after retries", FieldDomain, alert.Domain)
+	LogError("Ntfy batch notification failed after retries", "count", len(batch))
 }
 
-func (nm *NotificationManager) sendNtfy(alert Alert) bool {
+func (nm *NotificationManager) sendNtfyBatch(batch []Alert) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultHTTPTimeout)
 	defer cancel()
 
 	defer RecoverAndLogPanic(NameNtfyProvider)
 
-	msg := alert.Redacted
-	if msg == "" {
-		msg = alert.Message
-	}
-
-	if alert.Domain != "" {
-		replacement := RedactedDomainPlaceholder
-		if alert.Name != "" {
-			replacement = alert.Name
+	var sb strings.Builder
+	for i, alert := range batch {
+		msg := alert.Redacted
+		if msg == "" {
+			msg = alert.Message
 		}
-		msg = strings.ReplaceAll(msg, alert.Domain, replacement)
+
+		if alert.Domain != "" {
+			replacement := RedactedDomainPlaceholder
+			if alert.Name != "" {
+				replacement = alert.Name
+			}
+			msg = strings.ReplaceAll(msg, alert.Domain, replacement)
+		}
+
+		prefix := ""
+		if alert.Name != "" {
+			prefix = fmt.Sprintf(NtfyPrefixFormat, alert.Name)
+		}
+		
+		sb.WriteString(prefix + msg)
+		if i < len(batch)-1 {
+			sb.WriteString("\n")
+		}
 	}
 
-	prefix := ""
-	if alert.Name != "" {
-		prefix = fmt.Sprintf(NtfyPrefixFormat, alert.Name)
-	}
-
-	text := prefix + TruncateRunes(msg, MaxAlertMessageRunes)
+	text := TruncateRunes(sb.String(), MaxAlertMessageRunes)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, nm.NtfyURL, strings.NewReader(strings.TrimSpace(text)))
 	if err != nil {
@@ -137,10 +184,20 @@ func (nm *NotificationManager) sendNtfy(alert Alert) bool {
 		req.Header.Set(HeaderAuthorization, nm.NtfyAuth)
 	}
 	req.Header.Set(HeaderNtfyTitle, NotificationAlertTitle)
-	req.Header.Set(HeaderNtfyPriority, string(alert.Priority))
+	
+	pri := maxPriority(batch)
+	req.Header.Set(HeaderNtfyPriority, string(pri))
 
-	if alert.Tag != "" {
-		req.Header.Set(HeaderNtfyTags, string(alert.Tag))
+	var tags []string
+	seenTags := make(map[string]bool)
+	for _, a := range batch {
+		if a.Tag != "" && !seenTags[string(a.Tag)] {
+			seenTags[string(a.Tag)] = true
+			tags = append(tags, string(a.Tag))
+		}
+	}
+	if len(tags) > 0 {
+		req.Header.Set(HeaderNtfyTags, strings.Join(tags, ","))
 	}
 
 	resp, err := notifyHTTPClient.Do(req)
@@ -166,12 +223,12 @@ func (nm *NotificationManager) sendNtfy(alert Alert) bool {
 	return true
 }
 
-func (nm *NotificationManager) sendTelegramWithRetry(alert Alert) {
+func (nm *NotificationManager) sendTelegramBatchWithRetry(batch []Alert) {
 	maxRetries := 3
 	backoff := 1 * time.Second
 
 	for i := 0; i < maxRetries; i++ {
-		success := nm.sendTelegram(alert)
+		success := nm.sendTelegramBatch(batch)
 		if success {
 			return
 		}
@@ -180,37 +237,44 @@ func (nm *NotificationManager) sendTelegramWithRetry(alert Alert) {
 			backoff *= 2
 		}
 	}
-	LogError("Telegram notification failed after retries", FieldDomain, alert.Domain)
+	LogError("Telegram batch notification failed after retries", "count", len(batch))
 }
 
-func (nm *NotificationManager) sendTelegram(alert Alert) bool {
+func (nm *NotificationManager) sendTelegramBatch(batch []Alert) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultHTTPTimeout)
 	defer cancel()
 
 	defer RecoverAndLogPanic(NameTelegramProvider)
 
-	msg := alert.Redacted
-	if msg == "" {
-		msg = alert.Message
-	}
+	var sb strings.Builder
+	sb.WriteString(TelegramAlertHeader)
 
-	if alert.Domain != "" {
-		replacement := RedactedDomainPlaceholder
-		if alert.Name != "" {
-			replacement = alert.Name
+	for _, alert := range batch {
+		msg := alert.Redacted
+		if msg == "" {
+			msg = alert.Message
 		}
-		msg = strings.ReplaceAll(msg, alert.Domain, replacement)
+
+		if alert.Domain != "" {
+			replacement := RedactedDomainPlaceholder
+			if alert.Name != "" {
+				replacement = alert.Name
+			}
+			msg = strings.ReplaceAll(msg, alert.Domain, replacement)
+		}
+
+		msg = TruncateRunes(msg, MaxAlertMessageRunes)
+
+		prefix := ""
+		if alert.Name != "" {
+			prefix = fmt.Sprintf(TelegramPrefixFormat, html.EscapeString(alert.Name))
+		}
+
+		line := fmt.Sprintf(TelegramLineFormat, prefix, html.EscapeString(msg))
+		sb.WriteString(line)
 	}
-
-	msg = TruncateRunes(msg, MaxAlertMessageRunes)
-
-	prefix := ""
-	if alert.Name != "" {
-		prefix = fmt.Sprintf(TelegramPrefixFormat, html.EscapeString(alert.Name))
-	}
-
-	line := fmt.Sprintf(TelegramLineFormat, prefix, html.EscapeString(msg))
-	text := TelegramAlertHeader + line
+	
+	text := sb.String()
 
 	apiURL := TelegramAPIBase + nm.TelegramToken + TelegramAPISendMessageSuffix
 	payloadBytes, err := jsonv2.Marshal(map[string]any{

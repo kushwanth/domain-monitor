@@ -697,7 +697,20 @@
       container.innerHTML = html;
     }
 
-
+    function formatSince(sinceISO) {
+      if (!sinceISO) return '';
+      const since = new Date(sinceISO);
+      const now = new Date();
+      const diffMs = now - since;
+      
+      const diffMins = Math.floor(diffMs / 60000);
+      if (diffMins < 1) return 'just now';
+      if (diffMins < 60) return `${diffMins}m`;
+      const diffHours = Math.floor(diffMins / 60);
+      if (diffHours < 24) return `${diffHours}h`;
+      const diffDays = Math.floor(diffHours / 24);
+      return `${diffDays}d`;
+    }
 
 
     // Theme initialization with localStorage persistence and query param support
@@ -1167,6 +1180,22 @@
         } else {
           labelsHtml = `<span class="badge success">healthy</span>`;
         }
+
+        // Add since badge if condition exists
+        const renderSince = (state, labelPrefix) => {
+           if (state && state.condition && state.condition.since && state.status === 'failed') {
+             const sinceStr = formatSince(state.condition.since);
+             if (sinceStr) {
+               labelsHtml += `<span class="badge error" style="margin-left:4px; opacity: 0.8;" title="${labelPrefix} failing since ${new Date(state.condition.since).toLocaleString()}">⏱ ${sinceStr}</span>`;
+             }
+           }
+        };
+        
+        renderSince(rdapState, "RDAP");
+        renderSince(emailState, "Email");
+        renderSince(dnssecState, "DNSSEC");
+        renderSince(caaState, "CAA");
+        renderSince(nsHealthState, "NS Health");
 
         if (statusClass === 'error' || statusClass === 'warning') {
           issueCount++;
@@ -1776,6 +1805,13 @@
           labelsHtml = `<span class="badge" style="color: var(--text-muted); background: var(--border);">pending</span>`;
         } else {
           labelsHtml = `<span class="badge success">healthy</span>`;
+        }
+
+        if (state && state.condition && state.condition.since && state.status === 'failed') {
+          const sinceStr = formatSince(state.condition.since);
+          if (sinceStr) {
+            labelsHtml += `<span class="badge error" style="margin-left:4px; opacity: 0.8;" title="DNS failing since ${new Date(state.condition.since).toLocaleString()}">⏱ ${sinceStr}</span>`;
+          }
         }
 
         dnsDataList.push({

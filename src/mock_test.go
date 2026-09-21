@@ -8,7 +8,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-// MockHTTPClient implements HTTPClient for tests.
+// MockHTTPClient implements HTTPDoer for tests.
 type MockHTTPClient struct {
 	MockDo func(req *http.Request) (*http.Response, error)
 }

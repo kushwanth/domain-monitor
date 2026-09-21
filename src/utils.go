@@ -146,7 +146,7 @@ func TruncateRunes(s string, maxRunes int) string {
 var DefaultHTTPClient = &http.Client{Timeout: DefaultHTTPTimeout}
 
 // ResolveHTTPClient returns client if non-nil; otherwise it returns DefaultHTTPClient.
-func ResolveHTTPClient(client HTTPClient) HTTPClient {
+func ResolveHTTPClient(client HTTPDoer) HTTPDoer {
 	if client == nil {
 		return DefaultHTTPClient
 	}

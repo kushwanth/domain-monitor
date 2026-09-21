@@ -255,6 +255,194 @@ const (
 	PriorityDefault AlertPriority = "default"
 )
 
+// ResultCode represents a typed, zero-allocation condition code for protocol-level evaluator verdicts.
+type ResultCode int
+
+const (
+	CodeNone ResultCode = iota
+
+	// RDAP / WHOIS
+	CodeRDAPSuccess
+	CodeWHOISSuccess
+	CodeDomainNotFound
+	CodeRDAPHTTPError
+	CodeWHOISParsingFailed
+	CodeEPPServerHold
+	CodeEPPClientHold
+	CodeEPPPendingDelete
+	CodeEPPRedemptionPeriod
+	CodeEPPInactive
+	CodeRDAPExpired
+	CodeRDAPExpiringSoon
+	CodeRDAPRegistrarMismatch
+	CodeRDAPTransferUnlocked
+	CodeRDAPSuspended
+
+	// NS Health
+	CodeNSSyncVerified
+	CodeNSUnreachable
+	CodeNSNotAuthoritative
+	CodeNSMissingSOA
+	CodeNSSOALags
+	CodeNSDNSKEYMismatch
+	CodeExpectedNSMissing
+	CodeUnauthorizedNS
+
+	// DNS Records
+	CodeDNSMatchVerified
+	CodeDNSMismatch
+	CodeDNSLookupFailed
+	CodeDNSServerError
+	CodeDNSPrefixMismatch
+	CodeDNSSubstringMismatch
+
+	// Email Security
+	CodeEmailVerified
+	CodeEmailMissingMX
+	CodeEmailUnauthorizedMX
+	CodeEmailHijackedMX
+	CodeEmailMissingSPF
+	CodeEmailMultipleSPF
+	CodeEmailMissingDMARC
+	CodeEmailMultipleDMARC
+	CodeEmailMissingDKIM
+	CodeMXQueryFailed
+	CodeNoMXRecords
+	CodeSPFLookupFailed
+	CodeDMARCLookupFailed
+	CodeDKIMLookupFailed
+
+	// DNSSEC
+	CodeDNSSECVerified
+	CodeDNSSECNetworkError
+	CodeDNSSECDisabled
+	CodeDNSSECNoDS
+	CodeDNSSECNoDNSKEY
+	CodeDNSSECDSMismatch
+	CodeDNSSECRRSIGFailed
+	CodeDNSSECChainBroken
+
+	// CAA
+	CodeCAAVerified
+	CodeCAAQueryFailed
+	CodeCAAMissingDenyAll
+	CodeCAAUnexpectedIssuer
+	CodeCAAMissingIssuer
+
+	// CT Logs
+	CodeCTLogsVerified
+	CodeCTLogsRateLimited
+	CodeCTLogsHTTPError
+
+	// SSL
+	CodeSSLVerified
+	CodeSSLResolveFailed
+	CodeSSLValidationFailed
+	CodeSSLExpired
+	CodeSSLExpiringSoon
+
+	// App-level
+	CodeCheckTimeout
+	CodeCheckPanic
+)
+
+// resultCodeNames maps each ResultCode to its camelCase JSON string representation.
+var resultCodeNames = [...]string{
+	CodeNone: "",
+
+	// RDAP / WHOIS
+	CodeRDAPSuccess:           "rdapSuccess",
+	CodeWHOISSuccess:          "whoisSuccess",
+	CodeDomainNotFound:        "domainNotFound",
+	CodeRDAPHTTPError:         "rdapHttpError",
+	CodeWHOISParsingFailed:    "whoisParsingFailed",
+	CodeEPPServerHold:         "serverHold",
+	CodeEPPClientHold:         "clientHold",
+	CodeEPPPendingDelete:      "pendingDelete",
+	CodeEPPRedemptionPeriod:   "redemptionPeriod",
+	CodeEPPInactive:           "inactive",
+	CodeRDAPExpired:           "rdapExpired",
+	CodeRDAPExpiringSoon:      "rdapExpiringSoon",
+	CodeRDAPRegistrarMismatch: "rdapRegistrarMismatch",
+	CodeRDAPTransferUnlocked:  "rdapTransferUnlocked",
+	CodeRDAPSuspended:         "rdapSuspended",
+
+	// NS Health
+	CodeNSSyncVerified:    "nsSyncVerified",
+	CodeNSUnreachable:     "nsUnreachable",
+	CodeNSNotAuthoritative: "nsNotAuthoritative",
+	CodeNSMissingSOA:      "nsMissingSoa",
+	CodeNSSOALags:         "nsSoaLags",
+	CodeNSDNSKEYMismatch:  "nsDnskeyMismatch",
+	CodeExpectedNSMissing: "expectedNsMissing",
+	CodeUnauthorizedNS:    "unauthorizedNs",
+
+	// DNS Records
+	CodeDNSMatchVerified:     "dnsMatchVerified",
+	CodeDNSMismatch:          "dnsMismatch",
+	CodeDNSLookupFailed:      "dnsLookupFailed",
+	CodeDNSServerError:       "dnsServerError",
+	CodeDNSPrefixMismatch:    "dnsPrefixMismatch",
+	CodeDNSSubstringMismatch: "dnsSubstringMismatch",
+
+	// Email Security
+	CodeEmailVerified:        "emailVerified",
+	CodeEmailMissingMX:       "emailMissingMx",
+	CodeEmailUnauthorizedMX:  "emailUnauthorizedMx",
+	CodeEmailHijackedMX:      "emailHijackedMx",
+	CodeEmailMissingSPF:      "emailMissingSpf",
+	CodeEmailMultipleSPF:     "emailMultipleSpf",
+	CodeEmailMissingDMARC:    "emailMissingDmarc",
+	CodeEmailMultipleDMARC:   "emailMultipleDmarc",
+	CodeEmailMissingDKIM:     "emailMissingDkim",
+	CodeMXQueryFailed:     "mxQueryFailed",
+	CodeNoMXRecords:       "noMxRecords",
+	CodeSPFLookupFailed:   "spfLookupFailed",
+	CodeDMARCLookupFailed: "dmarcLookupFailed",
+	CodeDKIMLookupFailed:  "dkimLookupFailed",
+
+	// DNSSEC
+	CodeDNSSECVerified:    "dnssecVerified",
+	CodeDNSSECNetworkError: "dnssecNetworkError",
+	CodeDNSSECDisabled:    "dnssecDisabled",
+	CodeDNSSECNoDS:        "dnssecNoDs",
+	CodeDNSSECNoDNSKEY:    "dnssecNoDnskey",
+	CodeDNSSECDSMismatch:  "dnssecDsMismatch",
+	CodeDNSSECRRSIGFailed: "dnssecRrsigFailed",
+	CodeDNSSECChainBroken: "dnssecChainBroken",
+
+	// CAA
+	CodeCAAVerified:        "caaVerified",
+	CodeCAAQueryFailed:     "caaQueryFailed",
+	CodeCAAMissingDenyAll:  "caaMissingDenyAll",
+	CodeCAAUnexpectedIssuer: "caaUnexpectedIssuer",
+	CodeCAAMissingIssuer:   "caaMissingIssuer",
+
+	// CT Logs
+	CodeCTLogsVerified:    "ctLogsVerified",
+	CodeCTLogsRateLimited: "ctLogsRateLimited",
+	CodeCTLogsHTTPError:   "ctLogsHttpError",
+
+	// SSL
+	CodeSSLVerified:         "sslVerified",
+	CodeSSLResolveFailed:    "sslResolveFailed",
+	CodeSSLValidationFailed: "sslValidationFailed",
+	CodeSSLExpired:          "sslExpired",
+	CodeSSLExpiringSoon:     "sslExpiringSoon",
+
+	// App-level
+	CodeCheckTimeout: "checkTimeout",
+	CodeCheckPanic:   "checkPanic",
+}
+
+// String returns the camelCase JSON string representation of a ResultCode.
+func (r ResultCode) String() string {
+	if int(r) >= 0 && int(r) < len(resultCodeNames) {
+		return resultCodeNames[r]
+	}
+	return ""
+}
+
 // SSL Expiration Sentinel Values
 const (
 	SSLDaysNotApplicable = -9999
@@ -401,15 +589,15 @@ var (
 	ReValidDomain    = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 	ValidDomainRegex = ReValidDomain
 
-	ReWHOISReferral  = regexp.MustCompile(`(?i)(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)\s*:\s*(?:whois:\/\/)?([a-zA-Z0-9.-]+)`)
-	ReWHOISExpiry    = regexp.MustCompile(`(?i)(?:\[?(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\]?)\s*[:\]]?\s*([^\r\n]+)`)
-	ReWHOISCreated   = regexp.MustCompile(`(?i)(?:\[?(?:Creation Date|Created on|Created|Registration Date|created|registered|created-date|Registered Date|Connected Date)\]?)\s*[:\]]?\s*([^\r\n]+)`)
-	ReWHOISUpdated   = regexp.MustCompile(`(?i)(?:\[?(?:Updated Date|Last Updated Date|Last Modified|changed|modified|updated-date|Last Update)\]?)\s*[:\]]?\s*([^\r\n]+)`)
-	ReWHOISRegistrar = regexp.MustCompile(`(?i)(?:\[?(?:Registrar Name|Sponsoring Registrar Organization|Sponsoring Registrar|registrar-name|Registrar|Organization|sponsoring-registrar|registrar)\]?)\s*[:\]]?\s*([^\r\n]+)`)
-	ReWHOISIANAID    = regexp.MustCompile(`(?i)(?:\[?(?:Registrar IANA ID|Sponsoring Registrar IANA ID|IANA ID|Registrar IANA ID Number)\]?)\s*[:\]]?\s*([0-9]+)`)
-	ReWHOISNS        = regexp.MustCompile(`(?i)(?:\[?(?:Name Server|nameserver|nserver|DNS|Name Server Name)\]?)\s*[:\]]?\s*([a-zA-Z0-9.-]+)`)
-	ReWHOISStatus    = regexp.MustCompile(`(?i)(?:\[?(?:Domain Status|Status|state|Domain State|Registration status)\]?)\s*[:\]]?\s*([^\r\n]+)`)
-	ReWHOISDNSSEC    = regexp.MustCompile(`(?i)(?:\[?(?:DNSSEC|dnssec)\]?)\s*[:\]]?\s*([^\r\n]+)`)
+	ReWHOISReferral  = regexp.MustCompile(`(?m)^(?i)\s*(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)\s*:\s*(?:whois:\/\/)?([a-zA-Z0-9.-]+)`)
+	ReWHOISExpiry    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISCreated   = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Creation Date|Created on|Created|Registration Date|created|registered|created-date|Registered Date|Connected Date)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISUpdated   = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Updated Date|Last Updated Date|Last Modified|changed|modified|updated-date|Last Update)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISRegistrar = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registrar Name|Sponsoring Registrar Organization|Sponsoring Registrar|registrar-name|Registrar|Organization|sponsoring-registrar|registrar)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISIANAID    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registrar IANA ID|Sponsoring Registrar IANA ID|IANA ID|Registrar IANA ID Number)\]?)\s*[:\]]\s*([0-9]+)`)
+	ReWHOISNS        = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Name Server|nameserver|nserver|DNS|Name Server Name)\]?)\s*[:\]]\s*([a-zA-Z0-9.-]+)`)
+	ReWHOISStatus    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Domain Status|Status|state|Domain State|Registration status)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISDNSSEC    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:DNSSEC|dnssec)\]?)\s*[:\]]\s*([^\r\n]+)`)
 )
 
 // Stealth RDAP Seeds for ccTLDs not yet published in IANA bootstrap
@@ -950,8 +1138,8 @@ const (
 	MsgErrInitAppNil                         = "cannot initialize dependencies: app is nil"
 	MsgErrInitConfigNil                      = "cannot initialize dependencies: config is nil"
 	MsgErrInitNotifierNil                    = "cannot initialize dependencies: notifier is nil"
-	MsgErrSSLInvalid                         = "%w: invalid for %s on %s: %v"
-	MsgErrSSLCertValidationFailed            = "%w: certificate validation failed for %s on %s: %v"
+	MsgErrSSLInvalid                         = "%w: invalid for %s on %s: %w"
+	MsgErrSSLCertValidationFailed            = "%w: certificate validation failed for %s on %s: %w"
 	MsgErrNilStringListReceiver              = "nil StringList receiver"
 	MsgPrefixLookupOn                        = "lookup %s on %s"
 	MsgPrefixLookupOnWithRcode               = "lookup %s on %s (%s)"
@@ -981,7 +1169,7 @@ const (
 	MsgErrSecondaryNSNotAuthoritative        = "Secondary nameserver not authoritative (AA flag missing)"
 	MsgErrNoSOARecordReturned                = "No SOA record returned in answer or authority sections"
 	MsgErrDomainNotFound404                  = "Domain not found (404)"
-	MsgErrRDAPAndWHOIS                       = "RDAP: %s | WHOIS: %s"
+	MsgErrRDAPAndWHOIS                       = "RDAP: %w | WHOIS: %w"
 )
 
 // RegistryDateLayouts specifies supported WHOIS/RDAP date format layouts for parseFlexibleDate.

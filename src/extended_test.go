@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+
 	jsonv2 "encoding/json/v2"
 	"io"
 	"net/http"
@@ -13,6 +14,14 @@ import (
 	"strings"
 	"testing"
 )
+
+func evaluateCTLogsForTest(ctx context.Context, app *AppState, target DomainConfig, prevState CTLogState) CTLogState {
+	snap := FetchCTLogsSnapshot(ctx, app, target, prevState)
+	status, cond, res := EvaluateCTLogs(target, snap)
+	res.Status = status
+	res.Condition = cond
+	return res
+}
 
 func init() {
 	SetCTLogsPath(filepath.Join(os.TempDir(), "ct_logs_test"))
@@ -331,7 +340,7 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 		MonitorCTLogs:  true,
 		SuppressAlerts: false,
 	}
-	saved := evaluateCTLogs(context.Background(), app, target, CTLogState{})
+	saved := evaluateCTLogsForTest(context.Background(), app, target, CTLogState{})
 
 	// First run must not emit notifications for existing cert baseline
 	if len(app.Notifier.TestBuffer) != 0 {
@@ -386,7 +395,7 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 		Status:           StatusOK,
 	}
 
-	res := evaluateCTLogs(context.Background(), app, target, existing)
+	res := evaluateCTLogsForTest(context.Background(), app, target, existing)
 
 	if res.Status == "" {
 		t.Fatalf("Expected CTLogState to be present")

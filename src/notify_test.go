@@ -143,7 +143,7 @@ func TestNotificationRedaction_NtfyMatchesTelegram(t *testing.T) {
 		Name:     "Corp Secret Portal",
 	}
 
-	nm.sendNtfy(alert)
+	nm.sendNtfyBatch([]Alert{alert})
 
 	ntfyMu.Lock()
 	body := ntfyBody
@@ -202,7 +202,7 @@ func TestWorkerLoop_ExponentialBackoff(t *testing.T) {
 	// But it's hardcoded, so we just run it and wait. We test them sequentially.
 
 	start := time.Now()
-	nm.sendNtfyWithRetry(Alert{Message: "Test"})
+	nm.sendNtfyBatchWithRetry([]Alert{{Message: "Test"}})
 	if time.Since(start) < 2*time.Second {
 		t.Errorf("expected backoff to take time")
 	}
@@ -218,7 +218,7 @@ func TestWorkerLoop_ExponentialBackoff(t *testing.T) {
 	transport.failTimes = 2
 	transport.mu.Unlock()
 
-	nm.sendTelegramWithRetry(Alert{Message: "Test"})
+	nm.sendTelegramBatchWithRetry([]Alert{{Message: "Test"}})
 	transport.mu.Lock()
 	if transport.attempts != 3 {
 		t.Errorf("expected 3 telegram attempts, got %d", transport.attempts)
@@ -234,7 +234,7 @@ func TestNotification_ChannelProcessing(t *testing.T) {
 	notifyHTTPClient = &http.Client{Transport: transport}
 
 	nm := &NotificationManager{
-		alertChan:      make(chan Alert, 10),
+		alertChan:      make(chan []Alert, 10),
 		NtfyURL:        "http://dummy-ntfy",
 		TelegramToken:  "testtoken",
 		TelegramChatID: "12345",
@@ -248,6 +248,7 @@ func TestNotification_ChannelProcessing(t *testing.T) {
 	}()
 
 	nm.Dispatch("msg1", "", PriorityHigh, "tag1", "domain1.com", "name1")
+	nm.Flush()
 
 	close(nm.alertChan)
 	wg.Wait()

@@ -95,7 +95,7 @@ func KnownWHOISServer(domain string) string {
 	return ""
 }
 
-func NewBootstrap(httpClient HTTPClient) *Bootstrap {
+func NewBootstrap(httpClient HTTPDoer) *Bootstrap {
 	return &Bootstrap{http: ResolveHTTPClient(httpClient), url: BootstrapURL}
 }
 

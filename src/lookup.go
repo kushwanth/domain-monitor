@@ -22,7 +22,6 @@ import (
 var (
 	allowInsecureRDAPURLs = false
 	whoisQueryFn          = defaultWHOISQuery
-	rdapBootstrap         = NewBootstrap(&http.Client{Timeout: DefaultHTTPTimeout})
 )
 
 func defaultWHOISQuery(domain string) (string, error) {
@@ -65,7 +64,7 @@ func queryWHOISWithContext(ctx context.Context, app *AppState, domain string, ho
 			if server != "" {
 				raw, qErr = whois.NewClient().SetTimeout(DefaultWHOISTimeout).Whois(asciiDomain, server)
 			} else {
-				raw, qErr = whoisQueryFn(asciiDomain)
+				raw, qErr = defaultWHOISQuery(asciiDomain)
 			}
 		}
 		ch <- queryResult{raw: raw, err: qErr}
@@ -629,17 +628,15 @@ func extractWHOISTier(raw string, source string, server string) *DomainTierData 
 	return tier
 }
 
-// synthesizeTierData merges RegistryTier and RegistrarTier into a coherent RDAPState,
+// synthesizeTierData merges RegistryTier and RegistrarTier into a coherent RDAPSnapshot,
 // detecting hierarchy discrepancies like Auto-Renew Grace Period date mismatch and NS desync.
-func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RDAPState, []string) {
+func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RDAPSnapshot, []string) {
 	if registry == nil && registrar == nil {
-		return RDAPState{
-			Status: StatusFailed,
-			Error:  MsgErrNoTierData,
+		return RDAPSnapshot{
+			Err:  errors.New(MsgErrNoTierData),
 		}, nil
 	}
-	state := RDAPState{
-		Status:        StatusOK,
+	state := RDAPSnapshot{
 		RegistryTier:  registry,
 		RegistrarTier: registrar,
 	}
@@ -751,82 +748,207 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RD
 	return state, discrepancies
 }
 
-func evaluateRDAP(ctx context.Context, httpClient HTTPClient, app *AppState, target DomainConfig) RDAPState {
-	rdapState, err := fetchRDAPFn(ctx, httpClient, target.Domain)
+// FetchRDAPSnapshot fetches raw registry data via RDAP, falling back to WHOIS.
+// Returns raw data only — no business logic, no alerting.
+func FetchRDAPSnapshot(ctx context.Context, httpClient HTTPDoer, app *AppState, domain string) RDAPSnapshot {
+	snapshot, err := fetchRDAP(ctx, httpClient, app, domain)
 	if err != nil {
 		if errors.Is(err, ErrRDAPNotFound) {
-			LogInfo(MsgLogRDAPReturned404, FieldDomain, target.Domain)
+			LogInfo(MsgLogRDAPReturned404, FieldDomain, domain)
 		} else if errors.Is(err, ErrRDAPRateLimited) {
-			LogWarn(MsgLogRDAPRateLimited, FieldDomain, target.Domain)
+			LogWarn(MsgLogRDAPRateLimited, FieldDomain, domain)
 		} else {
-			LogInfof(MsgLogWHOISFallback, target.Domain)
+			LogInfof(MsgLogWHOISFallback, domain)
 		}
 
-		whoisState, whoisErr := fetchWHOISFn(ctx, app, target.Domain)
+		whoisSnapshot, whoisErr := fetchWHOIS(ctx, app, domain)
 		if whoisErr != nil {
 			if errors.Is(whoisErr, ErrDomainNotFound) || strings.Contains(whoisErr.Error(), "404") || strings.Contains(whoisErr.Error(), "not found") {
-				LogInfo(MsgLogWHOISUnregistered, FieldDomain, target.Domain)
-				return RDAPState{
-					Status:       StatusFailed,
-					Error:        MsgErrDomainNotFound404,
+				LogInfo(MsgLogWHOISUnregistered, FieldDomain, domain)
+				return RDAPSnapshot{
 					Source:       SourceWHOIS404,
 					ProtocolUsed: ProtocolWHOIS,
+					Err:          ErrDomainNotFound,
 				}
 			}
 
-			LogErrorf(MsgLogWHOISFailed, target.Domain, whoisErr)
+			LogErrorf(MsgLogWHOISFailed, domain, whoisErr)
 
-			status := StatusFailed
-			errStr := whoisErr.Error()
-			if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "i/o timeout") || strings.Contains(errStr, "no such host") || strings.Contains(errStr, "temporary failure") || isWHOISRateLimited(errStr, whoisErr) || errors.Is(whoisErr, ErrWHOISRateLimited) {
-				status = StatusWarning
-			}
-
-			return RDAPState{
-				Status:       status,
-				Error:        fmt.Sprintf(MsgErrRDAPAndWHOIS, err.Error(), whoisErr.Error()),
+			return RDAPSnapshot{
 				ProtocolUsed: ProtocolWHOISFailed,
+				Err:          fmt.Errorf(MsgErrRDAPAndWHOIS, err, whoisErr),
 			}
 		}
 
-		LogInfof(MsgLogWHOISSuccess, target.Domain)
-		return validateRDAPState(app, target, whoisState)
+		LogInfof(MsgLogWHOISSuccess, domain)
+		return whoisSnapshot
 	}
 
 	// Hybrid Tier Supplementation: If RDAP is thin (no registrar tier), attempt WHOIS referral supplement
-	if rdapState.Status != "" && rdapState.RegistrarTier == nil && (rdapState.Expiration == "" || rdapState.Registrar == "") {
-		if whoisState, whoisErr := fetchWHOISFn(ctx, app, target.Domain); whoisErr == nil {
-			if whoisState.RegistrarTier != nil {
-				rdapState.RegistrarTier = whoisState.RegistrarTier
-			} else if whoisState.RegistryTier != nil && rdapState.RegistryTier == nil {
-				rdapState.RegistryTier = whoisState.RegistryTier
+	if snapshot.Err == nil && snapshot.RegistrarTier == nil && (snapshot.Expiration == "" || snapshot.Registrar == "") {
+		if whoisSnapshot, whoisErr := fetchWHOIS(ctx, app, domain); whoisErr == nil {
+			if whoisSnapshot.RegistrarTier != nil {
+				snapshot.RegistrarTier = whoisSnapshot.RegistrarTier
+			} else if whoisSnapshot.RegistryTier != nil && snapshot.RegistryTier == nil {
+				snapshot.RegistryTier = whoisSnapshot.RegistryTier
 			}
-			synthesized, discrepancies := synthesizeTierData(rdapState.RegistryTier, rdapState.RegistrarTier)
-			rdapState.Expiration = synthesized.Expiration
-			rdapState.Registrar = synthesized.Registrar
-			rdapState.RegistrarIANAID = synthesized.RegistrarIANAID
-			rdapState.Nameservers = synthesized.Nameservers
-			rdapState.DomainStatus = synthesized.DomainStatus
-			rdapState.DNSSEC = synthesized.DNSSEC
-			rdapState.Discrepancies = discrepancies
-			rdapState.Source = synthesized.Source
-			rdapState.ProtocolUsed = ProtocolHybrid
+			synthesized, discrepancies := synthesizeTierData(snapshot.RegistryTier, snapshot.RegistrarTier)
+			snapshot.Expiration = synthesized.Expiration
+			snapshot.Registrar = synthesized.Registrar
+			snapshot.RegistrarIANAID = synthesized.RegistrarIANAID
+			snapshot.Nameservers = synthesized.Nameservers
+			snapshot.DomainStatus = synthesized.DomainStatus
+			snapshot.DNSSEC = synthesized.DNSSEC
+			snapshot.Discrepancies = discrepancies
+			snapshot.Source = synthesized.Source
+			snapshot.ProtocolUsed = ProtocolHybrid
 		}
 	}
 
-	return validateRDAPState(app, target, rdapState)
+	return snapshot
 }
 
-// fetchRDAPFn is a variable to allow mocking in tests
-var fetchRDAPFn = fetchRDAP
+// EvaluateRDAP compares expected config against fetched RDAP snapshot.
+// Pure CPU — no network calls, no alerting.
+// Returns (CheckStatus, *StateCondition).
+func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *StateCondition) {
+	if target.Domain == "" {
+		return StatusPending, nil
+	}
 
-func fetchRDAP(ctx context.Context, httpClient HTTPClient, domain string) (RDAPState, error) {
+	if snapshot.Err != nil {
+		if errors.Is(snapshot.Err, ErrDomainNotFound) {
+			return StatusFailed, &StateCondition{Code: CodeDomainNotFound}
+		}
+
+		errStr := snapshot.Err.Error()
+		if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "i/o timeout") || strings.Contains(errStr, "no such host") || strings.Contains(errStr, "temporary failure") || isWHOISRateLimited(errStr, snapshot.Err) || errors.Is(snapshot.Err, ErrWHOISRateLimited) {
+			return StatusWarning, &StateCondition{Code: CodeRDAPHTTPError}
+		}
+
+		return StatusFailed, &StateCondition{Code: CodeRDAPHTTPError}
+	}
+
+	worstStatus := StatusOK
+	var worstCond *StateCondition
+
+	setCond := func(status CheckStatus, code ResultCode, tgt string) {
+		if status == StatusFailed {
+			worstStatus = StatusFailed
+			if worstCond == nil || worstCond.Code == CodeNone || worstStatus != StatusFailed {
+				worstCond = &StateCondition{Code: code, Target: tgt}
+			}
+		} else if status == StatusWarning && worstStatus != StatusFailed {
+			worstStatus = StatusWarning
+			if worstCond == nil || worstCond.Code == CodeNone {
+				worstCond = &StateCondition{Code: code, Target: tgt}
+			}
+		}
+	}
+
+	// 1. Checks expiration
+	if !target.AllowExpiry && snapshot.Expiration != "" {
+		if t, _, err := parseFlexibleDate(snapshot.Expiration); err == nil {
+			days := time.Until(t).Hours() / 24
+			if days < 0 {
+				setCond(StatusFailed, CodeRDAPExpired, "")
+			} else if days <= DefaultRDAPExpiryWarningDays {
+				priority := StatusWarning
+				if days <= 7 {
+					priority = StatusFailed
+				}
+				setCond(priority, CodeRDAPExpiringSoon, "")
+			}
+		}
+	}
+
+	// 2. Checks NS delegation
+	if len(target.ExpectedNS) > 0 {
+		liveNS := make(map[string]bool)
+		authorizedMap := make(map[string]bool)
+
+		for _, ns := range target.ExpectedNS {
+			norm := NormalizeDomain(ns)
+			if norm != "" {
+				authorizedMap[norm] = true
+			}
+		}
+		for _, ns := range target.SecondaryNS {
+			norm := NormalizeDomain(ns)
+			if norm != "" {
+				authorizedMap[norm] = true
+			}
+		}
+
+		for _, raw := range snapshot.Nameservers {
+			ns := NormalizeDomain(raw)
+			if ns == "" {
+				continue
+			}
+			liveNS[ns] = true
+			if !authorizedMap[ns] {
+				setCond(StatusFailed, CodeUnauthorizedNS, ns)
+			}
+		}
+
+		for _, expectedRaw := range target.ExpectedNS {
+			expected := NormalizeDomain(expectedRaw)
+			if expected != "" && !liveNS[expected] {
+				setCond(StatusFailed, CodeExpectedNSMissing, expectedRaw)
+			}
+		}
+	}
+
+	// 3. Checks EPP statuses
+	if isSusp, suspStatus := isDomainSuspended(snapshot.DomainStatus); isSusp {
+		code := CodeRDAPSuspended
+		suspClean := NormalizeStatusToken(suspStatus)
+		if suspClean == EPPStatusServerHold {
+			code = CodeEPPServerHold
+		} else if suspClean == EPPStatusClientHold {
+			code = CodeEPPClientHold
+		} else if suspClean == EPPStatusPendingDelete {
+			code = CodeEPPPendingDelete
+		} else if suspClean == EPPStatusRedemptionPeriod {
+			code = CodeEPPRedemptionPeriod
+		} else if suspClean == EPPStatusInactive {
+			code = CodeEPPInactive
+		}
+		setCond(StatusFailed, code, "")
+	}
+
+	// 4. Checks transfer lock
+	if target.DomainTransferLocked && !isTransferLocked(snapshot.DomainStatus) {
+		setCond(StatusWarning, CodeRDAPTransferUnlocked, "")
+	}
+
+	// 5. Checks registrar match
+	if target.ExpectedRegistrarID != "" {
+		if snapshot.RegistrarIANAID != target.ExpectedRegistrarID {
+			setCond(StatusFailed, CodeRDAPRegistrarMismatch, "IANA "+target.ExpectedRegistrarID)
+		}
+	} else if target.ExpectedRegistrarName != "" {
+		if !strings.Contains(strings.ToLower(snapshot.Registrar), strings.ToLower(target.ExpectedRegistrarName)) {
+			setCond(StatusFailed, CodeRDAPRegistrarMismatch, target.ExpectedRegistrarName)
+		}
+	}
+
+	if worstCond == nil {
+		worstCond = &StateCondition{Code: CodeRDAPSuccess}
+	}
+	return worstStatus, worstCond
+}
+
+func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain string) (RDAPSnapshot, error) {
 	start := time.Now()
 	asciiDomain := NormalizeDomainToASCIIText(domain)
 
-	urls, err := rdapBootstrap.ServersFor(ctx, asciiDomain)
+	if app == nil || app.Bootstrap == nil {
+		return RDAPSnapshot{}, errors.New("app state or bootstrap is nil")
+	}
+	urls, err := app.Bootstrap.ServersFor(ctx, asciiDomain)
 	if err != nil {
-		return RDAPState{}, WrapError(MsgErrNoRDAPServer, err)
+		return RDAPSnapshot{}, WrapError(MsgErrNoRDAPServer, err)
 	}
 
 	if httpClient == nil {
@@ -853,11 +975,11 @@ func fetchRDAP(ctx context.Context, httpClient HTTPClient, domain string) (RDAPS
 
 		if resp.StatusCode == http.StatusNotFound {
 			DrainAndClose(resp.Body, MaxBodyDrainSize)
-			return RDAPState{}, ErrRDAPNotFound
+			return RDAPSnapshot{}, ErrRDAPNotFound
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			DrainAndClose(resp.Body, MaxBodyDrainSize)
-			return RDAPState{}, ErrRDAPRateLimited
+			return RDAPSnapshot{}, ErrRDAPRateLimited
 		}
 		if resp.StatusCode != http.StatusOK {
 			DrainAndClose(resp.Body, MaxBodyDrainSize)
@@ -896,9 +1018,9 @@ func fetchRDAP(ctx context.Context, httpClient HTTPClient, domain string) (RDAPS
 	}
 
 	if lastErr != nil {
-		return RDAPState{}, lastErr
+		return RDAPSnapshot{}, lastErr
 	}
-	return RDAPState{}, errors.New(MsgErrRDAPLookupFailedAllCandidates)
+	return RDAPSnapshot{}, errors.New(MsgErrRDAPLookupFailedAllCandidates)
 }
 
 // isSafeRDAPURL validates that candidate registrar RDAP referral URLs are safe to query,
@@ -951,7 +1073,7 @@ func isSafeWHOISServer(server string) bool {
 	return ReValidDomain.MatchString(host)
 }
 
-func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client HTTPClient) *RDAPDomainResponse {
+func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client HTTPDoer) *RDAPDomainResponse {
 	httpClient := client
 	if httpClient == nil {
 		httpClient = NewRDAPHTTPClient(DefaultReferralRDAPTimeout)
@@ -1012,10 +1134,7 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 	return nil
 }
 
-// fetchWHOISFn is a variable to allow mocking in tests
-var fetchWHOISFn = fetchWHOIS
-
-func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPState, error) {
+func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPSnapshot, error) {
 	start := time.Now()
 	if ctx == nil {
 		ctx = context.Background()
@@ -1031,7 +1150,7 @@ func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPState, e
 		cancel()
 
 		if queryErr != nil && result == "" {
-			return RDAPState{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
+			return RDAPSnapshot{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
 		}
 
 		if !isWHOISRateLimited(result, queryErr) {
@@ -1045,11 +1164,11 @@ func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPState, e
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return RDAPState{}, ctx.Err()
+				return RDAPSnapshot{}, ctx.Err()
 			case <-timer.C:
 			}
 		} else {
-			return RDAPState{}, ErrWHOISRateLimited
+			return RDAPSnapshot{}, ErrWHOISRateLimited
 		}
 	}
 
@@ -1082,103 +1201,17 @@ func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPState, e
 
 	// Check for domain not registered
 	if isDomainNotFoundInWHOIS(result) && state.Expiration == "" && len(state.Nameservers) == 0 {
-		return RDAPState{}, ErrDomainNotFound
+		return RDAPSnapshot{}, ErrDomainNotFound
 	}
 
 	if state.Expiration == "" && state.Registrar == "" && len(state.Nameservers) == 0 && len(state.DomainStatus) == 0 {
 		if queryErr != nil {
-			return RDAPState{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
+			return RDAPSnapshot{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
 		}
-		return RDAPState{}, errors.New(MsgErrWHOISParsingFailed)
+		return RDAPSnapshot{}, errors.New(MsgErrWHOISParsingFailed)
 	}
 
 	return state, nil
-}
-
-func validateRDAPState(app *AppState, target DomainConfig, parsed RDAPState) RDAPState {
-	if target.Domain == "" || parsed.Status == "" {
-		return parsed
-	}
-	parsed.AllowExpiry = target.AllowExpiry
-	if parsed.Expiration != "" {
-		if t, norm, err := parseFlexibleDate(parsed.Expiration); err == nil {
-			parsed.Expiration = norm
-			days := time.Until(t).Hours() / 24
-			if days < 0 {
-				parsed.Status = StatusFailed
-				if !target.SuppressAlerts && !target.AllowExpiry {
-					app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedRDAPExpired, MsgAlertRDAPExpired, target.Domain, math.Abs(days))
-				}
-			} else if days <= DefaultRDAPExpiryWarningDays {
-				priority := PriorityWarning
-				if days <= 7 {
-					priority = PriorityUrgent
-				}
-				if parsed.Status == StatusOK {
-					parsed.Status = StatusWarning
-				}
-				if !target.SuppressAlerts && !target.AllowExpiry {
-					app.SafeDispatchf(priority, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedRDAPExpiring, int(days)), MsgAlertRDAPExpiry, target.Domain, days)
-				}
-			}
-		}
-	}
-
-	validateDelegatedNameservers(app, target, parsed.Nameservers, &parsed)
-
-	// Status & Suspension evaluation
-	parsed.DomainStatus = NormalizeDomainStatuses(parsed.DomainStatus)
-	if isSusp, suspStatus := isDomainSuspended(parsed.DomainStatus); isSusp {
-		parsed.Status = StatusFailed
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityUrgent, TagError, target.Domain, target.Name, fmt.Sprintf(MsgRedactedRDAPSuspended, suspStatus), MsgAlertRDAPSuspended, target.Domain, suspStatus)
-		}
-	}
-
-	if target.DomainTransferLocked && !isTransferLocked(parsed.DomainStatus) {
-		if parsed.Status == StatusOK {
-			parsed.Status = StatusWarning
-		}
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityHigh, TagUnlock, target.Domain, target.Name, MsgRedactedRDAPUnlocked, MsgAlertRDAPUnlocked, target.Domain)
-		}
-	}
-
-	// Registrar Validation: Both fields can be present in config.
-	// Order of priority: expected_registrar_id (Priority 1) takes precedence over expected_registrar_name (Priority 2).
-	// In evaluation, they are mutually exclusive: if expected_registrar_id is configured, it is evaluated and name is superseded.
-	if target.ExpectedRegistrarID != "" {
-		if parsed.RegistrarIANAID != target.ExpectedRegistrarID {
-			parsed.Status = StatusFailed
-			parsed.RegistrarMismatch = true
-			parsed.ExpectedRegistrar = "IANA " + target.ExpectedRegistrarID
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, fmt.Sprintf(MsgRedactedRDAPRegistrarID, target.ExpectedRegistrarID), MsgAlertRDAPRegistrarIDMismatch, target.Domain, target.ExpectedRegistrarID, parsed.RegistrarIANAID)
-			}
-		}
-	} else if target.ExpectedRegistrarName != "" {
-		if !strings.Contains(strings.ToLower(parsed.Registrar), strings.ToLower(target.ExpectedRegistrarName)) {
-			parsed.Status = StatusFailed
-			parsed.RegistrarMismatch = true
-			parsed.ExpectedRegistrar = target.ExpectedRegistrarName
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, fmt.Sprintf(MsgRedactedRDAPRegistrarName, target.ExpectedRegistrarName), MsgAlertRDAPRegistrarNameMismatch, target.Domain, target.ExpectedRegistrarName, parsed.Registrar)
-			}
-		}
-	}
-
-	// Report Hierarchy Discrepancies if detected
-	for _, discrepancy := range parsed.Discrepancies {
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityWarning, TagWarning, target.Domain, target.Name, discrepancy, MsgAlertRDAPDiscrepancy, target.Domain, discrepancy)
-		}
-	}
-
-	if target.RenewalPrice > 0 {
-		parsed.RenewalPrice = target.RenewalPrice
-	}
-
-	return parsed
 }
 
 func resolveRootZoneResolvers(ctx context.Context, app *AppState, rootZone string, globalResolvers []string) []string {
@@ -1196,13 +1229,8 @@ func resolveRootZoneResolvers(ctx context.Context, app *AppState, rootZone strin
 	return rootIPs
 }
 
-func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfig) RDAPState {
-	parsed := RDAPState{
-		Status:          StatusOK,
-		IsDelegatedZone: true,
-		Source:          SourceDNSDelegation,
-		AllowExpiry:     target.AllowExpiry,
-	}
+func FetchNSDelegationSnapshot(ctx context.Context, app *AppState, target DomainConfig) NSDelegationSnapshot {
+	var snapshot NSDelegationSnapshot
 
 	resolversToUse := app.Resolvers()
 	rd := true
@@ -1214,11 +1242,10 @@ func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfi
 		}
 	}
 
-	r, err := queryDNSMsgWithRDFn(ctx, app, target.Domain, dns.TypeNS, resolversToUse, rd)
+	r, err := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeNS, resolversToUse, rd)
 	if err != nil {
-		parsed.Status = StatusFailed
-		parsed.Error = fmt.Sprintf(MsgErrFailedToQueryNSRecords, err.Error())
-		return parsed
+		snapshot.Err = fmt.Errorf("failed to query NS records: %w", err)
+		return snapshot
 	}
 
 	var nsRecords []string
@@ -1240,17 +1267,17 @@ func evaluateNSDelegation(ctx context.Context, app *AppState, target DomainConfi
 	}
 
 	for _, ns := range nsRecords {
-		parsed.Nameservers = append(parsed.Nameservers, NormalizeDomain(ns))
+		snapshot.Nameservers = append(snapshot.Nameservers, NormalizeDomain(ns))
 	}
 
-	validateDelegatedNameservers(app, target, parsed.Nameservers, &parsed)
-
-	return parsed
+	return snapshot
 }
 
-// validateDelegatedNameservers verifies that delegated nameservers returned by the registrar/registry
-// match the configured expected primary nameservers and secondary (slave/replica) nameservers.
-func validateDelegatedNameservers(app *AppState, target DomainConfig, nameservers []string, parsed *RDAPState) {
+func EvaluateNSDelegation(target DomainConfig, snapshot NSDelegationSnapshot) (CheckStatus, *StateCondition) {
+	if snapshot.Err != nil {
+		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: snapshot.Err.Error()}
+	}
+
 	liveNS := make(map[string]bool)
 	authorizedMap := make(map[string]bool)
 
@@ -1268,31 +1295,34 @@ func validateDelegatedNameservers(app *AppState, target DomainConfig, nameserver
 	}
 
 	hasConfiguredNS := len(authorizedMap) > 0
-	for _, raw := range nameservers {
+
+	worstStatus := StatusOK
+	var worstCond *StateCondition
+
+	setCond := func(code ResultCode, tgt string) {
+		worstStatus = StatusFailed
+		if worstCond == nil || worstCond.Code == CodeNone {
+			worstCond = &StateCondition{Code: code, Target: tgt}
+		}
+	}
+
+	for _, raw := range snapshot.Nameservers {
 		ns := NormalizeDomain(raw)
 		if ns == "" {
 			continue
 		}
 		liveNS[ns] = true
 		if hasConfiguredNS && !authorizedMap[ns] {
-			if parsed != nil {
-				parsed.Status = StatusFailed
-			}
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityUrgent, TagSkull, target.Domain, target.Name, MsgRedactedRDAPUnauthorizedNS, MsgAlertRDAPUnauthorizedNS, target.Domain, ns)
-			}
+			setCond(CodeUnauthorizedNS, ns)
 		}
 	}
 
 	for _, expectedRaw := range target.ExpectedNS {
 		expected := NormalizeDomain(expectedRaw)
 		if expected != "" && !liveNS[expected] {
-			if parsed != nil {
-				parsed.Status = StatusFailed
-			}
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedRDAPMissingNS, MsgAlertRDAPMissingNS, target.Domain, expectedRaw)
-			}
+			setCond(CodeExpectedNSMissing, expectedRaw)
 		}
 	}
+
+	return worstStatus, worstCond
 }

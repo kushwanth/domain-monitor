@@ -18,7 +18,7 @@ var (
 )
 
 // NewPricingManager initializes a PricingManager targeting DotSweep with the provided HTTP client.
-func NewPricingManager(httpClient HTTPClient) *PricingManager {
+func NewPricingManager(httpClient HTTPDoer) *PricingManager {
 	return &PricingManager{
 		http:   ResolveHTTPClient(httpClient),
 		url:    DotSweepAPIEndpoint,

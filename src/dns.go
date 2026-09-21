@@ -123,20 +123,15 @@ func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acce
 	return minDays, nil
 }
 
-// queryDNSMsgFn is a variable to allow mocking in tests
-var queryDNSMsgFn = queryDNSMsg
-
 // queryDNSMsg queries the given resolvers for the specified hostname and record type using miekg/dns.
 // It retries on network errors and SERVFAIL using the next resolver in round-robin order.
 func queryDNSMsg(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) (*dns.Msg, error) {
-	return queryDNSMsgWithRDFn(ctx, app, hostname, qtype, resolvers, true)
+	return queryDNSMsgWithRD(ctx, app, hostname, qtype, resolvers, true)
 }
 
 // queryDNSMsgWithRD queries the given resolvers with explicit recursionDesired configuration.
 // The "RD" acronym corresponds directly to the RFC 1035 wire-format header bit (Recursion Desired),
 // which is set to false (RD=0) when querying authoritative nameservers directly.
-var queryDNSMsgWithRDFn = queryDNSMsgWithRD
-
 func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string, recursionDesired bool) (*dns.Msg, error) {
 	if len(resolvers) == 0 {
 		return nil, ErrNoResolvers
@@ -222,7 +217,7 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 // queryDNS queries the given resolvers and returns parsed string results.
 // It bypasses the OS resolver completely and forces a direct UDP/TCP connection to the provided IP.
 func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) ([]string, error) {
-	r, err := queryDNSMsgFn(ctx, app, hostname, qtype, resolvers)
+	r, err := queryDNSMsg(ctx, app, hostname, qtype, resolvers)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +269,7 @@ func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16,
 // queryCAARecords queries CAA records and returns structured entries
 // instead of raw string representations that require brittle re-parsing.
 func queryCAARecords(ctx context.Context, app *AppState, hostname string, resolvers []string) ([]CAAEntry, error) {
-	r, err := queryDNSMsgFn(ctx, app, hostname, dns.TypeCAA, resolvers)
+	r, err := queryDNSMsg(ctx, app, hostname, dns.TypeCAA, resolvers)
 	if err != nil {
 		return nil, err
 	}
@@ -334,19 +329,25 @@ func queryIPRecords(ctx context.Context, app *AppState, hostname string, resolve
 	return found, nil
 }
 
-func evaluateCAA(ctx context.Context, app *AppState, target DomainConfig) CAAResult {
+func FetchCAASnapshot(ctx context.Context, app *AppState, target DomainConfig) CAASnapshot {
 	if target.CAA == nil {
-		return CAAResult{}
+		return CAASnapshot{}
 	}
+	res, found := fetchCAA(ctx, app, target.Domain, app.Resolvers())
+	return CAASnapshot{Found: found, Result: res}
+}
 
-	res, found := fetchCAAFn(ctx, app, target.Domain, app.Resolvers())
-	if !found {
-		return CAAResult{Valid: false, Error: MsgErrFailedToQueryCAA}
+func EvaluateCAA(target DomainConfig, snapshot CAASnapshot) (CheckStatus, *StateCondition, CAAResult) {
+	if target.CAA == nil {
+		return StatusOK, nil, CAAResult{}
 	}
-
+	if !snapshot.Found {
+		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: MsgErrFailedToQueryCAA}, CAAResult{Valid: false, Error: MsgErrFailedToQueryCAA}
+	}
+	res := snapshot.Result
 	if res.Error != "" {
 		res.Valid = false
-		return res
+		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: res.Error}, res
 	}
 
 	liveIssue := make(map[string]bool)
@@ -370,90 +371,84 @@ func evaluateCAA(ctx context.Context, app *AppState, target DomainConfig) CAARes
 	}
 
 	res.Valid = true
+	var cond *StateCondition
+	status := StatusOK
 
-	// Validate 'issue' if configured
 	if target.CAA.Issue != nil {
-		res = validateCAATag(app, target, CAATagIssue, target.CAA.Issue, liveIssue, res)
+		res, cond = evaluateCAATag(target, CAATagIssue, target.CAA.Issue, liveIssue, res, cond)
 	}
-	// Validate 'issuewild' if configured
 	if target.CAA.IssueWild != nil {
-		res = validateCAATag(app, target, CAATagIssueWild, target.CAA.IssueWild, liveIssueWild, res)
+		res, cond = evaluateCAATag(target, CAATagIssueWild, target.CAA.IssueWild, liveIssueWild, res, cond)
 	}
-	// Validate 'issuemail' if configured
 	if target.CAA.IssueMail != nil {
-		res = validateCAATag(app, target, CAATagIssueMail, target.CAA.IssueMail, liveIssueMail, res)
+		res, cond = evaluateCAATag(target, CAATagIssueMail, target.CAA.IssueMail, liveIssueMail, res, cond)
 	}
 
-	return res
+	if !res.Valid {
+		status = StatusFailed
+	} else {
+		cond = &StateCondition{Code: CodeCAAVerified}
+	}
+
+	return status, cond, res
 }
 
-func validateCAATag(app *AppState, target DomainConfig, tag string, expected []string, live map[string]bool, res CAAResult) CAAResult {
+func evaluateCAATag(target DomainConfig, tag string, expected []string, live map[string]bool, res CAAResult, cond *StateCondition) (CAAResult, *StateCondition) {
 	if expected == nil {
-		return res
+		return res, cond
 	}
 
-	// 1. Explicit Deny-All (empty slice / no CAs authorized)
 	if len(expected) == 0 {
 		if len(live) == 0 {
-			// In DNS, absence of CAA records means any CA can issue certs by default
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAADenyAllMissing, tag), MsgAlertCAAMissing, tag, target.Domain)
-			}
 			res.Valid = false
-			return res
+			return res, &StateCondition{Code: CodeCAAMissingDenyAll, Target: tag}
 		}
 
 		for liveCA := range live {
 			if liveCA != CAADenyAll {
-				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAUnauthorizedDeny, liveCA, tag), MsgAlertCAAUnauthorized, liveCA, tag, target.Domain)
-				}
 				if !slices.Contains(res.UnknownCAs, liveCA) {
 					res.UnknownCAs = append(res.UnknownCAs, liveCA)
 				}
 				res.Valid = false
+				if cond == nil {
+					cond = &StateCondition{Code: CodeCAAUnexpectedIssuer, Target: liveCA + " in " + tag}
+				}
 			}
 		}
-		return res
+		return res, cond
 	}
 
-	// 2. Specific CAs expected
 	expectedMap := make(map[string]bool)
 	for _, v := range expected {
 		expectedMap[v] = true
 	}
 
 	if len(live) == 0 {
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAMissing, tag), MsgAlertCAAMissing, tag, target.Domain)
-		}
 		res.Valid = false
-		return res
+		return res, &StateCondition{Code: CodeCAAMissingIssuer, Target: tag}
 	}
 
-	// Check for missing expected CAs
 	for _, exp := range expected {
 		if !live[exp] {
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAExpectedMissing, exp, tag), MsgAlertCAAExpectedNA, exp, tag, target.Domain)
-			}
 			res.Valid = false
+			if cond == nil {
+				cond = &StateCondition{Code: CodeCAAMissingIssuer, Target: exp + " in " + tag}
+			}
 		}
 	}
 
-	// Check for unauthorized CAs
 	for liveCA := range live {
 		if !expectedMap[liveCA] {
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, fmt.Sprintf(MsgRedactedCAAUnauthorized, liveCA, tag), MsgAlertCAAUnauthorized, liveCA, tag, target.Domain)
-			}
 			if !slices.Contains(res.UnknownCAs, liveCA) {
 				res.UnknownCAs = append(res.UnknownCAs, liveCA)
 			}
 			res.Valid = false
+			if cond == nil {
+				cond = &StateCondition{Code: CodeCAAUnexpectedIssuer, Target: liveCA + " in " + tag}
+			}
 		}
 	}
-	return res
+	return res, cond
 }
 
 func fetchCAANode(ctx context.Context, app *AppState, domain string, resolvers []string, visitedAliases map[string]bool) (CAAResult, bool) {
@@ -518,12 +513,6 @@ func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []str
 	return fetchCAATree(ctx, app, currentDomain, resolvers, make(map[string]bool))
 }
 
-// fetchCAAFn is a variable to allow mocking in tests
-var fetchCAAFn = fetchCAA
-
-// validateDNSSECFn is a variable to allow mocking in tests
-var validateDNSSECFn = validateDNSSEC
-
 func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers []string, dohURLTemplate string) DNSSECResult {
 	res := DNSSECResult{
 		Source: DNSSECSourceLocalDoH,
@@ -532,7 +521,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	fqdn := dns.Fqdn(domain)
 
 	// 1. Query DS
-	dsResp, err := queryDNSMsgFn(ctx, app, domain, dns.TypeDS, resolvers)
+	dsResp, err := queryDNSMsg(ctx, app, domain, dns.TypeDS, resolvers)
 	if err != nil {
 		res.Valid = false
 		res.Error = fmt.Sprintf(MsgErrDSQueryFailed, err.Error())
@@ -550,7 +539,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	}
 
 	// 2. Query DNSKEY
-	keyResp, err := queryDNSMsgFn(ctx, app, domain, dns.TypeDNSKEY, resolvers)
+	keyResp, err := queryDNSMsg(ctx, app, domain, dns.TypeDNSKEY, resolvers)
 	if err != nil {
 		res.Valid = false
 		res.Error = fmt.Sprintf(MsgErrDNSKEYQueryFailed, err.Error())
@@ -664,11 +653,11 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 			dohReq.Header.Set(HeaderAccept, MIMEDNSJSON)
 			dohReq.Header.Set(HeaderUserAgent, DefaultUserAgent)
 			
-			var client HTTPClient
+			var httpClient HTTPDoer
 			if app != nil {
-				client = app.HTTPClient
+				httpClient = app.HTTPClient
 			}
-			client = ResolveHTTPClient(client)
+			client := ResolveHTTPClient(httpClient)
 			
 			dohResp, err := client.Do(dohReq)
 
@@ -726,110 +715,102 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 
 	return res
 }
-
-func evaluateDNSSEC(ctx context.Context, app *AppState, target DomainConfig) DNSSECResult {
+func FetchDNSSECSnapshot(ctx context.Context, app *AppState, target DomainConfig) DNSSECSnapshot {
 	if !target.DNSSEC {
-		return DNSSECResult{}
+		return DNSSECSnapshot{}
 	}
-
 	dohURL := DefaultDoHURL
 	if app != nil && app.Config().DoHURL != "" {
 		dohURL = app.Config().DoHURL
 	}
-
-	res := validateDNSSECFn(ctx, app, target.Domain, app.Resolvers(), dohURL)
-	if res.Source == "" {
-		return DNSSECResult{Valid: false, Source: DNSSECSourceLocalOnly, Error: MsgErrValidateDNSSECNil}
-	}
-
-	if !res.Valid && !target.SuppressAlerts {
-		if res.Error != "" && strings.Contains(res.Error, "query failed") {
-			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedDNSSECFailedNetwork, MsgAlertDNSSECNetworkError, target.Domain, res.Error)
-		} else if !res.HasDS && !res.HasDNSKEY {
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedDNSSECDisabled, MsgAlertDNSSECUnsigned, target.Domain)
-		} else if !res.HasDS {
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedDNSSECDSNotFound, MsgAlertDNSSECNoDS, target.Domain)
-		} else if !res.HasDNSKEY {
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedDNSSECDNSKEYNotFound, MsgAlertDNSSECNoDNSKEY, target.Domain)
-		} else if !res.DSMatchesDNSKEY {
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedDNSSECDSMismatch, MsgAlertDNSSECMismatch, target.Domain)
-		} else if !res.RRSIGValid {
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedDNSSECRRSIGFailed, MsgAlertDNSSECRRSIGFailed, target.Domain)
-		} else if !res.ChainIntact && res.Source != DNSSECSourceLocalOnly {
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedDNSSECChainFailed, MsgAlertDNSSECChainBroken, target.Domain)
-		}
-	}
-
-	return res
+	res := validateDNSSEC(ctx, app, target.Domain, app.Resolvers(), dohURL)
+	return DNSSECSnapshot{Result: res}
 }
 
-// evaluateDNSFn is a variable to allow mocking in tests
-var evaluateDNSFn = evaluateDNS
-
-// evaluateDNS orchestrates the resolution and validation of a DNS task
-func evaluateDNS(ctx context.Context, app *AppState, target DNSTask) DNSState {
-	foundRecords, err := resolveTargetFn(ctx, app, target)
-
-	if err != nil {
-		app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, fmt.Sprintf(MsgRedactedDNSResolutionFailed, target.Hostname, target.Type), MsgAlertDNSFailed, target.Hostname, target.Type)
-
-		return DNSState{
-			Hostname: target.Hostname,
-			Name:     target.Name,
-			Type:     target.Type,
-			Expected: target.Expected,
-			Status:   StatusFailed,
-			Error:    err.Error(),
+func EvaluateDNSSEC(target DomainConfig, snapshot DNSSECSnapshot) (CheckStatus, *StateCondition, DNSSECResult) {
+	if !target.DNSSEC {
+		return StatusOK, nil, DNSSECResult{}
+	}
+	res := snapshot.Result
+	if res.Source == "" {
+		res.Source = DNSSECSourceLocalOnly
+		res.Error = MsgErrValidateDNSSECNil
+		res.Valid = false
+	}
+	status := StatusOK
+	var cond *StateCondition
+	if !res.Valid {
+		status = StatusFailed
+		if res.Error != "" && strings.Contains(res.Error, "query failed") {
+			cond = &StateCondition{Code: CodeDNSLookupFailed, Target: res.Error}
+		} else if !res.HasDS && !res.HasDNSKEY {
+			cond = &StateCondition{Code: CodeDNSSECDisabled}
+		} else if !res.HasDS {
+			cond = &StateCondition{Code: CodeDNSSECNoDS}
+		} else if !res.HasDNSKEY {
+			cond = &StateCondition{Code: CodeDNSSECNoDNSKEY}
+		} else if !res.DSMatchesDNSKEY {
+			cond = &StateCondition{Code: CodeDNSSECDSMismatch}
+		} else if !res.RRSIGValid {
+			cond = &StateCondition{Code: CodeDNSSECRRSIGFailed}
+		} else if !res.ChainIntact && res.Source != DNSSECSourceLocalOnly {
+			cond = &StateCondition{Code: CodeDNSSECChainBroken}
 		}
+	} else {
+		cond = &StateCondition{Code: CodeDNSSECVerified}
+	}
+	return status, cond, res
+}
+
+
+// FetchDNSSnapshot performs the DNS resolution and returns a snapshot
+func FetchDNSSnapshot(ctx context.Context, app *AppState, target DNSTask) DNSSnapshot {
+	foundRecords, err := resolveTarget(ctx, app, target)
+	return DNSSnapshot{
+		Records: foundRecords,
+		Err:     err,
+	}
+}
+
+// EvaluateDNS evaluates the DNS records against the expected ones
+func EvaluateDNS(target DNSTask, snapshot DNSSnapshot) (CheckStatus, *StateCondition) {
+	if snapshot.Err != nil {
+		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: snapshot.Err.Error()}
 	}
 
-	allMatch, mismatchReason := validateRecordsWithReason(app, target, foundRecords)
+	allMatch, mismatchReason, mismatchCode := validateRecordsWithReason(target, snapshot.Records)
+	if !allMatch {
+		return StatusMismatch, &StateCondition{Code: mismatchCode, Target: mismatchReason}
+	}
+
+	return StatusOK, &StateCondition{Code: CodeDNSMatchVerified}
+}
+
+// FetchSSLSnapshot connects to the target on port 443 and fetches the certificate
+func FetchSSLSnapshot(ctx context.Context, app *AppState, target DNSTask, foundRecords []string) SSLSnapshot {
 	sslDays := SSLDaysNotApplicable
 	if !target.SkipSSL {
 		sslDays = validateCertificate(ctx, app, target, foundRecords)
 	}
-
-	status := StatusOK
-	var recordErr string
-	if !allMatch {
-		status = StatusMismatch
-		recordErr = mismatchReason
-	}
-
-	if sslDays == SSLDaysError || (sslDays != SSLDaysNotApplicable && sslDays < 0) {
-		status = StatusFailed
-		if recordErr == "" {
-			recordErr = "SSL validation failed or certificate expired"
-		} else {
-			recordErr += " | SSL validation failed or certificate expired"
-		}
-	} else if sslDays != SSLDaysNotApplicable && sslDays <= DefaultSSLExpiryWarningDays {
-		if status == StatusOK {
-			status = StatusWarning
-		}
-	}
-
-	var sslDaysPtr *int
-	if sslDays != SSLDaysNotApplicable && sslDays != SSLDaysError {
-		d := sslDays // create copy for pointer
-		sslDaysPtr = &d
-	}
-
-	return DNSState{
-		Hostname: target.Hostname,
-		Name:     target.Name,
-		Type:     target.Type,
-		Expected: target.Expected,
-		Status:   status,
-		Found:    foundRecords,
-		SSLDays:  sslDaysPtr,
-		SkipSSL:  target.SkipSSL,
-		Error:    recordErr,
+	return SSLSnapshot{
+		ExpiryDays: sslDays,
 	}
 }
 
-// resolveTargetFn is a variable to allow mocking in tests
-var resolveTargetFn = resolveTarget
+// EvaluateSSL evaluates the SSL certificate expiry
+func EvaluateSSL(target DNSTask, snapshot SSLSnapshot) (CheckStatus, *StateCondition) {
+	if snapshot.ExpiryDays == SSLDaysNotApplicable {
+		return StatusOK, nil
+	}
+
+	if snapshot.ExpiryDays == SSLDaysError || snapshot.ExpiryDays < 0 {
+		return StatusFailed, &StateCondition{Code: CodeSSLExpired} // Wait, validateCertificate returns SSLDaysError for network issues. CodeSSLResolveFailed or CodeSSLValidationFailed.
+	} else if snapshot.ExpiryDays <= DefaultSSLExpiryWarningDays {
+		return StatusWarning, &StateCondition{Code: CodeSSLExpiringSoon}
+	}
+
+	return StatusOK, &StateCondition{Code: CodeSSLVerified}
+}
 
 func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string, error) {
 	resolvers := app.Resolvers()
@@ -940,12 +921,12 @@ func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string
 	return foundRecords, err
 }
 
-func validateRecords(app *AppState, target DNSTask, foundRecords []string) bool {
-	valid, _ := validateRecordsWithReason(app, target, foundRecords)
+func validateRecords(target DNSTask, foundRecords []string) bool {
+	valid, _, _ := validateRecordsWithReason(target, foundRecords)
 	return valid
 }
 
-func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []string) (bool, string) {
+func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, string, ResultCode) {
 	matchType := strings.ToLower(strings.TrimSpace(target.MatchType))
 	if matchType == "" {
 		matchType = MatchExact
@@ -964,13 +945,14 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 				}
 			}
 			if !matched {
-				redacted := fmt.Sprintf(MsgRedactedDNSMismatchPrefix, target.Hostname, target.Type)
-				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSMismatch, target.Hostname, target.Type, expected, strings.Join(foundRecords, ", "))
 				allMatch = false
 				mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonPrefixNotFound, expected, strings.Join(foundRecords, ", ")))
 			}
 		}
-		return allMatch, strings.Join(mismatchReasons, "; ")
+		if !allMatch {
+			return false, strings.Join(mismatchReasons, "; "), CodeDNSPrefixMismatch
+		}
+		return true, "", CodeDNSMatchVerified
 
 	case MatchContains:
 		allMatch := true
@@ -984,13 +966,14 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 				}
 			}
 			if !matched {
-				redacted := fmt.Sprintf(MsgRedactedDNSMismatchSubstring, target.Hostname, target.Type)
-				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSMismatch, target.Hostname, target.Type, expected, strings.Join(foundRecords, ", "))
 				allMatch = false
 				mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonSubstringNotFound, expected, strings.Join(foundRecords, ", ")))
 			}
 		}
-		return allMatch, strings.Join(mismatchReasons, "; ")
+		if !allMatch {
+			return false, strings.Join(mismatchReasons, "; "), CodeDNSSubstringMismatch
+		}
+		return true, "", CodeDNSMatchVerified
 
 	case MatchAnyOf:
 		matched := false
@@ -1001,11 +984,9 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 			}
 		}
 		if !matched {
-			redacted := fmt.Sprintf(MsgRedactedDNSMismatchAnyOf, target.Hostname, target.Type)
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSMismatch, target.Hostname, target.Type, strings.Join(target.Expected, " OR "), strings.Join(foundRecords, ", "))
-			return false, fmt.Sprintf(MsgReasonNoneMatched, strings.Join(target.Expected, " OR "), strings.Join(foundRecords, ", "))
+			return false, fmt.Sprintf(MsgReasonNoneMatched, strings.Join(target.Expected, " OR "), strings.Join(foundRecords, ", ")), CodeDNSMismatch
 		}
-		return true, ""
+		return true, "", CodeDNSMatchVerified
 
 	default: // MatchExact
 		allMatch := true
@@ -1018,8 +999,6 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 			}
 		}
 		if len(missing) > 0 {
-			redacted := fmt.Sprintf(MsgRedactedDNSMismatchExact, target.Hostname, target.Type)
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSMismatch, target.Hostname, target.Type, strings.Join(missing, ", "), strings.Join(foundRecords, ", "))
 			mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonMissingRecords, strings.Join(missing, ", ")))
 		}
 
@@ -1031,11 +1010,13 @@ func validateRecordsWithReason(app *AppState, target DNSTask, foundRecords []str
 			}
 		}
 		if len(unauthorized) > 0 {
-			redacted := fmt.Sprintf(MsgRedactedDNSUnauthorized, target.Hostname, target.Type)
-			app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, redacted, MsgAlertDNSUnauthorized, target.Hostname, target.Type, strings.Join(unauthorized, ", "), strings.Join(target.Expected, ", "))
 			mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonUnauthorizedRecords, strings.Join(unauthorized, ", ")))
 		}
-		return allMatch, strings.Join(mismatchReasons, "; ")
+
+		if !allMatch {
+			return false, strings.Join(mismatchReasons, " | "), CodeDNSMismatch
+		}
+		return true, "", CodeDNSMatchVerified
 	}
 }
 
@@ -1081,117 +1062,262 @@ func validateCertificate(ctx context.Context, app *AppState, target DNSTask, fou
 	return days
 }
 
-func evaluateEmailSecurity(ctx context.Context, app *AppState, target DomainConfig) EmailState {
+func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig) EmailSnapshot {
+	snap := EmailSnapshot{
+		DKIMResults: make(map[string]bool),
+		DKIMErrs:    make(map[string]error),
+	}
 	if !target.CheckEmailSecurity {
-		return EmailState{}
+		return snap
 	}
 
+	mxs, mxErr := queryDNS(ctx, app, target.Domain, dns.TypeMX, app.Resolvers())
+	if mxErr != nil && errors.Is(mxErr, ErrNXDOMAIN) {
+		mxs = nil
+		mxErr = nil // NXDOMAIN is authoritatively empty
+	}
+	snap.MXRecords = mxs
+	snap.MXErr = mxErr
+
+	snap.SPFRecords, snap.SPFErr = queryDNS(ctx, app, target.Domain, dns.TypeTXT, app.Resolvers())
+
+	currentDomain := NormalizeDomain(target.Domain)
+	for {
+		dmarcHost := "_dmarc." + currentDomain
+		dmarcTxts, dmarcErr := queryDNS(ctx, app, dmarcHost, dns.TypeTXT, app.Resolvers())
+		if dmarcErr != nil {
+			snap.DMARCErr = dmarcErr
+		} else {
+			snap.DMARCErr = nil
+			snap.DMARCRecords = dmarcTxts
+			dmarcFound := false
+			for _, txt := range dmarcTxts {
+				txtLower := strings.ToLower(strings.TrimSpace(txt))
+				if strings.HasPrefix(txtLower, DMARCPrefix+" ") || strings.HasPrefix(txtLower, DMARCPrefix+";") || txtLower == DMARCPrefix {
+					dmarcFound = true
+					break
+				}
+			}
+			if dmarcFound {
+				break
+			}
+		}
+		
+		_, parent, found := strings.Cut(currentDomain, ".")
+		if !found || parent == "" || !strings.Contains(parent, ".") {
+			break
+		}
+		currentDomain = parent
+	}
+	// Note: if last query failed with non-NXDOMAIN, snap.DMARCErr retains it
+
+	var selectorsToCheck []string
+	if target.MailProvider != "" {
+		if defaults, ok := ProviderDKIMMap[target.MailProvider]; ok {
+			selectorsToCheck = append(selectorsToCheck, defaults...)
+		}
+	}
+	selectorsToCheck = append(selectorsToCheck, target.DKIMSelectors...)
+
+	for _, selector := range selectorsToCheck {
+		dkimHost := selector + "._domainkey." + target.Domain
+		dkimTxts, err := queryDNS(ctx, app, dkimHost, dns.TypeTXT, app.Resolvers())
+		if err != nil {
+			if !errors.Is(err, ErrNXDOMAIN) {
+				snap.DKIMErrs[selector] = err
+			} else {
+				snap.DKIMResults[selector] = false
+			}
+		} else {
+			dkimFound := false
+			for _, txt := range dkimTxts {
+				txtLower := strings.TrimSpace(strings.ToLower(txt))
+				if strings.HasPrefix(txtLower, DKIMPrefix) || strings.Contains(txtLower, DKIMPublicKeyTag) {
+					dkimFound = true
+					break
+				}
+			}
+			snap.DKIMResults[selector] = dkimFound
+		}
+	}
+
+	return snap
+}
+
+func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot) (CheckStatus, *StateCondition, EmailState) {
+	if !target.CheckEmailSecurity {
+		return StatusOK, nil, EmailState{}
+	}
+
+	var conditions []StateCondition
 	emailStatus := StatusOK
-	liveMXs, mxStatus, err := validateMX(ctx, app, target)
-	if err != nil {
-		return EmailState{Status: StatusFailed, Error: err.Error()}
-	}
-	if mxStatus != StatusOK {
-		emailStatus = mxStatus
+
+	// MX
+	var liveMXs []string
+	if snap.MXErr != nil {
+		emailStatus = StatusFailed
+		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: snap.MXErr.Error()})
+	} else if len(snap.MXRecords) == 0 {
+		emailStatus = StatusFailed
+		conditions = append(conditions, StateCondition{Code: CodeEmailMissingMX})
+	} else {
+		liveMXs = append(liveMXs, snap.MXRecords...)
+		if len(target.MXRecords) > 0 {
+			allMatch := true
+			for _, expected := range target.MXRecords {
+				if !slices.Contains(liveMXs, expected) {
+					allMatch = false
+					conditions = append(conditions, StateCondition{Code: CodeEmailMissingMX, Target: expected})
+				}
+			}
+			for _, found := range liveMXs {
+				if !slices.Contains(target.MXRecords, found) {
+					allMatch = false
+					conditions = append(conditions, StateCondition{Code: CodeEmailUnauthorizedMX, Target: found})
+				}
+			}
+			if !allMatch && emailStatus == StatusOK {
+				emailStatus = StatusMismatch
+			}
+		} else if target.MailProvider != "" {
+			safe, known := isProviderMXSafe(liveMXs, target.MailProvider)
+			if !known {
+				LogWarnf(MsgLogEmailUnknownProvider, target.MailProvider, target.Domain)
+			} else if !safe {
+				emailStatus = StatusHijacked
+				conditions = append(conditions, StateCondition{Code: CodeEmailHijackedMX, Target: strings.Join(liveMXs, ", ")})
+			}
+		}
 	}
 
-	foundSPF, spfStatus, spfErr := validateSPF(ctx, app, target)
-	if spfStatus != StatusOK && emailStatus == StatusOK {
-		emailStatus = spfStatus
+	// SPF
+	var spfFound bool
+	if snap.SPFErr != nil {
+		if emailStatus == StatusOK {
+			emailStatus = StatusWarning
+		}
+		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: "SPF: " + snap.SPFErr.Error()})
+	} else {
+		spfCount := 0
+		for _, txt := range snap.SPFRecords {
+			txtLower := strings.ToLower(strings.TrimSpace(txt))
+			if strings.HasPrefix(txtLower, SPFPrefix+" ") || txtLower == SPFPrefix {
+				spfCount++
+			}
+		}
+		if spfCount == 0 {
+			if emailStatus == StatusOK {
+				emailStatus = StatusWarning
+			}
+			conditions = append(conditions, StateCondition{Code: CodeEmailMissingSPF})
+		} else if spfCount > 1 {
+			if emailStatus == StatusOK {
+				emailStatus = StatusWarning
+			}
+			conditions = append(conditions, StateCondition{Code: CodeEmailMultipleSPF})
+		} else {
+			spfFound = true
+		}
 	}
 
-	foundDMARC, dmarcStatus, dmarcErr := validateDMARC(ctx, app, target)
-	if dmarcStatus != StatusOK && emailStatus == StatusOK {
-		emailStatus = dmarcStatus
+	// DMARC
+	var dmarcFound bool
+	if snap.DMARCErr != nil && !errors.Is(snap.DMARCErr, ErrNXDOMAIN) {
+		if emailStatus == StatusOK {
+			emailStatus = StatusFailed // original logic set status to failed for DMARC error
+		}
+		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: "DMARC: " + snap.DMARCErr.Error()})
+	} else {
+		dmarcCount := 0
+		for _, txt := range snap.DMARCRecords {
+			txtLower := strings.ToLower(strings.TrimSpace(txt))
+			if strings.HasPrefix(txtLower, DMARCPrefix+" ") || strings.HasPrefix(txtLower, DMARCPrefix+";") || txtLower == DMARCPrefix {
+				dmarcCount++
+			}
+		}
+		if dmarcCount > 0 {
+			if dmarcCount > 1 {
+				if emailStatus == StatusOK {
+					emailStatus = StatusWarning
+				}
+				conditions = append(conditions, StateCondition{Code: CodeEmailMultipleDMARC})
+			} else {
+				dmarcFound = true
+			}
+		} else {
+			if emailStatus == StatusOK {
+				emailStatus = StatusWarning
+			}
+			conditions = append(conditions, StateCondition{Code: CodeEmailMissingDMARC})
+		}
 	}
 
-	validDkims, dkimStatus, dkimErr := validateDKIM(ctx, app, target)
-	if dkimStatus != StatusOK && emailStatus == StatusOK {
-		emailStatus = dkimStatus
+	// DKIM
+	var validDkims []string
+	var missingDkims []string
+	var dkimNetworkErr error
+	for sel, err := range snap.DKIMErrs {
+		if err != nil {
+			dkimNetworkErr = err
+			missingDkims = append(missingDkims, sel)
+		}
 	}
-
-	var errs []string
-	if spfErr != nil {
-		errs = append(errs, fmt.Sprintf(MsgErrSPFLookupError, spfErr.Error()))
-	}
-	if dmarcErr != nil {
-		errs = append(errs, fmt.Sprintf(MsgErrDMARCLookupError, dmarcErr.Error()))
-	}
-	if dkimErr != nil {
-		errs = append(errs, fmt.Sprintf(MsgErrDKIMLookupError, dkimErr.Error()))
-	}
-	if len(errs) > 0 && emailStatus == StatusOK {
-		emailStatus = StatusWarning
+	for sel, found := range snap.DKIMResults {
+		if found {
+			validDkims = append(validDkims, sel)
+		} else {
+			missingDkims = append(missingDkims, sel)
+		}
 	}
 
 	hasDKIMExpected := (target.MailProvider != "" && len(ProviderDKIMMap[target.MailProvider]) > 0) || len(target.DKIMSelectors) > 0
+	if hasDKIMExpected && len(validDkims) == 0 {
+		if dkimNetworkErr != nil {
+			if emailStatus == StatusOK {
+				emailStatus = StatusWarning
+			}
+			conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: "DKIM: " + dkimNetworkErr.Error()})
+		} else {
+			if emailStatus == StatusOK {
+				emailStatus = StatusWarning
+			}
+			conditions = append(conditions, StateCondition{Code: CodeEmailMissingDKIM, Target: strings.Join(missingDkims, ", ")})
+		}
+	}
 
-	return EmailState{
+	var errs []string
+	if snap.SPFErr != nil {
+		errs = append(errs, fmt.Sprintf(MsgErrSPFLookupError, snap.SPFErr.Error()))
+	}
+	if snap.DMARCErr != nil && !errors.Is(snap.DMARCErr, ErrNXDOMAIN) {
+		errs = append(errs, fmt.Sprintf(MsgErrDMARCLookupError, snap.DMARCErr.Error()))
+	}
+	if dkimNetworkErr != nil {
+		errs = append(errs, fmt.Sprintf(MsgErrDKIMLookupError, dkimNetworkErr.Error()))
+	}
+
+	state := EmailState{
 		Status:       emailStatus,
 		Provider:     target.MailProvider,
-		SPF:          foundSPF,
-		DMARC:        foundDMARC,
+		SPF:          spfFound,
+		DMARC:        dmarcFound,
 		DKIMExpected: hasDKIMExpected,
 		DKIMValid:    validDkims,
 		MX:           liveMXs,
 		Error:        strings.Join(errs, " | "),
 	}
-}
 
-func validateMX(ctx context.Context, app *AppState, target DomainConfig) ([]string, CheckStatus, error) {
-	mxs, err := queryDNS(ctx, app, target.Domain, dns.TypeMX, app.Resolvers())
-	if err != nil {
-		if !errors.Is(err, ErrNXDOMAIN) {
-			return nil, StatusFailed, WrapError(MsgErrMXQueryError, err)
-		}
-		// NXDOMAIN is authoritatively non-existent
-		mxs = nil
-	}
-	if len(mxs) == 0 {
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityUrgent, TagEnvelope, target.Domain, target.Name, MsgRedactedEmailNoMX, MsgAlertEmailNoMX, target.Domain)
-		}
-		return nil, StatusFailed, errors.New(MsgErrNoMXRecordsFound)
+	// Return highest priority condition
+	var finalCond *StateCondition
+	if len(conditions) > 0 {
+		finalCond = &conditions[0]
+		// In a complete implementation we might want to attach multiple conditions,
+		// but since we return one *StateCondition, we just pick the first (which is usually MX).
+	} else if emailStatus == StatusOK {
+		finalCond = &StateCondition{Code: CodeEmailVerified}
 	}
 
-	var liveMXs []string
-	liveMXs = append(liveMXs, mxs...)
-	derivedStatus := StatusOK
-
-	if len(target.MXRecords) > 0 {
-		allMatch := true
-		for _, expected := range target.MXRecords {
-			if !slices.Contains(liveMXs, expected) {
-				allMatch = false
-				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityUrgent, TagEnvelope, target.Domain, target.Name, MsgRedactedEmailMXMissing, MsgAlertEmailMXMissing, expected, target.Domain, strings.Join(liveMXs, ", "))
-				}
-			}
-		}
-		for _, found := range liveMXs {
-			if !slices.Contains(target.MXRecords, found) {
-				allMatch = false
-				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedEmailMXUnauthorized, MsgAlertEmailMXUnauthorized, found, target.Domain, strings.Join(target.MXRecords, ", "))
-				}
-			}
-		}
-		if !allMatch {
-			derivedStatus = StatusMismatch
-		}
-	} else if target.MailProvider != "" {
-		safe, known := isProviderMXSafe(liveMXs, target.MailProvider)
-		if !known {
-			LogWarnf(MsgLogEmailUnknownProvider, target.MailProvider, target.Domain)
-		} else if !safe {
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Domain, target.Name, MsgRedactedEmailMXHijack, MsgAlertEmailMXHijack, target.Domain, target.MailProvider, strings.Join(liveMXs, ", "))
-			}
-			derivedStatus = StatusHijacked
-		}
-	}
-
-	return liveMXs, derivedStatus, nil
+	return emailStatus, finalCond, state
 }
 
 // isProviderMXSafe checks whether all live MX hostnames match the expected provider's domain suffixes.
@@ -1220,152 +1346,16 @@ func isProviderMXSafe(liveMXs []string, provider string) (isSafe bool, knownProv
 	return true, true
 }
 
-func validateSPF(ctx context.Context, app *AppState, target DomainConfig) (bool, CheckStatus, error) {
-	txts, err := queryDNS(ctx, app, target.Domain, dns.TypeTXT, app.Resolvers())
-	if err != nil {
-		return false, StatusFailed, err
-	}
-	spfCount := 0
-
-	for _, txt := range txts {
-		txtLower := strings.ToLower(strings.TrimSpace(txt))
-		if strings.HasPrefix(txtLower, SPFPrefix+" ") || txtLower == SPFPrefix {
-			spfCount++
-		}
-	}
-
-	if spfCount == 0 {
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedEmailNoSPF, MsgAlertEmailNoSPF, target.Domain)
-		}
-		return false, StatusWarning, nil
-	} else if spfCount > 1 {
-		if !target.SuppressAlerts {
-			app.SafeDispatchf(PriorityUrgent, TagError, target.Domain, target.Name, MsgRedactedEmailMultiSPF, MsgAlertEmailMultiSPF, target.Domain)
-		}
-		return false, StatusWarning, nil
-	}
-	return true, StatusOK, nil
-}
-
-func validateDMARC(ctx context.Context, app *AppState, target DomainConfig) (bool, CheckStatus, error) {
-	currentDomain := NormalizeDomain(target.Domain)
-	var lastErr error
-
-	for {
-		dmarcHost := "_dmarc." + currentDomain
-		dmarcTxts, err := queryDNS(ctx, app, dmarcHost, dns.TypeTXT, app.Resolvers())
-		if err != nil {
-			lastErr = err
-		} else {
-			dmarcFound := false
-			dmarcCount := 0
-			for _, txt := range dmarcTxts {
-				txtLower := strings.ToLower(strings.TrimSpace(txt))
-				if strings.HasPrefix(txtLower, DMARCPrefix+" ") || strings.HasPrefix(txtLower, DMARCPrefix+";") || txtLower == DMARCPrefix {
-					dmarcFound = true
-					dmarcCount++
-				}
-			}
-
-			if dmarcFound {
-				if dmarcCount > 1 {
-					if !target.SuppressAlerts {
-						app.SafeDispatchf(PriorityUrgent, TagError, target.Domain, target.Name, MsgRedactedEmailMultiDMARC, MsgAlertEmailMultiDMARC, target.Domain)
-					}
-					return false, StatusWarning, nil
-				}
-				return true, StatusOK, nil
-			}
-		}
-
-		// Tree climbing per RFC 7489 Section 6.6.3: strip leftmost label
-		_, parent, found := strings.Cut(currentDomain, ".")
-		if !found || parent == "" || !strings.Contains(parent, ".") {
-			break // Stop at TLD or apex
-		}
-		currentDomain = parent
-	}
-
-	if lastErr != nil && !errors.Is(lastErr, ErrNXDOMAIN) {
-		return false, StatusFailed, lastErr
-	}
-
-	if !target.SuppressAlerts {
-		app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedEmailNoDMARC, MsgAlertEmailNoDMARC, target.Domain, target.Domain)
-	}
-	return false, StatusWarning, nil
-}
-
-func validateDKIM(ctx context.Context, app *AppState, target DomainConfig) ([]string, CheckStatus, error) {
-	var selectorsToCheck []string
-	if target.MailProvider != "" {
-		if defaults, ok := ProviderDKIMMap[target.MailProvider]; ok {
-			selectorsToCheck = append(selectorsToCheck, defaults...)
-		}
-	}
-	selectorsToCheck = append(selectorsToCheck, target.DKIMSelectors...)
-
-	var validDkims []string
-	var missingDkims []string
-	var lookupErr error
-
-	for _, selector := range selectorsToCheck {
-		dkimHost := selector + "._domainkey." + target.Domain
-		dkimTxts, err := queryDNS(ctx, app, dkimHost, dns.TypeTXT, app.Resolvers())
-		if err != nil {
-			if !errors.Is(err, ErrNXDOMAIN) {
-				lookupErr = err
-			}
-			missingDkims = append(missingDkims, selector)
-			continue
-		}
-
-		dkimFound := false
-		for _, txt := range dkimTxts {
-			txtLower := strings.TrimSpace(strings.ToLower(txt))
-			if strings.HasPrefix(txtLower, DKIMPrefix) || strings.Contains(txtLower, DKIMPublicKeyTag) {
-				dkimFound = true
-				break
-			}
-		}
-
-		if dkimFound {
-			validDkims = append(validDkims, selector)
-		} else {
-			missingDkims = append(missingDkims, selector)
-		}
-	}
-
-	// If at least one selector is valid, DKIM authentication passes for the domain;
-	// non-matching or unused alternate candidate selectors do not fail the check.
-	if len(validDkims) > 0 {
-		return validDkims, StatusOK, nil
-	}
-
-	derivedStatus := StatusOK
-	if len(missingDkims) > 0 && len(selectorsToCheck) > 0 {
-		if lookupErr == nil {
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedEmailNoDKIM, MsgAlertEmailNoDKIM, target.Domain, strings.Join(missingDkims, ", "))
-			}
-			derivedStatus = StatusWarning
-		}
-	}
-	return validDkims, derivedStatus, lookupErr
-}
-
-func checkSingleNameserver(ctx context.Context, app *AppState, nsName string, isPrimary bool, target DomainConfig) (NSHealthServerResult, uint32, bool, []string, error) {
-	srv := NSHealthServerResult{
+func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimary bool, target DomainConfig) NSSnapshot {
+	srv := NSSnapshot{
 		Nameserver: nsName,
 		IsPrimary:  isPrimary,
 	}
 
 	host, port, err := net.SplitHostPort(DefaultPort(nsName, DefaultDNSPort))
 	if err != nil {
-		err = WrapError(fmt.Sprintf(MsgErrInvalidNSAddress, nsName), err)
-		srv.Error = err.Error()
-		return srv, 0, false, nil, err
+		srv.Err = WrapError(fmt.Sprintf(MsgErrInvalidNSAddress, nsName), err)
+		return srv
 	}
 
 	var ip string
@@ -1374,176 +1364,163 @@ func checkSingleNameserver(ctx context.Context, app *AppState, nsName string, is
 	} else {
 		ips, ipErr := queryIPRecords(ctx, app, host, app.Resolvers())
 		if ipErr != nil {
-			ipErr = WrapError(MsgErrFailedToResolveIP, ipErr)
-			srv.Error = ipErr.Error()
-			return srv, 0, false, nil, ipErr
+			srv.Err = WrapError(MsgErrFailedToResolveIP, ipErr)
+			return srv
 		}
 		if len(ips) == 0 {
-			ipErr = fmt.Errorf(MsgErrNoIPRecordsForHost, host)
-			srv.Error = ipErr.Error()
-			return srv, 0, false, nil, ipErr
+			srv.Err = fmt.Errorf(MsgErrNoIPRecordsForHost, host)
+			return srv
 		}
 		ip = net.JoinHostPort(ips[0], port)
 	}
 
-	soaMsg, soaErr := queryDNSMsgWithRDFn(ctx, app, target.Domain, dns.TypeSOA, []string{ip}, false)
+	soaMsg, soaErr := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeSOA, []string{ip}, false)
 	if soaErr != nil || soaMsg == nil {
 		if soaErr == nil {
 			soaErr = fmt.Errorf("nil SOA response")
 		}
-		err = fmt.Errorf(MsgErrSOALookupFailed, soaErr.Error())
-		srv.Error = err.Error()
-		return srv, 0, false, nil, err
+		srv.Err = fmt.Errorf(MsgErrSOALookupFailed, soaErr.Error())
+		return srv
 	}
 
 	srv.Authoritative = soaMsg.Authoritative
 	if !srv.Authoritative {
 		if isPrimary {
-			err = fmt.Errorf(MsgErrPrimaryNSNotAuthoritative)
+			srv.Err = fmt.Errorf(MsgErrPrimaryNSNotAuthoritative)
 		} else {
-			err = fmt.Errorf(MsgErrSecondaryNSNotAuthoritative)
+			srv.Err = fmt.Errorf(MsgErrSecondaryNSNotAuthoritative)
 		}
-		srv.Error = err.Error()
 	}
 
-	var serial uint32
-	var foundSOA bool
 	for _, ans := range soaMsg.Answer {
 		if soa, ok := ans.(*dns.SOA); ok {
-			serial = soa.Serial
-			foundSOA = true
+			srv.SOASerial = soa.Serial
+			srv.HasSOA = true
 			break
 		}
 	}
-	if !foundSOA {
+	if !srv.HasSOA {
 		for _, nsRec := range soaMsg.Ns {
 			if soa, ok := nsRec.(*dns.SOA); ok {
-				serial = soa.Serial
-				foundSOA = true
+				srv.SOASerial = soa.Serial
+				srv.HasSOA = true
 				break
 			}
 		}
 	}
-	if !foundSOA {
+	if !srv.HasSOA {
 		soaMissingErr := fmt.Errorf(MsgErrNoSOARecordReturned)
-		if srv.Error == "" {
-			srv.Error = soaMissingErr.Error()
-		}
-		if err == nil {
-			err = soaMissingErr
+		if srv.Err == nil {
+			srv.Err = soaMissingErr
 		}
 	}
-	srv.SOASerial = serial
 
-	var dnskeys []string
-	if dnskeyMsg, _ := queryDNSMsgWithRDFn(ctx, app, target.Domain, dns.TypeDNSKEY, []string{ip}, false); dnskeyMsg != nil {
+	if dnskeyMsg, _ := queryDNSMsgWithRD(ctx, app, target.Domain, dns.TypeDNSKEY, []string{ip}, false); dnskeyMsg != nil {
 		for _, rr := range dnskeyMsg.Answer {
 			if dnskey, ok := rr.(*dns.DNSKEY); ok {
 				fps := strconv.Itoa(int(dnskey.Flags)) + "-" + strconv.Itoa(int(dnskey.Protocol)) + "-" + strconv.Itoa(int(dnskey.Algorithm)) + "-" + dnskey.PublicKey
-				dnskeys = append(dnskeys, fps)
+				srv.DNSKEYs = append(srv.DNSKEYs, fps)
 			}
 		}
-		if len(dnskeys) > 0 {
-			slices.Sort(dnskeys)
+		if len(srv.DNSKEYs) > 0 {
+			slices.Sort(srv.DNSKEYs)
 			srv.HasDNSKEY = true
 		}
 	}
-	return srv, serial, foundSOA, dnskeys, err
+	return srv
 }
 
-func evaluateNSHealth(ctx context.Context, app *AppState, target DomainConfig) NSHealthResult {
+func FetchNSHealthSnapshots(ctx context.Context, app *AppState, target DomainConfig) []NSSnapshot {
 	if !target.VerifyNSHealth || len(target.ExpectedNS) == 0 {
-		return NSHealthResult{}
+		return nil
 	}
 
 	primaryNS := target.ExpectedNS[0]
-	res := NSHealthResult{
-		Valid:   true,
-		Primary: primaryNS,
-		Servers: make([]NSHealthServerResult, 0, 1+len(target.SecondaryNS)),
-	}
+	snapshots := make([]NSSnapshot, 0, 1+len(target.SecondaryNS))
 
-	primarySrv, primarySerial, primaryFoundSOA, primaryDNSKEYs, pErr := checkSingleNameserver(ctx, app, primaryNS, true, target)
-
-	if pErr != nil {
-		res.Valid = false
-		if !target.SuppressAlerts {
-			errStr := pErr.Error()
-			if strings.Contains(errStr, "resolve IP") || strings.Contains(errStr, "invalid nameserver") || strings.Contains(errStr, "SOA lookup failed") || strings.Contains(errStr, "no IP records") {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSUnreachablePrimary, MsgAlertNSUnreachable, primaryNS, target.Domain, pErr)
-			} else if !primarySrv.Authoritative {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSNonAuthoritative, MsgAlertNSNonAuthoritative, primaryNS, target.Domain)
-			} else if !primaryFoundSOA {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSMissingSOA, MsgAlertNSMissingSOA, primaryNS, target.Domain)
-			}
-		}
-	}
-	primarySrv.DNSKEYMatch = true
-	res.Servers = append(res.Servers, primarySrv)
+	primarySnapshot := FetchNSSnapshot(ctx, app, primaryNS, true, target)
+	snapshots = append(snapshots, primarySnapshot)
 
 	for _, secNS := range target.SecondaryNS {
 		secNS = strings.TrimSpace(secNS)
 		if secNS == "" {
 			continue
 		}
-
-		secSrv, secSerial, secFoundSOA, secDNSKEYs, sErr := checkSingleNameserver(ctx, app, secNS, false, target)
-		if sErr != nil {
-			res.Valid = false
-			if !target.SuppressAlerts {
-				errStr := sErr.Error()
-				if strings.Contains(errStr, "resolve IP") || strings.Contains(errStr, "invalid nameserver") || strings.Contains(errStr, "SOA lookup failed") || strings.Contains(errStr, "no IP records") {
-					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSUnreachableSecondary, MsgAlertNSUnreachable, secNS, target.Domain, sErr)
-				} else if !secSrv.Authoritative {
-					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSNonAuthoritative, MsgAlertNSNonAuthoritative, secNS, target.Domain)
-				} else if !secFoundSOA {
-					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSMissingSOA, MsgAlertNSMissingSOA, secNS, target.Domain)
-				}
-			}
-		}
-
-		if primaryFoundSOA && secFoundSOA {
-			if secSerial < primarySerial {
-				res.Valid = false
-				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSSOALags, MsgAlertNSSOALag, secNS, secSerial, primaryNS, primarySerial, target.Domain)
-				}
-			} else if secSerial != primarySerial {
-				res.Valid = false
-				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityWarning, TagWarning, target.Domain, target.Name, MsgRedactedNSSOADiffers, MsgAlertNSSOAMismatch, secNS, secSerial, primaryNS, primarySerial, target.Domain)
-				}
-			}
-		}
-
-		if len(primaryDNSKEYs) > 0 {
-			if len(secDNSKEYs) == 0 {
-				res.Valid = false
-				secSrv.DNSKEYMatch = false
-				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSDNSKEYMissing, MsgAlertNSDNSKEYMissing, secNS, target.Domain)
-				}
-			} else if !slices.Equal(primaryDNSKEYs, secDNSKEYs) {
-				res.Valid = false
-				secSrv.DNSKEYMatch = false
-				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSDNSKEYMismatch, MsgAlertNSDNSKEYMismatch, secNS, target.Domain)
-				}
-			} else {
-				secSrv.DNSKEYMatch = true
-			}
-		} else if len(secDNSKEYs) > 0 {
-			res.Valid = false
-			secSrv.DNSKEYMatch = false
-			if !target.SuppressAlerts {
-				app.SafeDispatchf(PriorityHigh, TagWarning, target.Domain, target.Name, MsgRedactedNSDNSKEYUnexpected, MsgAlertNSDNSKEYUnexpected, secNS, target.Domain)
-			}
-		} else {
-			secSrv.DNSKEYMatch = true
-		}
-
-		res.Servers = append(res.Servers, secSrv)
+		secSnapshot := FetchNSSnapshot(ctx, app, secNS, false, target)
+		snapshots = append(snapshots, secSnapshot)
 	}
 
-	return res
+	return snapshots
+}
+
+func EvaluateNSHealth(target DomainConfig, snapshots []NSSnapshot) (CheckStatus, *StateCondition) {
+	if len(snapshots) == 0 {
+		return StatusOK, nil
+	}
+
+	worstStatus := StatusOK
+	var worstCond *StateCondition
+
+	setCond := func(status CheckStatus, code ResultCode, tgt string) {
+		if status == StatusFailed {
+			worstStatus = StatusFailed
+			if worstCond == nil || worstCond.Code == CodeNone || worstStatus != StatusFailed {
+				worstCond = &StateCondition{Code: code, Target: tgt}
+			}
+		} else if status == StatusWarning && worstStatus != StatusFailed {
+			worstStatus = StatusWarning
+			if worstCond == nil || worstCond.Code == CodeNone {
+				worstCond = &StateCondition{Code: code, Target: tgt}
+			}
+		}
+	}
+
+	primary := snapshots[0]
+	if primary.Err != nil {
+		errStr := primary.Err.Error()
+		if strings.Contains(errStr, "resolve IP") || strings.Contains(errStr, "invalid nameserver") || strings.Contains(errStr, "SOA lookup failed") || strings.Contains(errStr, "no IP records") {
+			setCond(StatusFailed, CodeNSUnreachable, primary.Nameserver)
+		} else if !primary.Authoritative {
+			setCond(StatusFailed, CodeNSNotAuthoritative, primary.Nameserver)
+		} else if !primary.HasSOA {
+			setCond(StatusFailed, CodeNSMissingSOA, primary.Nameserver)
+		}
+	}
+
+	for _, sec := range snapshots[1:] {
+		if sec.Err != nil {
+			errStr := sec.Err.Error()
+			if strings.Contains(errStr, "resolve IP") || strings.Contains(errStr, "invalid nameserver") || strings.Contains(errStr, "SOA lookup failed") || strings.Contains(errStr, "no IP records") {
+				setCond(StatusFailed, CodeNSUnreachable, sec.Nameserver)
+			} else if !sec.Authoritative {
+				setCond(StatusFailed, CodeNSNotAuthoritative, sec.Nameserver)
+			} else if !sec.HasSOA {
+				setCond(StatusFailed, CodeNSMissingSOA, sec.Nameserver)
+			}
+		}
+
+		if primary.HasSOA && sec.HasSOA {
+			if sec.SOASerial < primary.SOASerial {
+				setCond(StatusFailed, CodeNSSOALags, sec.Nameserver)
+			} else if sec.SOASerial != primary.SOASerial {
+				setCond(StatusWarning, CodeNSSOALags, sec.Nameserver) // Changed to lags or mismatch
+			}
+		}
+
+		if primary.HasDNSKEY {
+			if !sec.HasDNSKEY {
+				setCond(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
+			} else if !slices.Equal(primary.DNSKEYs, sec.DNSKEYs) {
+				setCond(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
+			}
+		} else if sec.HasDNSKEY {
+			setCond(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
+		}
+	}
+
+	if worstCond == nil {
+		worstCond = &StateCondition{Code: CodeNSSyncVerified, Target: target.Domain}
+	}
+
+	return worstStatus, worstCond
 }

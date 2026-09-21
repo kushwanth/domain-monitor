@@ -35,80 +35,48 @@ func SetCTLogsPath(p string) {
 	ctLogsPath = p
 }
 
-func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, prevState CTLogState) CTLogState {
+func FetchCTLogsSnapshot(ctx context.Context, app *AppState, target DomainConfig, prevState CTLogState) CTLogsSnapshot {
 	if !target.MonitorCTLogs {
-		return CTLogState{}
+		return CTLogsSnapshot{}
 	}
 
-	var latestID, backfillCursor string
-	var backfillComplete bool
-	if prevState.LatestID != "" || prevState.BackfillCursor != "" || prevState.Status != "" {
-		latestID = prevState.LatestID
-		backfillCursor = prevState.BackfillCursor
-		backfillComplete = prevState.BackfillComplete
+	snap := CTLogsSnapshot{
+		CheckpointID:     prevState.LatestID,
+		BackfillCursor:   prevState.BackfillCursor,
+		BackfillComplete: prevState.BackfillComplete,
+		IsFirstRun:       prevState.LatestID == "",
 	}
 
-	// 1. Fetch Page 1 (Forward Polling for New Certs)
 	apiURL := CTLogsAPIEndpoint + target.Domain
 	respPage1, err := fetchCTPage(ctx, app, apiURL)
 	if err != nil {
-		LogError(MsgLogCTLogsPollingFailed, FieldDomain, target.Domain, FieldError, err)
-		return CTLogState{
-			LatestID:         latestID,
-			BackfillCursor:   backfillCursor,
-			BackfillComplete: backfillComplete,
-			Status:           StatusFailed,
-			Error:            err.Error(),
-		}
+		snap.Page1Err = err
+		return snap
 	}
-
-	var newCerts []CTCert
-	isFirstRun := (latestID == "")
-	var checkpointID string = latestID
-	var firstPageCursor string = respPage1.NextCursor
 
 	if len(respPage1.Rows) > 0 {
-		checkpointID = respPage1.Rows[0].ID
-
+		snap.CheckpointID = respPage1.Rows[0].ID
 		for _, row := range respPage1.Rows {
-			if row.ID == latestID {
+			if row.ID == prevState.LatestID {
 				break
 			}
-			newCerts = append(newCerts, row)
-
-			if !isFirstRun {
-				issuerName := row.Issuer
-				if issuerName == "" {
-					issuerName = DefaultUnknownCA
-				}
-				redacted := fmt.Sprintf(MsgRedactedNewSSLCert, issuerName, row.Match)
-				if !target.SuppressAlerts {
-					app.SafeDispatchf(PriorityHigh, TagLock, target.Domain, target.Name, redacted, MsgAlertNewSSLCert, target.Domain, issuerName, row.Match)
-				}
-			}
+			snap.NewCerts = append(snap.NewCerts, row)
 		}
 	}
 
-	// Save new certs to history
-	if len(newCerts) > 0 {
-		LogInfo(MsgLogDiscoveredNewCerts, FieldDomain, target.Domain, FieldCount, len(newCerts))
-		if err := saveCertsToHistory(target.Domain, newCerts); err != nil {
-			LogError(MsgLogSaveCTLogsFailed, FieldDomain, target.Domain, FieldError, err)
-			return CTLogState{
-				LatestID:         latestID, // Keep previous checkpoint on write failure to allow retry
-				BackfillCursor:   backfillCursor,
-				BackfillComplete: backfillComplete,
-				Status:           StatusFailed,
-				Error:            fmt.Sprintf(MsgErrHistorySaveFailed, err.Error()),
-			}
+	if len(snap.NewCerts) > 0 {
+		LogInfo(MsgLogDiscoveredNewCerts, FieldDomain, target.Domain, FieldCount, len(snap.NewCerts))
+		if err := saveCertsToHistory(target.Domain, snap.NewCerts); err != nil {
+			snap.CheckpointID = prevState.LatestID
+			snap.Page1Err = fmt.Errorf(MsgErrHistorySaveFailed, err.Error())
+			return snap
 		}
 	}
 
-	// 2. Incremental Backfilling
-	if !backfillComplete {
-		cursorToUse := backfillCursor
+	if !snap.BackfillComplete {
+		cursorToUse := snap.BackfillCursor
 		if cursorToUse == "" {
-			cursorToUse = firstPageCursor
+			cursorToUse = respPage1.NextCursor
 		}
 
 		if cursorToUse != "" {
@@ -125,46 +93,62 @@ func evaluateCTLogs(ctx context.Context, app *AppState, target DomainConfig, pre
 
 			respBackfill, err := fetchCTPage(ctx, app, backfillURL)
 			if err != nil {
-				LogWarn(MsgLogCTLogsBackfillFailed, FieldDomain, target.Domain, FieldError, err)
-				return CTLogState{
-					LatestID:         checkpointID,
-					BackfillCursor:   cursorToUse, // Keep old cursor to retry later
-					BackfillComplete: false,
-					Status:           StatusFailed,
-					Error:            fmt.Sprintf(MsgErrBackfillError, err.Error()),
-				}
+				snap.BackfillErr = err
+				return snap
 			}
 
 			if len(respBackfill.Rows) > 0 {
 				if err := saveCertsToHistory(target.Domain, respBackfill.Rows); err != nil {
-					LogError(MsgLogSaveBackfilledCTLogsFailed, FieldDomain, target.Domain, FieldError, err)
-					return CTLogState{
-						LatestID:         checkpointID,
-						BackfillCursor:   cursorToUse, // don't advance cursor
-						BackfillComplete: false,
-						Status:           StatusFailed,
-						Error:            fmt.Sprintf(MsgErrBackfillSaveFailed, err.Error()),
-					}
+					snap.BackfillErr = fmt.Errorf(MsgErrBackfillSaveFailed, err.Error())
+					return snap
 				}
 			}
 
-			backfillCursor = respBackfill.NextCursor
-			if !respBackfill.HasNext || backfillCursor == "" {
-				backfillComplete = true
+			snap.BackfillCursor = respBackfill.NextCursor
+			if !respBackfill.HasNext || snap.BackfillCursor == "" {
+				snap.BackfillComplete = true
 			}
 		} else {
-			// No cursor available on page 1, meaning there are no more pages
-			backfillComplete = true
+			snap.BackfillComplete = true
 		}
 	}
 
-	return CTLogState{
-		LatestID:         checkpointID,
-		BackfillCursor:   backfillCursor,
-		BackfillComplete: backfillComplete,
-		Status:           StatusOK,
-		Error:            "",
+	return snap
+}
+
+func EvaluateCTLogs(target DomainConfig, snapshot CTLogsSnapshot) (CheckStatus, *StateCondition, CTLogState) {
+	if !target.MonitorCTLogs {
+		return StatusOK, nil, CTLogState{}
 	}
+
+	state := CTLogState{
+		LatestID:         snapshot.CheckpointID,
+		BackfillCursor:   snapshot.BackfillCursor,
+		BackfillComplete: snapshot.BackfillComplete,
+	}
+
+	if snapshot.Page1Err != nil {
+		state.Error = snapshot.Page1Err.Error()
+		code := CodeCTLogsHTTPError
+		if strings.Contains(state.Error, "rate limit") {
+			code = CodeCTLogsRateLimited
+		}
+		return StatusFailed, &StateCondition{Code: code, Target: state.Error}, state
+	}
+	if snapshot.BackfillErr != nil {
+		state.Error = snapshot.BackfillErr.Error()
+		code := CodeCTLogsHTTPError
+		if strings.Contains(state.Error, "rate limit") {
+			code = CodeCTLogsRateLimited
+		}
+		return StatusFailed, &StateCondition{Code: code, Target: state.Error}, state
+	}
+
+	if !snapshot.IsFirstRun && len(snapshot.NewCerts) > 0 {
+		state.NewCerts = snapshot.NewCerts
+	}
+
+	return StatusOK, &StateCondition{Code: CodeCTLogsVerified}, state
 }
 
 func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPageResponse, error) {
@@ -179,7 +163,7 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPage
 
 	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
-	var client HTTPClient
+	var client HTTPDoer
 	if app != nil {
 		client = app.HTTPClient
 	}

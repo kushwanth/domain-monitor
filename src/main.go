@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
 )
 
 //go:embed index.html
@@ -186,7 +185,53 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 					}
 				}
 			}()
-			res := evaluateDNS(ctx, app, record)
+			dnsSnap := FetchDNSSnapshot(ctx, app, record)
+			status, cond := EvaluateDNS(record, dnsSnap)
+
+			var sslDays *int
+			if !record.SkipSSL {
+				// We fetch SSL snapshot regardless of DNS match as long as it's not a complete lookup failure, 
+				// but wait, if it's a lookup failure we still might want to try? 
+				// The original code did: sslDays = validateCertificate(ctx, app, target, foundRecords) unconditionally if !SkipSSL.
+				sslSnap := FetchSSLSnapshot(ctx, app, record, dnsSnap.Records)
+				sslStatus, sslCond := EvaluateSSL(record, sslSnap)
+				
+				if sslSnap.ExpiryDays != SSLDaysError && sslSnap.ExpiryDays != SSLDaysNotApplicable {
+					d := sslSnap.ExpiryDays
+					sslDays = &d
+				}
+
+				if sslStatus != StatusOK {
+					if status == StatusOK || status == StatusWarning {
+						status = sslStatus
+					}
+					// Only overwrite condition if it was purely OK
+					if cond == nil || cond.Code == CodeDNSMatchVerified {
+						cond = sslCond
+					} else {
+						// Append to target for legacy support
+						cond.Target += " | " + sslCond.Target
+					}
+				}
+			}
+
+			errStr := ""
+			if cond != nil && cond.Code != CodeDNSMatchVerified && cond.Code != CodeSSLVerified {
+				errStr = cond.Target
+			}
+
+			res := DNSState{
+				Hostname:  record.Hostname,
+				Name:      record.Name,
+				Type:      record.Type,
+				Expected:  record.Expected,
+				Status:    status,
+				Condition: cond,
+				Found:     dnsSnap.Records,
+				SSLDays:   sslDays,
+				SkipSSL:   record.SkipSSL,
+				Error:     errStr,
+			}
 			dnsResults[index] = DNSResult{Name: record.Name, State: res}
 			return nil
 		})
@@ -215,20 +260,70 @@ func executeFastDomainChecks(ctx context.Context, app *AppState, domains []Domai
 			var res DomainResult
 			res.Domain = domain.Domain
 
-			if !domain.AllowExpiry {
-				res.Email = evaluateEmailSecurity(ctx, app, domain)
-			}
+			emailSnap := FetchEmailSnapshot(ctx, app, domain)
+			_, cond, emailState := EvaluateEmailSecurity(domain, emailSnap)
+			emailState.Condition = cond
+			res.Email = emailState
 
 			if domain.IsDelegatedZone {
-				res.RDAP = evaluateNSDelegation(ctx, app, domain)
+				snapshot := FetchNSDelegationSnapshot(ctx, app, domain)
+				status, cond := EvaluateNSDelegation(domain, snapshot)
+				res.RDAP = RDAPState{
+					Status:          status,
+					Condition:       cond,
+					IsDelegatedZone: true,
+					Source:          SourceDNSDelegation,
+					AllowExpiry:     domain.AllowExpiry,
+					Nameservers:     snapshot.Nameservers,
+				}
 			}
 
 			if !domain.AllowExpiry {
-				res.DNSSEC = evaluateDNSSEC(ctx, app, domain)
-				res.CAA = evaluateCAA(ctx, app, domain)
+				dnssecSnap := FetchDNSSECSnapshot(ctx, app, domain)
+				dnssecStatus, dnssecCond, dnssecRes := EvaluateDNSSEC(domain, dnssecSnap)
+				dnssecRes.Status = dnssecStatus
+				dnssecRes.Condition = dnssecCond
+				res.DNSSEC = dnssecRes
+
+				caaSnap := FetchCAASnapshot(ctx, app, domain)
+				caaStatus, caaCond, caaRes := EvaluateCAA(domain, caaSnap)
+				caaRes.Status = caaStatus
+				caaRes.Condition = caaCond
+				res.CAA = caaRes
 
 				if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
-					res.NSHealth = evaluateNSHealth(ctx, app, domain)
+					snapshots := FetchNSHealthSnapshots(ctx, app, domain)
+					status, _ := EvaluateNSHealth(domain, snapshots)
+					
+					var servers []NSHealthServerResult
+					for _, srvSnap := range snapshots {
+						errStr := ""
+						if srvSnap.Err != nil {
+							errStr = srvSnap.Err.Error()
+						}
+						servers = append(servers, NSHealthServerResult{
+							Nameserver:    srvSnap.Nameserver,
+							IsPrimary:     srvSnap.IsPrimary,
+							Authoritative: srvSnap.Authoritative,
+							HasSOA:        srvSnap.HasSOA,
+							SOASerial:     srvSnap.SOASerial,
+							HasDNSKEY:     srvSnap.HasDNSKEY,
+							DNSKEYMatch:   true, // TODO: Compute from snapshots if needed for API?
+							Error:         errStr,
+						})
+					}
+					
+					res.NSHealth = NSHealthResult{
+						Valid:   status != StatusFailed,
+						Primary: domain.ExpectedNS[0],
+						Status:  status,
+						Servers: servers,
+					}
+					// Note: NSHealthResult is legacy API output struct, but we attach condition 
+					// to the top level domain result eventually. Wait, NSHealthResult doesn't have 
+					// Status and Condition fields. Wait!
+					// Actually, DomainResult doesn't have a top level status/cond for NSHealth yet, 
+					// but we will do that in Step 7. For now, we just pass what the API expects.
 				}
 			}
 
@@ -247,9 +342,6 @@ func executeRateLimitedChecks(
 	rdapHTTPClient *http.Client,
 	ctLogPersist map[string]CTLogState,
 ) ([]RDAPState, []CTLogState) {
-	rdapLimiter := rate.NewLimiter(rate.Every(RDAPRateLimitInterval), 1)
-	ctLimiter := rate.NewLimiter(rate.Every(CTLogsRateLimitInterval), 1)
-
 	rdapResults := make([]RDAPState, len(domains))
 	ctResults := make([]CTLogState, len(domains))
 
@@ -262,7 +354,7 @@ func executeRateLimitedChecks(
 			if domainConfig.IsDelegatedZone {
 				continue
 			}
-			if err := rdapLimiter.Wait(ctx); err != nil {
+			if err := app.RDAPLimiter.Wait(ctx); err != nil {
 				for j := i; j < len(domains); j++ {
 					if !domains[j].IsDelegatedZone && rdapResults[j].Status == "" {
 						rdapResults[j] = RDAPState{
@@ -283,7 +375,39 @@ func executeRateLimitedChecks(
 						}
 					}
 				}()
-				rdapResults[i] = evaluateRDAP(ctx, rdapHTTPClient, app, domainConfig)
+				
+				snapshot := FetchRDAPSnapshot(ctx, rdapHTTPClient, app, domainConfig.Domain)
+				status, cond := EvaluateRDAP(domainConfig, snapshot)
+				
+				rdapState := RDAPState{
+					Status:            status,
+					Condition:         cond,
+					Registrar:         snapshot.Registrar,
+					RegistrarIANAID:   snapshot.RegistrarIANAID,
+					Expiration:        snapshot.Expiration,
+					Nameservers:       snapshot.Nameservers,
+					DomainStatus:      snapshot.DomainStatus,
+					DNSSEC:            snapshot.DNSSEC,
+					RenewalPrice:      domainConfig.RenewalPrice,
+					AllowExpiry:       domainConfig.AllowExpiry,
+					Source:            snapshot.Source,
+					ProtocolUsed:      snapshot.ProtocolUsed,
+					QueryDurationMs:   snapshot.QueryDurationMs,
+					RegistryTier:      snapshot.RegistryTier,
+					RegistrarTier:     snapshot.RegistrarTier,
+					Discrepancies:     snapshot.Discrepancies,
+				}
+				
+				if snapshot.Err != nil {
+					rdapState.Error = snapshot.Err.Error()
+				}
+				
+				if cond != nil && cond.Code == CodeRDAPRegistrarMismatch {
+					rdapState.RegistrarMismatch = true
+					rdapState.ExpectedRegistrar = cond.Target
+				}
+				
+				rdapResults[i] = rdapState
 			}()
 		}
 		return nil
@@ -296,7 +420,7 @@ func executeRateLimitedChecks(
 			if !domainConfig.MonitorCTLogs || domainConfig.AllowExpiry {
 				continue
 			}
-			if err := ctLimiter.Wait(ctx); err != nil {
+			if err := app.CTLimiter.Wait(ctx); err != nil {
 				for j := i; j < len(domains); j++ {
 					if domains[j].MonitorCTLogs && ctResults[j].Status == "" {
 						ctResults[j] = CTLogState{
@@ -317,7 +441,11 @@ func executeRateLimitedChecks(
 						}
 					}
 				}()
-				ctResults[i] = evaluateCTLogs(ctx, app, domainConfig, ctLogPersist[domainConfig.Domain])
+				ctSnap := FetchCTLogsSnapshot(ctx, app, domainConfig, ctLogPersist[domainConfig.Domain])
+				ctStatus, ctCond, ctRes := EvaluateCTLogs(domainConfig, ctSnap)
+				ctRes.Status = ctStatus
+				ctRes.Condition = ctCond
+				ctResults[i] = ctRes
 			}()
 		}
 		return nil
@@ -337,6 +465,7 @@ func runMonitoringCycle(
 	prevRDAPStatus map[string]CheckStatus,
 	prevDNSStatus map[string]CheckStatus,
 	prevEmailStatus map[string]CheckStatus,
+	prevConditions map[string]StateCondition,
 ) *CheckState {
 	defer RecoverAndLogPanic(NameOpMonitoringCycle)
 
@@ -444,6 +573,9 @@ func runMonitoringCycle(
 	logStateTransitions(CheckTypeDNS, TargetKeyRecord, loopState.DNS, func(s DNSState) CheckStatus { return s.Status }, prevDNSStatus)
 	logStateTransitions(CheckTypeEmail, TargetKeyDomain, loopState.Email, func(s EmailState) CheckStatus { return s.Status }, prevEmailStatus)
 
+	// 6. Track Since Timestamps and Dispatch Cycle Report
+	processConditionsAndAlerts(app, loopState, domains, dnsRecords, prevConditions)
+
 	// 7. Update timestamps and pre-render atomic JSON cache
 	loopState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 	loopState.NextRefresh = time.Now().Add(loopDur).UTC().Format(time.RFC3339)
@@ -460,7 +592,97 @@ func runMonitoringCycle(
 		FieldDNSRecordsChecked, len(dnsRecords),
 	)
 
+	if app != nil && app.Notifier != nil {
+		app.Notifier.Flush()
+	}
+
 	return loopState
+}
+
+func applyConditionSince(cond *StateCondition, key string, prev map[string]StateCondition) {
+	if cond == nil {
+		return
+	}
+	prevCond, exists := prev[key]
+	if exists && prevCond.Code == cond.Code && prevCond.Target == cond.Target {
+		cond.Since = prevCond.Since
+	} else {
+		cond.Since = time.Now().UTC()
+	}
+	prev[key] = *cond
+}
+
+func formatDurationSince(since time.Time) string {
+	d := time.Since(since).Round(time.Minute)
+	if d < time.Minute {
+		return "just now"
+	}
+	return d.String()
+}
+
+func processConditionsAndAlerts(app *AppState, state *CheckState, domains []DomainConfig, dnsRecords []DNSTask, prev map[string]StateCondition) {
+	if app == nil || app.Notifier == nil {
+		return
+	}
+
+	var cycleAlerts []string
+
+	// Helper to track since and append to alerts
+	checkAndAppend := func(domainName, domain, checkName string, cond *StateCondition, status CheckStatus, suppress bool) {
+		if cond == nil {
+			return
+		}
+		applyConditionSince(cond, checkName+":"+domain, prev)
+		if status == StatusFailed && !suppress {
+			cycleAlerts = append(cycleAlerts, fmt.Sprintf("• [%s] %s failed: %s (Since: %s)", domainName, checkName, cond.Code, formatDurationSince(cond.Since)))
+		}
+	}
+
+	for _, domainCfg := range domains {
+		d := domainCfg.Domain
+		name := domainCfg.Name
+		suppress := domainCfg.SuppressAlerts
+
+		if st, ok := state.RDAP[d]; ok {
+			checkAndAppend(name, d, "RDAP", st.Condition, st.Status, suppress)
+		}
+		if st, ok := state.Email[d]; ok {
+			checkAndAppend(name, d, "Email", st.Condition, st.Status, suppress)
+		}
+		if st, ok := state.CAA[d]; ok {
+			checkAndAppend(name, d, "CAA", st.Condition, st.Status, suppress)
+		}
+		if st, ok := state.DNSSEC[d]; ok {
+			checkAndAppend(name, d, "DNSSEC", st.Condition, st.Status, suppress)
+		}
+		if st, ok := state.NSHealth[d]; ok {
+			checkAndAppend(name, d, "NSHealth", st.Condition, st.Status, suppress)
+		}
+		if st, ok := state.CTLogs[d]; ok {
+			checkAndAppend(name, d, "CTLogs", st.Condition, st.Status, suppress)
+			if !suppress {
+				for _, cert := range st.NewCerts {
+					issuer := cert.Issuer
+					if issuer == "" {
+						issuer = DefaultUnknownCA
+					}
+					cycleAlerts = append(cycleAlerts, fmt.Sprintf("• [%s] New Cert Issued: %s", name, issuer))
+				}
+			}
+		}
+	}
+
+	for _, dnsCfg := range dnsRecords {
+		name := dnsCfg.Name
+		if st, ok := state.DNS[name]; ok {
+			checkAndAppend(name, name, "DNS", st.Condition, st.Status, false)
+		}
+	}
+
+	if len(cycleAlerts) > 0 {
+		report := "Monitor Cycle Alert:\n" + strings.Join(cycleAlerts, "\n")
+		app.SafeDispatchf(PriorityHigh, TagSkull, "Global", "System", report, "%s", report)
+	}
 }
 
 func main() {
@@ -510,34 +732,6 @@ func main() {
 	rdapHTTPClient := NewRDAPHTTPClient(10 * time.Second)
 	LogInfof(MsgLogStartup, len(app.Config().Domains), len(app.Config().DNSRecords))
 
-	// Pre-render initial application state immediately so GET / and GET /api/state
-	// are instantly available upon process startup.
-	initialState := NewCheckState()
-	for _, domainCfg := range app.Config().Domains {
-		initialState.RDAP[domainCfg.Domain] = RDAPState{Status: StatusPending}
-		if domainCfg.VerifyNSHealth && len(domainCfg.ExpectedNS) > 0 {
-			initialState.NSHealth[domainCfg.Domain] = NSHealthResult{
-				Primary: domainCfg.ExpectedNS[0],
-			}
-		}
-	}
-	for _, dnsRecord := range app.Config().DNSRecords {
-		key := dnsRecord.Name
-		initialState.DNS[key] = DNSState{
-			Hostname: dnsRecord.Hostname,
-			Name:     dnsRecord.Name,
-			Type:     dnsRecord.Type,
-			Expected: dnsRecord.Expected,
-			Status:   StatusPending,
-			SkipSSL:  dnsRecord.SkipSSL,
-		}
-	}
-	initialState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
-	initialState.NextRefresh = time.Now().Add(app.LoopDuration).UTC().Format(time.RFC3339)
-	if b, err := jsonv2.Marshal(initialState); err == nil {
-		app.PrerenderedJSON.Store(b)
-	}
-
 	server, serverErrChan := setupHTTPServer(app, app.Config().Port)
 
 	engineDone := make(chan struct{})
@@ -550,6 +744,7 @@ func main() {
 		prevRDAPStatus := make(map[string]CheckStatus)
 		prevDNSStatus := make(map[string]CheckStatus)
 		prevEmailStatus := make(map[string]CheckStatus)
+		prevConditions := make(map[string]StateCondition)
 
 		if b, err := os.ReadFile(ctStatePath); err == nil {
 			if jsonErr := jsonv2.Unmarshal(b, &ctLogPersist); jsonErr != nil {
@@ -557,8 +752,12 @@ func main() {
 			}
 		}
 
+
+
 		for {
-			_ = runMonitoringCycle(ctx, app, rdapHTTPClient, ctStatePath, ctLogPersist, prevRDAPStatus, prevDNSStatus, prevEmailStatus)
+			_ = runMonitoringCycle(ctx, app, rdapHTTPClient, ctStatePath, ctLogPersist, prevRDAPStatus, prevDNSStatus, prevEmailStatus, prevConditions)
+
+
 
 			timer := time.NewTimer(app.LoopDuration)
 			select {

@@ -43,6 +43,7 @@ func TestRunMonitoringCycle(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		make(map[string]StateCondition),
 	)
 
 	require.NotNil(t, state)

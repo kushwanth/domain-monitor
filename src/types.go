@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"golang.org/x/time/rate"
 )
 
 // StringList is a slice of strings that unmarshals from either a single JSON string or an array of strings.
@@ -42,6 +43,14 @@ func (s *StringList) UnmarshalJSON(data []byte) error {
 	}
 	*s = list
 	return nil
+}
+
+// StateCondition represents a typed evaluator verdict with optional context and duration tracking.
+// Code is an iota-based int (zero-allocation). Target references existing config string headers.
+type StateCondition struct {
+	Code   ResultCode `json:"code"`
+	Target string     `json:"target,omitempty"`
+	Since  time.Time  `json:"since,omitempty"`
 }
 
 // 1. Status & Priority Enums
@@ -125,18 +134,18 @@ type DNSTask struct {
 	SkipSSL          bool       `json:"skip_ssl,omitempty"`
 }
 
-// HTTPClient defines an interface for executing HTTP requests, allowing for mocking in tests.
-type HTTPClient interface {
+// HTTPDoer defines an interface for executing HTTP requests, allowing for mocking in tests.
+type HTTPDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// DNSResolver defines an interface for executing DNS queries, allowing for mocking in tests.
-type DNSResolver interface {
+// Resolver defines an interface for executing DNS queries, allowing for mocking in tests.
+type Resolver interface {
 	ExchangeContext(ctx context.Context, m *dns.Msg, a string) (r *dns.Msg, rtt time.Duration, err error)
 }
 
-// WHOISClient defines an interface for executing WHOIS queries, allowing for mocking in tests.
-type WHOISClient interface {
+// WHOISQuerier defines an interface for executing WHOIS queries, allowing for mocking in tests.
+type WHOISQuerier interface {
 	Query(ctx context.Context, domain, server string) (string, error)
 }
 
@@ -150,9 +159,13 @@ type AppState struct {
 	PrerenderedJSON     atomic.Value
 	GlobalResolverIndex atomic.Uint32
 
-	HTTPClient  HTTPClient
-	DNSClient   DNSResolver
-	WHOISClient WHOISClient
+	Bootstrap   *Bootstrap
+	HTTPClient  HTTPDoer
+	DNSClient   Resolver
+	WHOISClient WHOISQuerier
+
+	RDAPLimiter *rate.Limiter
+	CTLimiter   *rate.Limiter
 }
 
 // Config returns a value copy of the application configuration loaded at startup.
@@ -183,7 +196,10 @@ func NewAppState(cfg AppConfig) *AppState {
 		activeResolvers: slices.Clone(cfg.Resolvers),
 		Notifier:        &NotificationManager{},
 		Pricing:         NewPricingManager(nil),
+		Bootstrap:       NewBootstrap(nil),
 		LoopDuration:    time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
+		RDAPLimiter:     rate.NewLimiter(rate.Every(RDAPRateLimitInterval), 1),
+		CTLimiter:       rate.NewLimiter(rate.Every(CTLogsRateLimitInterval), 1),
 	}
 }
 
@@ -281,6 +297,7 @@ type DomainTierData struct {
 
 type RDAPState struct {
 	Status            CheckStatus     `json:"status"`
+	Condition         *StateCondition `json:"condition,omitempty"`
 	Registrar         string          `json:"registrar,omitempty"`
 	RegistrarIANAID   string          `json:"registrar_iana_id,omitempty"`
 	RegistrarMismatch bool            `json:"registrar_mismatch,omitempty"`
@@ -303,26 +320,28 @@ type RDAPState struct {
 }
 
 type DNSState struct {
-	Hostname string      `json:"hostname"`
-	Name     string      `json:"name"`
-	Type     string      `json:"type"`
-	Expected []string    `json:"expected"`
-	Status   CheckStatus `json:"status"`
-	Found    []string    `json:"found,omitempty"`
-	SSLDays  *int        `json:"ssl_days,omitempty"`
-	SkipSSL  bool        `json:"skip_ssl,omitempty"`
-	Error    string      `json:"error,omitempty"`
+	Hostname  string          `json:"hostname"`
+	Name      string          `json:"name"`
+	Type      string          `json:"type"`
+	Expected  []string        `json:"expected"`
+	Status    CheckStatus     `json:"status"`
+	Condition *StateCondition `json:"condition,omitempty"`
+	Found     []string        `json:"found,omitempty"`
+	SSLDays   *int            `json:"ssl_days,omitempty"`
+	SkipSSL   bool            `json:"skip_ssl,omitempty"`
+	Error     string          `json:"error,omitempty"`
 }
 
 type EmailState struct {
-	Provider     string      `json:"provider,omitempty"`
-	Status       CheckStatus `json:"status"`
-	SPF          bool        `json:"spf,omitempty"`
-	DMARC        bool        `json:"dmarc,omitempty"`
-	DKIMExpected bool        `json:"dkim_expected,omitempty"`
-	DKIMValid    []string    `json:"dkim_valid,omitempty"`
-	MX           []string    `json:"mx,omitempty"`
-	Error        string      `json:"error,omitempty"`
+	Provider     string          `json:"provider,omitempty"`
+	Status       CheckStatus     `json:"status"`
+	Condition    *StateCondition `json:"condition,omitempty"`
+	SPF          bool            `json:"spf,omitempty"`
+	DMARC        bool            `json:"dmarc,omitempty"`
+	DKIMExpected bool            `json:"dkim_expected,omitempty"`
+	DKIMValid    []string        `json:"dkim_valid,omitempty"`
+	MX           []string        `json:"mx,omitempty"`
+	Error        string          `json:"error,omitempty"`
 }
 
 type CAAEntry struct {
@@ -332,17 +351,22 @@ type CAAEntry struct {
 }
 
 type CAAResult struct {
-	Valid      bool     `json:"valid"`
-	Issue      []string `json:"issue"`
-	IssueWild  []string `json:"issuewild"`
-	IssueMail  []string `json:"issuemail"`
-	UnknownCAs []string `json:"unknown_cas,omitempty"`
-	Error      string   `json:"error,omitempty"`
+	Status      CheckStatus      `json:"status"`
+	Condition   *StateCondition  `json:"condition,omitempty"`
+	Valid       bool             `json:"valid"`
+	Issue       []string         `json:"issue"`
+	IssueWild   []string `json:"issuewild"`
+	IssueMail   []string `json:"issuemail"`
+	UnknownCAs  []string `json:"unknown_cas,omitempty"`
+	QueryFailed bool     `json:"query_failed,omitempty"`
+	Error       string   `json:"error,omitempty"`
 }
 
 type DNSSECResult struct {
-	Valid           bool     `json:"valid"`
-	HasDS           bool     `json:"has_ds"`
+	Status          CheckStatus      `json:"status"`
+	Condition       *StateCondition  `json:"condition,omitempty"`
+	Valid           bool             `json:"valid"`
+	HasDS           bool             `json:"has_ds"`
 	HasDNSKEY       bool     `json:"has_dnskey"`
 	DSMatchesDNSKEY bool     `json:"ds_matches_dnskey"`
 	RRSIGValid      bool     `json:"rrsig_valid"`
@@ -350,6 +374,8 @@ type DNSSECResult struct {
 	ChainIntact     bool     `json:"chain_intact"`
 	Algorithms      []string `json:"algorithms,omitempty"`
 	Source          string   `json:"source"`
+	NetworkError    bool     `json:"network_error,omitempty"`
+	Disabled        bool     `json:"disabled,omitempty"`
 	Error           string   `json:"error,omitempty"`
 }
 
@@ -362,11 +388,13 @@ type CTCert struct {
 }
 
 type CTLogState struct {
-	LatestID         string      `json:"latest_id"`
-	BackfillCursor   string      `json:"backfill_cursor"`
-	BackfillComplete bool        `json:"backfill_complete"`
-	Status           CheckStatus `json:"status"`
-	Error            string      `json:"error,omitempty"`
+	LatestID         string          `json:"latest_id"`
+	BackfillCursor   string          `json:"backfill_cursor"`
+	BackfillComplete bool            `json:"backfill_complete"`
+	Status           CheckStatus     `json:"status"`
+	Condition        *StateCondition `json:"condition,omitempty"`
+	Error            string          `json:"error,omitempty"`
+	NewCerts         []CTCert        `json:"-"`
 }
 
 // NSHealthServerResult stores the evaluation metrics for an individual authoritative nameserver.
@@ -374,9 +402,11 @@ type NSHealthServerResult struct {
 	Nameserver    string `json:"nameserver"`
 	IsPrimary     bool   `json:"is_primary"`
 	Authoritative bool   `json:"authoritative"`
+	HasSOA        bool   `json:"has_soa"`
 	SOASerial     uint32 `json:"soa_serial,omitempty"`
 	HasDNSKEY     bool   `json:"has_dnskey,omitempty"`
 	DNSKEYMatch   bool   `json:"dnskey_match,omitempty"`
+	Unreachable   bool   `json:"unreachable,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
 
@@ -384,8 +414,9 @@ type NSHealthServerResult struct {
 type NSHealthResult struct {
 	Valid   bool                   `json:"valid"`
 	Primary string                 `json:"primary"`
-	Servers []NSHealthServerResult `json:"servers"`
-	Error   string                 `json:"error,omitempty"`
+	Status    CheckStatus            `json:"status"`
+	Condition *StateCondition        `json:"condition,omitempty"`
+	Servers   []NSHealthServerResult `json:"servers"`
 }
 
 // CheckState coordinates the per-cycle aggregated state across all checks.
@@ -457,15 +488,7 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 	if res.Email.Status != "" {
 		InitMap(&c.Email)[res.Domain] = res.Email
 	}
-	// CAAResult has Valid (bool) instead of CheckStatus. Use a specific check if empty.
-	// We can check if Status or Error is set, but CAA uses Valid. Actually, CAAResult doesn't have Status.
-	// Let's check Issue != nil or Valid is true to determine if it ran.
-	// If CAA wasn't checked, its struct is zero-valued.
-	// Actually, we can check a simple string field that is always populated when it runs, like Source (wait, CAA has no source).
-	// Or we can add an `Enabled` bool or check if `res.CAA` is non-zero.
-	// Wait, CAA check will always populate `Valid` or `Error`. So if `Valid` is false and `Error` is empty, it might be uninitialized.
-	// Let's add an explicit `Ran` bool or just assume if it has Valid || Error != "" or issues.
-	if res.CAA.Valid || res.CAA.Error != "" || len(res.CAA.Issue) > 0 {
+	if res.CAA.Status != "" {
 		InitMap(&c.CAA)[res.Domain] = res.CAA
 	}
 	if res.DNSSEC.Source != "" || res.DNSSEC.Error != "" || res.DNSSEC.Valid {
@@ -474,8 +497,122 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 	if res.CTLogs.Status != "" {
 		InitMap(&c.CTLogs)[res.Domain] = res.CTLogs
 	}
-	if res.NSHealth.Primary != "" || res.NSHealth.Error != "" || res.NSHealth.Valid {
+	if res.NSHealth.Status != "" {
 		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
+	}
+}
+
+// 7. Pipeline Snapshot Structs (Phase 2 Fetcher Outputs)
+
+// RDAPSnapshot holds raw registry/registrar data fetched from RDAP or WHOIS.
+// Fields mirror RDAPState for direct assembly.
+type RDAPSnapshot struct {
+	Registrar       string
+	RegistrarIANAID string
+	Expiration      string
+	Nameservers     []string
+	DomainStatus    []string
+	DNSSEC          bool
+	Source          string
+	ProtocolUsed    string
+	QueryDurationMs int64
+	RegistryTier    *DomainTierData
+	RegistrarTier   *DomainTierData
+	Discrepancies   []string
+	RawResponsePath string
+	Err             error
+}
+
+// NSDelegationSnapshot holds raw nameserver records fetched from root/parent zones.
+type NSDelegationSnapshot struct {
+	Nameservers []string
+	Err         error
+}
+
+// NSSnapshot holds raw data fetched from a single authoritative nameserver.
+type NSSnapshot struct {
+	Nameserver    string
+	IsPrimary     bool
+	Authoritative bool
+	HasSOA        bool
+	SOASerial     uint32
+	HasDNSKEY     bool
+	DNSKEYs       []string
+	Unreachable   bool
+	Err           error
+}
+
+// DNSSnapshot holds raw DNS query results for a single record check.
+type DNSSnapshot struct {
+	Records []string
+	Err     error
+}
+
+// EmailSnapshot holds raw email security DNS lookups.
+type EmailSnapshot struct {
+	MXRecords    []string
+	SPFRecords   []string
+	DMARCRecords []string
+	DKIMResults  map[string]bool
+	MXErr        error
+	SPFErr       error
+	DMARCErr     error
+	DKIMErrs     map[string]error
+}
+
+// DNSSECSnapshot holds raw DNSSEC chain data.
+type DNSSECSnapshot struct {
+	Result DNSSECResult
+}
+
+// CAASnapshot holds raw CAA record data.
+type CAASnapshot struct {
+	Found  bool
+	Result CAAResult
+}
+
+// CTLogsSnapshot holds raw CT log query results.
+type CTLogsSnapshot struct {
+	Page1Err         error
+	BackfillErr      error
+	IsFirstRun       bool
+	NewCerts         []CTCert
+	CheckpointID     string
+	BackfillCursor   string
+	BackfillComplete bool
+}
+
+// SSLSnapshot holds raw TLS certificate data.
+type SSLSnapshot struct {
+	ExpiryDays int
+	Err        error
+}
+
+// CycleSnapshot aggregates all raw data fetched during Phase 2 for the entire monitoring cycle.
+type CycleSnapshot struct {
+	RDAP         map[string]RDAPSnapshot
+	NSDelegation map[string]RDAPSnapshot
+	NSHealth     map[string][]NSSnapshot
+	DNS          map[string]DNSSnapshot
+	Email        map[string]EmailSnapshot
+	DNSSEC       map[string]DNSSECSnapshot
+	CAA          map[string]CAASnapshot
+	CTLogs       map[string]CTLogsSnapshot
+	SSL          map[string]SSLSnapshot
+}
+
+// NewCycleSnapshot returns a fresh CycleSnapshot with all maps initialized.
+func NewCycleSnapshot() *CycleSnapshot {
+	return &CycleSnapshot{
+		RDAP:         make(map[string]RDAPSnapshot),
+		NSDelegation: make(map[string]RDAPSnapshot),
+		NSHealth:     make(map[string][]NSSnapshot),
+		DNS:          make(map[string]DNSSnapshot),
+		Email:        make(map[string]EmailSnapshot),
+		DNSSEC:       make(map[string]DNSSECSnapshot),
+		CAA:          make(map[string]CAASnapshot),
+		CTLogs:       make(map[string]CTLogsSnapshot),
+		SSL:          make(map[string]SSLSnapshot),
 	}
 }
 
@@ -501,7 +638,10 @@ type NotificationManager struct {
 	mu        sync.Mutex
 	sentState map[string]time.Time
 
-	alertChan chan Alert
+	alertChan chan []Alert
+
+	batchMu    sync.Mutex
+	alertBatch []Alert
 
 	// TestMode captures dispatched alerts into TestBuffer for unit testing without leaking memory in production.
 	TestMode   bool
@@ -534,7 +674,7 @@ type queryResult struct {
 
 // Bootstrap manages IANA RDAP bootstrap registry caches and queries.
 type Bootstrap struct {
-	http      HTTPClient
+	http      HTTPDoer
 	url       string
 	mu        sync.RWMutex
 	fetchMu   sync.Mutex
@@ -557,7 +697,7 @@ type DotSweepResponse struct {
 
 // PricingManager manages TLD renewal pricing cache and scheduled upstream fetching.
 type PricingManager struct {
-	http      HTTPClient
+	http      HTTPDoer
 	url       string
 	mu        sync.RWMutex
 	fetchMu   sync.Mutex
