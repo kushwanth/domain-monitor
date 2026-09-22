@@ -92,8 +92,6 @@ func NormalizeDomainToASCIIText(domain string) string {
 	return cleaned
 }
 
-
-
 // DeduplicateNonEmptyStrings trims each string in items, filters out empty strings,
 // and deduplicates the remainder while preserving order.
 func DeduplicateNonEmptyStrings(items []string) []string {

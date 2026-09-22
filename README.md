@@ -177,6 +177,13 @@ docker run -d \
 
 *Note: Ensure your host data directory (`/path/to/your/data`) has write permissions for UID 65532.*
 
+### Local Execution
+
+```bash
+go build -o domain_monitor ./src
+./domain_monitor -config config.json
+```
+
 ### Systemd / Podman Quadlet
 
 Deploy using the included `domain-monitor.container` Quadlet file:

@@ -23,10 +23,6 @@ func evaluateCTLogsForTest(ctx context.Context, app *AppState, target DomainConf
 	return res
 }
 
-func init() {
-	SetCTLogsPath(filepath.Join(os.TempDir(), "ct_logs_test"))
-}
-
 func TestEmailMXVerification(t *testing.T) {
 	t.Parallel()
 
@@ -149,9 +145,10 @@ func TestSaveCertsToHistory(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
+	logsPath := filepath.Join(os.TempDir(), "ct_logs_test")
 	domain := "test-example-" + filepath.Base(tmpDir) + ".com"
 	defer func() {
-		_ = os.Remove(filepath.Join(GetCTLogsPath(), domain+".json"))
+		_ = os.Remove(filepath.Join(logsPath, domain+".json"))
 	}()
 
 	certs1 := []CTCert{
@@ -159,7 +156,7 @@ func TestSaveCertsToHistory(t *testing.T) {
 		{ID: "cert-2", Match: "sub.example.com", Issuer: "DigiCert", NotBefore: "2026-02-01T00:00:00Z"},
 	}
 
-	if err := saveCertsToHistory(domain, certs1); err != nil {
+	if err := saveCertsToHistory(domain, certs1, logsPath); err != nil {
 		t.Fatalf("saveCertsToHistory batch 1 failed: %v", err)
 	}
 
@@ -168,12 +165,12 @@ func TestSaveCertsToHistory(t *testing.T) {
 		{ID: "cert-2", Match: "sub.example.com", Issuer: "DigiCert", NotBefore: "2026-02-01T00:00:00Z"},
 		{ID: "cert-3", Match: "api.example.com", Issuer: "Let's Encrypt", NotBefore: "2026-03-01T00:00:00Z"},
 	}
-	if err := saveCertsToHistory(domain, certs2); err != nil {
+	if err := saveCertsToHistory(domain, certs2, logsPath); err != nil {
 		t.Fatalf("saveCertsToHistory batch 2 failed: %v", err)
 	}
 
 	// Verify deduplicated combined file
-	savedFile := filepath.Join(GetCTLogsPath(), domain+".json")
+	savedFile := filepath.Join(logsPath, domain+".json")
 	b, err := os.ReadFile(savedFile)
 	if err != nil {
 		t.Fatalf("Failed to read saved certs file: %v", err)
@@ -196,7 +193,10 @@ func TestSaveCertsToHistory(t *testing.T) {
 }
 
 func TestHTTPServerRoutes(t *testing.T) {
-	app := &AppState{}
+	app := &AppState{
+		CTLogsPath: filepath.Join(os.TempDir(), "ct_logs_server_test"),
+	}
+	defer os.RemoveAll(app.CTLogsPath)
 	app.PrerenderedJSON.Store([]byte(`{"status":"prerendered"}`))
 
 	server, _ := setupHTTPServer(app, "0")
@@ -204,7 +204,7 @@ func TestHTTPServerRoutes(t *testing.T) {
 
 	// Write a mock certs file for testdomain.com
 	testDomain := "testdomain.com"
-	_ = saveCertsToHistory(testDomain, []CTCert{{ID: "c1", Match: testDomain, Issuer: "CA1"}})
+	_ = saveCertsToHistory(testDomain, []CTCert{{ID: "c1", Match: testDomain, Issuer: "CA1"}}, app.CTLogsPath)
 
 	// 1. GET /health
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -333,7 +333,7 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 
 	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}, HTTPClient: mockClient}
 	domain := "firstrun.example.com"
-	defer func() { _ = os.Remove(filepath.Join(GetCTLogsPath(), domain+".json")) }()
+	defer func() { _ = os.Remove(filepath.Join(app.CTLogsPath, domain+".json")) }()
 
 	target := DomainConfig{
 		Domain:         domain,
@@ -343,8 +343,8 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 	saved := evaluateCTLogsForTest(context.Background(), app, target, CTLogState{})
 
 	// First run must not emit notifications for existing cert baseline
-	if len(app.Notifier.TestBuffer) != 0 {
-		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(app.Notifier.TestBuffer))
+	if len(app.Notifier.(*NotificationManager).TestBuffer) != 0 {
+		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(app.Notifier.(*NotificationManager).TestBuffer))
 	}
 
 	if saved.Status == "" {
@@ -380,7 +380,7 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 
 	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}, HTTPClient: mockClient}
 	domain := "ratelimit.example.com"
-	defer func() { _ = os.Remove(filepath.Join(GetCTLogsPath(), domain+".json")) }()
+	defer func() { _ = os.Remove(filepath.Join(app.CTLogsPath, domain+".json")) }()
 
 	target := DomainConfig{
 		Domain:         domain,
@@ -462,7 +462,8 @@ func TestFetchCTPage_KeyRedaction(t *testing.T) {
 
 func TestSaveCertsToHistory_CapAtMaxHistory(t *testing.T) {
 	domain := "cap-test.example.com"
-	cleanFile := filepath.Join(GetCTLogsPath(), domain+".json")
+	logsPath := filepath.Join(os.TempDir(), "ct_logs_test")
+	cleanFile := filepath.Join(logsPath, domain+".json")
 	defer func() { _ = os.Remove(cleanFile) }()
 
 	// Create 1,050 certs
@@ -477,7 +478,7 @@ func TestSaveCertsToHistory_CapAtMaxHistory(t *testing.T) {
 		}
 	}
 
-	if err := saveCertsToHistory(domain, certs); err != nil {
+	if err := saveCertsToHistory(domain, certs, logsPath); err != nil {
 		t.Fatalf("saveCertsToHistory failed: %v", err)
 	}
 

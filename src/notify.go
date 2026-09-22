@@ -9,10 +9,45 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
-var notifyHTTPClient = ResolveHTTPClient(&http.Client{Timeout: DefaultHTTPTimeout})
+// NotificationManager handles sending alerts sequentially using a background worker.
+type NotificationManager struct {
+	NtfyURL        string
+	NtfyAuth       string
+	TelegramToken  string
+	TelegramChatID string
+
+	mu        sync.Mutex
+	sentState map[string]time.Time
+
+	alertChan chan []Alert
+
+	batchMu    sync.Mutex
+	alertBatch []Alert
+
+	// TestMode determines if we're running in tests (skips actual notification dispatches).
+	TestMode   bool
+	TestBuffer []Alert
+
+	// Dependencies for network/IO
+	HTTPClient HTTPDoer
+}
+
+func NewNotificationManager(ntfyURL, ntfyAuth, teleToken, teleChatID string) *NotificationManager {
+	nm := &NotificationManager{
+		NtfyURL:        ntfyURL,
+		NtfyAuth:       ntfyAuth,
+		TelegramToken:  teleToken,
+		TelegramChatID: teleChatID,
+		alertChan:      make(chan []Alert, 100),
+		sentState:      make(map[string]time.Time),
+	}
+	go nm.workerLoop()
+	return nm
+}
 
 func maxPriority(batch []Alert) AlertPriority {
 	hasHigh := false
@@ -165,7 +200,7 @@ func (nm *NotificationManager) sendNtfyBatch(batch []Alert) bool {
 		if alert.Name != "" {
 			prefix = fmt.Sprintf(NtfyPrefixFormat, alert.Name)
 		}
-		
+
 		sb.WriteString(prefix + msg)
 		if i < len(batch)-1 {
 			sb.WriteString("\n")
@@ -184,7 +219,7 @@ func (nm *NotificationManager) sendNtfyBatch(batch []Alert) bool {
 		req.Header.Set(HeaderAuthorization, nm.NtfyAuth)
 	}
 	req.Header.Set(HeaderNtfyTitle, NotificationAlertTitle)
-	
+
 	pri := maxPriority(batch)
 	req.Header.Set(HeaderNtfyPriority, string(pri))
 
@@ -200,7 +235,11 @@ func (nm *NotificationManager) sendNtfyBatch(batch []Alert) bool {
 		req.Header.Set(HeaderNtfyTags, strings.Join(tags, ","))
 	}
 
-	resp, err := notifyHTTPClient.Do(req)
+	client := nm.HTTPClient
+	if client == nil {
+		client = ResolveHTTPClient(&http.Client{Timeout: DefaultHTTPTimeout})
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		errStr := err.Error()
 		if nm.NtfyAuth != "" {
@@ -273,7 +312,7 @@ func (nm *NotificationManager) sendTelegramBatch(batch []Alert) bool {
 		line := fmt.Sprintf(TelegramLineFormat, prefix, html.EscapeString(msg))
 		sb.WriteString(line)
 	}
-	
+
 	text := sb.String()
 
 	apiURL := TelegramAPIBase + nm.TelegramToken + TelegramAPISendMessageSuffix
@@ -295,7 +334,11 @@ func (nm *NotificationManager) sendTelegramBatch(batch []Alert) bool {
 	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 	req.Header.Set(HeaderContentType, MIMEApplicationJSON)
 
-	resp, err := notifyHTTPClient.Do(req)
+	client := nm.HTTPClient
+	if client == nil {
+		client = ResolveHTTPClient(&http.Client{Timeout: DefaultHTTPTimeout})
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		errStr := err.Error()
 		if nm.TelegramToken != "" {

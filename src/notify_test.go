@@ -185,17 +185,13 @@ func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestWorkerLoop_ExponentialBackoff(t *testing.T) {
-	// Mock notifyHTTPClient
-	originalClient := notifyHTTPClient
-	defer func() { notifyHTTPClient = originalClient }()
-
 	transport := &mockTransport{failTimes: 2}
-	notifyHTTPClient = &http.Client{Transport: transport}
 
 	nm := &NotificationManager{
 		NtfyURL:        "http://dummy-ntfy",
 		TelegramToken:  "testtoken",
 		TelegramChatID: "12345",
+		HTTPClient:     &http.Client{Transport: transport},
 	}
 
 	// Because backoff takes 1s + 2s = 3 seconds, we don't want to run this in full if we can avoid it.
@@ -227,17 +223,14 @@ func TestWorkerLoop_ExponentialBackoff(t *testing.T) {
 }
 
 func TestNotification_ChannelProcessing(t *testing.T) {
-	originalClient := notifyHTTPClient
-	defer func() { notifyHTTPClient = originalClient }()
-
 	transport := &mockTransport{failTimes: 0}
-	notifyHTTPClient = &http.Client{Transport: transport}
 
 	nm := &NotificationManager{
 		alertChan:      make(chan []Alert, 10),
 		NtfyURL:        "http://dummy-ntfy",
 		TelegramToken:  "testtoken",
 		TelegramChatID: "12345",
+		HTTPClient:     &http.Client{Transport: transport},
 	}
 
 	var wg sync.WaitGroup

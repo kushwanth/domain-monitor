@@ -35,7 +35,7 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 }
 
 // serveCTLogFile serves the CT log history JSON file for the given domain.
-func serveCTLogFile(w http.ResponseWriter, domain string) {
+func serveCTLogFile(app *AppState, w http.ResponseWriter, domain string) {
 	domain = NormalizeDomain(domain)
 	if domain == "" || !ReValidDomain.MatchString(domain) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
@@ -44,7 +44,10 @@ func serveCTLogFile(w http.ResponseWriter, domain string) {
 		return
 	}
 
-	logsPath := GetCTLogsPath()
+	logsPath := DefaultCTLogsSubdir
+	if app != nil && app.CTLogsPath != "" {
+		logsPath = app.CTLogsPath
+	}
 	filePath := filepath.Join(logsPath, domain+".json")
 	cleanPath := filepath.Clean(filePath)
 	if !IsSafeSubpath(logsPath, cleanPath) {
@@ -96,12 +99,12 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 
 	mux.HandleFunc(RouteAPICerts, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		serveCTLogFile(w, r.URL.Query().Get(ParamDomain))
+		serveCTLogFile(app, w, r.URL.Query().Get(ParamDomain))
 	})
 
 	mux.HandleFunc(RouteAPICTLogs, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		serveCTLogFile(w, r.PathValue(ParamDomain))
+		serveCTLogFile(app, w, r.PathValue(ParamDomain))
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -190,12 +193,12 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 
 			var sslDays *int
 			if !record.SkipSSL {
-				// We fetch SSL snapshot regardless of DNS match as long as it's not a complete lookup failure, 
-				// but wait, if it's a lookup failure we still might want to try? 
+				// We fetch SSL snapshot regardless of DNS match as long as it's not a complete lookup failure,
+				// but wait, if it's a lookup failure we still might want to try?
 				// The original code did: sslDays = validateCertificate(ctx, app, target, foundRecords) unconditionally if !SkipSSL.
 				sslSnap := FetchSSLSnapshot(ctx, app, record, dnsSnap.Records)
 				sslStatus, sslCond := EvaluateSSL(record, sslSnap)
-				
+
 				if sslSnap.ExpiryDays != SSLDaysError && sslSnap.ExpiryDays != SSLDaysNotApplicable {
 					d := sslSnap.ExpiryDays
 					sslDays = &d
@@ -293,13 +296,19 @@ func executeFastDomainChecks(ctx context.Context, app *AppState, domains []Domai
 
 				if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
 					snapshots := FetchNSHealthSnapshots(ctx, app, domain)
-					status, _ := EvaluateNSHealth(domain, snapshots)
-					
+					status, nsCond := EvaluateNSHealth(domain, snapshots)
+
 					var servers []NSHealthServerResult
-					for _, srvSnap := range snapshots {
+					for idx, srvSnap := range snapshots {
 						errStr := ""
 						if srvSnap.Err != nil {
 							errStr = srvSnap.Err.Error()
+						}
+						dnskeyMatch := true
+						if idx > 0 {
+							if len(snapshots[0].DNSKEYs) > 0 || len(srvSnap.DNSKEYs) > 0 {
+								dnskeyMatch = slices.Equal(snapshots[0].DNSKEYs, srvSnap.DNSKEYs)
+							}
 						}
 						servers = append(servers, NSHealthServerResult{
 							Nameserver:    srvSnap.Nameserver,
@@ -308,22 +317,18 @@ func executeFastDomainChecks(ctx context.Context, app *AppState, domains []Domai
 							HasSOA:        srvSnap.HasSOA,
 							SOASerial:     srvSnap.SOASerial,
 							HasDNSKEY:     srvSnap.HasDNSKEY,
-							DNSKEYMatch:   true, // TODO: Compute from snapshots if needed for API?
+							DNSKEYMatch:   dnskeyMatch,
 							Error:         errStr,
 						})
 					}
-					
+
 					res.NSHealth = NSHealthResult{
-						Valid:   status != StatusFailed,
-						Primary: domain.ExpectedNS[0],
-						Status:  status,
-						Servers: servers,
+						Valid:     status != StatusFailed,
+						Primary:   domain.ExpectedNS[0],
+						Status:    status,
+						Condition: nsCond,
+						Servers:   servers,
 					}
-					// Note: NSHealthResult is legacy API output struct, but we attach condition 
-					// to the top level domain result eventually. Wait, NSHealthResult doesn't have 
-					// Status and Condition fields. Wait!
-					// Actually, DomainResult doesn't have a top level status/cond for NSHealth yet, 
-					// but we will do that in Step 7. For now, we just pass what the API expects.
 				}
 			}
 
@@ -375,38 +380,38 @@ func executeRateLimitedChecks(
 						}
 					}
 				}()
-				
+
 				snapshot := FetchRDAPSnapshot(ctx, rdapHTTPClient, app, domainConfig.Domain)
 				status, cond := EvaluateRDAP(domainConfig, snapshot)
-				
+
 				rdapState := RDAPState{
-					Status:            status,
-					Condition:         cond,
-					Registrar:         snapshot.Registrar,
-					RegistrarIANAID:   snapshot.RegistrarIANAID,
-					Expiration:        snapshot.Expiration,
-					Nameservers:       snapshot.Nameservers,
-					DomainStatus:      snapshot.DomainStatus,
-					DNSSEC:            snapshot.DNSSEC,
-					RenewalPrice:      domainConfig.RenewalPrice,
-					AllowExpiry:       domainConfig.AllowExpiry,
-					Source:            snapshot.Source,
-					ProtocolUsed:      snapshot.ProtocolUsed,
-					QueryDurationMs:   snapshot.QueryDurationMs,
-					RegistryTier:      snapshot.RegistryTier,
-					RegistrarTier:     snapshot.RegistrarTier,
-					Discrepancies:     snapshot.Discrepancies,
+					Status:          status,
+					Condition:       cond,
+					Registrar:       snapshot.Registrar,
+					RegistrarIANAID: snapshot.RegistrarIANAID,
+					Expiration:      snapshot.Expiration,
+					Nameservers:     snapshot.Nameservers,
+					DomainStatus:    snapshot.DomainStatus,
+					DNSSEC:          snapshot.DNSSEC,
+					RenewalPrice:    domainConfig.RenewalPrice,
+					AllowExpiry:     domainConfig.AllowExpiry,
+					Source:          snapshot.Source,
+					ProtocolUsed:    snapshot.ProtocolUsed,
+					QueryDurationMs: snapshot.QueryDurationMs,
+					RegistryTier:    snapshot.RegistryTier,
+					RegistrarTier:   snapshot.RegistrarTier,
+					Discrepancies:   snapshot.Discrepancies,
 				}
-				
+
 				if snapshot.Err != nil {
 					rdapState.Error = snapshot.Err.Error()
 				}
-				
+
 				if cond != nil && cond.Code == CodeRDAPRegistrarMismatch {
 					rdapState.RegistrarMismatch = true
 					rdapState.ExpectedRegistrar = cond.Target
 				}
-				
+
 				rdapResults[i] = rdapState
 			}()
 		}
@@ -633,8 +638,8 @@ func processConditionsAndAlerts(app *AppState, state *CheckState, domains []Doma
 			return
 		}
 		applyConditionSince(cond, checkName+":"+domain, prev)
-		if status == StatusFailed && !suppress {
-			cycleAlerts = append(cycleAlerts, fmt.Sprintf("• [%s] %s failed: %s (Since: %s)", domainName, checkName, cond.Code, formatDurationSince(cond.Since)))
+		if (status == StatusFailed || status == StatusMismatch || status == StatusHijacked) && !suppress {
+			cycleAlerts = append(cycleAlerts, fmt.Sprintf("• [%s] %s %s: %s (Since: %s)", domainName, checkName, status, cond.Code, formatDurationSince(cond.Since)))
 		}
 	}
 
@@ -723,7 +728,7 @@ func main() {
 		LogWarn(MsgLogDataDirEnsureFailed, FieldPath, dataDir, FieldError, err)
 	}
 	ctLogsDir := filepath.Join(dataDir, DefaultCTLogsSubdir)
-	SetCTLogsPath(ctLogsDir)
+	app.CTLogsPath = ctLogsDir
 	if err := os.MkdirAll(ctLogsDir, DirPermDefault); err != nil {
 		LogWarn(MsgLogCTLogsDirEnsureFailed, FieldPath, ctLogsDir, FieldError, err)
 	}
@@ -731,6 +736,23 @@ func main() {
 
 	rdapHTTPClient := NewRDAPHTTPClient(10 * time.Second)
 	LogInfof(MsgLogStartup, len(app.Config().Domains), len(app.Config().DNSRecords))
+
+	initialState := NewCheckState()
+	for _, domainCfg := range app.Config().Domains {
+		initialState.RDAP[domainCfg.Domain] = RDAPState{Status: StatusPending}
+	}
+	for _, dnsRecord := range app.Config().DNSRecords {
+		initialState.DNS[dnsRecord.Name] = DNSState{
+			Hostname: dnsRecord.Hostname, Name: dnsRecord.Name,
+			Type: dnsRecord.Type, Expected: dnsRecord.Expected,
+			Status: StatusPending, SkipSSL: dnsRecord.SkipSSL,
+		}
+	}
+	initialState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+	initialState.NextRefresh = time.Now().Add(app.LoopDuration).UTC().Format(time.RFC3339)
+	if b, err := jsonv2.Marshal(initialState); err == nil {
+		app.PrerenderedJSON.Store(b)
+	}
 
 	server, serverErrChan := setupHTTPServer(app, app.Config().Port)
 
@@ -752,12 +774,8 @@ func main() {
 			}
 		}
 
-
-
 		for {
 			_ = runMonitoringCycle(ctx, app, rdapHTTPClient, ctStatePath, ctLogPersist, prevRDAPStatus, prevDNSStatus, prevEmailStatus, prevConditions)
-
-
 
 			timer := time.NewTimer(app.LoopDuration)
 			select {

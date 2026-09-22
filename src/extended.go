@@ -13,27 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 )
-
-var (
-	ctLogsMu     sync.RWMutex
-	ctLogsPath   = DefaultCTLogsSubdir
-)
-
-// GetCTLogsPath safely returns the current CT logs directory path.
-func GetCTLogsPath() string {
-	ctLogsMu.RLock()
-	defer ctLogsMu.RUnlock()
-	return ctLogsPath
-}
-
-// SetCTLogsPath safely updates the current CT logs directory path.
-func SetCTLogsPath(p string) {
-	ctLogsMu.Lock()
-	defer ctLogsMu.Unlock()
-	ctLogsPath = p
-}
 
 func FetchCTLogsSnapshot(ctx context.Context, app *AppState, target DomainConfig, prevState CTLogState) CTLogsSnapshot {
 	if !target.MonitorCTLogs {
@@ -66,7 +46,12 @@ func FetchCTLogsSnapshot(ctx context.Context, app *AppState, target DomainConfig
 
 	if len(snap.NewCerts) > 0 {
 		LogInfo(MsgLogDiscoveredNewCerts, FieldDomain, target.Domain, FieldCount, len(snap.NewCerts))
-		if err := saveCertsToHistory(target.Domain, snap.NewCerts); err != nil {
+
+		path := DefaultCTLogsSubdir
+		if app != nil && app.CTLogsPath != "" {
+			path = app.CTLogsPath
+		}
+		if err := saveCertsToHistory(target.Domain, snap.NewCerts, path); err != nil {
 			snap.CheckpointID = prevState.LatestID
 			snap.Page1Err = fmt.Errorf(MsgErrHistorySaveFailed, err.Error())
 			return snap
@@ -98,7 +83,11 @@ func FetchCTLogsSnapshot(ctx context.Context, app *AppState, target DomainConfig
 			}
 
 			if len(respBackfill.Rows) > 0 {
-				if err := saveCertsToHistory(target.Domain, respBackfill.Rows); err != nil {
+				path := DefaultCTLogsSubdir
+				if app != nil && app.CTLogsPath != "" {
+					path = app.CTLogsPath
+				}
+				if err := saveCertsToHistory(target.Domain, respBackfill.Rows, path); err != nil {
 					snap.BackfillErr = fmt.Errorf(MsgErrBackfillSaveFailed, err.Error())
 					return snap
 				}
@@ -194,12 +183,11 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPage
 	return &ctResp, nil
 }
 
-func saveCertsToHistory(domain string, certs []CTCert) error {
+func saveCertsToHistory(domain string, certs []CTCert, logsPath string) error {
 	cleanDomain := NormalizeDomain(domain)
 	if cleanDomain == "" || !ReValidDomain.MatchString(cleanDomain) {
 		return fmt.Errorf(MsgErrInvalidDomainCertsHistory, strconv.Quote(domain))
 	}
-	logsPath := GetCTLogsPath()
 	if err := os.MkdirAll(logsPath, DirPermDefault); err != nil {
 		return err
 	}

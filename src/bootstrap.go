@@ -47,7 +47,7 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 			Timeout:   timeout,
 			KeepAlive: DefaultTCPKeepAlive,
 			Control: func(_, address string, _ syscall.RawConn) error {
-				if allowInsecureRDAPURLs {
+				if AllowInsecureRDAPURLs {
 					return nil
 				}
 				host, _, err := net.SplitHostPort(address)
@@ -74,7 +74,7 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 			if len(via) >= MaxRedirects {
 				return errors.New(MsgErrStoppedAfterRedirects)
 			}
-			if !isSafeRDAPURL(req.URL.String()) {
+			if !IsSafeRDAPURL(req.URL.String()) {
 				return fmt.Errorf(MsgErrInsecureRedirectURL, req.URL.String())
 			}
 			return nil

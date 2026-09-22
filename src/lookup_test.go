@@ -871,8 +871,8 @@ func TestFetchWHOIS_NotFound(t *testing.T) {
 }
 
 func TestFollowRegistrarRDAPLinks(t *testing.T) {
-	allowInsecureRDAPURLs = true
-	defer func() { allowInsecureRDAPURLs = false }()
+	AllowInsecureRDAPURLs = true
+	defer func() { AllowInsecureRDAPURLs = false }()
 
 	registrarServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/rdap+json")
@@ -1267,8 +1267,8 @@ func TestFollowRegistrarRDAPLinks_SSRFProtection(t *testing.T) {
 	}
 
 	for _, unsafeURL := range unsafeLinks {
-		if isSafeRDAPURL(unsafeURL) {
-			t.Errorf("Expected isSafeRDAPURL to reject unsafe URL %q", unsafeURL)
+		if IsSafeRDAPURL(unsafeURL) {
+			t.Errorf("Expected IsSafeRDAPURL to reject unsafe URL %q", unsafeURL)
 		}
 	}
 
@@ -1279,14 +1279,14 @@ func TestFollowRegistrarRDAPLinks_SSRFProtection(t *testing.T) {
 
 	// Valid public HTTPS RDAP endpoint format should be permitted
 	validPublicURL := "https://rdap.markmonitor.com/rdap/domain/example.com"
-	if !isSafeRDAPURL(validPublicURL) {
-		t.Errorf("Expected isSafeRDAPURL to accept valid public HTTPS URL %q", validPublicURL)
+	if !IsSafeRDAPURL(validPublicURL) {
+		t.Errorf("Expected IsSafeRDAPURL to accept valid public HTTPS URL %q", validPublicURL)
 	}
 }
 
 func TestFollowRegistrarRDAPLinks_QueryParamReferral(t *testing.T) {
-	allowInsecureRDAPURLs = true
-	defer func() { allowInsecureRDAPURLs = false }()
+	AllowInsecureRDAPURLs = true
+	defer func() { AllowInsecureRDAPURLs = false }()
 
 	var receivedPath string
 	var receivedQuery string
@@ -1321,7 +1321,7 @@ func TestFollowRegistrarRDAPLinks_QueryParamReferral(t *testing.T) {
 
 func TestNewRDAPHTTPClient_BlocksInsecureRedirects(t *testing.T) {
 	// Insecure RDAP URLs disallowed (default)
-	allowInsecureRDAPURLs = false
+	AllowInsecureRDAPURLs = false
 
 	client := NewRDAPHTTPClient(2 * time.Second)
 	if client.CheckRedirect == nil {

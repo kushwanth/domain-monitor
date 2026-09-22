@@ -53,6 +53,23 @@ type StateCondition struct {
 	Since  time.Time  `json:"since,omitempty"`
 }
 
+// ConditionTracker tracks the worst status and its associated condition.
+type ConditionTracker struct {
+	Status CheckStatus
+	Cond   *StateCondition
+}
+
+// Promote escalates the tracked status/condition if the new status is worse.
+func (ct *ConditionTracker) Promote(status CheckStatus, code ResultCode, target string) {
+	if status == StatusFailed && ct.Status != StatusFailed {
+		ct.Status = StatusFailed
+		ct.Cond = &StateCondition{Code: code, Target: target}
+	} else if status == StatusWarning && ct.Status == StatusOK {
+		ct.Status = StatusWarning
+		ct.Cond = &StateCondition{Code: code, Target: target}
+	}
+}
+
 // 1. Status & Priority Enums
 
 // CheckStatus represents lifecycle status of a check
@@ -153,7 +170,7 @@ type WHOISQuerier interface {
 type AppState struct {
 	config              AppConfig
 	activeResolvers     []string
-	Notifier            *NotificationManager
+	Notifier            Notifier
 	Pricing             *PricingManager
 	LoopDuration        time.Duration
 	PrerenderedJSON     atomic.Value
@@ -166,6 +183,7 @@ type AppState struct {
 
 	RDAPLimiter *rate.Limiter
 	CTLimiter   *rate.Limiter
+	CTLogsPath  string
 }
 
 // Config returns a value copy of the application configuration loaded at startup.
@@ -194,7 +212,7 @@ func NewAppState(cfg AppConfig) *AppState {
 	return &AppState{
 		config:          cfg,
 		activeResolvers: slices.Clone(cfg.Resolvers),
-		Notifier:        &NotificationManager{},
+		Notifier:        nil,
 		Pricing:         NewPricingManager(nil),
 		Bootstrap:       NewBootstrap(nil),
 		LoopDuration:    time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
@@ -351,32 +369,32 @@ type CAAEntry struct {
 }
 
 type CAAResult struct {
-	Status      CheckStatus      `json:"status"`
-	Condition   *StateCondition  `json:"condition,omitempty"`
-	Valid       bool             `json:"valid"`
-	Issue       []string         `json:"issue"`
-	IssueWild   []string `json:"issuewild"`
-	IssueMail   []string `json:"issuemail"`
-	UnknownCAs  []string `json:"unknown_cas,omitempty"`
-	QueryFailed bool     `json:"query_failed,omitempty"`
-	Error       string   `json:"error,omitempty"`
+	Status      CheckStatus     `json:"status"`
+	Condition   *StateCondition `json:"condition,omitempty"`
+	Valid       bool            `json:"valid"`
+	Issue       []string        `json:"issue"`
+	IssueWild   []string        `json:"issuewild"`
+	IssueMail   []string        `json:"issuemail"`
+	UnknownCAs  []string        `json:"unknown_cas,omitempty"`
+	QueryFailed bool            `json:"query_failed,omitempty"`
+	Error       string          `json:"error,omitempty"`
 }
 
 type DNSSECResult struct {
-	Status          CheckStatus      `json:"status"`
-	Condition       *StateCondition  `json:"condition,omitempty"`
-	Valid           bool             `json:"valid"`
-	HasDS           bool             `json:"has_ds"`
-	HasDNSKEY       bool     `json:"has_dnskey"`
-	DSMatchesDNSKEY bool     `json:"ds_matches_dnskey"`
-	RRSIGValid      bool     `json:"rrsig_valid"`
-	RRSIGExpiry     string   `json:"rrsig_expiry,omitempty"`
-	ChainIntact     bool     `json:"chain_intact"`
-	Algorithms      []string `json:"algorithms,omitempty"`
-	Source          string   `json:"source"`
-	NetworkError    bool     `json:"network_error,omitempty"`
-	Disabled        bool     `json:"disabled,omitempty"`
-	Error           string   `json:"error,omitempty"`
+	Status          CheckStatus     `json:"status"`
+	Condition       *StateCondition `json:"condition,omitempty"`
+	Valid           bool            `json:"valid"`
+	HasDS           bool            `json:"has_ds"`
+	HasDNSKEY       bool            `json:"has_dnskey"`
+	DSMatchesDNSKEY bool            `json:"ds_matches_dnskey"`
+	RRSIGValid      bool            `json:"rrsig_valid"`
+	RRSIGExpiry     string          `json:"rrsig_expiry,omitempty"`
+	ChainIntact     bool            `json:"chain_intact"`
+	Algorithms      []string        `json:"algorithms,omitempty"`
+	Source          string          `json:"source"`
+	NetworkError    bool            `json:"network_error,omitempty"`
+	Disabled        bool            `json:"disabled,omitempty"`
+	Error           string          `json:"error,omitempty"`
 }
 
 type CTCert struct {
@@ -412,8 +430,8 @@ type NSHealthServerResult struct {
 
 // NSHealthResult stores the aggregated nameserver health and dumb secondary replication status for a domain.
 type NSHealthResult struct {
-	Valid   bool                   `json:"valid"`
-	Primary string                 `json:"primary"`
+	Valid     bool                   `json:"valid"`
+	Primary   string                 `json:"primary"`
 	Status    CheckStatus            `json:"status"`
 	Condition *StateCondition        `json:"condition,omitempty"`
 	Servers   []NSHealthServerResult `json:"servers"`
@@ -588,34 +606,6 @@ type SSLSnapshot struct {
 	Err        error
 }
 
-// CycleSnapshot aggregates all raw data fetched during Phase 2 for the entire monitoring cycle.
-type CycleSnapshot struct {
-	RDAP         map[string]RDAPSnapshot
-	NSDelegation map[string]RDAPSnapshot
-	NSHealth     map[string][]NSSnapshot
-	DNS          map[string]DNSSnapshot
-	Email        map[string]EmailSnapshot
-	DNSSEC       map[string]DNSSECSnapshot
-	CAA          map[string]CAASnapshot
-	CTLogs       map[string]CTLogsSnapshot
-	SSL          map[string]SSLSnapshot
-}
-
-// NewCycleSnapshot returns a fresh CycleSnapshot with all maps initialized.
-func NewCycleSnapshot() *CycleSnapshot {
-	return &CycleSnapshot{
-		RDAP:         make(map[string]RDAPSnapshot),
-		NSDelegation: make(map[string]RDAPSnapshot),
-		NSHealth:     make(map[string][]NSSnapshot),
-		DNS:          make(map[string]DNSSnapshot),
-		Email:        make(map[string]EmailSnapshot),
-		DNSSEC:       make(map[string]DNSSECSnapshot),
-		CAA:          make(map[string]CAASnapshot),
-		CTLogs:       make(map[string]CTLogsSnapshot),
-		SSL:          make(map[string]SSLSnapshot),
-	}
-}
-
 // 4. Notification Models & Interfaces
 
 // Alert represents a single notification event
@@ -628,24 +618,10 @@ type Alert struct {
 	Name     string
 }
 
-// NotificationManager handles sending alerts sequentially using a background worker.
-type NotificationManager struct {
-	NtfyURL        string
-	NtfyAuth       string
-	TelegramToken  string
-	TelegramChatID string
-
-	mu        sync.Mutex
-	sentState map[string]time.Time
-
-	alertChan chan []Alert
-
-	batchMu    sync.Mutex
-	alertBatch []Alert
-
-	// TestMode captures dispatched alerts into TestBuffer for unit testing without leaking memory in production.
-	TestMode   bool
-	TestBuffer []Alert
+// Notifier is the interface for dispatching alerts.
+type Notifier interface {
+	Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string)
+	Flush()
 }
 
 // 5. External API & Response Payloads

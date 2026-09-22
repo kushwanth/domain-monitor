@@ -20,7 +20,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-
 func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
 	dialHost := hostname
 	if strings.HasPrefix(dialHost, PrefixWildcard) {
@@ -594,7 +593,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 		res.Error = MsgErrDSRecordDoesNotMatchDNSKEY
 	}
 
-	// 4. Validate RRSIG covering DNSKEY RRset using DS-authenticated KSK (RFC 4035 Section 5.3)
+	// 4. Validate dns.RRSIG covering DNSKEY RRset using DS-authenticated KSK (RFC 4035 Section 5.3)
 	if len(rrsigRecords) > 0 && len(rrset) > 0 {
 
 		keysToVerify := authenticatedKSKs
@@ -652,13 +651,13 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 		} else {
 			dohReq.Header.Set(HeaderAccept, MIMEDNSJSON)
 			dohReq.Header.Set(HeaderUserAgent, DefaultUserAgent)
-			
+
 			var httpClient HTTPDoer
 			if app != nil {
 				httpClient = app.HTTPClient
 			}
 			client := ResolveHTTPClient(httpClient)
-			
+
 			dohResp, err := client.Do(dohReq)
 
 			if err != nil || dohResp.StatusCode != http.StatusOK {
@@ -762,7 +761,6 @@ func EvaluateDNSSEC(target DomainConfig, snapshot DNSSECSnapshot) (CheckStatus, 
 	return status, cond, res
 }
 
-
 // FetchDNSSnapshot performs the DNS resolution and returns a snapshot
 func FetchDNSSnapshot(ctx context.Context, app *AppState, target DNSTask) DNSSnapshot {
 	foundRecords, err := resolveTarget(ctx, app, target)
@@ -788,12 +786,33 @@ func EvaluateDNS(target DNSTask, snapshot DNSSnapshot) (CheckStatus, *StateCondi
 
 // FetchSSLSnapshot connects to the target on port 443 and fetches the certificate
 func FetchSSLSnapshot(ctx context.Context, app *AppState, target DNSTask, foundRecords []string) SSLSnapshot {
-	sslDays := SSLDaysNotApplicable
-	if !target.SkipSSL {
-		sslDays = validateCertificate(ctx, app, target, foundRecords)
+	if target.SkipSSL || (target.Type != RecordTypeA && target.Type != RecordTypeAAAA && target.Type != RecordTypeIP && target.Type != RecordTypeCNAME && target.Type != RecordTypeALIAS) {
+		return SSLSnapshot{ExpiryDays: SSLDaysNotApplicable}
 	}
+
+	var sslIPs []string
+	if target.Type == RecordTypeCNAME || target.Type == RecordTypeALIAS {
+		resolversToUse := app.Resolvers()
+		if target.CustomResolver != "" {
+			resolversToUse = []string{target.CustomResolver}
+		}
+		var ipErr error
+		sslIPs, ipErr = queryIPRecords(ctx, app, target.Hostname, resolversToUse)
+		if ipErr != nil {
+			LogWarn(MsgLogSSLResolveIPsFailed, FieldDomain, target.Hostname, FieldError, ipErr)
+		}
+	} else {
+		sslIPs = foundRecords
+	}
+
+	if len(sslIPs) == 0 {
+		return SSLSnapshot{ExpiryDays: SSLDaysError, Err: errors.New("no IP addresses found for SSL validation")}
+	}
+
+	days, err := checkSSLExpiryDays(ctx, target.Hostname, sslIPs, target.AcceptSelfSigned)
 	return SSLSnapshot{
-		ExpiryDays: sslDays,
+		ExpiryDays: days,
+		Err:        err,
 	}
 }
 
@@ -802,13 +821,15 @@ func EvaluateSSL(target DNSTask, snapshot SSLSnapshot) (CheckStatus, *StateCondi
 	if snapshot.ExpiryDays == SSLDaysNotApplicable {
 		return StatusOK, nil
 	}
-
-	if snapshot.ExpiryDays == SSLDaysError || snapshot.ExpiryDays < 0 {
-		return StatusFailed, &StateCondition{Code: CodeSSLExpired} // Wait, validateCertificate returns SSLDaysError for network issues. CodeSSLResolveFailed or CodeSSLValidationFailed.
-	} else if snapshot.ExpiryDays <= DefaultSSLExpiryWarningDays {
+	if snapshot.Err != nil {
+		return StatusFailed, &StateCondition{Code: CodeSSLValidationFailed, Target: snapshot.Err.Error()}
+	}
+	if snapshot.ExpiryDays < 0 {
+		return StatusFailed, &StateCondition{Code: CodeSSLExpired}
+	}
+	if snapshot.ExpiryDays <= DefaultSSLExpiryWarningDays {
 		return StatusWarning, &StateCondition{Code: CodeSSLExpiringSoon}
 	}
-
 	return StatusOK, &StateCondition{Code: CodeSSLVerified}
 }
 
@@ -1020,48 +1041,6 @@ func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, str
 	}
 }
 
-func validateCertificate(ctx context.Context, app *AppState, target DNSTask, foundRecords []string) int {
-	if target.SkipSSL {
-		return SSLDaysNotApplicable
-	}
-
-	if target.Type != RecordTypeA && target.Type != RecordTypeAAAA && target.Type != RecordTypeIP && target.Type != RecordTypeCNAME && target.Type != RecordTypeALIAS {
-		return SSLDaysNotApplicable
-	}
-
-	var sslIPs []string
-	if target.Type == RecordTypeCNAME || target.Type == RecordTypeALIAS {
-		resolversToUse := app.Resolvers()
-		if target.CustomResolver != "" {
-			resolversToUse = []string{target.CustomResolver}
-		}
-		var ipErr error
-		sslIPs, ipErr = queryIPRecords(ctx, app, target.Hostname, resolversToUse)
-		if ipErr != nil {
-			LogWarn(MsgLogSSLResolveIPsFailed, FieldDomain, target.Hostname, FieldError, ipErr)
-		}
-	} else {
-		sslIPs = foundRecords
-	}
-
-	if len(sslIPs) == 0 {
-		return SSLDaysError
-	}
-
-	days, err := checkSSLExpiryDays(ctx, target.Hostname, sslIPs, target.AcceptSelfSigned)
-	if err != nil {
-		app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, MsgRedactedSSLValidationFailed, MsgAlertSSLError, target.Hostname, err)
-		return SSLDaysError
-	}
-
-	if days < 0 {
-		app.SafeDispatchf(PriorityUrgent, TagRotatingLight, target.Hostname, target.Name, MsgRedactedSSLExpired, MsgAlertSSLExpired, target.Hostname, days)
-	} else if days <= DefaultSSLExpiryWarningDays {
-		app.SafeDispatchf(PriorityHigh, TagWarning, target.Hostname, target.Name, fmt.Sprintf(MsgRedactedSSLExpires, int(days)), MsgAlertSSLExpiry, target.Hostname, days)
-	}
-	return days
-}
-
 func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig) EmailSnapshot {
 	snap := EmailSnapshot{
 		DKIMResults: make(map[string]bool),
@@ -1102,7 +1081,7 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 				break
 			}
 		}
-		
+
 		_, parent, found := strings.Cut(currentDomain, ".")
 		if !found || parent == "" || !strings.Contains(parent, ".") {
 			break
@@ -1310,9 +1289,8 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot) (CheckStatus
 	// Return highest priority condition
 	var finalCond *StateCondition
 	if len(conditions) > 0 {
-		finalCond = &conditions[0]
-		// In a complete implementation we might want to attach multiple conditions,
-		// but since we return one *StateCondition, we just pick the first (which is usually MX).
+		c := conditions[0]
+		finalCond = &c
 	} else if emailStatus == StatusOK {
 		finalCond = &StateCondition{Code: CodeEmailVerified}
 	}
@@ -1355,6 +1333,7 @@ func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimar
 	host, port, err := net.SplitHostPort(DefaultPort(nsName, DefaultDNSPort))
 	if err != nil {
 		srv.Err = WrapError(fmt.Sprintf(MsgErrInvalidNSAddress, nsName), err)
+		srv.Unreachable = true
 		return srv
 	}
 
@@ -1365,10 +1344,12 @@ func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimar
 		ips, ipErr := queryIPRecords(ctx, app, host, app.Resolvers())
 		if ipErr != nil {
 			srv.Err = WrapError(MsgErrFailedToResolveIP, ipErr)
+			srv.Unreachable = true
 			return srv
 		}
 		if len(ips) == 0 {
 			srv.Err = fmt.Errorf(MsgErrNoIPRecordsForHost, host)
+			srv.Unreachable = true
 			return srv
 		}
 		ip = net.JoinHostPort(ips[0], port)
@@ -1380,6 +1361,7 @@ func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimar
 			soaErr = fmt.Errorf("nil SOA response")
 		}
 		srv.Err = fmt.Errorf(MsgErrSOALookupFailed, soaErr.Error())
+		srv.Unreachable = true
 		return srv
 	}
 
@@ -1458,69 +1440,56 @@ func EvaluateNSHealth(target DomainConfig, snapshots []NSSnapshot) (CheckStatus,
 		return StatusOK, nil
 	}
 
-	worstStatus := StatusOK
-	var worstCond *StateCondition
-
-	setCond := func(status CheckStatus, code ResultCode, tgt string) {
-		if status == StatusFailed {
-			worstStatus = StatusFailed
-			if worstCond == nil || worstCond.Code == CodeNone || worstStatus != StatusFailed {
-				worstCond = &StateCondition{Code: code, Target: tgt}
-			}
-		} else if status == StatusWarning && worstStatus != StatusFailed {
-			worstStatus = StatusWarning
-			if worstCond == nil || worstCond.Code == CodeNone {
-				worstCond = &StateCondition{Code: code, Target: tgt}
-			}
-		}
-	}
+	ct := ConditionTracker{Status: StatusOK}
 
 	primary := snapshots[0]
 	if primary.Err != nil {
-		errStr := primary.Err.Error()
-		if strings.Contains(errStr, "resolve IP") || strings.Contains(errStr, "invalid nameserver") || strings.Contains(errStr, "SOA lookup failed") || strings.Contains(errStr, "no IP records") {
-			setCond(StatusFailed, CodeNSUnreachable, primary.Nameserver)
+		if primary.Unreachable {
+			ct.Promote(StatusFailed, CodeNSUnreachable, primary.Nameserver)
 		} else if !primary.Authoritative {
-			setCond(StatusFailed, CodeNSNotAuthoritative, primary.Nameserver)
+			ct.Promote(StatusFailed, CodeNSNotAuthoritative, primary.Nameserver)
 		} else if !primary.HasSOA {
-			setCond(StatusFailed, CodeNSMissingSOA, primary.Nameserver)
+			ct.Promote(StatusFailed, CodeNSMissingSOA, primary.Nameserver)
+		} else {
+			ct.Promote(StatusFailed, CodeNSUnreachable, primary.Nameserver)
 		}
 	}
 
 	for _, sec := range snapshots[1:] {
 		if sec.Err != nil {
-			errStr := sec.Err.Error()
-			if strings.Contains(errStr, "resolve IP") || strings.Contains(errStr, "invalid nameserver") || strings.Contains(errStr, "SOA lookup failed") || strings.Contains(errStr, "no IP records") {
-				setCond(StatusFailed, CodeNSUnreachable, sec.Nameserver)
+			if sec.Unreachable {
+				ct.Promote(StatusFailed, CodeNSUnreachable, sec.Nameserver)
 			} else if !sec.Authoritative {
-				setCond(StatusFailed, CodeNSNotAuthoritative, sec.Nameserver)
+				ct.Promote(StatusFailed, CodeNSNotAuthoritative, sec.Nameserver)
 			} else if !sec.HasSOA {
-				setCond(StatusFailed, CodeNSMissingSOA, sec.Nameserver)
+				ct.Promote(StatusFailed, CodeNSMissingSOA, sec.Nameserver)
+			} else {
+				ct.Promote(StatusFailed, CodeNSUnreachable, sec.Nameserver)
 			}
 		}
 
 		if primary.HasSOA && sec.HasSOA {
 			if sec.SOASerial < primary.SOASerial {
-				setCond(StatusFailed, CodeNSSOALags, sec.Nameserver)
+				ct.Promote(StatusFailed, CodeNSSOALags, sec.Nameserver)
 			} else if sec.SOASerial != primary.SOASerial {
-				setCond(StatusWarning, CodeNSSOALags, sec.Nameserver) // Changed to lags or mismatch
+				ct.Promote(StatusWarning, CodeNSSOALags, sec.Nameserver)
 			}
 		}
 
 		if primary.HasDNSKEY {
 			if !sec.HasDNSKEY {
-				setCond(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
+				ct.Promote(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
 			} else if !slices.Equal(primary.DNSKEYs, sec.DNSKEYs) {
-				setCond(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
+				ct.Promote(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
 			}
 		} else if sec.HasDNSKEY {
-			setCond(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
+			ct.Promote(StatusFailed, CodeNSDNSKEYMismatch, sec.Nameserver)
 		}
 	}
 
-	if worstCond == nil {
-		worstCond = &StateCondition{Code: CodeNSSyncVerified, Target: target.Domain}
+	if ct.Cond == nil {
+		ct.Cond = &StateCondition{Code: CodeNSSyncVerified, Target: target.Domain}
 	}
 
-	return worstStatus, worstCond
+	return ct.Status, ct.Cond
 }

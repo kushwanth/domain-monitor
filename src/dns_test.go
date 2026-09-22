@@ -102,7 +102,7 @@ func TestValidateDNSSEC(t *testing.T) {
 		t.Errorf("Expected DS to match DNSKEY")
 	}
 	if !res.RRSIGValid {
-		t.Errorf("Expected RRSIG to be valid")
+		t.Errorf("Expected dns.RRSIG to be valid")
 	}
 	if !res.ChainIntact {
 		t.Errorf("Expected Google DoH to report ChainIntact (AD bit set)")
@@ -441,7 +441,7 @@ func TestSSLSentinels(t *testing.T) {
 		Type:     "TXT",
 		Expected: []string{"test"},
 	}
-	res := validateCertificate(context.Background(), app, txtTask, []string{"v=spf1 ~all"})
+	res := FetchSSLSnapshot(context.Background(), app, txtTask, []string{"v=spf1 ~all"}).ExpiryDays
 	if res != SSLDaysNotApplicable {
 		t.Errorf("Expected SSLDaysNotApplicable (%d) for TXT record, got %d", SSLDaysNotApplicable, res)
 	}
@@ -452,7 +452,7 @@ func TestSSLSentinels(t *testing.T) {
 		Type:     "A",
 		Expected: []string{"1.2.3.4"},
 	}
-	resEmpty := validateCertificate(context.Background(), app, aTask, []string{})
+	resEmpty := FetchSSLSnapshot(context.Background(), app, aTask, []string{}).ExpiryDays
 	if resEmpty != SSLDaysError {
 		t.Errorf("Expected SSLDaysError (%d) for empty IPs, got %d", SSLDaysError, resEmpty)
 	}
@@ -515,7 +515,7 @@ func TestDNSSEC_AuthenticatedKSKLinkage(t *testing.T) {
 	res := validateDNSSEC(context.Background(), app, "testsec.example", []string{l.LocalAddr().String()}, "")
 
 	if res.Valid {
-		t.Errorf("Expected DNSSEC validation to fail when RRSIG is signed by unlinked key2, but got Valid=true")
+		t.Errorf("Expected DNSSEC validation to fail when dns.RRSIG is signed by unlinked key2, but got Valid=true")
 	}
 }
 
@@ -535,7 +535,7 @@ func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 	defer cancel()
 	savedState := evaluateEmailSecurityForTest(ctx, app, target)
 
-	for _, alert := range app.Notifier.TestBuffer {
+	for _, alert := range app.Notifier.(*NotificationManager).TestBuffer {
 		if strings.Contains(alert.Message, "Missing SPF") || strings.Contains(alert.Message, "Missing DMARC") {
 			t.Errorf("Unexpected false alert on DNS lookup error: %s", alert.Message)
 		}
@@ -931,7 +931,7 @@ func TestValidateRecords_EmptyExpectedWithLiveRecords(t *testing.T) {
 	}
 
 	// 2. When no live records exist, exact match must succeed
-	app.Notifier.TestBuffer = nil
+	app.Notifier.(*NotificationManager).TestBuffer = nil
 	if !validateRecords(task, []string{}) {
 		t.Errorf("Expected validateRecords to return true when no live records exist for empty expected list, got false")
 	}
@@ -1532,10 +1532,10 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 		t.Errorf("expected no error, got %s", resSkip.Error)
 	}
 
-	// 2. Direct call to validateCertificate: when SkipSSL is true, immediately returns SSLDaysNotApplicable
-	days := validateCertificate(context.Background(), app, taskSkip, []string{"127.0.0.1"})
+	// 2. Direct call to FetchSSLSnapshot: when SkipSSL is true, immediately returns SSLDaysNotApplicable
+	days := FetchSSLSnapshot(context.Background(), app, taskSkip, []string{"127.0.0.1"}).ExpiryDays
 	if days != SSLDaysNotApplicable {
-		t.Errorf("validateCertificate expected SSLDaysNotApplicable, got %d", days)
+		t.Errorf("FetchSSLSnapshot expected SSLDaysNotApplicable, got %d", days)
 	}
 }
 
@@ -1933,11 +1933,11 @@ func TestValidateCertificateExtensive(t *testing.T) {
 		Type:     "A",
 	}
 
-	days := validateCertificate(context.Background(), app, target, []string{"127.0.0.1"})
+	days := FetchSSLSnapshot(context.Background(), app, target, []string{"127.0.0.1"}).ExpiryDays
 	assert.Equal(t, -9998, days)
 
 	target.SkipSSL = true
-	days = validateCertificate(context.Background(), app, target, []string{"127.0.0.1"})
+	days = FetchSSLSnapshot(context.Background(), app, target, []string{"127.0.0.1"}).ExpiryDays
 	assert.Equal(t, -9999, days)
 }
 

@@ -6,6 +6,7 @@
 *.dylib
 bin/
 domain-monitor
+domain_monitor
 src/src
 
 # Test binary, built with `go test -c`
@@ -26,3 +27,4 @@ data/
 
 # Antigravity Customizations
 .agents/
+plan/

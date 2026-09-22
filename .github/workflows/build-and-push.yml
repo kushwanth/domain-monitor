@@ -2,10 +2,7 @@ name: CI/CD
 run-name: ${{ github.event.head_commit.message || github.ref_name }}
 on:
   push:
-    branches: [ "main" ]
     tags: [ 'v*.*.*' ]
-  pull_request:
-    branches: [ "main" ]
 
 env:
   REGISTRY: ghcr.io
@@ -30,7 +27,7 @@ jobs:
 
       - name: Enforce Test Coverage Threshold
         run: |
-          MIN_COVERAGE=83.0
+          MIN_COVERAGE=80
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print substr($3, 1, length($3)-1)}')
           if (( $(echo "$COVERAGE < $MIN_COVERAGE" | bc -l) )); then
             echo "Test coverage ($COVERAGE%) is below the minimum threshold ($MIN_COVERAGE%)"

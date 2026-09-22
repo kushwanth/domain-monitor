@@ -84,7 +84,6 @@ func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 		}
 	}
 
-
 	seenDNSNames := make(map[string]bool, len(rawCfg.DNSRecords))
 	for i := range rawCfg.DNSRecords {
 		if err := normalizeDNSTask(&rawCfg.DNSRecords[i], i, seenDNSNames); err != nil {
@@ -337,16 +336,17 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 	}
 	DrainAndClose(resp.Body, MaxBodyDrainSize)
 
-	app.Notifier.NtfyURL = cfg.Notifications.Ntfy.URL
-	app.Notifier.NtfyAuth = auth
-	app.Notifier.alertChan = make(chan []Alert, 100)
-	go app.Notifier.workerLoop()
-
-	if cfg.Notifications.Telegram != nil && cfg.Notifications.Telegram.Token != "" && cfg.Notifications.Telegram.ChatID != "" {
-		app.Notifier.TelegramToken = cfg.Notifications.Telegram.Token
-		app.Notifier.TelegramChatID = cfg.Notifications.Telegram.ChatID
-		LogInfo(MsgLogTelegramConfig)
+	var telegramToken, telegramChatID string
+	if cfg.Notifications.Telegram != nil {
+		telegramToken = cfg.Notifications.Telegram.Token
+		telegramChatID = cfg.Notifications.Telegram.ChatID
 	}
+	app.Notifier = NewNotificationManager(
+		cfg.Notifications.Ntfy.URL,
+		auth,
+		telegramToken,
+		telegramChatID,
+	)
 
 	var healthyResolvers []string
 	var lastResolverErr error

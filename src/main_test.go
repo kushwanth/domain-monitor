@@ -28,7 +28,7 @@ func TestRunMonitoringCycle(t *testing.T) {
 
 	httpClient := &http.Client{Timeout: 2 * time.Second}
 	ctLogPersist := make(map[string]CTLogState)
-	
+
 	// Use a temporary file for ct state path
 	tmpFile, err := os.CreateTemp("", "ctstate_*.json")
 	require.NoError(t, err)

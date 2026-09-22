@@ -368,14 +368,14 @@ var resultCodeNames = [...]string{
 	CodeRDAPSuspended:         "rdapSuspended",
 
 	// NS Health
-	CodeNSSyncVerified:    "nsSyncVerified",
-	CodeNSUnreachable:     "nsUnreachable",
+	CodeNSSyncVerified:     "nsSyncVerified",
+	CodeNSUnreachable:      "nsUnreachable",
 	CodeNSNotAuthoritative: "nsNotAuthoritative",
-	CodeNSMissingSOA:      "nsMissingSoa",
-	CodeNSSOALags:         "nsSoaLags",
-	CodeNSDNSKEYMismatch:  "nsDnskeyMismatch",
-	CodeExpectedNSMissing: "expectedNsMissing",
-	CodeUnauthorizedNS:    "unauthorizedNs",
+	CodeNSMissingSOA:       "nsMissingSoa",
+	CodeNSSOALags:          "nsSoaLags",
+	CodeNSDNSKEYMismatch:   "nsDnskeyMismatch",
+	CodeExpectedNSMissing:  "expectedNsMissing",
+	CodeUnauthorizedNS:     "unauthorizedNs",
 
 	// DNS Records
 	CodeDNSMatchVerified:     "dnsMatchVerified",
@@ -386,37 +386,37 @@ var resultCodeNames = [...]string{
 	CodeDNSSubstringMismatch: "dnsSubstringMismatch",
 
 	// Email Security
-	CodeEmailVerified:        "emailVerified",
-	CodeEmailMissingMX:       "emailMissingMx",
-	CodeEmailUnauthorizedMX:  "emailUnauthorizedMx",
-	CodeEmailHijackedMX:      "emailHijackedMx",
-	CodeEmailMissingSPF:      "emailMissingSpf",
-	CodeEmailMultipleSPF:     "emailMultipleSpf",
-	CodeEmailMissingDMARC:    "emailMissingDmarc",
-	CodeEmailMultipleDMARC:   "emailMultipleDmarc",
-	CodeEmailMissingDKIM:     "emailMissingDkim",
-	CodeMXQueryFailed:     "mxQueryFailed",
-	CodeNoMXRecords:       "noMxRecords",
-	CodeSPFLookupFailed:   "spfLookupFailed",
-	CodeDMARCLookupFailed: "dmarcLookupFailed",
-	CodeDKIMLookupFailed:  "dkimLookupFailed",
+	CodeEmailVerified:       "emailVerified",
+	CodeEmailMissingMX:      "emailMissingMx",
+	CodeEmailUnauthorizedMX: "emailUnauthorizedMx",
+	CodeEmailHijackedMX:     "emailHijackedMx",
+	CodeEmailMissingSPF:     "emailMissingSpf",
+	CodeEmailMultipleSPF:    "emailMultipleSpf",
+	CodeEmailMissingDMARC:   "emailMissingDmarc",
+	CodeEmailMultipleDMARC:  "emailMultipleDmarc",
+	CodeEmailMissingDKIM:    "emailMissingDkim",
+	CodeMXQueryFailed:       "mxQueryFailed",
+	CodeNoMXRecords:         "noMxRecords",
+	CodeSPFLookupFailed:     "spfLookupFailed",
+	CodeDMARCLookupFailed:   "dmarcLookupFailed",
+	CodeDKIMLookupFailed:    "dkimLookupFailed",
 
 	// DNSSEC
-	CodeDNSSECVerified:    "dnssecVerified",
+	CodeDNSSECVerified:     "dnssecVerified",
 	CodeDNSSECNetworkError: "dnssecNetworkError",
-	CodeDNSSECDisabled:    "dnssecDisabled",
-	CodeDNSSECNoDS:        "dnssecNoDs",
-	CodeDNSSECNoDNSKEY:    "dnssecNoDnskey",
-	CodeDNSSECDSMismatch:  "dnssecDsMismatch",
-	CodeDNSSECRRSIGFailed: "dnssecRrsigFailed",
-	CodeDNSSECChainBroken: "dnssecChainBroken",
+	CodeDNSSECDisabled:     "dnssecDisabled",
+	CodeDNSSECNoDS:         "dnssecNoDs",
+	CodeDNSSECNoDNSKEY:     "dnssecNoDnskey",
+	CodeDNSSECDSMismatch:   "dnssecDsMismatch",
+	CodeDNSSECRRSIGFailed:  "dnssecRrsigFailed",
+	CodeDNSSECChainBroken:  "dnssecChainBroken",
 
 	// CAA
-	CodeCAAVerified:        "caaVerified",
-	CodeCAAQueryFailed:     "caaQueryFailed",
-	CodeCAAMissingDenyAll:  "caaMissingDenyAll",
+	CodeCAAVerified:         "caaVerified",
+	CodeCAAQueryFailed:      "caaQueryFailed",
+	CodeCAAMissingDenyAll:   "caaMissingDenyAll",
 	CodeCAAUnexpectedIssuer: "caaUnexpectedIssuer",
-	CodeCAAMissingIssuer:   "caaMissingIssuer",
+	CodeCAAMissingIssuer:    "caaMissingIssuer",
 
 	// CT Logs
 	CodeCTLogsVerified:    "ctLogsVerified",
@@ -748,7 +748,7 @@ const (
 	MsgAlertDNSSECNoDS         = "DNSSEC: No DS record at parent for %s"
 	MsgAlertDNSSECNoDNSKEY     = "DNSSEC: No DNSKEY records found for %s"
 	MsgAlertDNSSECMismatch     = "DNSSEC: DS does not match any DNSKEY for %s"
-	MsgAlertDNSSECRRSIGFailed  = "DNSSEC: RRSIG verification failed for %s"
+	MsgAlertDNSSECRRSIGFailed  = "DNSSEC: dns.RRSIG verification failed for %s"
 	MsgAlertDNSSECChainBroken  = "DNSSEC: Full chain of trust validation failed (AD flag missing) for %s"
 
 	// SSL Alerts
@@ -811,7 +811,7 @@ const (
 	MsgRedactedDNSSECDSNotFound     = "DNSSEC DS record is missing."
 	MsgRedactedDNSSECDNSKEYNotFound = "DNSSEC DNSKEY record is missing."
 	MsgRedactedDNSSECDSMismatch     = "DNSSEC DS does not match KSK."
-	MsgRedactedDNSSECRRSIGFailed    = "DNSSEC RRSIG verification failed or expired."
+	MsgRedactedDNSSECRRSIGFailed    = "DNSSEC dns.RRSIG verification failed or expired."
 	MsgRedactedDNSSECChainFailed    = "DNSSEC Full chain of trust validation failed."
 
 	MsgRedactedSSLValidationFailed = "SSL Certificate Validation Failed."
@@ -935,48 +935,48 @@ const (
 
 // HTTP Routes & Query Params
 const (
-	RouteHealth      = "GET /health"
-	RouteAPIState    = "GET /api/state"
-	RouteAPICerts    = "GET /api/certs"
-	RouteAPICTLogs   = "GET /api/ctlogs/{domain}"
-	ParamDomain      = "domain"
-	ParamName        = "name"
-	ParamType        = "type"
-	ParamDO          = "do"
-	ParamDOValue     = "1"
-	ParamAfter       = "after"
-	ParamRegistrars  = "registrars"
-	RecordTypeDNSKEY        = "DNSKEY"
-	FieldChatID             = "chat_id"
-	FieldText               = "text"
-	FieldParseMode          = "parse_mode"
-	FieldCacheAge           = "cache_age"
-	FieldError              = "error"
-	FieldDomain             = "domain"
-	FieldPriority           = "priority"
-	FieldTag                = "tag"
-	FieldPanic              = "panic"
-	FieldOperation          = "operation"
-	FieldPath               = "path"
-	FieldCount              = "count"
-	FieldStatus             = "status"
-	FieldResponse           = "response"
-	FieldResolver           = "resolver"
-	FieldRecord             = "record"
-	FieldURL                = "url"
-	FieldReferralServer     = "referral_server"
-	FieldDurationMS         = "duration_ms"
-	FieldDomainsChecked     = "domains_checked"
-	FieldDNSRecordsChecked  = "dns_records_checked"
-	FieldPrev               = "prev"
-	FieldCurrent            = "current"
-	FieldCheck              = "check"
-	FieldAttempt            = "attempt"
-	FieldRetryIn            = "retry_in"
-	FieldConfigured         = "configured"
-	MIMEDNSJSON             = "application/dns-json"
-	DoHQueryTemplate        = "?name=%s&type=DNSKEY&do=1"
-	PathRDAPDomain          = "/domain/"
+	RouteHealth            = "GET /health"
+	RouteAPIState          = "GET /api/state"
+	RouteAPICerts          = "GET /api/certs"
+	RouteAPICTLogs         = "GET /api/ctlogs/{domain}"
+	ParamDomain            = "domain"
+	ParamName              = "name"
+	ParamType              = "type"
+	ParamDO                = "do"
+	ParamDOValue           = "1"
+	ParamAfter             = "after"
+	ParamRegistrars        = "registrars"
+	RecordTypeDNSKEY       = "DNSKEY"
+	FieldChatID            = "chat_id"
+	FieldText              = "text"
+	FieldParseMode         = "parse_mode"
+	FieldCacheAge          = "cache_age"
+	FieldError             = "error"
+	FieldDomain            = "domain"
+	FieldPriority          = "priority"
+	FieldTag               = "tag"
+	FieldPanic             = "panic"
+	FieldOperation         = "operation"
+	FieldPath              = "path"
+	FieldCount             = "count"
+	FieldStatus            = "status"
+	FieldResponse          = "response"
+	FieldResolver          = "resolver"
+	FieldRecord            = "record"
+	FieldURL               = "url"
+	FieldReferralServer    = "referral_server"
+	FieldDurationMS        = "duration_ms"
+	FieldDomainsChecked    = "domains_checked"
+	FieldDNSRecordsChecked = "dns_records_checked"
+	FieldPrev              = "prev"
+	FieldCurrent           = "current"
+	FieldCheck             = "check"
+	FieldAttempt           = "attempt"
+	FieldRetryIn           = "retry_in"
+	FieldConfigured        = "configured"
+	MIMEDNSJSON            = "application/dns-json"
+	DoHQueryTemplate       = "?name=%s&type=DNSKEY&do=1"
+	PathRDAPDomain         = "/domain/"
 )
 
 // Server Defaults & Subdirectories
@@ -1155,7 +1155,7 @@ const (
 	MsgErrDSQueryFailed                      = "DS query failed: %s"
 	MsgErrDNSKEYQueryFailed                  = "DNSKEY query failed: %s"
 	MsgErrDSRecordDoesNotMatchDNSKEY         = "DS record does not match any DNSKEY"
-	MsgErrRRSIGExpiredOrNotYetValid          = "RRSIG is expired or not yet valid"
+	MsgErrRRSIGExpiredOrNotYetValid          = "dns.RRSIG is expired or not yet valid"
 	MsgErrDNSSECLocalVerifiedDoHUnavailable  = "Local DNSSEC records verified; upstream DoH chain integrity unavailable"
 	MsgErrDNSSECUpstreamChainBroken          = "Upstream validating resolver returned AD=false (chain broken)"
 	MsgErrDNSSECValidationFailed             = "DNSSEC Validation Failed"

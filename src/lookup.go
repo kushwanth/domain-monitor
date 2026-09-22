@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	allowInsecureRDAPURLs = false
+	AllowInsecureRDAPURLs = false
 	whoisQueryFn          = defaultWHOISQuery
 )
 
@@ -633,7 +633,7 @@ func extractWHOISTier(raw string, source string, server string) *DomainTierData 
 func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RDAPSnapshot, []string) {
 	if registry == nil && registrar == nil {
 		return RDAPSnapshot{
-			Err:  errors.New(MsgErrNoTierData),
+			Err: errors.New(MsgErrNoTierData),
 		}, nil
 	}
 	state := RDAPSnapshot{
@@ -829,35 +829,20 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *Sta
 		return StatusFailed, &StateCondition{Code: CodeRDAPHTTPError}
 	}
 
-	worstStatus := StatusOK
-	var worstCond *StateCondition
-
-	setCond := func(status CheckStatus, code ResultCode, tgt string) {
-		if status == StatusFailed {
-			worstStatus = StatusFailed
-			if worstCond == nil || worstCond.Code == CodeNone || worstStatus != StatusFailed {
-				worstCond = &StateCondition{Code: code, Target: tgt}
-			}
-		} else if status == StatusWarning && worstStatus != StatusFailed {
-			worstStatus = StatusWarning
-			if worstCond == nil || worstCond.Code == CodeNone {
-				worstCond = &StateCondition{Code: code, Target: tgt}
-			}
-		}
-	}
+	ct := ConditionTracker{Status: StatusOK}
 
 	// 1. Checks expiration
 	if !target.AllowExpiry && snapshot.Expiration != "" {
 		if t, _, err := parseFlexibleDate(snapshot.Expiration); err == nil {
 			days := time.Until(t).Hours() / 24
 			if days < 0 {
-				setCond(StatusFailed, CodeRDAPExpired, "")
+				ct.Promote(StatusFailed, CodeRDAPExpired, "")
 			} else if days <= DefaultRDAPExpiryWarningDays {
 				priority := StatusWarning
 				if days <= 7 {
 					priority = StatusFailed
 				}
-				setCond(priority, CodeRDAPExpiringSoon, "")
+				ct.Promote(priority, CodeRDAPExpiringSoon, "")
 			}
 		}
 	}
@@ -887,14 +872,14 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *Sta
 			}
 			liveNS[ns] = true
 			if !authorizedMap[ns] {
-				setCond(StatusFailed, CodeUnauthorizedNS, ns)
+				ct.Promote(StatusFailed, CodeUnauthorizedNS, ns)
 			}
 		}
 
 		for _, expectedRaw := range target.ExpectedNS {
 			expected := NormalizeDomain(expectedRaw)
 			if expected != "" && !liveNS[expected] {
-				setCond(StatusFailed, CodeExpectedNSMissing, expectedRaw)
+				ct.Promote(StatusFailed, CodeExpectedNSMissing, expectedRaw)
 			}
 		}
 	}
@@ -914,29 +899,29 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *Sta
 		} else if suspClean == EPPStatusInactive {
 			code = CodeEPPInactive
 		}
-		setCond(StatusFailed, code, "")
+		ct.Promote(StatusFailed, code, "")
 	}
 
 	// 4. Checks transfer lock
 	if target.DomainTransferLocked && !isTransferLocked(snapshot.DomainStatus) {
-		setCond(StatusWarning, CodeRDAPTransferUnlocked, "")
+		ct.Promote(StatusWarning, CodeRDAPTransferUnlocked, "")
 	}
 
 	// 5. Checks registrar match
 	if target.ExpectedRegistrarID != "" {
 		if snapshot.RegistrarIANAID != target.ExpectedRegistrarID {
-			setCond(StatusFailed, CodeRDAPRegistrarMismatch, "IANA "+target.ExpectedRegistrarID)
+			ct.Promote(StatusFailed, CodeRDAPRegistrarMismatch, "IANA "+target.ExpectedRegistrarID)
 		}
 	} else if target.ExpectedRegistrarName != "" {
 		if !strings.Contains(strings.ToLower(snapshot.Registrar), strings.ToLower(target.ExpectedRegistrarName)) {
-			setCond(StatusFailed, CodeRDAPRegistrarMismatch, target.ExpectedRegistrarName)
+			ct.Promote(StatusFailed, CodeRDAPRegistrarMismatch, target.ExpectedRegistrarName)
 		}
 	}
 
-	if worstCond == nil {
-		worstCond = &StateCondition{Code: CodeRDAPSuccess}
+	if ct.Cond == nil {
+		ct.Cond = &StateCondition{Code: CodeRDAPSuccess}
 	}
-	return worstStatus, worstCond
+	return ct.Status, ct.Cond
 }
 
 func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain string) (RDAPSnapshot, error) {
@@ -1023,10 +1008,10 @@ func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain s
 	return RDAPSnapshot{}, errors.New(MsgErrRDAPLookupFailedAllCandidates)
 }
 
-// isSafeRDAPURL validates that candidate registrar RDAP referral URLs are safe to query,
+// IsSafeRDAPURL validates that candidate registrar RDAP referral URLs are safe to query,
 // blocking loopback, private, link-local, multicast, and cloud metadata destinations (RFC 7480 Section 5.3).
-func isSafeRDAPURL(rawURL string) bool {
-	if allowInsecureRDAPURLs {
+func IsSafeRDAPURL(rawURL string) bool {
+	if AllowInsecureRDAPURLs {
 		return true
 	}
 	u, err := url.Parse(rawURL)
@@ -1095,7 +1080,7 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 				targetURL = strings.TrimRight(targetURL, "/") + "/domain/" + domain
 			}
 		}
-		if !isSafeRDAPURL(targetURL) {
+		if !IsSafeRDAPURL(targetURL) {
 			LogWarn(MsgLogSkippingUnsafeRDAP, FieldDomain, domain, FieldURL, targetURL)
 			continue
 		}
@@ -1296,15 +1281,7 @@ func EvaluateNSDelegation(target DomainConfig, snapshot NSDelegationSnapshot) (C
 
 	hasConfiguredNS := len(authorizedMap) > 0
 
-	worstStatus := StatusOK
-	var worstCond *StateCondition
-
-	setCond := func(code ResultCode, tgt string) {
-		worstStatus = StatusFailed
-		if worstCond == nil || worstCond.Code == CodeNone {
-			worstCond = &StateCondition{Code: code, Target: tgt}
-		}
-	}
+	ct := ConditionTracker{Status: StatusOK}
 
 	for _, raw := range snapshot.Nameservers {
 		ns := NormalizeDomain(raw)
@@ -1313,16 +1290,16 @@ func EvaluateNSDelegation(target DomainConfig, snapshot NSDelegationSnapshot) (C
 		}
 		liveNS[ns] = true
 		if hasConfiguredNS && !authorizedMap[ns] {
-			setCond(CodeUnauthorizedNS, ns)
+			ct.Promote(StatusFailed, CodeUnauthorizedNS, ns)
 		}
 	}
 
 	for _, expectedRaw := range target.ExpectedNS {
 		expected := NormalizeDomain(expectedRaw)
 		if expected != "" && !liveNS[expected] {
-			setCond(CodeExpectedNSMissing, expectedRaw)
+			ct.Promote(StatusFailed, CodeExpectedNSMissing, expectedRaw)
 		}
 	}
 
-	return worstStatus, worstCond
+	return ct.Status, ct.Cond
 }
