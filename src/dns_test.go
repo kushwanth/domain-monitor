@@ -56,7 +56,7 @@ func TestDNSCheck(t *testing.T) {
 func TestGenericCAARecordUsesRDATAWithoutTTL(t *testing.T) {
 	const hostname = "example.com"
 	target := DNSTask{Hostname: hostname, Name: "CAA record", Type: RecordTypeCAA,
-		Expected: []string{`0 issue "letsencrypt.org; validationmethods=dns-01"`}, SkipSSL: false}
+		Expected: []string{`0 issue "letsencrypt.org; validationmethods=dns-01"`}, CheckSSL: true}
 	require.NoError(t, normalizeDNSTask(&target, 0, map[string]bool{}))
 	assert.Equal(t, `0 issue "letsencrypt.org; validationmethods=dns-01"`, target.Expected[0])
 	app := NewAppState(AppConfig{Resolvers: testResolvers()})
@@ -1898,7 +1898,7 @@ func TestNSHealthIgnoresWrongClassSOAAndDNSKEY(t *testing.T) {
 	assert.Equal(t, CodeNSMissingSOA, condition.Code)
 }
 
-func TestEvaluateDNS_SkipSSL(t *testing.T) {
+func TestEvaluateDNS_CheckSSL(t *testing.T) {
 	mux := dns.NewServeMux()
 	mux.HandleFunc("web.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
@@ -1930,13 +1930,12 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 		DNS: make(map[string]DNSState),
 	}
 
-	// 1. Task with SkipSSL = true: port 443 should NOT be dialed at all, SSLDays should be SSLDaysNotApplicable (-9999)
+	// 1. Task with CheckSSL = false (default): port 443 should NOT be dialed at all, SSLDays should be SSLDaysNotApplicable (-9999)
 	taskSkip := DNSTask{
 		Hostname: "web.example.com",
 		Name:     "Web Server No SSL",
 		Type:     "A",
 		Expected: []string{"127.0.0.1"},
-		SkipSSL:  true,
 	}
 
 	resSkip := evaluateDNSForTest(context.Background(), app, taskSkip)
@@ -1950,8 +1949,8 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 	if resSkip.Status != StatusOK {
 		t.Errorf("expected StatusOK, got %v", resSkip.Status)
 	}
-	if !resSkip.SkipSSL {
-		t.Errorf("expected DNSState.SkipSSL to be true")
+	if resSkip.CheckSSL {
+		t.Errorf("expected DNSState.CheckSSL to be false")
 	}
 	if resSkip.SSLDays != nil {
 		t.Errorf("expected SSLDays to be nil, got %d", *resSkip.SSLDays)
@@ -1960,7 +1959,7 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 		t.Errorf("expected no error, got %s", resSkip.Error)
 	}
 
-	// 2. Direct call to FetchSSLSnapshot: when SkipSSL is true, immediately returns SSLDaysNotApplicable
+	// 2. Direct call to FetchSSLSnapshot: when CheckSSL is false, immediately returns SSLDaysNotApplicable
 	days := FetchSSLSnapshot(context.Background(), app, taskSkip, []string{"127.0.0.1"}).ExpiryDays
 	if days != SSLDaysNotApplicable {
 		t.Errorf("FetchSSLSnapshot expected SSLDaysNotApplicable, got %d", days)
@@ -2019,7 +2018,6 @@ func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
 		Name:     "Multi IP Test",
 		Type:     "IP",
 		Expected: []string{"192.0.2.1", "198.51.100.2", "2001:db8::1"},
-		SkipSSL:  true,
 	}
 
 	res := evaluateDNSForTest(context.Background(), app, task)
@@ -2077,7 +2075,6 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 		Name:     "Flattened CNAME Direct IP",
 		Type:     "CNAME",
 		Expected: []string{"192.0.2.99"},
-		SkipSSL:  true,
 	}
 
 	res := evaluateDNSForTest(context.Background(), app, task)
@@ -2186,7 +2183,6 @@ func TestNilSafety_EvaluationsWithNilApp(t *testing.T) {
 		Name:     "example-a",
 		Type:     "A",
 		Expected: StringList{"93.184.216.34"},
-		SkipSSL:  true,
 	}
 	dnsState := evaluateDNSForTest(ctx, nil, dnsTask)
 	if dnsState.Status == StatusUnknown {
@@ -2537,7 +2533,7 @@ func TestValidateCertificateExtensive(t *testing.T) {
 	days := FetchSSLSnapshot(context.Background(), app, target, []string{"127.0.0.1"}).ExpiryDays
 	assert.Equal(t, -9998, days)
 
-	target.SkipSSL = true
+	target.CheckSSL = false
 	days = FetchSSLSnapshot(context.Background(), app, target, []string{"127.0.0.1"}).ExpiryDays
 	assert.Equal(t, -9999, days)
 }
@@ -2722,7 +2718,7 @@ func TestEvaluateDNS_MockedPaths(t *testing.T) {
 					return resp, 0, nil
 				},
 			}
-			res := evaluateDNSForTest(ctx, app, DNSTask{Hostname: "example.com", Type: "A", Expected: []string{"1.2.3.4"}, SkipSSL: true})
+			res := evaluateDNSForTest(ctx, app, DNSTask{Hostname: "example.com", Type: "A", Expected: []string{"1.2.3.4"}})
 			assert.Equal(t, tt.expect, res.Status)
 		})
 	}
@@ -2820,7 +2816,7 @@ func evaluateDNSForTest(ctx context.Context, app *AppState, record DNSTask) DNSS
 	dnsSnap := FetchDNSSnapshot(ctx, app, record)
 	status, cond := EvaluateDNS(record, dnsSnap)
 	var sslDays *int
-	if !record.SkipSSL {
+	if record.CheckSSL {
 		sslSnap := FetchSSLSnapshot(ctx, app, record, dnsSnap.Records)
 		sslStatus, sslCond := EvaluateSSL(record, sslSnap)
 		if sslSnap.ExpiryDays != SSLDaysError && sslSnap.ExpiryDays != SSLDaysNotApplicable {
@@ -2849,7 +2845,7 @@ func evaluateDNSForTest(ctx context.Context, app *AppState, record DNSTask) DNSS
 		Condition: cond,
 		Found:     dnsSnap.Records,
 		SSLDays:   sslDays,
-		SkipSSL:   record.SkipSSL,
+		CheckSSL:  record.CheckSSL,
 		Error:     errStr,
 	}
 }

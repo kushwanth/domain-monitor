@@ -1262,7 +1262,7 @@ const (
 	MsgErrDNSMissingName                     = "dns record %s (%s) is missing a mandatory 'name' field"
 	MsgErrDuplicateDNSName                   = "duplicate dns record name %s; each dns record must have a unique name"
 	MsgErrDNSMissingType                     = "dns record %s is missing a type (e.g. A, CNAME)"
-	MsgErrSkipSSLNotApplicable               = "dns record %s (%s) has skip_ssl enabled; skip_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types"
+	MsgErrCheckSSLNotApplicable              = "dns record %s (%s) has check_ssl enabled; check_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types"
 	MsgErrExpectedIPv6ForTypeA               = "dns record %s (%s): expected %s is an IPv6 address, but record type is A (requires IPv4)"
 	MsgErrExpectedNotValidIPv4               = "dns record %s (%s): expected %s is not a valid IPv4 address for type A"
 	MsgErrExpectedIPv4ForTypeAAAA            = "dns record %s (%s): expected %s is an IPv4 address, but record type is AAAA (requires IPv6)"

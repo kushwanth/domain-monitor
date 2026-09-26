@@ -670,7 +670,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}
 }
 
-func TestSkipSSLValidation(t *testing.T) {
+func TestCheckSSLValidation(t *testing.T) {
 	// 1. Valid record types that can have SSL: A, AAAA, CNAME, ALIAS, IP
 	validTypes := []string{"A", "AAAA", "CNAME", "ALIAS", "IP"}
 	for _, vt := range validTypes {
@@ -679,41 +679,41 @@ func TestSkipSSLValidation(t *testing.T) {
 			if vt == "AAAA" {
 				expectedVal = `"2001:db8::1"`
 			}
-			cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records": [{"hostname": "web.example.com", "name": "Web Test", "type": "` + vt + `", "expected": [` + expectedVal + `], "skip_ssl": true}]}`
-			tmpFile := t.TempDir() + "/valid_skip_ssl.json"
+			cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records": [{"hostname": "web.example.com", "name": "Web Test", "type": "` + vt + `", "expected": [` + expectedVal + `], "check_ssl": true}]}`
+			tmpFile := t.TempDir() + "/valid_check_ssl.json"
 			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 				t.Fatalf("failed to write temp file: %v", err)
 			}
 			cfg, err := LoadConfig(context.Background(), tmpFile)
 			if err != nil {
-				t.Fatalf("expected valid config for skip_ssl with type %s, got error: %v", vt, err)
+				t.Fatalf("expected valid config for check_ssl with type %s, got error: %v", vt, err)
 			}
-			if !cfg.DNSRecords[0].SkipSSL {
-				t.Errorf("expected SkipSSL to be true for %s", vt)
+			if !cfg.DNSRecords[0].CheckSSL {
+				t.Errorf("expected CheckSSL to be true for %s", vt)
 			}
 		})
 	}
 
-	// 2. Invalid record types for skip_ssl: TXT, MX, CAA, NS
+	// 2. Invalid record types for check_ssl: TXT, MX, CAA, NS
 	invalidTypes := []string{"TXT", "MX", "CAA", "NS"}
 	for _, it := range invalidTypes {
 		t.Run("Invalid_"+it, func(t *testing.T) {
-			cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records": [{"hostname": "record.example.com", "name": "Invalid Test", "type": "` + it + `", "expected": ["something"], "skip_ssl": true}]}`
-			tmpFile := t.TempDir() + "/invalid_skip_ssl.json"
+			cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records": [{"hostname": "record.example.com", "name": "Invalid Test", "type": "` + it + `", "expected": ["something"], "check_ssl": true}]}`
+			tmpFile := t.TempDir() + "/invalid_check_ssl.json"
 			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 				t.Fatalf("failed to write temp file: %v", err)
 			}
 			_, err := LoadConfig(context.Background(), tmpFile)
 			if err == nil {
-				t.Fatalf("expected validation error when skip_ssl is configured on %s, got nil", it)
+				t.Fatalf("expected validation error when check_ssl is configured on %s, got nil", it)
 			}
-			if !strings.Contains(err.Error(), "skip_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types") {
+			if !strings.Contains(err.Error(), "check_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types") {
 				t.Errorf("expected error message to mention allowed types, got: %v", err)
 			}
 		})
 	}
 
-	// 3. Omitted skip_ssl defaults to false and succeeds for any valid record type
+	// 3. Omitted check_ssl defaults to false and succeeds for any valid record type
 	t.Run("Default_Omitted", func(t *testing.T) {
 		cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 			"dns_records": [
@@ -725,7 +725,7 @@ func TestSkipSSLValidation(t *testing.T) {
 				}
 			]
 		}`
-		tmpFile := t.TempDir() + "/default_skip_ssl.json"
+		tmpFile := t.TempDir() + "/default_check_ssl.json"
 		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 			t.Fatalf("failed to write temp file: %v", err)
 		}
@@ -733,8 +733,8 @@ func TestSkipSSLValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.DNSRecords[0].SkipSSL {
-			t.Errorf("expected SkipSSL to default to false")
+		if cfg.DNSRecords[0].CheckSSL {
+			t.Errorf("expected CheckSSL to default to false")
 		}
 	})
 }

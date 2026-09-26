@@ -407,8 +407,8 @@ func validateDNSTaskOptions(dnsRecord *DNSTask) error {
 			return fmt.Errorf(MsgErrInvalidCustomResolverFor, dnsRecord.Hostname, err)
 		}
 	}
-	if dnsRecord.SkipSSL && !supportsSSLCheck(dnsRecord.Type) {
-		return fmt.Errorf(MsgErrSkipSSLNotApplicable, dnsRecord.Hostname, dnsRecord.Type)
+	if dnsRecord.CheckSSL && !supportsSSLCheck(dnsRecord.Type) {
+		return fmt.Errorf(MsgErrCheckSSLNotApplicable, dnsRecord.Hostname, dnsRecord.Type)
 	}
 	return nil
 }

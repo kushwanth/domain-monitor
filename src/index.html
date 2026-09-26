@@ -1369,7 +1369,7 @@
                 <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value" style="text-transform: lowercase;">${ns}</div></div>
                 <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="text-transform: capitalize;">${statuses}</div></div>
                 <div class="detail-row"><div class="detail-label">DNSSEC:</div><div class="detail-value">${rdapState.dnssec ? 'Enabled' : 'Disabled'}</div></div>
-                ${rdapState.source ? `<div class="detail-row"><div class="detail-label">Lookup Source:</div><div class="detail-value" style="text-transform: uppercase; font-size: 0.85em; opacity: 0.8;">${escapeHTML(rdapState.source)}</div></div>` : ''}
+
                 ${rdapState.error ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value" style="color: var(--error)">${escapeHTML(rdapState.error)}</div></div>` : ''}
               </div>`;
           }
@@ -1414,7 +1414,7 @@
               <h3>Nameserver Health</h3>
               <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="color: ${statusColor}; font-weight: 600;">${statusText}</div></div>
               <div class="detail-row"><div class="detail-label">Servers Checked:</div><div class="detail-value">${isNSPending ? 'Query Pending' : `${serverCount} (${escapeHTML(nsHealthState.primary || 'expected_ns[0]')})`}</div></div>
-              <div class="detail-row"><div class="detail-label">Full Inspection:</div><div class="detail-value"><a href="#nshealth:${escapeHTML(domain.toLowerCase())}" onclick="switchView('nshealth');" style="color: var(--primary); text-decoration: none; font-weight: 500;">Open Nameservers Dashboard &rarr;</a></div></div>
+              ${rdapState.source ? `<div class="detail-row"><div class="detail-label">Lookup Source:</div><div class="detail-value" style="text-transform: uppercase; font-size: 0.85em; opacity: 0.8;">${escapeHTML(rdapState.source)}</div></div>` : ''}
             </div>
           `;
         }
@@ -1758,13 +1758,13 @@
       const dnsDataList = [];
       for (const key of dnsKeys) {
         const state = dnsChecks[key] || {};
-        const hasSSLIssue = !state.skip_ssl && state.ssl_days !== undefined && (state.ssl_days === -9998 || (state.ssl_days < 0 && state.ssl_days !== -9999));
+        const hasSSLIssue = state.check_ssl && state.ssl_days !== undefined && (state.ssl_days === -9998 || (state.ssl_days < 0 && state.ssl_days !== -9999));
         if (state.status === 'failed' || state.status === 'api_error' || state.status === 'mismatch' || hasSSLIssue) {
           issueCount++;
         } else if (state.status === 'ok' || state.status === 'ok_flattened') {
           healthyCount++;
         }
-        if (!state.skip_ssl && state.ssl_days !== undefined && state.ssl_days !== -9999 && state.ssl_days !== -9998 && state.ssl_days <= 30) {
+        if (state.check_ssl && state.ssl_days !== undefined && state.ssl_days !== -9999 && state.ssl_days !== -9998 && state.ssl_days <= 30) {
           expiringCertCount++;
         }
 
@@ -1787,9 +1787,7 @@
         let isExpiringCert = false;
         let sslRow = '';
         let badgeHtml = '';
-        if (state.skip_ssl) {
-          sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value" style="color: var(--text-muted);">Skipped (skip_ssl: true)</div></div>`;
-        } else if (state.ssl_days !== undefined && state.ssl_days !== -9999) {
+        if (state.check_ssl && state.ssl_days !== undefined && state.ssl_days !== -9999) {
           if (state.ssl_days === -9998 || (state.ssl_days === -1 && state.error)) {
             sslRow = `<div class="detail-row"><div class="detail-label">SSL:</div><div class="detail-value" style="color: var(--warning);">No Cert / Error</div></div>`;
             badgeHtml = `<span class="badge error">No Cert</span>`;
@@ -1929,7 +1927,7 @@
             </div>
             <div class="domain-header-right">
               <div class="domain-expiry">
-                ${badgeHtml ? badgeHtml : (state.skip_ssl ? '<span class="badge" style="background: var(--bg-hover); color: var(--text-muted); font-size: 0.75rem;">ssl skipped</span>' : '')}
+                ${badgeHtml ? badgeHtml : ''}
               </div>
               <div class="domain-status">
                 <span class="status-label">

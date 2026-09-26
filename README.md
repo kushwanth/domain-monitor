@@ -144,7 +144,7 @@ owner. Bootstrap cache access returns a copy and pricing access returns values.
 | `match_type` | string | No | Strategy: `"exact"` (default), `"prefix"`, `"contains"`, `"any_of"`. |
 | `custom_resolver` | string | No | Custom resolver IP for this record. |
 | `accept_self_signed` | bool | No | Accepts a current, hostname-matching, directly self-signed leaf certificate for this record. |
-| `skip_ssl` | bool | No | Skips TLS/SSL certificate checks entirely. |
+| `check_ssl` | bool | No | Checks TLS/SSL certificate expiry and validity (default: false). |
 
 ---
 

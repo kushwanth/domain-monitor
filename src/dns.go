@@ -412,7 +412,7 @@ func FetchCAASnapshot(ctx context.Context, app *AppState, target DomainConfig) C
 // EvaluateCAA ...
 func EvaluateCAA(target DomainConfig, snapshot CAASnapshot) (CheckStatus, *StateCondition, CAAResult) {
 	if target.CAA == nil {
-		return StatusOK, nil, CAAResult{}
+		return StatusUnknown, nil, CAAResult{}
 	}
 	if !snapshot.Found {
 		return StatusFailed, &StateCondition{Code: CodeCAAMissingIssuer, Target: StrNoCAAPolicyFound}, CAAResult{Valid: false}
@@ -926,7 +926,7 @@ func EvaluateDNS(target DNSTask, snapshot DNSSnapshot) (CheckStatus, *StateCondi
 
 // FetchSSLSnapshot connects to the target on port 443 and fetches the certificate
 func FetchSSLSnapshot(ctx context.Context, app *AppState, target DNSTask, foundRecords []string) SSLSnapshot {
-	if target.SkipSSL || (target.Type != RecordTypeA && target.Type != RecordTypeAAAA && target.Type != RecordTypeIP && target.Type != RecordTypeCNAME && target.Type != RecordTypeALIAS) {
+	if !target.CheckSSL || (target.Type != RecordTypeA && target.Type != RecordTypeAAAA && target.Type != RecordTypeIP && target.Type != RecordTypeCNAME && target.Type != RecordTypeALIAS) {
 		return SSLSnapshot{ExpiryDays: SSLDaysNotApplicable}
 	}
 	if app == nil || app.TLSCheck == nil {

@@ -180,8 +180,7 @@
       "type": "A",
       "expected": [
         "93.184.215.14"
-      ],
-      "skip_ssl": true
+      ]
     }
   ]
 }

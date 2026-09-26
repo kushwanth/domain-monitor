@@ -220,7 +220,7 @@ type DNSTask struct {
 	MatchType        string     `json:"match_type,omitempty"`
 	CustomResolver   string     `json:"custom_resolver,omitempty"`
 	AcceptSelfSigned bool       `json:"accept_self_signed,omitempty"`
-	SkipSSL          bool       `json:"skip_ssl,omitempty"`
+	CheckSSL         bool       `json:"check_ssl,omitempty"`
 }
 
 // HTTPDoer defines an interface for executing HTTP requests, allowing for mocking in tests.
@@ -486,7 +486,7 @@ type DNSState struct {
 	Condition *StateCondition `json:"condition,omitempty"`
 	Found     []string        `json:"found,omitempty"`
 	SSLDays   *int            `json:"ssl_days,omitempty"`
-	SkipSSL   bool            `json:"skip_ssl,omitempty"`
+	CheckSSL  bool            `json:"check_ssl,omitempty"`
 	Error     string          `json:"error,omitempty"`
 }
 

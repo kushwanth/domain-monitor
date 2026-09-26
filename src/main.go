@@ -231,7 +231,7 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 							Status:    StatusFailed,
 							Error:     fmt.Sprintf(MsgErrInternalDNSCheckPanic, AnyToString(r)),
 							Condition: &StateCondition{Code: CodeDNSLookupFailed, Target: StrInternalDNSCheckPanic},
-							SkipSSL:   record.SkipSSL,
+							CheckSSL:  record.CheckSSL,
 						},
 					}
 				}
@@ -240,10 +240,10 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 			status, cond := EvaluateDNS(record, dnsSnap)
 
 			var sslDays *int
-			if !record.SkipSSL {
+			if record.CheckSSL {
 				// We fetch SSL snapshot regardless of DNS match as long as it's not a complete lookup failure,
 				// but wait, if it's a lookup failure we still might want to try?
-				// The original code did: sslDays = validateCertificate(ctx, app, target, foundRecords) unconditionally if !SkipSSL.
+				// The original code did: sslDays = validateCertificate(ctx, app, target, foundRecords) unconditionally if CheckSSL.
 				sslSnap := FetchSSLSnapshot(ctx, app, record, dnsSnap.Records)
 				sslStatus, sslCond := EvaluateSSL(record, sslSnap)
 
@@ -280,7 +280,7 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 				Condition: cond,
 				Found:     dnsSnap.Records,
 				SSLDays:   sslDays,
-				SkipSSL:   record.SkipSSL,
+				CheckSSL:  record.CheckSSL,
 				Error:     errStr,
 			}
 			dnsResults[index] = DNSResult{Name: record.Name, State: res}
@@ -969,7 +969,7 @@ func (a *AppState) PublishInitialState() {
 		initialState.DNS[dnsRecord.Name] = DNSState{
 			Hostname: dnsRecord.Hostname, Name: dnsRecord.Name,
 			Type: dnsRecord.Type, Expected: dnsRecord.Expected,
-			Status: StatusPending, SkipSSL: dnsRecord.SkipSSL,
+			Status: StatusPending, CheckSSL: dnsRecord.CheckSSL,
 		}
 	}
 	if b, err := jsonv2.Marshal(initialState); err == nil {

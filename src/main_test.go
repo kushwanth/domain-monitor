@@ -88,7 +88,7 @@ func TestFastDomainWorkerPanicPreservesCompletedEmail(t *testing.T) {
 func TestRunMonitoringCycle(t *testing.T) {
 	app := NewAppState(AppConfig{DNSRecords: []DNSTask{{
 		Hostname: "example.com", Name: "example A", Type: RecordTypeA,
-		Expected: []string{"192.0.2.10"}, SkipSSL: true,
+		Expected: []string{"192.0.2.10"},
 	}}})
 	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 		response := new(dns.Msg)
@@ -132,7 +132,7 @@ func TestRunMonitoringCycle(t *testing.T) {
 func TestMonitoringCycleDoesNotReportWrongClassDNSMatch(t *testing.T) {
 	app := NewAppState(AppConfig{DNSRecords: []DNSTask{{
 		Hostname: "example.com", Name: "example A", Type: RecordTypeA,
-		Expected: []string{"192.0.2.10"}, SkipSSL: true,
+		Expected: []string{"192.0.2.10"},
 	}}})
 	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 		response := new(dns.Msg)
@@ -375,7 +375,7 @@ func TestDaemonSixCyclesRestartWriteFailureAndRateLimit(t *testing.T) {
 	config := AppConfig{
 		Resolvers:     []string{"192.0.2.53:53"},
 		Domains:       []DomainConfig{{Domain: domain, Name: "Example", IsDelegatedZone: true, MonitorCTLogs: true, ExpectedNS: []string{"ns1.example.com"}}},
-		DNSRecords:    []DNSTask{{Hostname: domain, Name: "example A", Type: RecordTypeA, Expected: []string{"192.0.2.10"}, SkipSSL: true}},
+		DNSRecords:    []DNSTask{{Hostname: domain, Name: "example A", Type: RecordTypeA, Expected: []string{"192.0.2.10"}}},
 		Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/test"}},
 	}
 	goodA, err := dns.NewRR("example.com. 60 IN A 192.0.2.10")
@@ -752,7 +752,7 @@ func TestDaemonCancellationPublishesFailureAndKeepsCTCheckpoint(t *testing.T) {
 	config := AppConfig{
 		Resolvers:  []string{"192.0.2.53:53"},
 		Domains:    []DomainConfig{{Domain: domain, Name: "Example", IsDelegatedZone: true, MonitorCTLogs: true, ExpectedNS: []string{"ns1.example.com"}}},
-		DNSRecords: []DNSTask{{Hostname: domain, Name: "example A", Type: RecordTypeA, Expected: []string{"192.0.2.10"}, SkipSSL: true}},
+		DNSRecords: []DNSTask{{Hostname: domain, Name: "example A", Type: RecordTypeA, Expected: []string{"192.0.2.10"}}},
 	}
 	app := NewAppState(config)
 	app.CTLimiter = nil
@@ -967,7 +967,7 @@ func TestDaemonDNSRecordOutcomeMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.recordType, func(t *testing.T) {
 			target := DNSTask{Hostname: "example.com", Name: tc.recordType, Type: tc.recordType,
-				Expected: []string{tc.expected}, SkipSSL: supportsSSLCheck(tc.recordType)}
+				Expected: []string{tc.expected}}
 			require.NoError(t, normalizeDNSTask(&target, 0, map[string]bool{}))
 			app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}, DNSRecords: []DNSTask{target}})
 			notifier := &assuranceNotifier{}
@@ -1071,7 +1071,7 @@ func TestCTDisabledOnRestartDoesNotPublishOrDeliverStaleWork(t *testing.T) {
 func TestDNSResultsCannotMutateConfiguration(t *testing.T) {
 	for _, panics := range []bool{false, true} {
 		t.Run(strconv.FormatBool(panics), func(t *testing.T) {
-			app := NewAppState(AppConfig{DNSRecords: []DNSTask{{Hostname: "example.com", Name: "example A", Type: RecordTypeA, Expected: []string{"192.0.2.10"}, SkipSSL: true}}})
+			app := NewAppState(AppConfig{DNSRecords: []DNSTask{{Hostname: "example.com", Name: "example A", Type: RecordTypeA, Expected: []string{"192.0.2.10"}}}})
 			app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 				if panics {
 					panic("injected failure")
