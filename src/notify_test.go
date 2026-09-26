@@ -1,13 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"io"
+	"log/slog"
 	"net/http"
-	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNotificationManager(t *testing.T) {
@@ -44,8 +51,7 @@ func TestNotificationManager(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			nm := &NotificationManager{
-				TestMode:   true,
-				TestBuffer: make([]Alert, 0),
+				NtfyURL: "https://ntfy.invalid/test",
 			}
 
 			for _, a := range tt.alerts {
@@ -53,8 +59,8 @@ func TestNotificationManager(t *testing.T) {
 			}
 
 			nm.mu.Lock()
-			if len(nm.TestBuffer) != tt.expectSent {
-				t.Errorf("expected %d alerts in buffer, got %d", tt.expectSent, len(nm.TestBuffer))
+			if len(nm.alertBatch) != tt.expectSent {
+				t.Errorf("expected %d alerts in buffer, got %d", tt.expectSent, len(nm.alertBatch))
 			}
 			nm.mu.Unlock()
 		})
@@ -65,8 +71,7 @@ func TestNotificationDeduplication(t *testing.T) {
 	t.Parallel()
 
 	nm := &NotificationManager{
-		TestMode:   true,
-		TestBuffer: make([]Alert, 0),
+		NtfyURL: "https://ntfy.invalid/test",
 	}
 
 	// First occurrence of alert
@@ -80,8 +85,8 @@ func TestNotificationDeduplication(t *testing.T) {
 	nm.Dispatch("Critical Alert 2", "Redacted 2", PriorityUrgent, "skull", "example.com", "Test")
 
 	nm.mu.Lock()
-	if len(nm.TestBuffer) != 2 {
-		t.Fatalf("Expected 2 message in buffer (deduplicated), got %d", len(nm.TestBuffer))
+	if len(nm.alertBatch) != 2 {
+		t.Fatalf("Expected 2 message in buffer (deduplicated), got %d", len(nm.alertBatch))
 	}
 	nm.mu.Unlock()
 }
@@ -98,19 +103,18 @@ func TestNotificationManager_PriorityLogging(t *testing.T) {
 
 	for _, p := range priorities {
 		p := p
-		t.Run(string(p), func(t *testing.T) {
+		t.Run(p.String(), func(t *testing.T) {
 			t.Parallel()
 
 			nm := &NotificationManager{
-				TestMode:   true,
-				TestBuffer: make([]Alert, 0),
+				NtfyURL: "https://ntfy.invalid/test",
 			}
 
 			nm.Dispatch("test message", "redacted", p, "tag", "example.com", "Test")
 
 			nm.mu.Lock()
-			if len(nm.TestBuffer) != 1 {
-				t.Errorf("priority %s: expected 1 alert sent, got %d", p, len(nm.TestBuffer))
+			if len(nm.alertBatch) != 1 {
+				t.Errorf("priority %s: expected 1 alert sent, got %d", p, len(nm.alertBatch))
 			}
 			nm.mu.Unlock()
 		})
@@ -119,18 +123,16 @@ func TestNotificationManager_PriorityLogging(t *testing.T) {
 
 func TestNotificationRedaction_NtfyMatchesTelegram(t *testing.T) {
 	var ntfyBody string
-	var ntfyMu sync.Mutex
-	ntfyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		ntfyMu.Lock()
-		ntfyBody = string(b)
-		ntfyMu.Unlock()
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ntfyServer.Close()
-
 	nm := &NotificationManager{
-		NtfyURL: ntfyServer.URL,
+		NtfyURL: "http://ntfy.invalid/topic",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				return nil, err
+			}
+			ntfyBody = string(body)
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+		})},
 	}
 
 	secretDomain := "corp-secret.internal"
@@ -143,18 +145,29 @@ func TestNotificationRedaction_NtfyMatchesTelegram(t *testing.T) {
 		Name:     "Corp Secret Portal",
 	}
 
-	nm.sendNtfyBatch([]Alert{alert})
+	require.True(t, nm.sendNtfyBatchContext(context.Background(), []Alert{alert}))
+	assert.NotContains(t, ntfyBody, secretDomain)
+	assert.Contains(t, ntfyBody, "Corp Secret Portal")
+}
 
-	ntfyMu.Lock()
-	body := ntfyBody
-	ntfyMu.Unlock()
-
-	if strings.Contains(body, secretDomain) {
-		t.Errorf("Ntfy leaked unmasked domain %q: body=%q", secretDomain, body)
+func TestFlushContextCancellationRetainsAlert(t *testing.T) {
+	called := false
+	nm := &NotificationManager{
+		NtfyURL: "http://ntfy.invalid/topic",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			called = true
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+		})},
 	}
-	if !strings.Contains(body, "Corp Secret Portal") {
-		t.Errorf("Ntfy expected replacement Corp Secret Portal in body, got: %q", body)
-	}
+	nm.DispatchIdentified("warning", "warning", "warning", PriorityWarning, TagSkull, "example.com", "Example")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	nm.FlushContext(ctx)
+	assert.False(t, called)
+	require.Len(t, nm.alertBatch, 1)
+	nm.Flush()
+	assert.True(t, called)
+	assert.Empty(t, nm.alertBatch)
 }
 
 type mockTransport struct {
@@ -179,72 +192,23 @@ func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	return &http.Response{
 		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader("ok")),
+		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
 		Header:     make(http.Header),
 	}, nil
 }
 
-func TestWorkerLoop_ExponentialBackoff(t *testing.T) {
-	transport := &mockTransport{failTimes: 2}
-
-	nm := &NotificationManager{
-		NtfyURL:        "http://dummy-ntfy",
-		TelegramToken:  "testtoken",
-		TelegramChatID: "12345",
-		HTTPClient:     &http.Client{Transport: transport},
-	}
-
-	// Because backoff takes 1s + 2s = 3 seconds, we don't want to run this in full if we can avoid it.
-	// But it's hardcoded, so we just run it and wait. We test them sequentially.
-
-	start := time.Now()
-	nm.sendNtfyBatchWithRetry([]Alert{{Message: "Test"}})
-	if time.Since(start) < 2*time.Second {
-		t.Errorf("expected backoff to take time")
-	}
-
-	transport.mu.Lock()
-	if transport.attempts != 3 {
-		t.Errorf("expected 3 ntfy attempts, got %d", transport.attempts)
-	}
-	transport.mu.Unlock()
-
-	transport.mu.Lock()
-	transport.attempts = 0
-	transport.failTimes = 2
-	transport.mu.Unlock()
-
-	nm.sendTelegramBatchWithRetry([]Alert{{Message: "Test"}})
-	transport.mu.Lock()
-	if transport.attempts != 3 {
-		t.Errorf("expected 3 telegram attempts, got %d", transport.attempts)
-	}
-	transport.mu.Unlock()
-}
-
-func TestNotification_ChannelProcessing(t *testing.T) {
+func TestNotification_SynchronousFlush(t *testing.T) {
 	transport := &mockTransport{failTimes: 0}
 
 	nm := &NotificationManager{
-		alertChan:      make(chan []Alert, 10),
 		NtfyURL:        "http://dummy-ntfy",
 		TelegramToken:  "testtoken",
 		TelegramChatID: "12345",
 		HTTPClient:     &http.Client{Transport: transport},
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		nm.workerLoop()
-	}()
-
 	nm.Dispatch("msg1", "", PriorityHigh, "tag1", "domain1.com", "name1")
 	nm.Flush()
-
-	close(nm.alertChan)
-	wg.Wait()
 
 	transport.mu.Lock()
 	// Should process 1 Ntfy and 1 Telegram = 2 requests
@@ -252,4 +216,121 @@ func TestNotification_ChannelProcessing(t *testing.T) {
 		t.Errorf("expected 2 requests processed by worker loop, got %d", transport.attempts)
 	}
 	transport.mu.Unlock()
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+
+func TestNotification_ProviderAcceptanceAndRetry(t *testing.T) {
+	var ntfyCalls, telegramCalls int
+	nm := &NotificationManager{
+		NtfyURL: "http://ntfy.invalid/topic", TelegramToken: "token", TelegramChatID: "chat",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body := `{"ok":true}`
+			if strings.Contains(req.URL.Host, "ntfy.invalid") {
+				ntfyCalls++
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			}
+			telegramCalls++
+			if telegramCalls == 1 {
+				body = `{"ok":false}`
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		})},
+	}
+	nm.DispatchIdentified("RDAP|example.com|expired", "expired now", "expired", PriorityHigh, TagSkull, "example.com", "Example")
+	nm.Flush()
+	if ntfyCalls != 1 || telegramCalls != 1 {
+		t.Fatalf("expected one attempt per provider, got ntfy=%d telegram=%d", ntfyCalls, telegramCalls)
+	}
+	nm.Flush()
+	if ntfyCalls != 1 || telegramCalls != 2 {
+		t.Fatalf("expected retry only for rejected provider, got ntfy=%d telegram=%d", ntfyCalls, telegramCalls)
+	}
+}
+
+func TestNotification_CooldownDoesNotStarveNewAlerts(t *testing.T) {
+	t.Parallel()
+	nm := NewNotificationManager("http://ntfy.invalid/topic", "", "token", "chat")
+	now := time.Now()
+	for i := range MaxPendingAlerts {
+		identity := "already-sent-" + strconv.Itoa(i)
+		nm.sentState["ntfy|"+identity] = now
+		nm.sentState["telegram|"+identity] = now
+		nm.DispatchIdentified(identity, "old failure", "old failure", PriorityHigh, TagSkull, "example.com", "Example")
+	}
+	nm.DispatchIdentified("new-failure", "new failure", "new failure", PriorityHigh, TagSkull, "example.com", "Example")
+	require.Len(t, nm.alertBatch, 1)
+	assert.Equal(t, "new-failure", nm.alertBatch[0].Identity)
+}
+
+func TestNotification_PayloadBoundsAndTruncation(t *testing.T) {
+	message := strings.Repeat("☃", MaxProviderMessageBytes)
+	shortened := truncateAlertBytes(message, MaxProviderMessageBytes)
+	if len(shortened) > MaxProviderMessageBytes || !utf8.ValidString(shortened) || !strings.HasSuffix(shortened, AlertTruncationNotice) {
+		t.Fatalf("truncated message is not valid and disclosed: bytes=%d", len(shortened))
+	}
+
+	var deliveredText string
+	nm := &NotificationManager{
+		TelegramToken: "token", TelegramChatID: "chat",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				return nil, err
+			}
+			deliveredText = string(body)
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Header: make(http.Header)}, nil
+		})},
+	}
+	if !nm.sendTelegramBatchContext(context.Background(), []Alert{{Message: strings.Repeat("<", 1000), Name: strings.Repeat("&", 100)}}) {
+		t.Fatal("expected a bounded Telegram alert to be accepted")
+	}
+	if !strings.Contains(deliveredText, "truncated; see local state") {
+		t.Fatal("expected truncation notice in delivered Telegram message")
+	}
+}
+
+func TestCriticalAlertIsAdmittedAheadOfFullBacklog(t *testing.T) {
+	for _, backlogPriority := range []AlertPriority{PriorityWarning, PriorityHigh} {
+		t.Run(backlogPriority.String(), func(t *testing.T) {
+			notifier := NewNotificationManager("https://ntfy.invalid/test", "", "", "")
+			var messages []string
+			notifier.HTTPClient = &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(req.Body)
+				require.NoError(t, err)
+				messages = append(messages, string(body))
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}}
+			for i := 0; i < MaxPendingAlerts; i++ {
+				notifier.DispatchIdentified(strconv.Itoa(i), "old warning", "old warning", backlogPriority, "", "example.com", "")
+			}
+			notifier.DispatchIdentified("critical", "critical-new", "critical-new", PriorityHigh, "", "example.com", "")
+			assert.Len(t, notifier.alertBatch, MaxPendingAlerts)
+			notifier.FlushContext(context.Background())
+			require.NotEmpty(t, messages)
+			assert.Contains(t, messages[0], "critical-new")
+		})
+	}
+}
+
+func TestTelegramRejectsOversizedAcceptance(t *testing.T) {
+	nm := NewNotificationManager("", "", "token", "chat")
+	nm.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}` + strings.Repeat(" ", MaxNotificationPayloadSize)))}, nil
+	}}
+	assert.False(t, nm.sendTelegramBatchContext(context.Background(), []Alert{{Message: "test", Redacted: "test"}}))
+}
+
+func TestTelegramRequestCreationRedactsToken(t *testing.T) {
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+	defer slog.SetDefault(previous)
+	token := "private-secret%zz"
+	manager := NewNotificationManager("", "", token, "chat")
+	assert.False(t, manager.sendTelegramBatchContext(context.Background(), []Alert{{Message: "test"}}))
+	assert.NotContains(t, output.String(), token)
+	assert.Contains(t, output.String(), MsgLogTelegramRequestFailed)
 }

@@ -10,7 +10,6 @@ require (
 )
 
 require (
-	github.com/likexian/whois v1.15.7
 	github.com/likexian/whois-parser v1.24.21
 	github.com/miekg/dns v1.1.73
 	github.com/stretchr/testify v1.12.1

@@ -13,10 +13,6 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-var (
-	defaultPricingManager = NewPricingManager(&http.Client{Timeout: DefaultPricingHTTPTimeout})
-)
-
 // NewPricingManager initializes a PricingManager targeting DotSweep with the provided HTTP client.
 func NewPricingManager(httpClient HTTPDoer) *PricingManager {
 	return &PricingManager{
@@ -75,6 +71,10 @@ func (p *PricingManager) fetch(ctx context.Context) error {
 		return ErrPricingManagerNil
 	}
 	client := ResolveHTTPClient(p.http)
+	if client == nil {
+		return errors.New(MsgErrPricingHTTPClientNotConfigured)
+	}
+	// #nosec G704 -- p.url is the fixed DotSweep endpoint or a test-injected URL.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
 	if err != nil {
 		return WrapError(MsgErrDotSweepFetchFailed, err)
@@ -92,7 +92,14 @@ func (p *PricingManager) fetch(ctx context.Context) error {
 	}
 
 	var pResp DotSweepResponse
-	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, MaxPricingResponseSize), &pResp); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxPricingResponseSize+1))
+	if err != nil {
+		return fmt.Errorf("read pricing response: %w", err)
+	}
+	if len(body) > MaxPricingResponseSize {
+		return fmt.Errorf("pricing response exceeds %d bytes", MaxPricingResponseSize)
+	}
+	if err := jsonv2.Unmarshal(body, &pResp); err != nil {
 		return WrapError(MsgErrDotSweepParseError, err)
 	}
 
@@ -108,11 +115,12 @@ func (p *PricingManager) fetch(ctx context.Context) error {
 		}
 		if item.Renewal > 0 {
 			newPrices[tldClean] = item.Renewal
-		} else if item.Registration > 0 {
-			newPrices[tldClean] = item.Registration
 		}
 	}
 
+	if len(newPrices) == 0 {
+		return errors.New(MsgErrDotSweepNoData)
+	}
 	p.mu.Lock()
 	p.prices = newPrices
 	p.fetchedAt = time.Now()
@@ -152,15 +160,12 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 		return
 	}
 
-	cfg := app.Config()
+	cfg := app.configuration()
 
 	var needsTLDPricing bool
 	for _, domainCfg := range cfg.Domains {
-		if domainCfg.AllowExpiry {
-			continue
-		}
-		state, exists := loopState.RDAP[domainCfg.Domain]
-		if !exists || state.Status == "" {
+		state, eligible := eligibleForRenewalPrice(domainCfg, loopState.RDAP)
+		if !eligible {
 			continue
 		}
 		if domainCfg.RenewalPrice > 0 {
@@ -176,7 +181,7 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 	}
 
 	if pm == nil {
-		pm = defaultPricingManager
+		return
 	}
 
 	if err := pm.ensure(ctx); err != nil {
@@ -185,11 +190,11 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 	}
 
 	for _, domainCfg := range cfg.Domains {
-		if domainCfg.AllowExpiry || domainCfg.RenewalPrice > 0 {
+		if domainCfg.RenewalPrice > 0 {
 			continue
 		}
-		state, exists := loopState.RDAP[domainCfg.Domain]
-		if !exists || state.Status == "" {
+		state, eligible := eligibleForRenewalPrice(domainCfg, loopState.RDAP)
+		if !eligible {
 			continue
 		}
 		tld := extractTLD(domainCfg.Domain)
@@ -198,4 +203,12 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 			loopState.RDAP[domainCfg.Domain] = state
 		}
 	}
+}
+
+func eligibleForRenewalPrice(domainCfg DomainConfig, states map[string]RDAPState) (RDAPState, bool) {
+	if domainCfg.AllowExpiry || domainCfg.IsDelegatedZone {
+		return RDAPState{}, false
+	}
+	state, exists := states[domainCfg.Domain]
+	return state, exists && state.Status != StatusUnknown
 }

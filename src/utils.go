@@ -140,16 +140,13 @@ func TruncateRunes(s string, maxRunes int) string {
 
 // --- 4. HTTP Resiliency & Connection Management ---
 
-// DefaultHTTPClient provides a safe fallback HTTP client with a 10-second timeout.
-var DefaultHTTPClient = &http.Client{Timeout: DefaultHTTPTimeout}
-
-// ResolveHTTPClient returns client if non-nil; otherwise it returns DefaultHTTPClient.
+// ResolveHTTPClient returns the injected client, or nil when it is absent.
 func ResolveHTTPClient(client HTTPDoer) HTTPDoer {
 	if client == nil {
-		return DefaultHTTPClient
+		return nil
 	}
 	if c, ok := client.(*http.Client); ok && c == nil {
-		return DefaultHTTPClient
+		return nil
 	}
 	return client
 }
@@ -202,7 +199,7 @@ func IsRestrictedIP(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
 		return true
 	}
 	if ip4 := ip.To4(); ip4 != nil {
@@ -245,10 +242,12 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 	defer func() {
 		if err != nil {
 			_ = tmp.Close()
+			// #nosec G703 -- tmpName is created by os.CreateTemp above.
 			_ = os.Remove(tmpName)
 		}
 	}()
 
+	// #nosec G703 -- tmpName is created by os.CreateTemp in the destination directory.
 	if err = os.Chmod(tmpName, perm); err != nil {
 		return err
 	}
@@ -261,6 +260,7 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
+	// #nosec G703 -- tmpName is a fresh temp file and path is the caller-selected destination.
 	if err = os.Rename(tmpName, path); err != nil {
 		return err
 	}

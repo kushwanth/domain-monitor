@@ -2,13 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -45,86 +53,166 @@ func TestDNSCheck(t *testing.T) {
 	}
 }
 
-// testResolvers returns the default resolver set matching config.jsonnet.
-// Tests needing real DNS should use these; tests needing determinism should use mock DNS servers.
+func TestGenericCAARecordUsesRDATAWithoutTTL(t *testing.T) {
+	const hostname = "example.com"
+	target := DNSTask{Hostname: hostname, Name: "CAA record", Type: RecordTypeCAA,
+		Expected: []string{`0 issue "letsencrypt.org; validationmethods=dns-01"`}, SkipSSL: false}
+	require.NoError(t, normalizeDNSTask(&target, 0, map[string]bool{}))
+	assert.Equal(t, `0 issue "letsencrypt.org; validationmethods=dns-01"`, target.Expected[0])
+	app := NewAppState(AppConfig{Resolvers: testResolvers()})
+	answer := `example.com. 60 IN CAA 0 issue "letsencrypt.org; validationmethods=dns-01"`
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		rr, err := dns.NewRR(answer)
+		require.NoError(t, err)
+		response.Answer = []dns.RR{rr}
+		return response, 0, nil
+	}}
+	check := func(want CheckStatus, code ResultCode) {
+		t.Helper()
+		status, condition := EvaluateDNS(target, FetchDNSSnapshot(context.Background(), app, target))
+		assert.Equal(t, want, status)
+		require.NotNil(t, condition)
+		assert.Equal(t, code, condition.Code)
+	}
+	check(StatusOK, CodeDNSMatchVerified)
+	answer = `example.com. 3600 IN CAA 0 issue "letsencrypt.org; validationmethods=dns-01"`
+	check(StatusOK, CodeDNSMatchVerified)
+	answer = `example.com. 3600 IN CAA 0 issue "other.example"`
+	check(StatusMismatch, CodeDNSMismatch)
+	answer = `other.example. 60 IN CAA 0 issue "letsencrypt.org; validationmethods=dns-01"`
+	check(StatusMismatch, CodeDNSMismatch)
+	answer = `example.com. 60 CH CAA 0 issue "letsencrypt.org; validationmethods=dns-01"`
+	check(StatusMismatch, CodeDNSMismatch)
+	mixedCase, err := normalizeExpectedDNSValue(target, `0 IODEF "https://example.com/CaseSensitive"`)
+	require.NoError(t, err)
+	assert.Equal(t, `0 iodef "https://example.com/CaseSensitive"`, mixedCase)
+	_, err = normalizeExpectedDNSValue(target, `not a valid CAA value`)
+	assert.Error(t, err)
+}
+
+// testResolvers supplies documentation addresses; test queries use injected resolvers.
 func testResolvers() []string {
-	return []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+	return []string{"192.0.2.53"}
 }
 
 func TestFetchCAA(t *testing.T) {
-	app := &AppState{}
-	resolvers := testResolvers()
-	res, _ := fetchCAA(context.Background(), app, "google.com", resolvers)
-
-	require.Empty(t, res.Error, "Expected no error, got %v", res.Error)
-
-	if len(res.Issue) == 0 {
-		// Even if they don't have issue, they might have something, but let's assume pki.goog
-		// Actually, google.com has issue "pki.goog"
-		t.Logf("google.com CAA issue is empty, this might happen depending on tree climbing or actual records.")
-	} else {
-		assert.Contains(t, res.Issue, "pki.goog", "Expected pki.goog in issue records for google.com")
-	}
+	app := caaFixtureApp(t, "example.com.")
+	res, found := fetchCAA(context.Background(), app, "example.com", testResolvers())
+	require.True(t, found)
+	require.Empty(t, res.Error)
+	assert.Equal(t, []string{"ca.example"}, res.Issue)
 }
 
 func TestFetchCAATreeClimbing(t *testing.T) {
-	app := &AppState{}
-	resolvers := testResolvers()
-	res, _ := fetchCAA(context.Background(), app, "some-random-subdomain.google.com", resolvers)
+	app := caaFixtureApp(t, "example.com.")
+	res, found := fetchCAA(context.Background(), app, "sub.example.com", testResolvers())
+	require.True(t, found)
+	require.Empty(t, res.Error)
+	assert.Equal(t, []string{"ca.example"}, res.Issue)
+}
 
-	if res.Error != "" {
-		t.Errorf("Expected no error, got %v", res.Error)
-	}
-
-	if len(res.Issue) > 0 {
-		found := slices.Contains(res.Issue, "pki.goog")
-		if !found {
-			t.Errorf("Expected pki.goog from parent google.com, got %v", res.Issue)
+func caaFixtureApp(t *testing.T, owner string) *AppState {
+	t.Helper()
+	return &AppState{DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		if query.Question[0].Qtype == dns.TypeCAA && query.Question[0].Name == owner {
+			record, err := dns.NewRR(owner + ` 60 IN CAA 0 issue "ca.example"`)
+			require.NoError(t, err)
+			response.Answer = []dns.RR{record}
 		}
-	}
+		return response, 0, nil
+	}}}
 }
 
-func TestValidateDNSSEC(t *testing.T) {
-	app := &AppState{}
-	resolvers := testResolvers()
-	res := validateDNSSEC(context.Background(), app, "example.com", resolvers, "https://dns.google/resolve")
+func TestValidateDNSSECOfflineChain(t *testing.T) {
+	key := &dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 60}, Flags: 257, Protocol: 3, Algorithm: dns.ED25519}
+	privateKey, err := key.Generate(256)
+	require.NoError(t, err)
+	ds := key.ToDS(dns.SHA256)
+	require.NotNil(t, ds)
+	wrongOwnerDS := *ds
+	wrongOwnerDS.Hdr.Name = "other.example."
+	sig := &dns.RRSIG{Hdr: dns.RR_Header{Ttl: 60}, Algorithm: dns.ED25519, KeyTag: key.KeyTag(), SignerName: "example.com.", Inception: uint32(time.Now().Add(-time.Hour).Unix()), Expiration: uint32(time.Now().Add(time.Hour).Unix())}
+	edKey, ok := privateKey.(ed25519.PrivateKey)
+	require.True(t, ok)
+	require.NoError(t, sig.Sign(edKey, []dns.RR{key}))
+	rolloverKey := &dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 60}, Flags: 257, Protocol: 3, Algorithm: dns.ED25519}
+	_, err = rolloverKey.Generate(256)
+	require.NoError(t, err)
+	rolloverSig := *sig
+	require.NoError(t, rolloverSig.Sign(edKey, []dns.RR{key, rolloverKey}))
+	validDoHBody := fmt.Sprintf(`{"Status":0,"AD":true,"Question":[{"name":"example.com.","type":48}],"Answer":[{"name":"example.com.","type":48,"data":"%d %d %d %s"}]}`,
+		key.Flags, key.Protocol, key.Algorithm, key.PublicKey)
+	rolloverDoHBody := fmt.Sprintf(`{"Status":0,"AD":true,"Question":[{"name":"example.com.","type":48}],"Answer":[{"name":"example.com.","type":48,"data":"%d %d %d %s"},{"name":"example.com.","type":48,"data":"%d %d %d %s"}]}`,
+		key.Flags, key.Protocol, key.Algorithm, key.PublicKey, rolloverKey.Flags, rolloverKey.Protocol, rolloverKey.Algorithm, rolloverKey.PublicKey)
+	wrongKeyDoHBody := fmt.Sprintf(`{"Status":0,"AD":true,"Question":[{"name":"example.com.","type":48}],"Answer":[{"name":"example.com.","type":48,"data":"%d %d %d AQID"}]}`,
+		key.Flags, key.Protocol, key.Algorithm)
+	wrongOwnerDoHBody := fmt.Sprintf(`{"Status":0,"AD":true,"Question":[{"name":"example.com.","type":48}],"Answer":[{"name":"other.example.","type":48,"data":"%d %d %d %s"}]}`,
+		key.Flags, key.Protocol, key.Algorithm, key.PublicKey)
 
-	if !res.Valid {
-		t.Errorf("Expected example.com to be valid DNSSEC, but got invalid. Result: %+v", res)
-	}
-	if !res.HasDS {
-		t.Errorf("Expected example.com to have DS records")
-	}
-	if !res.HasDNSKEY {
-		t.Errorf("Expected example.com to have DNSKEY records")
-	}
-	if !res.DSMatchesDNSKEY {
-		t.Errorf("Expected DS to match DNSKEY")
-	}
-	if !res.RRSIGValid {
-		t.Errorf("Expected dns.RRSIG to be valid")
-	}
-	if !res.ChainIntact {
-		t.Errorf("Expected Google DoH to report ChainIntact (AD bit set)")
-	}
-	if len(res.Algorithms) == 0 {
-		t.Errorf("Expected Algorithms to be populated")
-	}
-}
-
-func TestValidateDNSSECUnsigned(t *testing.T) {
-	app := &AppState{}
-	resolvers := testResolvers()
-	res := validateDNSSEC(context.Background(), app, "google.com", resolvers, "https://dns.google/resolve")
-
-	if res.Valid {
-		t.Errorf("Expected google.com to be invalid or unsigned DNSSEC, but got valid")
-	}
-	if res.HasDS {
-		t.Errorf("Expected google.com to not have DS records")
-	}
-	if res.ChainIntact {
-		t.Errorf("Expected Google DoH to not report ChainIntact for unsigned domain")
+	for _, tc := range []struct {
+		name, dohBody string
+		signed        bool
+		noHTTPClient  bool
+		wrongDSOwner  bool
+		rollover      bool
+		wantValid     bool
+	}{
+		{name: "verified signed chain", signed: true, dohBody: validDoHBody, wantValid: true},
+		{name: "verified with second published key", signed: true, rollover: true, dohBody: rolloverDoHBody, wantValid: true},
+		{name: "authenticated empty answer", signed: true, dohBody: `{"Status":0,"AD":true,"Question":[{"name":"example.com.","type":48}]}`},
+		{name: "authenticated different key", signed: true, dohBody: wrongKeyDoHBody},
+		{name: "authenticated wrong owner", signed: true, dohBody: wrongOwnerDoHBody},
+		{name: "wrong local DS owner", signed: true, wrongDSOwner: true, dohBody: validDoHBody},
+		{name: "unsigned delegation", dohBody: `{"Status":0,"AD":false,"Question":[{"name":"example.com.","type":48}]}`},
+		{name: "missing AD bit", signed: true, dohBody: `{"Status":0,"AD":false,"Question":[{"name":"example.com.","type":48}]}`},
+		{name: "missing HTTP client", signed: true, noHTTPClient: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := &AppState{
+				DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+					response := new(dns.Msg)
+					response.SetReply(query)
+					if tc.signed {
+						switch query.Question[0].Qtype {
+						case dns.TypeDS:
+							if tc.wrongDSOwner {
+								response.Answer = []dns.RR{&wrongOwnerDS}
+							} else {
+								response.Answer = []dns.RR{ds}
+							}
+						case dns.TypeDNSKEY:
+							if tc.rollover {
+								response.Answer = []dns.RR{key, rolloverKey, &rolloverSig}
+							} else {
+								response.Answer = []dns.RR{key, sig}
+							}
+						}
+					}
+					return response, 0, nil
+				}},
+				HTTPClient: &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+					assert.Equal(t, "example.com", req.URL.Query().Get(ParamName))
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tc.dohBody))}, nil
+				}},
+			}
+			if tc.noHTTPClient {
+				app.HTTPClient = nil
+			}
+			result := validateDNSSEC(context.Background(), app, "example.com", testResolvers(), "https://doh.example/resolve")
+			assert.Equal(t, tc.wantValid, result.Valid)
+			assert.Equal(t, tc.signed && !tc.wrongDSOwner, result.HasDS)
+			if tc.wantValid {
+				assert.True(t, result.DSMatchesDNSKEY)
+				assert.True(t, result.RRSIGValid)
+				assert.True(t, result.ChainIntact)
+			} else {
+				assert.False(t, result.Valid)
+			}
+		})
 	}
 }
 
@@ -132,7 +220,7 @@ func TestValidateCAATag(t *testing.T) {
 	t.Parallel()
 
 	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	_ = app
 
@@ -294,7 +382,7 @@ func TestParseCAAIssuer(t *testing.T) {
 }
 
 func TestFetchCAABoundaries(t *testing.T) {
-	app := &AppState{}
+	app := caaFixtureApp(t, "example.com.")
 	resolvers := testResolvers()
 
 	// Empty domain
@@ -311,38 +399,81 @@ func TestFetchCAABoundaries(t *testing.T) {
 }
 
 func TestDNSSECValidationFallback(t *testing.T) {
-	app := &AppState{}
-	resolvers := testResolvers()
-
-	// When DoH URL is invalid or unreachable, validation falls back to local_only
-	res := validateDNSSEC(context.Background(), app, "example.com", resolvers, "http://127.0.0.1:1/invalid_doh")
-	if res.Source != "local_only" {
-		t.Errorf("Expected Source 'local_only', got %q", res.Source)
-	}
-	if !res.Valid {
-		t.Errorf("Expected example.com to be Valid=true under local checks, got false (error: %s)", res.Error)
-	}
-	if res.Error == "" {
-		t.Errorf("Expected descriptive fallback message in res.Error when DoH is offline, got empty")
-	}
+	assert.False(t, verifyDNSSECDoH(context.Background(), &AppState{}, "https://doh.example/resolve", "example.com", "example.com."))
 }
 
 func TestDNSSECValidationDoHHTTPError(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "server error", http.StatusInternalServerError)
-	}))
-	defer ts.Close()
+	app := &AppState{HTTPClient: &MockHTTPClient{MockDo: func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusInternalServerError, Body: io.NopCloser(strings.NewReader("server error"))}, nil
+	}}}
+	assert.False(t, verifyDNSSECDoH(context.Background(), app, "https://doh.example/resolve", "example.com", "example.com."))
+}
 
-	app := &AppState{}
-	resolvers := testResolvers()
+func TestQueryIPRecords_PartialLookupDoesNotPass(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		if msg.Question[0].Qtype == dns.TypeAAAA {
+			return nil, 0, errors.New("IPv6 resolver timeout")
+		}
+		response := new(dns.Msg)
+		response.SetReply(msg)
+		rr, err := dns.NewRR(msg.Question[0].Name + " 60 IN A 192.0.2.10")
+		require.NoError(t, err)
+		response.Answer = []dns.RR{rr}
+		return response, 0, nil
+	}}
+	records, err := queryIPRecords(context.Background(), app, "example.com", app.Resolvers())
+	assert.Equal(t, []string{"192.0.2.10"}, records)
+	require.Error(t, err)
+	status, cond := EvaluateDNS(DNSTask{Type: RecordTypeIP, Expected: []string{"192.0.2.10"}}, DNSSnapshot{Records: records, Err: err})
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, CodeDNSLookupFailed, cond.Code)
+}
 
-	// When DoH server returns HTTP 500 or 429, it must fall back to local_only without marking chain broken
-	res := validateDNSSEC(context.Background(), app, "example.com", resolvers, ts.URL)
-	if res.Source != "local_only" {
-		t.Errorf("Expected Source 'local_only' on DoH HTTP 500, got %q", res.Source)
-	}
-	if !res.Valid {
-		t.Errorf("Expected example.com to remain Valid=true on DoH HTTP 500, got false (error: %s)", res.Error)
+func TestEvaluateEmailSecurity_DMARCFailurePromotesSPFWarning(t *testing.T) {
+	status, cond, state := EvaluateEmailSecurity(DomainConfig{Domain: "example.com", CheckEmailSecurity: true}, EmailSnapshot{
+		MXRecords: []string{"mx.example.com"},
+		DMARCErr:  errors.New("resolver timeout"),
+	})
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, StatusFailed, state.Status)
+	require.NotNil(t, cond)
+	assert.Equal(t, CodeDNSLookupFailed, cond.Code)
+	assert.Contains(t, cond.Target, "DMARC")
+}
+
+func TestVerifyObservedCertificate_SelfSignedTimeAndHostname(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	now := time.Now()
+	for _, tc := range []struct {
+		name          string
+		before, after time.Time
+		hostname      string
+		extKeyUsage   []x509.ExtKeyUsage
+		allow         bool
+		wantErr       bool
+	}{
+		{name: "accepted current", before: now.Add(-time.Hour), after: now.Add(time.Hour), hostname: "example.com", allow: true},
+		{name: "untrusted by default", before: now.Add(-time.Hour), after: now.Add(time.Hour), hostname: "example.com", wantErr: true},
+		{name: "future leaf", before: now.Add(time.Hour), after: now.Add(2 * time.Hour), hostname: "example.com", allow: true, wantErr: true},
+		{name: "expired leaf", before: now.Add(-2 * time.Hour), after: now.Add(-time.Hour), hostname: "example.com", allow: true, wantErr: true},
+		{name: "wrong hostname", before: now.Add(-time.Hour), after: now.Add(time.Hour), hostname: "other.example.com", allow: true, wantErr: true},
+		{name: "client authentication only", before: now.Add(-time.Hour), after: now.Add(time.Hour), hostname: "example.com", extKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, allow: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			template := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{"example.com"}, NotBefore: tc.before, NotAfter: tc.after, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: tc.extKeyUsage}
+			der, err := x509.CreateCertificate(rand.Reader, template, template, privateKey.Public(), privateKey)
+			require.NoError(t, err)
+			cert, err := x509.ParseCertificate(der)
+			require.NoError(t, err)
+			err = verifyObservedCertificate([]*x509.Certificate{cert}, tc.hostname, tc.allow)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
 	}
 }
 
@@ -369,7 +500,7 @@ func TestValidateRecords_MatchTypes(t *testing.T) {
 	t.Parallel()
 
 	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	_ = app
 
@@ -432,7 +563,7 @@ func TestSSLSentinels(t *testing.T) {
 		config: AppConfig{
 			Resolvers: testResolvers(),
 		},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 
 	// 1. Non-SSL record type should return SSLDaysNotApplicable (-9999)
@@ -508,7 +639,7 @@ func TestDNSSEC_AuthenticatedKSKLinkage(t *testing.T) {
 		t.Fatalf("failed to listen packet: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{config: AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
@@ -524,7 +655,7 @@ func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 		config: AppConfig{
 			Resolvers: []string{"192.0.2.1:53"}, // Unroutable TEST-NET-1 IP
 		},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{
 		Domain:             "unreachable-domain.com",
@@ -535,13 +666,15 @@ func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 	defer cancel()
 	savedState := evaluateEmailSecurityForTest(ctx, app, target)
 
-	for _, alert := range app.Notifier.(*NotificationManager).TestBuffer {
+	notifier, ok := app.Notifier.(*NotificationManager)
+	require.True(t, ok)
+	for _, alert := range notifier.alertBatch {
 		if strings.Contains(alert.Message, "Missing SPF") || strings.Contains(alert.Message, "Missing DMARC") {
 			t.Errorf("Unexpected false alert on DNS lookup error: %s", alert.Message)
 		}
 	}
 
-	if savedState.Status == "" {
+	if savedState.Status == StatusUnknown {
 		t.Errorf("Expected email security check to execute")
 	}
 	if savedState.Status != StatusFailed && savedState.Status != StatusWarning {
@@ -567,7 +700,7 @@ func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
 	}
 	dkim1RR := &dns.TXT{
 		Hdr: dns.RR_Header{Name: "s1._domainkey.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300},
-		Txt: []string{"v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC12345"},
+		Txt: []string{"v=DKIM1; k=ed25519; p=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="},
 	}
 
 	mux.HandleFunc("example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
@@ -616,14 +749,14 @@ func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
 		t.Fatalf("failed to listen packet: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{
 		config: AppConfig{
 			Resolvers: []string{l.LocalAddr().String()},
 		},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{
 		Domain:             "example.com",
@@ -641,7 +774,7 @@ func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
 	state.Email["example.com"] = res
 	savedState := state.Email["example.com"]
 
-	if savedState.Status == "" {
+	if savedState.Status == StatusUnknown {
 		t.Fatalf("Expected EmailState to be saved for example.com")
 	}
 	if savedState.Status != StatusOK {
@@ -705,7 +838,7 @@ func TestFetchCAA_CNAMEAliasFollowing(t *testing.T) {
 		t.Fatalf("failed to listen packet: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{config: AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
@@ -717,6 +850,75 @@ func TestFetchCAA_CNAMEAliasFollowing(t *testing.T) {
 	if len(res.Issue) != 1 || res.Issue[0] != "letsencrypt.org" {
 		t.Errorf("Expected CAA issue 'letsencrypt.org' from CNAME target, got %v", res.Issue)
 	}
+}
+
+func TestCAATransientAliasLookupDoesNotVerifyParentPolicy(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		question := query.Question[0]
+		if question.Name == "child.example.com." && question.Qtype == dns.TypeCNAME {
+			return nil, 0, errors.New("CNAME lookup timed out")
+		}
+		response := new(dns.Msg)
+		response.SetReply(query)
+		if question.Name == "example.com." && question.Qtype == dns.TypeCAA {
+			rr, err := dns.NewRR(`example.com. 60 IN CAA 0 issue "ca.example"`)
+			require.NoError(t, err)
+			response.Answer = []dns.RR{rr}
+		}
+		return response, 0, nil
+	}}
+	target := DomainConfig{Domain: "child.example.com", CAA: &CAAConfig{Issue: []string{"ca.example"}}}
+	snapshot := FetchCAASnapshot(context.Background(), app, target)
+	status, condition, _ := EvaluateCAA(target, snapshot)
+	assert.Equal(t, StatusFailed, status)
+	require.NotNil(t, condition)
+	assert.Equal(t, CodeDNSLookupFailed, condition.Code)
+	assert.Contains(t, snapshot.Result.Error, "CNAME lookup timed out")
+}
+
+func TestCAAAliasLimitDoesNotVerifyParentPolicy(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		question := query.Question[0]
+		response := new(dns.Msg)
+		response.SetReply(query)
+		if question.Name == "example.com." && question.Qtype == dns.TypeCAA {
+			rr, err := dns.NewRR(`example.com. 60 IN CAA 0 issue "ca.example"`)
+			require.NoError(t, err)
+			response.Answer = []dns.RR{rr}
+		} else if question.Qtype == dns.TypeCNAME && strings.HasPrefix(question.Name, "alias") {
+			var index int
+			_, err := fmt.Sscanf(question.Name, "alias%d.example.com.", &index)
+			require.NoError(t, err)
+			rr, err := dns.NewRR(fmt.Sprintf("%s 60 IN CNAME alias%d.example.com.", question.Name, index+1))
+			require.NoError(t, err)
+			response.Answer = []dns.RR{rr}
+		}
+		return response, 0, nil
+	}}
+	res, found := fetchCAA(context.Background(), app, "alias0.example.com", app.Resolvers())
+	assert.True(t, found)
+	assert.Contains(t, res.Error, "alias traversal limit")
+}
+
+func TestCAADeepNameStillFindsParentPolicy(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		if query.Question[0].Name == "example.com." && query.Question[0].Qtype == dns.TypeCAA {
+			rr, err := dns.NewRR(`example.com. 60 IN CAA 0 issue "ca.example"`)
+			require.NoError(t, err)
+			response.Answer = []dns.RR{rr}
+		}
+		return response, 0, nil
+	}}
+	domain := strings.Repeat("sub.", MaxCNAMEAliasTraversals+1) + "example.com"
+	res, found := fetchCAA(context.Background(), app, domain, app.Resolvers())
+	assert.True(t, found)
+	assert.Empty(t, res.Error)
+	assert.Equal(t, []string{"ca.example"}, res.Issue)
 }
 
 func TestMultipleSameTypeDNSTasks_NoKeyCollision(t *testing.T) {
@@ -745,12 +947,12 @@ func TestMultipleSameTypeDNSTasks_NoKeyCollision(t *testing.T) {
 		t.Fatalf("failed to listen packet: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{
 		config:   AppConfig{Resolvers: []string{l.LocalAddr().String()}},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	state := &CheckState{
 		DNS: make(map[string]DNSState),
@@ -783,10 +985,10 @@ func TestMultipleSameTypeDNSTasks_NoKeyCollision(t *testing.T) {
 	if count != 2 {
 		t.Errorf("Expected 2 distinct DNS states, got %d", count)
 	}
-	if s1.Status == "" || s1.Status != StatusOK {
+	if s1.Status == StatusUnknown || s1.Status != StatusOK {
 		t.Errorf("Expected task 1 to be StatusOK, got %+v", s1)
 	}
-	if s2.Status == "" || s2.Status != StatusOK {
+	if s2.Status == StatusUnknown || s2.Status != StatusOK {
 		t.Errorf("Expected task 2 to be StatusOK, got %+v", s2)
 	}
 }
@@ -821,12 +1023,12 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 		t.Fatalf("failed to listen packet: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{
 		config:   AppConfig{Resolvers: []string{l.LocalAddr().String()}},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{
 		Domain:             "api.example.com",
@@ -838,6 +1040,51 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 	if !state.DMARC {
 		t.Errorf("Expected DMARC to be discovered from parent organizational domain example.com")
 	}
+}
+
+func TestDMARCTreeWalkQueriesPublicSuffix(t *testing.T) {
+	var queried []string
+	app := &AppState{
+		config: AppConfig{Resolvers: testResolvers()},
+		DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+			response := new(dns.Msg)
+			response.SetReply(query)
+			name := query.Question[0].Name
+			if strings.HasPrefix(name, "_dmarc.") {
+				queried = append(queried, name)
+				if name == "_dmarc.com." {
+					record, err := dns.NewRR(`_dmarc.com. 60 IN TXT "v=DMARC1; p=reject; psd=y"`)
+					require.NoError(t, err)
+					response.Answer = []dns.RR{record}
+				}
+			}
+			return response, 0, nil
+		}},
+	}
+	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "a.example.com", CheckEmailSecurity: true})
+	require.NoError(t, snapshot.DMARCErr)
+	require.Equal(t, []string{"_dmarc.a.example.com.", "_dmarc.example.com.", "_dmarc.com."}, queried)
+	require.Equal(t, []string{"v=DMARC1; p=reject; psd=y"}, snapshot.DMARCRecords)
+}
+
+func TestDMARCTreeWalkBoundsLongNames(t *testing.T) {
+	var queried []string
+	app := &AppState{
+		config: AppConfig{Resolvers: testResolvers()},
+		DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+			response := new(dns.Msg)
+			response.SetReply(query)
+			if strings.HasPrefix(query.Question[0].Name, "_dmarc.") {
+				queried = append(queried, query.Question[0].Name)
+			}
+			return response, 0, nil
+		}},
+	}
+	domain := "a.b.c.d.e.f.g.h.i.example.com"
+	_ = FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: domain, CheckEmailSecurity: true})
+	require.Len(t, queried, 8)
+	assert.Equal(t, "_dmarc."+domain+".", queried[0])
+	assert.Equal(t, "_dmarc.com.", queried[len(queried)-1])
 }
 
 func TestQueryDNSMsg_FailoverOnServerErrors(t *testing.T) {
@@ -854,7 +1101,7 @@ func TestQueryDNSMsg_FailoverOnServerErrors(t *testing.T) {
 		t.Fatalf("failed to listen on udp: %v", err)
 	}
 	s1.PacketConn = l1
-	defer s1.Shutdown()
+	defer func() { _ = s1.Shutdown() }()
 	go func() { _ = s1.ActivateAndServe() }()
 
 	// Server 2: Returns NOTIMP
@@ -870,7 +1117,7 @@ func TestQueryDNSMsg_FailoverOnServerErrors(t *testing.T) {
 		t.Fatalf("failed to listen on udp: %v", err)
 	}
 	s2.PacketConn = l2
-	defer s2.Shutdown()
+	defer func() { _ = s2.Shutdown() }()
 	go func() { _ = s2.ActivateAndServe() }()
 
 	// Server 3: Returns valid A record
@@ -891,11 +1138,11 @@ func TestQueryDNSMsg_FailoverOnServerErrors(t *testing.T) {
 		t.Fatalf("failed to listen on udp: %v", err)
 	}
 	s3.PacketConn = l3
-	defer s3.Shutdown()
+	defer func() { _ = s3.Shutdown() }()
 	go func() { _ = s3.ActivateAndServe() }()
 
 	resolvers := []string{l1.LocalAddr().String(), l2.LocalAddr().String(), l3.LocalAddr().String()}
-	app := &AppState{}
+	app := NewAppState(AppConfig{})
 
 	msg, err := queryDNSMsg(context.Background(), app, "failover.example.com", dns.TypeA, resolvers)
 	if err != nil {
@@ -913,7 +1160,7 @@ func TestValidateRecords_EmptyExpectedWithLiveRecords(t *testing.T) {
 	t.Parallel()
 
 	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 
 	task := DNSTask{
@@ -931,7 +1178,9 @@ func TestValidateRecords_EmptyExpectedWithLiveRecords(t *testing.T) {
 	}
 
 	// 2. When no live records exist, exact match must succeed
-	app.Notifier.(*NotificationManager).TestBuffer = nil
+	notifier, ok := app.Notifier.(*NotificationManager)
+	require.True(t, ok)
+	notifier.alertBatch = nil
 	if !validateRecords(task, []string{}) {
 		t.Errorf("Expected validateRecords to return true when no live records exist for empty expected list, got false")
 	}
@@ -960,11 +1209,11 @@ func TestQueryDNSMsgWithRD_AuthoritativeNonRecursive(t *testing.T) {
 		t.Fatalf("failed to listen on udp: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	resolvers := []string{l.LocalAddr().String()}
-	app := &AppState{}
+	app := NewAppState(AppConfig{})
 
 	// 1. With recursionDesired=false, query succeeds
 	msgNonRec, err := queryDNSMsgWithRD(context.Background(), app, "sub.example.com", dns.TypeNS, resolvers, false)
@@ -998,11 +1247,11 @@ func TestQueryDNSMsg_NXDOMAIN_ErrorsIs(t *testing.T) {
 		t.Fatalf("failed to listen on udp: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	resolvers := []string{l.LocalAddr().String()}
-	app := &AppState{}
+	app := NewAppState(AppConfig{})
 
 	_, qErr := queryDNSMsgWithRD(context.Background(), app, "nonexistent.example.com", dns.TypeA, resolvers, true)
 	if qErr == nil {
@@ -1035,11 +1284,11 @@ func TestQueryDNSMsg_QuestionEchoValidation(t *testing.T) {
 		t.Fatalf("failed to listen on udp: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	resolvers := []string{l.LocalAddr().String()}
-	app := &AppState{}
+	app := NewAppState(AppConfig{})
 
 	_, qErr := queryDNSMsgWithRD(context.Background(), app, "example.com", dns.TypeA, resolvers, true)
 	if qErr == nil {
@@ -1048,6 +1297,132 @@ func TestQueryDNSMsg_QuestionEchoValidation(t *testing.T) {
 
 	if !strings.Contains(qErr.Error(), "mismatch or missing") {
 		t.Errorf("Expected question mismatch error, got: %v", qErr)
+	}
+}
+
+func TestQueryDNSMsgRetriesTruncatedAnswerOverInjectedTCP(t *testing.T) {
+	t.Parallel()
+	const domain = "example.com"
+	app := NewAppState(AppConfig{})
+	tcpCalled := false
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		response.Truncated = true
+		return response, 0, nil
+	}}
+	app.DNSTCPClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		tcpCalled = true
+		response := new(dns.Msg)
+		response.SetReply(query)
+		response.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: dns.Fqdn(domain), Rrtype: dns.TypeA, Class: dns.ClassINET}, A: net.ParseIP("192.0.2.1")}}
+		return response, 0, nil
+	}}
+
+	response, err := queryDNSMsg(context.Background(), app, domain, dns.TypeA, []string{"192.0.2.53"})
+	require.NoError(t, err)
+	require.True(t, tcpCalled)
+	require.Len(t, response.Answer, 1)
+
+	app.DNSTCPClient = nil
+	_, err = queryDNSMsg(context.Background(), app, domain, dns.TypeA, []string{"192.0.2.53"})
+	require.ErrorContains(t, err, "TCP resolver is not configured")
+}
+
+func TestQueryDNSMsgUsesFreshIDsAndRejectsWrongQuestionClass(t *testing.T) {
+	t.Parallel()
+	app := NewAppState(AppConfig{})
+	ids := make(map[uint16]bool)
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		ids[query.Id] = true
+		response := new(dns.Msg)
+		response.SetReply(query)
+		return response, 0, nil
+	}}
+	for range 16 {
+		_, err := queryDNSMsg(context.Background(), app, "example.com", dns.TypeA, []string{"192.0.2.53"})
+		require.NoError(t, err)
+	}
+	require.Greater(t, len(ids), 1, "DNS request IDs must not be fixed across queries")
+
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		response.Question[0].Qclass = dns.ClassCHAOS
+		return response, 0, nil
+	}}
+	_, err := queryDNSMsg(context.Background(), app, "example.com", dns.TypeA, []string{"192.0.2.53"})
+	require.ErrorContains(t, err, "mismatch")
+}
+
+func TestDNSAnswerOwnerFiltering(t *testing.T) {
+	tests := []struct {
+		name    string
+		qtype   uint16
+		answers []string
+		want    []string
+		wantCAA []CAAEntry
+	}{
+		{
+			name: "direct A ignores unrelated answer", qtype: dns.TypeA,
+			answers: []string{"other.example. 60 IN A 192.0.2.1", "host.example. 60 IN A 192.0.2.2"},
+			want:    []string{"192.0.2.2"},
+		},
+		{
+			name: "direct A ignores wrong DNS class", qtype: dns.TypeA,
+			answers: []string{"host.example. 60 CH A 192.0.2.1", "host.example. 60 IN A 192.0.2.2"},
+			want:    []string{"192.0.2.2"},
+		},
+		{
+			name: "CNAME chain accepts target and rejects unrelated answer", qtype: dns.TypeA,
+			answers: []string{"final.example. 60 IN A 192.0.2.3", "host.example. 60 IN CNAME middle.example.", "middle.example. 60 IN CNAME final.example.", "other.example. 60 IN A 192.0.2.4"},
+			want:    []string{"192.0.2.3"},
+		},
+		{
+			name: "wrong-class CNAME cannot authorize target", qtype: dns.TypeA,
+			answers: []string{"host.example. 60 CH CNAME target.example.", "target.example. 60 IN A 192.0.2.3"},
+		},
+		{
+			name: "CNAME check uses immediate target", qtype: dns.TypeCNAME,
+			answers: []string{"host.example. 60 IN CNAME middle.example.", "middle.example. 60 IN CNAME final.example."},
+			want:    []string{"middle.example"},
+		},
+		{
+			name: "unrelated CAA cannot satisfy policy", qtype: dns.TypeCAA,
+			answers: []string{"other.example. 60 IN CAA 0 issue \"rogue.example\""},
+		},
+		{
+			name: "CAA at CNAME target is accepted", qtype: dns.TypeCAA,
+			answers: []string{"host.example. 60 IN CNAME policy.example.", "policy.example. 60 IN CAA 0 issue \"ca.example\""},
+			wantCAA: []CAAEntry{{Tag: CAATagIssue, Value: "ca.example"}},
+		},
+		{
+			name: "wrong-class CAA cannot satisfy policy", qtype: dns.TypeCAA,
+			answers: []string{"host.example. 60 CH CAA 0 issue \"rogue.example\""},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			app := &AppState{DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+				response := new(dns.Msg)
+				response.SetReply(query)
+				for _, raw := range tc.answers {
+					record, err := dns.NewRR(raw)
+					require.NoError(t, err)
+					response.Answer = append(response.Answer, record)
+				}
+				return response, 0, nil
+			}}}
+			if tc.qtype == dns.TypeCAA {
+				got, err := queryCAARecords(context.Background(), app, "host.example", []string{"192.0.2.53"})
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantCAA, got)
+				return
+			}
+			got, err := queryDNS(context.Background(), app, "host.example", tc.qtype, []string{"192.0.2.53"})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
 	}
 }
 
@@ -1080,7 +1455,7 @@ func TestFetchCAA_CNAMELoopTermination(t *testing.T) {
 		t.Fatalf("failed to listen packet: %v", err)
 	}
 	server.PacketConn = l
-	defer server.Shutdown()
+	defer func() { _ = server.Shutdown() }()
 	go func() { _ = server.ActivateAndServe() }()
 
 	app := &AppState{config: AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
@@ -1088,9 +1463,7 @@ func TestFetchCAA_CNAMELoopTermination(t *testing.T) {
 	defer cancel()
 
 	res, _ := fetchCAA(ctx, app, "loop.example.com", []string{l.LocalAddr().String()})
-	if res.Error != "" {
-		t.Fatalf("fetchCAA returned nil on CNAME loop")
-	}
+	assert.Contains(t, res.Error, "cyclic CNAME")
 }
 
 func evaluateNSHealthForTest(ctx context.Context, app *AppState, target DomainConfig) NSHealthResult {
@@ -1134,11 +1507,12 @@ func TestEvaluateNSHealth(t *testing.T) {
 			m.Authoritative = authoritative
 			if len(r.Question) > 0 {
 				q := r.Question[0]
-				if q.Qtype == dns.TypeSOA {
+				switch q.Qtype {
+				case dns.TypeSOA:
 					soaStr := "example.com. 3600 IN SOA ns1.example.com. hostmaster.example.com. " + strconv.FormatUint(uint64(serial), 10) + " 7200 3600 1209600 3600"
 					rr, _ := dns.NewRR(soaStr)
 					m.Answer = append(m.Answer, rr)
-				} else if q.Qtype == dns.TypeDNSKEY {
+				case dns.TypeDNSKEY:
 					for _, k := range dnskeys {
 						if k != nil {
 							m.Answer = append(m.Answer, dns.Copy(k))
@@ -1179,7 +1553,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Sync Domain",
@@ -1202,7 +1576,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil)
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Unsigned Domain",
@@ -1225,7 +1599,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Distinct key!
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Mismatched DNSKEY Domain",
@@ -1248,7 +1622,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Signed secondary!
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Unexpected DNSKEY Domain",
@@ -1264,14 +1638,14 @@ func TestEvaluateNSHealth(t *testing.T) {
 		}
 	})
 
-	// 5. DNSKEY Unexpected on Secondary even when target.DNSSEC is false -> REJECTED
-	t.Run("DNSKEYUnexpectedEvenWhenDNSSECIsFalse", func(t *testing.T) {
+	// DNSKEY comparison is requested only for DNSSEC-enabled NS health checks.
+	t.Run("DNSKEYIgnoredWhenDNSSECIsFalse", func(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, true, nil) // Unsigned primary
 		defer pClose()
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, []dns.RR{independentKey}) // Secondary serves DNSKEY!
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Dumb Secondary Unsigned Violation",
@@ -1282,8 +1656,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
-		if res.Valid {
-			t.Errorf("Expected NSHealth to be invalid when secondary serves DNSKEY even if DNSSEC=false")
+		if !res.Valid {
+			t.Errorf("Expected NSHealth to skip DNSKEY when DNSSEC=false")
 		}
 	})
 
@@ -1294,7 +1668,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil) // Missing DNSKEY!
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Missing DNSKEY Domain",
@@ -1317,7 +1691,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil) // 2026090101 < 2026090102
 		defer sClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Lagging Domain",
@@ -1327,9 +1701,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
-		if res.Valid {
-			t.Errorf("Expected NSHealth to be invalid on secondary SOA lag")
-		}
+		status, condition := EvaluateNSHealth(target, FetchNSHealthSnapshots(context.Background(), app, target))
+		assert.Equal(t, StatusWarning, status)
+		assert.Equal(t, CodeNSSOALags, condition.Code)
+		assert.True(t, res.Valid)
 	})
 
 	// 7. Happy Path: Primary Only (secondary_ns omitted -> secondary checks skipped)
@@ -1337,7 +1712,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
 		defer pClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Primary Only Domain",
@@ -1370,7 +1745,7 @@ func TestEvaluateNSHealth(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, false, nil) // AA=0!
 		defer pClose()
 
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Non-Authoritative Primary Domain",
@@ -1401,10 +1776,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 		}
 		srv := &dns.Server{PacketConn: l, Handler: mux}
 		go func() { _ = srv.ActivateAndServe() }()
-		defer srv.Shutdown()
+		defer func() { _ = srv.Shutdown() }()
 
 		pAddr := l.LocalAddr().String()
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "Missing SOA Primary Domain",
@@ -1449,10 +1824,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 		}
 		srv := &dns.Server{PacketConn: l, Handler: mux}
 		go func() { _ = srv.ActivateAndServe() }()
-		defer srv.Shutdown()
+		defer func() { _ = srv.Shutdown() }()
 
 		pAddr := l.LocalAddr().String()
-		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{TestMode: true}}
+		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
 			Domain:         "example.com",
 			Name:           "SOA In Authority Domain",
@@ -1468,6 +1843,59 @@ func TestEvaluateNSHealth(t *testing.T) {
 			t.Errorf("Expected SOA serial 2026090501, got %d", res.Servers[0].SOASerial)
 		}
 	})
+}
+
+func TestNSHealthChecksAllExpectedServersAndSOAOwner(t *testing.T) {
+	queries := make(map[string]int)
+	app := &AppState{DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+		queries[address]++
+		response := new(dns.Msg)
+		response.SetReply(q)
+		response.Authoritative = true
+		if q.Question[0].Qtype == dns.TypeSOA {
+			owner := "example.com."
+			if address == "93.184.216.35:53" {
+				owner = "other.example."
+			}
+			record, _ := dns.NewRR(owner + " 3600 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600")
+			response.Answer = []dns.RR{record}
+		}
+		return response, 0, nil
+	}}}
+	target := DomainConfig{Domain: "example.com", ExpectedNS: []string{"93.184.216.34", "93.184.216.35"}, SecondaryNS: []string{"93.184.216.34"}, VerifyNSHealth: true}
+	snapshots := FetchNSHealthSnapshots(context.Background(), app, target)
+	require.Len(t, snapshots, 2)
+	assert.Equal(t, 1, queries["93.184.216.34:53"])
+	assert.Equal(t, 1, queries["93.184.216.35:53"])
+	assert.False(t, snapshots[1].HasSOA)
+	status, condition := EvaluateNSHealth(target, snapshots)
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, CodeNSMissingSOA, condition.Code)
+}
+
+func TestNSHealthIgnoresWrongClassSOAAndDNSKEY(t *testing.T) {
+	app := &AppState{DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		response.Authoritative = true
+		switch query.Question[0].Qtype {
+		case dns.TypeSOA:
+			rr, err := dns.NewRR("example.com. 60 CH SOA ns.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600")
+			require.NoError(t, err)
+			response.Answer = []dns.RR{rr}
+		case dns.TypeDNSKEY:
+			response.Answer = []dns.RR{&dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassCHAOS}, Flags: 257, Protocol: 3, Algorithm: dns.ECDSAP256SHA256, PublicKey: "AQEBAQ=="}}
+		}
+		return response, 0, nil
+	}}}
+	target := DomainConfig{Domain: "example.com", ExpectedNS: []string{"192.0.2.53"}, VerifyNSHealth: true, DNSSEC: true}
+	snapshots := FetchNSHealthSnapshots(context.Background(), app, target)
+	require.Len(t, snapshots, 1)
+	assert.False(t, snapshots[0].HasSOA)
+	assert.False(t, snapshots[0].HasDNSKEY)
+	status, condition := EvaluateNSHealth(target, snapshots)
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, CodeNSMissingSOA, condition.Code)
 }
 
 func TestEvaluateDNS_SkipSSL(t *testing.T) {
@@ -1488,14 +1916,14 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 	}
 	srv := &dns.Server{PacketConn: l, Handler: mux}
 	go func() { _ = srv.ActivateAndServe() }()
-	defer srv.Shutdown()
+	defer func() { _ = srv.Shutdown() }()
 
 	pAddr := l.LocalAddr().String()
 	app := &AppState{
 		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 
 	state := &CheckState{
@@ -1516,7 +1944,7 @@ func TestEvaluateDNS_SkipSSL(t *testing.T) {
 	state.DNS[taskSkip.Name] = resSkip
 	resSkip = state.DNS["Web Server No SSL"]
 
-	if resSkip.Status == "" {
+	if resSkip.Status == StatusUnknown {
 		t.Fatalf("expected DNS state to be recorded for taskSkip")
 	}
 	if resSkip.Status != StatusOK {
@@ -1544,7 +1972,8 @@ func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
 	mux.HandleFunc("multi.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
-		if r.Question[0].Qtype == dns.TypeA {
+		switch r.Question[0].Qtype {
+		case dns.TypeA:
 			m.Answer = append(m.Answer, &dns.A{
 				Hdr: dns.RR_Header{Name: "multi.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
 				A:   net.ParseIP("198.51.100.2"),
@@ -1557,7 +1986,7 @@ func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
 				Hdr: dns.RR_Header{Name: "multi.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
 				A:   net.ParseIP("192.0.2.1"), // duplicate
 			})
-		} else if r.Question[0].Qtype == dns.TypeAAAA {
+		case dns.TypeAAAA:
 			m.Answer = append(m.Answer, &dns.AAAA{
 				Hdr:  dns.RR_Header{Name: "multi.example.com.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
 				AAAA: net.ParseIP("2001:db8::1"),
@@ -1572,14 +2001,14 @@ func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
 	}
 	srv := &dns.Server{PacketConn: l, Handler: mux}
 	go func() { _ = srv.ActivateAndServe() }()
-	defer srv.Shutdown()
+	defer func() { _ = srv.Shutdown() }()
 
 	pAddr := l.LocalAddr().String()
 	app := &AppState{
 		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	state := &CheckState{
 		DNS: make(map[string]DNSState),
@@ -1630,14 +2059,14 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 	}
 	srv := &dns.Server{PacketConn: l, Handler: mux}
 	go func() { _ = srv.ActivateAndServe() }()
-	defer srv.Shutdown()
+	defer func() { _ = srv.Shutdown() }()
 
 	pAddr := l.LocalAddr().String()
 	app := &AppState{
 		config: AppConfig{
 			Resolvers: []string{pAddr},
 		},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	state := &CheckState{
 		DNS: make(map[string]DNSState),
@@ -1670,7 +2099,7 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 func TestDNS_ValidateRecords_MultiIPConsolidatedAlert(t *testing.T) {
 	app := &AppState{
 		config:   AppConfig{},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	_ = app
 
@@ -1760,7 +2189,7 @@ func TestNilSafety_EvaluationsWithNilApp(t *testing.T) {
 		SkipSSL:  true,
 	}
 	dnsState := evaluateDNSForTest(ctx, nil, dnsTask)
-	if dnsState.Status == "" {
+	if dnsState.Status == StatusUnknown {
 		t.Errorf("expected non-nil DNSState")
 	}
 
@@ -1771,7 +2200,7 @@ func TestNilSafety_EvaluationsWithNilApp(t *testing.T) {
 		MXRecords:          []string{"mail.example.com"},
 	}
 	emailState := evaluateEmailSecurityForTest(ctx, nil, emailCfg)
-	if emailState.Status == "" {
+	if emailState.Status == StatusUnknown {
 		t.Errorf("expected non-nil EmailState")
 	}
 
@@ -1792,7 +2221,7 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 		config: AppConfig{
 			Resolvers: []string{"192.0.2.1:53"}, // Unreachable
 		},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{
 		Domain:             "transient-error.example.com",
@@ -1816,7 +2245,7 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
 	app := &AppState{
 		config:   AppConfig{},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	_ = app
 
@@ -1855,7 +2284,7 @@ func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
 func TestDNS_ResolverIndexOverflow(t *testing.T) {
 	app := &AppState{
 		config:   AppConfig{},
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 
 	resolvers := []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
@@ -1900,14 +2329,47 @@ func TestCheckSSLExpiryDays_ErrSSLValidationChaining(t *testing.T) {
 }
 
 func TestEvaluateDNSSECExtensive(t *testing.T) {
-	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
-	}
-	// Missing Name
-	_ = evaluateDNSSECForTest(context.Background(), app, DomainConfig{})
+	status, condition, _ := EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, DNSSECSnapshot{})
+	assert.Equal(t, StatusFailed, status)
+	require.NotNil(t, condition)
+	assert.Equal(t, CodeDNSSECNetworkError, condition.Code)
 
-	// Has Name but fails
-	_ = evaluateDNSSECForTest(context.Background(), app, DomainConfig{Domain: "example.com"})
+	snapshot := FetchDNSSECSnapshot(context.Background(), nil, DomainConfig{Domain: "example.com", DNSSEC: true})
+	assert.Equal(t, MsgErrDNSSECResolverNotConfigured, snapshot.Result.Error)
+	status, condition, _ = EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, snapshot)
+	assert.Equal(t, StatusFailed, status)
+	require.NotNil(t, condition)
+	assert.Equal(t, CodeDNSSECNetworkError, condition.Code)
+}
+
+func TestEvaluateDNSSECConditions(t *testing.T) {
+	base := DNSSECResult{Source: DNSSECSourceLocalDoH, HasDS: true, HasDNSKEY: true, DSMatchesDNSKEY: true, RRSIGValid: true, ChainIntact: true, Valid: true}
+	for _, tc := range []struct {
+		name string
+		edit func(*DNSSECResult)
+		want CheckStatus
+		code ResultCode
+	}{
+		{name: "verified", want: StatusOK, code: CodeDNSSECVerified},
+		{name: "transport unavailable", edit: func(r *DNSSECResult) { r.Valid = false; r.NetworkError = true; r.Error = "resolver timeout" }, want: StatusFailed, code: CodeDNSSECNetworkError},
+		{name: "unsigned", edit: func(r *DNSSECResult) { r.Valid = false; r.HasDS = false; r.HasDNSKEY = false }, want: StatusFailed, code: CodeDNSSECDisabled},
+		{name: "missing DS", edit: func(r *DNSSECResult) { r.Valid = false; r.HasDS = false }, want: StatusFailed, code: CodeDNSSECNoDS},
+		{name: "missing DNSKEY", edit: func(r *DNSSECResult) { r.Valid = false; r.HasDNSKEY = false }, want: StatusFailed, code: CodeDNSSECNoDNSKEY},
+		{name: "DS mismatch", edit: func(r *DNSSECResult) { r.Valid = false; r.DSMatchesDNSKEY = false }, want: StatusFailed, code: CodeDNSSECDSMismatch},
+		{name: "bad signature", edit: func(r *DNSSECResult) { r.Valid = false; r.RRSIGValid = false }, want: StatusFailed, code: CodeDNSSECRRSIGFailed},
+		{name: "no trusted chain evidence", edit: func(r *DNSSECResult) { r.Valid = false; r.ChainIntact = false; r.Error = "DoH unavailable" }, want: StatusFailed, code: CodeDNSLookupFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := base
+			if tc.edit != nil {
+				tc.edit(&result)
+			}
+			status, condition, _ := EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, DNSSECSnapshot{Result: result})
+			assert.Equal(t, tc.want, status)
+			require.NotNil(t, condition)
+			assert.Equal(t, tc.code, condition.Code)
+		})
+	}
 }
 
 func TestCheckSSLExpiryDaysExtensive(t *testing.T) {
@@ -1917,15 +2379,154 @@ func TestCheckSSLExpiryDaysExtensive(t *testing.T) {
 
 	days, err = checkSSLExpiryDays(context.Background(), "invalid.localhost", []string{}, true)
 	assert.Error(t, err)
+	assert.Equal(t, SSLDaysError, days)
 
 	// Test internal method
 	days, err = checkSSLExpiryDays(context.Background(), "invalid.localhost", []string{"invalid_ip"}, true)
 	assert.Error(t, err)
+	assert.Equal(t, SSLDaysError, days)
+}
+
+func TestFetchSSLSnapshotUsesInjectedChecker(t *testing.T) {
+	tests := []struct {
+		name       string
+		checker    func(context.Context, string, []string, bool) (int, error)
+		wantDays   int
+		wantErr    bool
+		wantCalled bool
+	}{
+		{
+			name: "injected checker",
+			checker: func(_ context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
+				assert.Equal(t, "example.com", hostname)
+				assert.Equal(t, []string{"192.0.2.10"}, ips)
+				assert.True(t, acceptSelfSigned)
+				return 30, nil
+			},
+			wantDays:   30,
+			wantCalled: true,
+		},
+		{name: "missing checker", wantDays: SSLDaysError, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			app := &AppState{TLSCheck: tc.checker}
+			if tc.checker != nil {
+				app.TLSCheck = func(ctx context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
+					called = true
+					return tc.checker(ctx, hostname, ips, acceptSelfSigned)
+				}
+			}
+			snapshot := FetchSSLSnapshot(context.Background(), app, DNSTask{Hostname: "example.com", Type: RecordTypeA, AcceptSelfSigned: true}, []string{"192.0.2.10"})
+			assert.Equal(t, tc.wantDays, snapshot.ExpiryDays)
+			assert.Equal(t, tc.wantCalled, called)
+			if tc.wantErr {
+				assert.ErrorContains(t, snapshot.Err, "TLS checker is not configured")
+			} else {
+				assert.NoError(t, snapshot.Err)
+			}
+		})
+	}
+	assert.NotNil(t, NewAppState(AppConfig{}).TLSCheck)
+	nilAppSnapshot := FetchSSLSnapshot(context.Background(), nil, DNSTask{Hostname: "alias.example.com", Type: RecordTypeCNAME}, nil)
+	assert.Equal(t, SSLDaysError, nilAppSnapshot.ExpiryDays)
+	assert.ErrorContains(t, nilAppSnapshot.Err, "TLS checker is not configured")
+}
+
+func TestFetchSSLSnapshotResolvesAliasBeforeTLSCheck(t *testing.T) {
+	var resolverAddresses []string
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, msg *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+		resolverAddresses = append(resolverAddresses, address)
+		response := new(dns.Msg)
+		response.SetReply(msg)
+		if msg.Question[0].Qtype == dns.TypeA {
+			rr, err := dns.NewRR(msg.Question[0].Name + " 60 IN A 192.0.2.10")
+			require.NoError(t, err)
+			response.Answer = []dns.RR{rr}
+		}
+		return response, 0, nil
+	}}
+	app.TLSCheck = func(_ context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
+		assert.Equal(t, "alias.example.com", hostname)
+		assert.Equal(t, []string{"192.0.2.10"}, ips)
+		assert.False(t, acceptSelfSigned)
+		return 45, nil
+	}
+	snapshot := FetchSSLSnapshot(context.Background(), app, DNSTask{
+		Hostname: "alias.example.com", Type: RecordTypeCNAME, CustomResolver: "198.51.100.53:53",
+	}, []string{"target.example.com"})
+	require.NoError(t, snapshot.Err)
+	assert.Equal(t, 45, snapshot.ExpiryDays)
+	assert.Equal(t, []string{"198.51.100.53:53", "198.51.100.53:53"}, resolverAddresses)
+}
+
+func TestFetchSSLSnapshotRejectsAliasWithoutAddresses(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(msg)
+		return response, 0, nil
+	}}
+	app.TLSCheck = func(context.Context, string, []string, bool) (int, error) {
+		t.Fatal("TLS checker called without an address")
+		return 0, nil
+	}
+	snapshot := FetchSSLSnapshot(context.Background(), app, DNSTask{Hostname: "alias.example.com", Type: RecordTypeALIAS}, nil)
+	assert.Equal(t, SSLDaysError, snapshot.ExpiryDays)
+	require.ErrorContains(t, snapshot.Err, "no IP addresses found")
+}
+
+func TestEvaluateSSLStatuses(t *testing.T) {
+	tests := []struct {
+		name     string
+		snapshot SSLSnapshot
+		status   CheckStatus
+		code     ResultCode
+	}{
+		{name: "skipped", snapshot: SSLSnapshot{ExpiryDays: SSLDaysNotApplicable}, status: StatusOK},
+		{name: "validation failed", snapshot: SSLSnapshot{ExpiryDays: 30, Err: errors.New("untrusted chain")}, status: StatusFailed, code: CodeSSLValidationFailed},
+		{name: "expired certificate error", snapshot: SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf("tls: %w", x509.CertificateInvalidError{Cert: &x509.Certificate{NotAfter: time.Now().Add(-time.Hour)}, Reason: x509.Expired})}, status: StatusFailed, code: CodeSSLExpired},
+		{name: "not yet valid certificate error", snapshot: SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf("tls: %w", x509.CertificateInvalidError{Cert: &x509.Certificate{NotAfter: time.Now().Add(time.Hour)}, Reason: x509.Expired})}, status: StatusFailed, code: CodeSSLValidationFailed},
+		{name: "expired", snapshot: SSLSnapshot{ExpiryDays: -1}, status: StatusFailed, code: CodeSSLExpired},
+		{name: "expiring", snapshot: SSLSnapshot{ExpiryDays: DefaultSSLExpiryWarningDays}, status: StatusWarning, code: CodeSSLExpiringSoon},
+		{name: "healthy", snapshot: SSLSnapshot{ExpiryDays: DefaultSSLExpiryWarningDays + 1}, status: StatusOK, code: CodeSSLVerified},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			status, condition := EvaluateSSL(DNSTask{Hostname: "example.com", Type: RecordTypeA}, tc.snapshot)
+			assert.Equal(t, tc.status, status)
+			if tc.code == CodeNone {
+				assert.Nil(t, condition)
+			} else {
+				require.NotNil(t, condition)
+				assert.Equal(t, tc.code, condition.Code)
+			}
+		})
+	}
+}
+
+func TestSelfSignedTLSOptInKeepsHostnameValidation(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	address := server.Listener.Addr().String()
+
+	_, err := checkSSLExpiryDays(context.Background(), "127.0.0.1", []string{address}, false)
+	require.ErrorIs(t, err, ErrSSLValidation)
+
+	days, err := checkSSLExpiryDays(context.Background(), "127.0.0.1", []string{address}, true)
+	require.NoError(t, err)
+	assert.Positive(t, days)
+
+	_, err = checkSSLExpiryDays(context.Background(), "wrong.local", []string{address}, true)
+	require.ErrorIs(t, err, ErrSSLValidation)
+	assert.ErrorContains(t, err, "certificate is valid for")
 }
 
 func TestValidateCertificateExtensive(t *testing.T) {
 	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 
 	target := DNSTask{
@@ -1942,30 +2543,44 @@ func TestValidateCertificateExtensive(t *testing.T) {
 }
 
 func TestResolveTargetExtensive(t *testing.T) {
-	app := &AppState{
-		Notifier:        &NotificationManager{TestMode: true},
-		activeResolvers: []string{"8.8.8.8"},
+	app := &AppState{activeResolvers: testResolvers(), DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		var answer string
+		switch query.Question[0].Qtype {
+		case dns.TypeA:
+			answer = "host.example. 60 IN A 192.0.2.10"
+		case dns.TypeCNAME:
+			answer = "host.example. 60 IN CNAME target.example."
+		case dns.TypeMX:
+			answer = "host.example. 60 IN MX 10 mail.example."
+		}
+		if answer != "" {
+			record, err := dns.NewRR(answer)
+			require.NoError(t, err)
+			response.Answer = []dns.RR{record}
+		}
+		return response, 0, nil
+	}}}
+	for _, tc := range []struct {
+		recordType string
+		want       []string
+	}{
+		{recordType: RecordTypeA, want: []string{"192.0.2.10"}},
+		{recordType: RecordTypeCNAME, want: []string{"target.example"}},
+		{recordType: RecordTypeMX, want: []string{"mail.example"}},
+	} {
+		t.Run(tc.recordType, func(t *testing.T) {
+			got, err := resolveTarget(context.Background(), app, DNSTask{Hostname: "host.example", Type: tc.recordType})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
 	}
-	target := DNSTask{
-		Hostname: "localhost",
-		Type:     "A",
-	}
-
-	ips, _ := resolveTarget(context.Background(), app, target)
-	_ = ips
-
-	target.Type = "CNAME"
-	ips, _ = resolveTarget(context.Background(), app, target)
-	_ = ips
-
-	target.Type = "MX"
-	ips, _ = resolveTarget(context.Background(), app, target)
-	_ = ips
 }
 
 func TestEvaluateCAAExtensive(t *testing.T) {
 	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{Domain: "example.com"}
 	_ = evaluateCAAForTest(context.Background(), app, target)
@@ -1973,7 +2588,7 @@ func TestEvaluateCAAExtensive(t *testing.T) {
 
 func TestValidateEmailSecurity(t *testing.T) {
 	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{Domain: "example.com"}
 	_ = evaluateEmailSecurityForTest(context.Background(), app, target)
@@ -2190,7 +2805,7 @@ func TestEvaluateEmailSecurity_MockedPaths(t *testing.T) {
 				return m, 0, nil
 			}
 			if qtype == dns.TypeTXT && normalized == "google._domainkey.example.com" {
-				m.Answer = append(m.Answer, &dns.TXT{Hdr: dns.RR_Header{Name: "google._domainkey.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300}, Txt: []string{"v=DKIM1; k=rsa; p=pubkey;"}})
+				m.Answer = append(m.Answer, &dns.TXT{Hdr: dns.RR_Header{Name: "google._domainkey.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300}, Txt: []string{"v=DKIM1; k=ed25519; p=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=;"}})
 				return m, 0, nil
 			}
 			return nil, 0, errors.New("mock error")
@@ -2260,4 +2875,287 @@ func evaluateCAAForTest(ctx context.Context, app *AppState, target DomainConfig)
 	res.Status = status
 	res.Condition = cond
 	return res
+}
+
+func TestHasUsableDKIMKey(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	require.NoError(t, err)
+	rsaDER, err := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
+	require.NoError(t, err)
+	for _, tt := range []struct {
+		record string
+		usable bool
+	}{
+		{"v=DKIM1; k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaDER), true},
+		{"v=DKIM1; k=ed25519; p=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", true},
+		{"v=DKIM1; k=rsa; p=QUJD", false},
+		{"v=DKIM1; p=", false},
+		{"v=DKIM1; note=incidental p=QUJD", false},
+		{"v=DKIM1; k=unknown; p=QUJD", false},
+		{"v=DKIM1; p=not-base64", false},
+		{"v=DKIM1; p=QUJD; p=REVG", false},
+	} {
+		assert.Equal(t, tt.usable, hasUsableDKIMKey(tt.record), tt.record)
+	}
+}
+
+func TestDMARCTransientFailureStopsParentDiscovery(t *testing.T) {
+	var dmarcQueries []string
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		name := q.Question[0].Name
+		if strings.HasPrefix(name, "_dmarc.") {
+			dmarcQueries = append(dmarcQueries, name)
+			return nil, 0, errors.New("temporary DNS failure")
+		}
+		response := new(dns.Msg)
+		response.SetReply(q)
+		return response, 0, nil
+	}}
+	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "sub.example.com", CheckEmailSecurity: true})
+	require.Error(t, snapshot.DMARCErr)
+	assert.Equal(t, []string{"_dmarc.sub.example.com."}, dmarcQueries)
+}
+
+func TestHasValidDMARCPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		record string
+		valid  bool
+	}{
+		{"v=DMARC1; p=reject; rua=mailto:dmarc@example.com", true},
+		{"v=DMARC1; p=none", true},
+		{"v=DMARC1; p=reject; sp=quarantine; np=none; psd=n", true},
+		{"v=DMARC1", false},
+		{"v=DMARC1; p=invalid", false},
+		{"v=DMARC1; p=reject; sp=invalid", false},
+		{"v=DMARC1; p=reject; np=invalid", false},
+		{"v=DMARC1; p=reject; psd=maybe", false},
+		{"v=DMARC1; p=reject; p=none", false},
+		{"note=v=DMARC1; p=reject", false},
+	} {
+		assert.Equal(t, tt.valid, hasValidDMARCPolicy(tt.record), tt.record)
+	}
+}
+
+func TestMalformedDMARCDoesNotInheritParentPolicy(t *testing.T) {
+	var dmarcQueries []string
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(q)
+		name := q.Question[0].Name
+		if strings.HasPrefix(name, "_dmarc.") {
+			dmarcQueries = append(dmarcQueries, name)
+			response.Answer = []dns.RR{&dns.TXT{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{"v=DMARC1; p=invalid"}}}
+		}
+		return response, 0, nil
+	}}
+	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "sub.example.com", CheckEmailSecurity: true})
+	require.ErrorContains(t, snapshot.DMARCErr, "invalid DMARC policy")
+	assert.Equal(t, []string{"_dmarc.sub.example.com."}, dmarcQueries)
+}
+
+func TestCAAClimbsOriginalNameAfterAlias(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	queried := make(map[string]bool)
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		name, qtype := q.Question[0].Name, q.Question[0].Qtype
+		queried[name] = true
+		response := new(dns.Msg)
+		response.SetReply(q)
+		var record string
+		switch {
+		case qtype == dns.TypeCNAME && name == "foo.example.com.":
+			record = "foo.example.com. IN CNAME bar.other.test."
+		case qtype == dns.TypeCAA && name == "other.test.":
+			record = "other.test. IN CAA 0 issue \"wrong.example\""
+		case qtype == dns.TypeCAA && name == "example.com.":
+			record = "example.com. IN CAA 0 issue \"right.example\""
+		}
+		if record != "" {
+			rr, err := dns.NewRR(record)
+			require.NoError(t, err)
+			response.Answer = []dns.RR{rr}
+		}
+		return response, 0, nil
+	}}
+	result, found := fetchCAA(context.Background(), app, "foo.example.com", app.Resolvers())
+	assert.True(t, found)
+	assert.Equal(t, []string{"right.example"}, result.Issue)
+	assert.False(t, queried["other.test."])
+}
+
+func TestCAAQueriesTLDAndRejectsUnknownCriticalTag(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(q)
+		if q.Question[0].Qtype == dns.TypeCAA && q.Question[0].Name == "com." {
+			record, err := dns.NewRR("com. IN CAA 128 future \"opaque\"")
+			require.NoError(t, err)
+			response.Answer = []dns.RR{record}
+		}
+		return response, 0, nil
+	}}
+	target := DomainConfig{Domain: "foo.example.com", CAA: &CAAConfig{}}
+	snapshot := FetchCAASnapshot(context.Background(), app, target)
+	assert.True(t, snapshot.Found)
+	assert.Equal(t, []string{"future"}, snapshot.Result.UnknownCriticalTags)
+	status, condition, _ := EvaluateCAA(target, snapshot)
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, CodeCAAQueryFailed, condition.Code)
+}
+
+func TestCAANoPolicyDiffersFromLookupError(t *testing.T) {
+	target := DomainConfig{Domain: "example.com", CAA: &CAAConfig{Issue: []string{"example-ca.com"}}}
+	status, condition, result := EvaluateCAA(target, CAASnapshot{})
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, CodeCAAMissingIssuer, condition.Code)
+	assert.Empty(t, result.Error)
+	status, condition, result = EvaluateCAA(target, CAASnapshot{Found: true, Result: CAAResult{Error: "DNS timeout"}})
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, CodeDNSLookupFailed, condition.Code)
+	assert.Equal(t, "DNS timeout", result.Error)
+}
+
+func TestDNSSECRejectsOversizedValidPrefix(t *testing.T) {
+	key := &dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET}, Flags: 257, Protocol: 3, Algorithm: dns.ED25519, PublicKey: "AQID"}
+	valid := `{"Status":0,"AD":true,"Question":[{"name":"example.com.","type":48}],"Answer":[{"name":"example.com.","type":48,"data":"257 3 15 AQID"}]}`
+	app := NewAppState(AppConfig{})
+	app.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(valid + strings.Repeat(" ", MaxNotificationPayloadSize)))}, nil
+	}}
+	assert.False(t, verifyDNSSECDoH(context.Background(), app, DefaultDoHURL, "example.com", "example.com.", key))
+}
+
+func TestPolicyTagsRejectMalformedFragments(t *testing.T) {
+	assert.False(t, hasValidDMARCPolicy("v=DMARC1; p=reject; broken"))
+}
+
+func FuzzEmailPolicyRecords(f *testing.F) {
+	for _, record := range []string{"", "v=DMARC1; p=reject", "v=DMARC1; p=reject; broken", "v=DKIM1; p=", "v=DKIM1; p=AA==; p=AA=="} {
+		f.Add(record)
+	}
+	f.Fuzz(func(_ *testing.T, record string) {
+		hasValidDMARCPolicy(record)
+		hasUsableDKIMKey(record)
+	})
+}
+
+func TestEmailUnavailableSelectorCannotHideBehindValidKey(t *testing.T) {
+	snapshot := EmailSnapshot{
+		MXRecords: []string{"mail.example.com"}, SPFRecords: []string{"v=spf1 -all"},
+		DMARCRecords: []string{"v=DMARC1; p=reject"},
+		DKIMResults:  map[string]bool{"good": true}, DKIMErrs: map[string]error{"other": errors.New("DNS timeout")},
+	}
+	target := DomainConfig{CheckEmailSecurity: true, DKIMSelectors: []string{"good", "other"}}
+	status, condition, state := EvaluateEmailSecurity(target, snapshot)
+	assert.Equal(t, StatusWarning, status)
+	require.NotNil(t, condition)
+	assert.Equal(t, CodeDNSLookupFailed, condition.Code)
+	assert.Equal(t, []string{"good"}, state.DKIMValid)
+}
+
+// TestLiveDNSSECMatrix compares monitor verdicts for signed, unsigned, and
+// deliberately broken zones. Confirm the expected outcomes independently with
+// delv before recording a release review; live DNS and DoH can change.
+func TestLiveDNSSECMatrix(t *testing.T) {
+	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
+		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external DNSSEC queries")
+	}
+	for _, test := range []struct {
+		domain string
+		status CheckStatus
+		code   ResultCode
+	}{
+		{domain: "cloudflare.com", status: StatusOK, code: CodeDNSSECVerified},
+		{domain: "google.com", status: StatusFailed, code: CodeDNSSECDisabled},
+		{domain: "dnssec-failed.org", status: StatusFailed, code: CodeDNSLookupFailed},
+	} {
+		t.Run(test.domain, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer cancel()
+			target := DomainConfig{Domain: test.domain, DNSSEC: true}
+			app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1", "8.8.8.8"}})
+			app.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+			status, condition, result := EvaluateDNSSEC(target, FetchDNSSECSnapshot(ctx, app, target))
+			t.Logf("status=%s condition=%v hasDS=%t hasDNSKEY=%t chainIntact=%t source=%s error=%q", status, condition, result.HasDS, result.HasDNSKEY, result.ChainIntact, result.Source, result.Error)
+			if status != test.status || condition == nil || condition.Code != test.code {
+				t.Fatalf("expected status=%s code=%s; got status=%s condition=%v", test.status, test.code, status, condition)
+			}
+		})
+	}
+}
+
+// TestLiveCAADiscoveryMatrix checks parent-policy and alias-policy discovery
+// against issuer sets observed with dig on the review date.
+func TestLiveCAADiscoveryMatrix(t *testing.T) {
+	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
+		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external CAA queries")
+	}
+	for _, test := range []struct {
+		domain string
+		issue  []string
+	}{
+		{domain: "www.cloudflare.com", issue: []string{"comodoca.com", "digicert.com", "letsencrypt.org", "pki.goog", "ssl.com"}},
+		{domain: "www.github.com", issue: []string{"digicert.com", "globalsign.com", "letsencrypt.org", "sectigo.com"}},
+	} {
+		t.Run(test.domain, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			target := DomainConfig{Domain: test.domain, CAA: &CAAConfig{Issue: test.issue}}
+			app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1", "8.8.8.8"}})
+			status, condition, result := EvaluateCAA(target, FetchCAASnapshot(ctx, app, target))
+			t.Logf("status=%s condition=%v issuers=%v error=%q", status, condition, result.Issue, result.Error)
+			if status != StatusOK || condition == nil || condition.Code != CodeCAAVerified {
+				t.Fatalf("expected verified CAA issuers %v; got status=%s condition=%v", test.issue, status, condition)
+			}
+		})
+	}
+}
+
+// TestLiveTLSFailureMatrix checks public certificate failure fixtures whose
+// failure classes are independently observable with openssl s_client.
+func TestLiveTLSFailureMatrix(t *testing.T) {
+	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
+		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external TLS queries")
+	}
+	for _, test := range []struct {
+		host   string
+		reason string
+		code   ResultCode
+	}{
+		{host: "wrong.host.badssl.com", reason: "certificate is valid for", code: CodeSSLValidationFailed},
+		{host: "untrusted-root.badssl.com", reason: "unknown authority", code: CodeSSLValidationFailed},
+		{host: "expired.badssl.com", reason: "outside its validity period", code: CodeSSLExpired},
+	} {
+		t.Run(test.host, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			days, err := checkSSLExpiryDays(ctx, test.host, nil, false)
+			status, condition := EvaluateSSL(DNSTask{Hostname: test.host, Type: RecordTypeA}, SSLSnapshot{ExpiryDays: days, Err: err})
+			t.Logf("status=%s condition=%v error=%v", status, condition, err)
+			if status != StatusFailed || condition == nil || condition.Code != test.code || err == nil || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("expected %q TLS validation failure", test.reason)
+			}
+		})
+	}
+}
+
+// TestLiveNullMX compares a public preference-zero null MX with direct dig
+// output. Other email policy records are evaluated by their own checks.
+func TestLiveNullMX(t *testing.T) {
+	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
+		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external MX queries")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	target := DomainConfig{Domain: "example.com", CheckEmailSecurity: true, MXRecords: []string{"."}}
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1", "8.8.8.8"}})
+	snapshot := FetchEmailSnapshot(ctx, app, target)
+	status, condition, state := EvaluateEmailSecurity(target, snapshot)
+	t.Logf("status=%s condition=%v mx=%v spf=%t dmarc=%t", status, condition, state.MX, state.SPF, state.DMARC)
+	if snapshot.MXErr != nil || !slices.Equal(snapshot.MXRecords, []string{"."}) || !slices.Equal(state.MX, []string{"."}) {
+		t.Fatalf("monitor did not preserve the public null MX: records=%v error=%v", snapshot.MXRecords, snapshot.MXErr)
+	}
 }

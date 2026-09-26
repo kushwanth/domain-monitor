@@ -11,6 +11,13 @@ import (
 
 // System & Default Paths and Files
 const (
+	MaxPendingAlerts           = 256
+	MaxAlertsPerFlush          = 32
+	CTStateVersion             = 1
+	MaxCTSeenIDs               = 1000
+	MaxCTScanPages             = 10
+	MaxCTPendingItems          = 256
+	MaxCTPendingBytes          = 1 << 20
 	DefaultConfigFile          = "config.json"
 	DefaultServerPort          = "8080"
 	DefaultDNSPort             = "53"
@@ -21,6 +28,7 @@ const (
 	DefaultUserAgent           = "DomainMonitor/1.0 (+https://github.com/domain-monitor)"
 	MaxBootstrapResponseSize   = 8 << 20  // 8 MB
 	MaxCTLogsResponseSize      = 16 << 20 // 16 MB
+	MaxCTHistoryFileSize       = 8 << 20  // 8 MB
 	MaxNotificationPayloadSize = 1 << 20  // 1 MB
 	MaxPricingResponseSize     = 5 << 20  // 5 MB
 )
@@ -34,6 +42,7 @@ const (
 	PricingMaxStaleAge          = 7 * 24 * time.Hour
 	DefaultWHOISTimeout         = 10 * time.Second
 	DefaultWHOISQueryTimeout    = 15 * time.Second
+	MaxWHOISResponseBytes       = 1 << 20
 	DefaultTCPKeepAlive         = 30 * time.Second
 	ShutdownTimeout             = 5 * time.Second
 	DefaultLoopDurationFallback = 6 * time.Hour
@@ -41,6 +50,20 @@ const (
 	CTLogsRateLimitInterval     = 5 * time.Second
 	DefaultReferralRDAPTimeout  = 6 * time.Second
 	DefaultAlertCooldown        = 24 * time.Hour
+)
+
+// WHOIS transport protocol and known server aliases.
+const (
+	WHOISPort              = "43"
+	WHOISIANAHost          = "whois.iana.org"
+	WHOISIANAReferralField = "refer"
+	WHOISIANAWHOISField    = "whois"
+	WHOISARINHost          = "whois.arin.net"
+	WHOISARINPrefix        = "n + "
+	WHOISGoDaddyAlias      = "whois.godaddy"
+	WHOISGoDaddyHost       = "whois.godaddy.com"
+	WHOISPorkbunAlias      = "porkbun.com/whois"
+	WHOISPorkbunHost       = "whois.porkbun.com"
 )
 
 // System Thresholds & Limits
@@ -58,6 +81,10 @@ const (
 	MaxCTCertHistory                  = 1000
 	MaxBodyDrainSize                  = 4096
 	MaxAlertMessageRunes              = 1000
+	MaxProviderMessageBytes           = 3500
+	MaxTelegramAlertRunes             = 400
+	MaxAlertNameRunes                 = 80
+	AlertTruncationNotice             = " [truncated; see local state]"
 	MaxSSLDaysSentinel                = 999999
 	HoursPerDay                       = 24
 	DirPermDefault                    = 0750
@@ -75,7 +102,7 @@ const (
 	EnvNtfyAuth       = "NTFY_AUTH"
 	EnvTelegramToken  = "TELEGRAM_TOKEN"
 	EnvTelegramChatID = "TELEGRAM_CHAT_ID"
-	EnvCTLogsAPIKey   = "CTLOGS_API_KEY"
+	EnvCTLogsAPIKey   = "CTLOGS_API_KEY" // #nosec G101 -- environment variable name, not a credential.
 )
 
 // HTTP Constants
@@ -113,8 +140,8 @@ const (
 
 	RedactedDomainPlaceholder = "[Hidden Domain]"
 	RedactedAuthPlaceholder   = "[REDACTED_AUTH]"
-	RedactedTokenPlaceholder  = "[REDACTED_TELEGRAM_TOKEN]"
-	RedactedAPIKeyPlaceholder = "[REDACTED_API_KEY]"
+	RedactedTokenPlaceholder  = "[REDACTED_TELEGRAM_TOKEN]" // #nosec G101 -- redaction marker, not a credential.
+	RedactedAPIKeyPlaceholder = "[REDACTED_API_KEY]"        // #nosec G101 -- redaction marker, not a credential.
 	DefaultUnknownCA          = "Unknown CA"
 	NotificationAlertTitle    = "Domain Monitor Alert"
 
@@ -172,17 +199,25 @@ const (
 	CAATagIssue     = "issue"
 	CAATagIssueWild = "issuewild"
 	CAATagIssueMail = "issuemail"
+	CAACriticalFlag = 0x80
 	CAATagIODEF     = "iodef"
 	CAADenyAll      = ";"
 )
 
 // Email Security & Protocol Sentinels
 const (
-	SPFPrefix        = "v=spf1"
-	DMARCPrefix      = "v=dmarc1"
-	DKIMPrefix       = "v=dkim1"
-	DKIMPublicKeyTag = "p="
-	NullMXRecord     = "."
+	SPFPrefix             = "v=spf1"
+	DMARCPrefix           = "v=dmarc1"
+	DKIMPrefix            = "v=dkim1"
+	DNSPolicyTagVersion   = "v"
+	DNSPolicyTagPublicKey = "p"
+	DKIMTagKeyType        = "k"
+	DKIMKeyTypeRSA        = "rsa"
+	DKIMKeyTypeEd25519    = "ed25519"
+	DMARCPolicyNone       = "none"
+	DMARCPolicyQuarantine = "quarantine"
+	DMARCPolicyReject     = "reject"
+	NullMXRecord          = "."
 )
 
 // DNSSEC Source Constants
@@ -201,6 +236,10 @@ const (
 	ProtocolWHOISFailed = "whois_failed"
 	ProtocolHybrid      = "hybrid"
 	ProtocolTCP         = "tcp"
+	WHOISDNSSECSigned   = "signed"
+	WHOISDNSSECYes      = "yes"
+	WHOISDNSSECActive   = "active"
+	WHOISDNSSECTrue     = "true"
 )
 
 // RDAP & WHOIS Data Sources
@@ -240,23 +279,27 @@ const (
 )
 
 const (
-	StatusPending  CheckStatus = "pending"
-	StatusOK       CheckStatus = "ok"
-	StatusFailed   CheckStatus = "failed"
-	StatusMismatch CheckStatus = "mismatch"
-	StatusWarning  CheckStatus = "warning"
-	StatusHijacked CheckStatus = "hijacked"
+	StatusUnknown CheckStatus = iota
+	StatusPending
+	StatusOK
+	StatusFailed
+	StatusMismatch
+	StatusWarning
+	StatusHijacked
 )
 
 const (
-	PriorityUrgent  AlertPriority = "urgent"
-	PriorityHigh    AlertPriority = "high"
-	PriorityWarning AlertPriority = "warning"
-	PriorityDefault AlertPriority = "default"
+	PriorityDefault AlertPriority = iota
+	PriorityWarning
+	PriorityHigh
+	PriorityUrgent
 )
 
+var checkStatusNames = [...]string{"", "pending", "ok", "failed", "mismatch", "warning", "hijacked"}
+var alertPriorityNames = [...]string{"default", "warning", "high", "urgent"}
+
 // ResultCode represents a typed, zero-allocation condition code for protocol-level evaluator verdicts.
-type ResultCode int
+type ResultCode int16
 
 const (
 	CodeNone ResultCode = iota
@@ -274,6 +317,7 @@ const (
 	CodeEPPInactive
 	CodeRDAPExpired
 	CodeRDAPExpiringSoon
+	CodeRDAPExpiryUnavailable
 	CodeRDAPRegistrarMismatch
 	CodeRDAPTransferUnlocked
 	CodeRDAPSuspended
@@ -333,6 +377,8 @@ const (
 	CodeCTLogsVerified
 	CodeCTLogsRateLimited
 	CodeCTLogsHTTPError
+	CodeCTPersistenceFailed
+	CodeCTCoverageIncomplete
 
 	// SSL
 	CodeSSLVerified
@@ -344,6 +390,8 @@ const (
 	// App-level
 	CodeCheckTimeout
 	CodeCheckPanic
+	// Append new codes here to preserve existing numeric values in published state.
+	CodeEmailInvalidNullMX
 )
 
 // resultCodeNames maps each ResultCode to its camelCase JSON string representation.
@@ -363,6 +411,7 @@ var resultCodeNames = [...]string{
 	CodeEPPInactive:           "inactive",
 	CodeRDAPExpired:           "rdapExpired",
 	CodeRDAPExpiringSoon:      "rdapExpiringSoon",
+	CodeRDAPExpiryUnavailable: "rdapExpiryUnavailable",
 	CodeRDAPRegistrarMismatch: "rdapRegistrarMismatch",
 	CodeRDAPTransferUnlocked:  "rdapTransferUnlocked",
 	CodeRDAPSuspended:         "rdapSuspended",
@@ -389,6 +438,7 @@ var resultCodeNames = [...]string{
 	CodeEmailVerified:       "emailVerified",
 	CodeEmailMissingMX:      "emailMissingMx",
 	CodeEmailUnauthorizedMX: "emailUnauthorizedMx",
+	CodeEmailInvalidNullMX:  "emailInvalidNullMx",
 	CodeEmailHijackedMX:     "emailHijackedMx",
 	CodeEmailMissingSPF:     "emailMissingSpf",
 	CodeEmailMultipleSPF:    "emailMultipleSpf",
@@ -419,9 +469,11 @@ var resultCodeNames = [...]string{
 	CodeCAAMissingIssuer:    "caaMissingIssuer",
 
 	// CT Logs
-	CodeCTLogsVerified:    "ctLogsVerified",
-	CodeCTLogsRateLimited: "ctLogsRateLimited",
-	CodeCTLogsHTTPError:   "ctLogsHttpError",
+	CodeCTLogsVerified:       "ctLogsVerified",
+	CodeCTLogsRateLimited:    "ctLogsRateLimited",
+	CodeCTLogsHTTPError:      "ctLogsHttpError",
+	CodeCTPersistenceFailed:  "ctPersistenceFailed",
+	CodeCTCoverageIncomplete: "ctCoverageIncomplete",
 
 	// SSL
 	CodeSSLVerified:         "sslVerified",
@@ -461,6 +513,7 @@ var (
 	ErrDomainNotFound         = errors.New("domain not found in whois (404)")
 	ErrNoResolvers            = errors.New("no resolvers configured")
 	ErrEmptyDNSResponse       = errors.New("empty dns response")
+	ErrInvalidNullMX          = errors.New("invalid null MX record")
 	ErrNoPeerCertificates     = errors.New("no peer certificates returned")
 	ErrRestrictedIP           = errors.New("connection to restricted IP blocked (SSRF)")
 	ErrBootstrapClientNil     = errors.New("bootstrap client is nil")
@@ -480,6 +533,65 @@ var DNSTypeMap = map[string]uint16{
 	RecordTypeTXT:   dns.TypeTXT,
 	RecordTypeCAA:   dns.TypeCAA,
 	RecordTypeNS:    dns.TypeNS,
+}
+
+// Compact domain statuses from RFC 5731, RGP (RFC 3915), and generic RDAP evidence.
+const (
+	EPPUnknown EPPCode = iota
+	EPPOK
+	EPPInactive
+	EPPClientHold
+	EPPServerHold
+	EPPClientTransferProhibited
+	EPPServerTransferProhibited
+	EPPClientDeleteProhibited
+	EPPServerDeleteProhibited
+	EPPClientUpdateProhibited
+	EPPServerUpdateProhibited
+	EPPClientRenewProhibited
+	EPPServerRenewProhibited
+	EPPPendingCreate
+	EPPPendingDelete
+	EPPPendingRenew
+	EPPPendingTransfer
+	EPPPendingUpdate
+	EPPRedemptionPeriod
+	EPPPendingRestore
+	EPPAddPeriod
+	EPPAutoRenewPeriod
+	EPPRenewPeriod
+	EPPTransferPeriod
+	EPPTransferProhibited
+	EPPHold
+)
+
+var eppCodeKeys = [...]string{
+	EPPUnknown:                  "",
+	EPPOK:                       "ok",
+	EPPInactive:                 "inactive",
+	EPPClientHold:               "clienthold",
+	EPPServerHold:               "serverhold",
+	EPPClientTransferProhibited: "clienttransferprohibited",
+	EPPServerTransferProhibited: "servertransferprohibited",
+	EPPClientDeleteProhibited:   "clientdeleteprohibited",
+	EPPServerDeleteProhibited:   "serverdeleteprohibited",
+	EPPClientUpdateProhibited:   "clientupdateprohibited",
+	EPPServerUpdateProhibited:   "serverupdateprohibited",
+	EPPClientRenewProhibited:    "clientrenewprohibited",
+	EPPServerRenewProhibited:    "serverrenewprohibited",
+	EPPPendingCreate:            "pendingcreate",
+	EPPPendingDelete:            "pendingdelete",
+	EPPPendingRenew:             "pendingrenew",
+	EPPPendingTransfer:          "pendingtransfer",
+	EPPPendingUpdate:            "pendingupdate",
+	EPPRedemptionPeriod:         "redemptionperiod",
+	EPPPendingRestore:           "pendingrestore",
+	EPPAddPeriod:                "addperiod",
+	EPPAutoRenewPeriod:          "autorenewperiod",
+	EPPRenewPeriod:              "renewperiod",
+	EPPTransferPeriod:           "transferperiod",
+	EPPTransferProhibited:       "transferprohibited",
+	EPPHold:                     "hold",
 }
 
 // EPPStatusMap maps raw or formatted EPP/RDAP tokens to canonical camelCase strings.
@@ -506,6 +618,7 @@ var EPPStatusMap = map[string]string{
 	"pendingtransfer":          "pendingTransfer",
 	"pendingupdate":            "pendingUpdate",
 	"redemptionperiod":         "redemptionPeriod",
+	"addperiod":                "addPeriod",
 	"autorenewperiod":          "autoRenewPeriod",
 	"renewperiod":              "renewPeriod",
 	"transferperiod":           "transferPeriod",
@@ -589,7 +702,7 @@ var (
 	ReValidDomain    = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 	ValidDomainRegex = ReValidDomain
 
-	ReWHOISReferral  = regexp.MustCompile(`(?m)^(?i)\s*(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)\s*:\s*(?:whois:\/\/)?([a-zA-Z0-9.-]+)`)
+	ReWHOISReferral  = regexp.MustCompile(`(?im)^[ \t]*(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)[ \t]*:[ \t]*(?:whois:\/\/)?([a-zA-Z0-9.-]+)(?::43)?[ \t]*$`)
 	ReWHOISExpiry    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\]?)\s*[:\]]\s*([^\r\n]+)`)
 	ReWHOISCreated   = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Creation Date|Created on|Created|Registration Date|created|registered|created-date|Registered Date|Connected Date)\]?)\s*[:\]]\s*([^\r\n]+)`)
 	ReWHOISUpdated   = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Updated Date|Last Updated Date|Last Modified|changed|modified|updated-date|Last Update)\]?)\s*[:\]]\s*([^\r\n]+)`)
@@ -861,16 +974,20 @@ const (
 	MsgLogStartup          = "Daemon initialized successfully. Domains: %d, DNS Records: %d"
 	MsgLogHTTPAPI          = "HTTP API running on :%s (Endpoints: /health, /api/state, /api/certs)"
 	MsgLogTelegramConfig   = "Telegram notifications configured."
+	MsgLogTelegramDisabled = "Telegram disabled: token and chat ID must both be configured."
 	MsgLogShutdownSignal   = "Received signal: %v. Initiating graceful shutdown..."
 	MsgLogShutdownComplete = "Daemon shutdown complete."
 
 	// Internal Operational Logs
-	MsgLogNtfyRequestFailed     = "Ntfy request creation failed"
-	MsgLogNtfyDeliveryFailed    = "Ntfy delivery failed"
-	MsgLogNtfyRequestError      = "Ntfy request error"
-	MsgErrTelegramChatIDMissing = "telegram chat_id is missing, cannot send notifications"
-	MsgErrTelegramTokenMissing  = "telegram token is missing, cannot send notifications"
-	MsgErrNoProvidersConfigured = "no notification providers configured"
+	MsgLogNtfyRequestFailed            = "Ntfy request creation failed"
+	MsgLogNtfyDeliveryFailed           = "Ntfy delivery failed"
+	MsgLogNtfyRequestError             = "Ntfy request error"
+	MsgLogNotificationClientMissing    = "Notification HTTP client is not configured"
+	MsgLogNotificationDeliveryDeferred = "Notification delivery deferred"
+	MsgLogNotificationBacklogFull      = "Notification backlog full; deferring alert until the next cycle"
+	MsgErrTelegramChatIDMissing        = "telegram chat_id is missing, cannot send notifications"
+	MsgErrTelegramTokenMissing         = "telegram token is missing, cannot send notifications"
+	MsgErrNoProvidersConfigured        = "no notification providers configured"
 
 	MsgErrDotSweepFetchFailed        = "dotsweep pricing request failed"
 	MsgErrDotSweepParseError         = "dotsweep json parse error"
@@ -881,46 +998,54 @@ const (
 	MsgErrDomainNegativeRenewalPrice = "domain %s: renewal_price cannot be negative"
 	MsgErrNoTierData                 = "no registry or registrar tier data available"
 
-	MsgLogTelegramMarshalFailed      = "Telegram payload marshal failed"
-	MsgLogTelegramRequestFailed      = "Telegram request creation failed"
-	MsgLogTelegramDeliveryFailed     = "Telegram delivery failed"
-	MsgLogTelegramRequestError       = "Telegram request error"
-	MsgLogRDAPRefreshFailed          = "Failed to refresh RDAP bootstrap from IANA; falling back to cached registry"
-	MsgLogWHOISPanicked              = "WHOIS query panicked"
-	MsgLogRDAPReturned404            = "RDAP returned 404, attempting WHOIS fallback"
-	MsgLogRDAPRateLimited            = "RDAP rate limited, falling back to WHOIS"
-	MsgLogWHOISRateLimitedRetry      = "WHOIS query rate limited, retrying"
-	MsgLogWHOISUnregistered          = "WHOIS reports domain is unregistered (404)"
-	MsgLogSkippingUnsafeRDAP         = "Skipping unsafe RDAP referral URL"
-	MsgLogQueryingRegistrarRDAP      = "Querying registrar RDAP link"
-	MsgLogRateLimitedRegistrarRDAP   = "Rate limited by registrar RDAP"
-	MsgLogFollowingWHOISReferral     = "Following WHOIS referral"
-	MsgLogLoopIntervalBelowMin       = "loop_interval_days is below minimum (0.125 days / 3 hours); defaulting to 0.125"
-	MsgLogLoopIntervalAboveMax       = "loop_interval_days exceeds maximum (365 days); defaulting to 365"
-	MsgLogResolverUnreachable        = "Configured resolver unreachable during health check"
-	MsgLogReadCTLogFailed            = "Failed to read CT log history file"
-	MsgLogHTTPServerFailed           = "HTTP server failed"
-	MsgLogStateTransition            = "State transition"
-	MsgLogPanicDNSWorker             = "Recovered from unexpected panic in DNS check worker"
-	MsgLogPanicDomainWorker          = "Recovered from unexpected panic in Domain check worker"
-	MsgLogPanicRDAP                  = "Recovered from unexpected panic in RDAP evaluation"
-	MsgLogPanicCTLogs                = "Recovered from unexpected panic in CT logs evaluation"
-	MsgLogWriteCTStateFailed         = "Failed to write ct_state.json"
-	MsgLogMonitoringCycleCompleted   = "Monitoring cycle completed"
-	MsgLogConfigError                = "Configuration error"
-	MsgLogInitError                  = "Initialization error"
-	MsgLogDataDirEnsureFailed        = "Failed to ensure data directory exists (ensure directory is writable by UID 65532 or use :U volume mount)"
-	MsgLogCTLogsDirEnsureFailed      = "Failed to ensure ct_logs directory exists (ensure directory is writable by UID 65532 or use :U volume mount)"
-	MsgLogParseCTStateFailed         = "Failed to parse ct_state.json"
-	MsgLogHTTPServerStopped          = "HTTP server stopped unexpectedly"
-	MsgLogMonitoringEngineStopped    = "Monitoring engine stopped unexpectedly"
-	MsgLogMonitoringEngineTimeout    = "Monitoring engine shutdown timed out"
-	MsgLogCTLogsPollingFailed        = "CT logs polling failed"
-	MsgLogDiscoveredNewCerts         = "Discovered new SSL certificates via CT logs"
-	MsgLogSaveCTLogsFailed           = "Failed to save CT logs history"
-	MsgLogCTLogsBackfillFailed       = "CT logs backfill failed"
-	MsgLogSaveBackfilledCTLogsFailed = "Failed to save backfilled CT logs"
-	MsgLogUnmarshalCTLogFailed       = "Failed to unmarshal existing CT log history; continuing with empty list"
+	MsgLogTelegramMarshalFailed           = "Telegram payload marshal failed"
+	MsgLogTelegramRequestFailed           = "Telegram request creation failed"
+	MsgLogTelegramDeliveryFailed          = "Telegram delivery failed"
+	MsgLogTelegramRequestError            = "Telegram request error"
+	MsgLogTelegramPayloadTooLarge         = "Telegram alert exceeds provider message budget"
+	MsgLogTelegramRejected                = "Telegram rejected notification"
+	MsgLogRDAPRefreshFailed               = "Failed to refresh RDAP bootstrap from IANA; falling back to cached registry"
+	MsgLogWHOISPanicked                   = "WHOIS query panicked"
+	MsgLogRDAPReturned404                 = "RDAP returned 404, attempting WHOIS fallback"
+	MsgLogRDAPRateLimited                 = "RDAP rate limited, falling back to WHOIS"
+	MsgLogWHOISRateLimitedRetry           = "WHOIS query rate limited, retrying"
+	MsgLogWHOISUnregistered               = "WHOIS reports domain is unregistered (404)"
+	MsgLogSkippingUnsafeRDAP              = "Skipping unsafe RDAP referral URL"
+	MsgLogQueryingRegistrarRDAP           = "Querying registrar RDAP link"
+	MsgLogRegistrarReferralInvalid        = "Registrar RDAP referral could not be read"
+	MsgLogRateLimitedRegistrarRDAP        = "Rate limited by registrar RDAP"
+	MsgLogFollowingWHOISReferral          = "Following WHOIS referral"
+	MsgLogLoopIntervalBelowMin            = "loop_interval_days is below minimum (0.125 days / 3 hours); defaulting to 0.125"
+	MsgLogLoopIntervalAboveMax            = "loop_interval_days exceeds maximum (365 days); defaulting to 365"
+	MsgLogResolverUnreachable             = "Configured resolver unreachable during health check"
+	MsgLogReadCTLogFailed                 = "Failed to read CT log history file"
+	MsgLogHTTPServerFailed                = "HTTP server failed"
+	MsgLogStateTransition                 = "State transition"
+	MsgLogPanicDNSWorker                  = "Recovered from unexpected panic in DNS check worker"
+	MsgLogPanicDomainWorker               = "Recovered from unexpected panic in Domain check worker"
+	MsgLogPanicRDAP                       = "Recovered from unexpected panic in RDAP evaluation"
+	MsgLogPanicCTLogs                     = "Recovered from unexpected panic in CT logs evaluation"
+	MsgLogWriteCTStateFailed              = "Failed to write ct_state.json"
+	MsgLogStateMarshalFailed              = "Failed to encode monitoring state"
+	MsgLogCTAcknowledgementPending        = "CT notification acknowledgement remains pending"
+	MsgLogMonitoringCycleCompleted        = "Monitoring cycle completed"
+	MsgLogConfigError                     = "Configuration error"
+	MsgLogInitError                       = "Initialization error"
+	MsgLogDataDirEnsureFailed             = "Failed to ensure data directory exists (ensure directory is writable by UID 65532 or use :U volume mount)"
+	MsgLogCTLogsDirEnsureFailed           = "Failed to ensure ct_logs directory exists (ensure directory is writable by UID 65532 or use :U volume mount)"
+	MsgLogParseCTStateFailed              = "Failed to parse ct_state.json"
+	MsgLogHTTPServerStopped               = "HTTP server stopped unexpectedly"
+	MsgLogMonitoringEngineStopped         = "Monitoring engine stopped unexpectedly"
+	MsgLogApplicationFailed               = "Application stopped with an error"
+	MsgLogMonitoringEngineTimeout         = "Monitoring engine shutdown timed out"
+	MsgErrMonitoringEngineExited          = "stopped before shutdown"
+	MsgErrMonitoringEngineShutdownTimeout = "did not finish within shutdown budget"
+	MsgLogCTLogsPollingFailed             = "CT logs polling failed"
+	MsgLogDiscoveredNewCerts              = "Discovered new SSL certificates via CT logs"
+	MsgLogSaveCTLogsFailed                = "Failed to save CT logs history"
+	MsgLogCTLogsBackfillFailed            = "CT logs backfill failed"
+	MsgLogSaveBackfilledCTLogsFailed      = "Failed to save backfilled CT logs"
+	MsgLogUnmarshalCTLogFailed            = "Failed to unmarshal existing CT log history; continuing with empty list"
 )
 
 // Extracted Constants
@@ -940,6 +1065,7 @@ const (
 	RouteAPICerts          = "GET /api/certs"
 	RouteAPICTLogs         = "GET /api/ctlogs/{domain}"
 	ParamDomain            = "domain"
+	RDAPObjectClassDomain  = "domain"
 	ParamName              = "name"
 	ParamType              = "type"
 	ParamDO                = "do"
@@ -959,6 +1085,7 @@ const (
 	FieldOperation         = "operation"
 	FieldPath              = "path"
 	FieldCount             = "count"
+	FieldBytes             = "bytes"
 	FieldStatus            = "status"
 	FieldResponse          = "response"
 	FieldResolver          = "resolver"
@@ -1028,6 +1155,10 @@ const (
 	CheckTypeRDAP          = "RDAP"
 	CheckTypeDNS           = "DNS"
 	CheckTypeEmail         = "Email"
+	CheckTypeCAA           = "CAA"
+	CheckTypeDNSSEC        = "DNSSEC"
+	CheckTypeNSHealth      = "NSHealth"
+	CheckTypeCTLogs        = "CTLogs"
 	TargetKeyDomain        = "domain"
 	TargetKeyRecord        = "record"
 	FlagConfig             = "config"
@@ -1038,14 +1169,19 @@ const (
 
 // Notification Formatting & Delimiters
 const (
-	TelegramAlertHeader     = "⚠️ <b>Domain Monitor Alerts</b>\n\n"
-	TelegramAlertHeaderCont = "⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n"
-	TelegramBullet          = "• "
-	TelegramPrefixFormat    = "<b>[%s]</b> "
-	TelegramLineFormat      = "• %s%s\n"
-	NtfyPrefixFormat        = "[%s] "
-	TagSeparator            = ","
-	AlertChunkSeparator     = "\n\n"
+	AlertConditionFormat         = "%s %s: %s %s (Since: %s)"
+	AlertConditionRedactedFormat = "%s %s: %s (Since: %s)"
+	AlertCTIdentityPrefix        = "CT:"
+	AlertNewCertificatePrefix    = "New Cert Issued: "
+	AlertNewCertificateRedacted  = "New Cert Issued"
+	TelegramAlertHeader          = "⚠️ <b>Domain Monitor Alerts</b>\n\n"
+	TelegramAlertHeaderCont      = "⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n"
+	TelegramBullet               = "• "
+	TelegramPrefixFormat         = "<b>[%s]</b> "
+	TelegramLineFormat           = "• %s%s\n"
+	NtfyPrefixFormat             = "[%s] "
+	TagSeparator                 = ","
+	AlertChunkSeparator          = "\n\n"
 )
 
 // Logging Formats
@@ -1074,6 +1210,7 @@ const (
 // Worker, Network & Internal Error Messages
 const (
 	MsgErrInternalDNSCheckPanic              = "internal check panic: %s"
+	MsgErrDomainCheckPanic                   = "domain check panicked: %s"
 	MsgErrInternalRDAPCheckPanic             = "internal rdap check panic: %s"
 	MsgErrInternalCTLogsPanic                = "internal ct logs panic: %s"
 	MsgErrCheckTimeoutOrCanceled             = "check timed out or canceled"
@@ -1132,6 +1269,7 @@ const (
 	MsgErrExpectedNotValidIPv6               = "dns record %s (%s): expected %s is not a valid IPv6 address for type AAAA"
 	MsgErrExpectedNotValidIP                 = "dns record %s (%s): expected %s is not a valid IPv4 or IPv6 address for composite type IP"
 	MsgErrNtfyURLMandatory                   = "cannot initialize dependencies: notifications.ntfy.url is mandatory (primary notification mechanism)"
+	MsgErrNtfyURLRequired                    = "ntfy and its URL are required"
 	MsgErrFailedCreateNtfyRequest            = "failed to create ntfy request"
 	MsgErrNtfyURLUnreachable                 = "ntfy URL provided is unreachable"
 	MsgErrAllResolversFailed                 = "all configured resolvers failed health checks"
@@ -1160,6 +1298,9 @@ const (
 	MsgErrDNSSECUpstreamChainBroken          = "Upstream validating resolver returned AD=false (chain broken)"
 	MsgErrDNSSECValidationFailed             = "DNSSEC Validation Failed"
 	MsgErrValidateDNSSECNil                  = "validateDNSSEC returned nil"
+	MsgErrDNSSECResolverNotConfigured        = "DNSSEC resolver is not configured"
+	MsgErrTLSCheckerNotConfigured            = "TLS checker is not configured for %s"
+	MsgErrPricingHTTPClientNotConfigured     = "fetch DotSweep pricing: HTTP client is not configured"
 	MsgErrSPFLookupError                     = "SPF lookup error: %s"
 	MsgErrDMARCLookupError                   = "DMARC lookup error: %s"
 	MsgErrDKIMLookupError                    = "DKIM lookup error: %s"

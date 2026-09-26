@@ -533,6 +533,12 @@
         gap: 8px;
       }
 
+      .domain-header-domains .domain-header-right {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        flex-shrink: 1;
+      }
+
       .domain-details {
         grid-template-columns: 1fr;
       }
@@ -632,6 +638,7 @@
     let currentFilter = 'all';
     let pollInterval = null;
     let appState = {};
+    let connectionError = false;
     let searchQuery = '';
     let currentPage = 1;
     const itemsPerPage = 50;
@@ -716,7 +723,8 @@
     // Theme initialization with localStorage persistence and query param support
     const urlParams = new URLSearchParams(window.location.search);
     const paramTheme = urlParams.get('theme');
-    const savedTheme = localStorage.getItem('theme');
+    let savedTheme = '';
+    try { savedTheme = localStorage.getItem('theme') || ''; } catch (e) { }
     if (paramTheme === 'dark' || paramTheme === 'light') {
       document.documentElement.setAttribute('data-theme', paramTheme);
     } else if (savedTheme) {
@@ -861,6 +869,10 @@
     function updateHeaderTimestamps() {
       const el = document.getElementById('last-updated');
       if (!el) return;
+      if (connectionError) {
+        el.textContent = appState.last_updated ? 'Connection lost — showing last received state' : 'Connection lost — waiting for state';
+        return;
+      }
       if (appState.last_updated) {
         const updatedDate = formatUserTzDate(appState.last_updated);
         let txt = `Last Updated: ${escapeHTML(updatedDate)}`;
@@ -877,15 +889,18 @@
     function updateRenewalPricing() {
       if (!appState || !appState.rdap_checks) return;
       let total = 0;
+      let unknown = 0;
       Object.values(appState.rdap_checks).forEach(c => {
-        if (c && c.renewal_price) total += c.renewal_price;
+        if (!c || c.allow_expiry) return;
+        if (c.renewal_price > 0) total += c.renewal_price;
+        else unknown++;
       });
       const el = document.getElementById('total-renewal-cost');
-      if (el) el.innerText = total.toFixed(2);
+      if (el) el.innerText = unknown > 0 ? `${total.toFixed(2)} (partial; ${unknown} unknown)` : total.toFixed(2);
       
       const container = document.getElementById('renewal-pricing');
       if (container) {
-        if (total > 0) {
+        if (total > 0 || unknown > 0) {
           container.style.display = 'block';
         } else {
           container.style.display = 'none';
@@ -896,13 +911,12 @@
     async function pollState() {
       try {
         const res = await fetch('/api/state');
-        if (!res.ok) return;
+        if (!res.ok) throw new Error(`State request failed: ${res.status}`);
         const data = await res.json();
+        connectionError = false;
         if (data && data.status !== 'initializing' && data.last_updated) {
-          const wasInitial = !appState.last_updated;
           if (data.last_updated !== appState.last_updated) {
             appState = data;
-            updateHeaderTimestamps();
             updateRenewalPricing();
             updateNavVisibility();
             if (currentView === 'domains') {
@@ -915,13 +929,13 @@
               renderNSHealth();
             }
           }
-          if (wasInitial && pollInterval) {
-            clearInterval(pollInterval);
-            pollInterval = setInterval(pollState, 15000);
-          }
         }
+        updateHeaderTimestamps();
       } catch (err) {
-        // Retry silently on next cycle
+        connectionError = true;
+        updateHeaderTimestamps();
+      } finally {
+        pollInterval = setTimeout(pollState, appState.last_updated ? 15000 : 2500);
       }
     }
 
@@ -1002,9 +1016,6 @@
         }
       });
 
-      // Set live polling
-      if (pollInterval) clearInterval(pollInterval);
-      pollInterval = setInterval(pollState, appState.last_updated ? 15000 : 2500);
     }
 
     function escapeHTML(str) {
@@ -1039,6 +1050,14 @@
       return escapeHTML(val);
     }
 
+    function aggregateDomainStatus(states) {
+      const statuses = states.map(state => state && state.status).filter(Boolean);
+      if (statuses.some(status => ['failed', 'mismatch', 'hijacked'].includes(status))) return 'error';
+      if (statuses.some(status => status === 'warning')) return 'warning';
+      if (statuses.length === 0 || statuses.some(status => status === 'pending')) return 'unknown';
+      return 'ok';
+    }
+
     function renderDomains() {
       const container = document.getElementById('view-domains');
       const previouslyOpen = new Set();
@@ -1052,6 +1071,7 @@
       const emailChecks = appState.email_checks || {};
       const caaChecks = appState.caa_checks || {};
       const dnssecChecks = appState.dnssec_checks || {};
+      const ctChecks = appState.ct_logs || {};
       const nsHealthChecks = appState.ns_health || appState.ns_health_checks || {};
 
       let allDomains = new Set(Object.keys(rdapChecks));
@@ -1090,13 +1110,14 @@
         const dnssecState = dnssecChecks[domain] || {};
         const caaState = caaChecks[domain] || {};
         const nsHealthState = nsHealthChecks[domain] || {};
+        const ctState = ctChecks[domain] || {};
 
         let statusClass = 'ok';
         let statusText = 'Healthy';
         let isExpiring = false;
 
         if (rdapState.status && rdapState.status !== "pending") {
-          if (rdapState.expiration) {
+          if (rdapState.expiration && !rdapState.allow_expiry) {
             const expDate = new Date(rdapState.expiration);
             const daysLeft = Math.ceil((expDate - new Date()) / (1000 * 60 * 60 * 24));
             if (daysLeft <= 30) {
@@ -1156,26 +1177,18 @@
         if (caaState.valid === false) badges.push({ label: 'caa_invalid', cls: 'warning' });
         if (caaState.unknown_cas && caaState.unknown_cas.length > 0) badges.push({ label: 'caa_unauthorized_ca', cls: 'warning' });
 
-        if (badges.length > 0) {
-          if (badges.some(b => b.cls === 'error')) {
-            statusClass = 'error';
-          } else {
-            statusClass = 'warning';
-          }
-        } else if (rdapState.status === 'pending') {
-          statusClass = 'unknown';
-        }
-
-        if (rdapState.allow_expiry) {
-          statusClass = 'unknown';
-          statusText = 'Let Go';
-          badges = [{ label: 'allow_expiry', cls: 'warning' }];
-        }
+        const checkStates = [rdapState, emailState, dnssecState, caaState, nsHealthState, ctState];
+        statusClass = aggregateDomainStatus(checkStates);
+        statusText = statusClass === 'error' ? 'Issue Detected' : statusClass === 'warning' ? 'Warning' : statusClass === 'unknown' ? 'Pending' : 'Healthy';
+        if (rdapState.allow_expiry) badges.push({ label: 'allow_expiry', cls: 'warning' });
+        if (emailState.status === 'failed' || emailState.status === 'hijacked') badges.push({ label: 'email_security_issue', cls: 'error' });
+        if (ctState.status === 'failed') badges.push({ label: 'ct_lookup_failed', cls: 'error' });
+        if (ctState.status === 'warning') badges.push({ label: 'ct_coverage_warning', cls: 'warning' });
 
         let labelsHtml = '';
         if (badges.length > 0) {
           labelsHtml = badges.map(b => `<span class="badge ${b.cls}">${b.label}</span>`).join('');
-        } else if (rdapState.status === 'pending' || statusClass === 'unknown') {
+        } else if (statusClass === 'unknown') {
           labelsHtml = `<span class="badge" style="color: var(--text-muted); background: var(--border);">pending</span>`;
         } else {
           labelsHtml = `<span class="badge success">healthy</span>`;
@@ -1290,10 +1303,16 @@
             </div>`;
         }
 
+        const renewalPrice = rdapState.allow_expiry ? 'Not renewing'
+          : rdapState.is_delegated_zone ? 'Not applicable'
+          : Number.isFinite(rdapState.renewal_price) && rdapState.renewal_price > 0
+            ? `$${rdapState.renewal_price.toFixed(2)}/yr` : 'Unknown';
+
         let rdapHtml = `
         <div class="detail-panel">
           <h3>Domain Information</h3>
           <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="color: var(--text-muted)">Not Configured</div></div>
+          <div class="detail-row"><div class="detail-label">Renewal Price:</div><div class="detail-value">${renewalPrice}</div></div>
         </div>`;
 
         let badgeHtml = '';
@@ -1322,6 +1341,7 @@
             rdapHtml = `
               <div class="detail-panel">
                 <h3>Delegated Zone</h3>
+                <div class="detail-row"><div class="detail-label">Renewal Price:</div><div class="detail-value">${renewalPrice}</div></div>
                 <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value" style="text-transform: lowercase;">${ns}</div></div>
                 <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value">Monitored</div></div>
               </div>`;
@@ -1338,6 +1358,7 @@
               <div class="detail-panel">
                 <h3>Domain Information</h3>
                 <div class="detail-row"><div class="detail-label">Registrar:</div><div class="detail-value">${regDisplay}</div></div>
+                <div class="detail-row"><div class="detail-label">Renewal Price:</div><div class="detail-value">${renewalPrice}</div></div>
                 <div class="detail-row"><div class="detail-label">Expiration:</div><div class="detail-value">${expText}</div></div>
                 <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value" style="text-transform: lowercase;">${ns}</div></div>
                 <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="text-transform: capitalize;">${statuses}</div></div>
@@ -1415,6 +1436,7 @@
                   ${labelsHtml}
                 </span>
               </div>
+              <span class="domain-price" style="color: var(--text-muted); font-size: 0.85rem; white-space: nowrap;">Renewal: ${renewalPrice}</span>
               ${chevronHtml}
             </div>
           </summary>
@@ -1424,6 +1446,7 @@
             ${dnssecHtml}
             ${caaHtml}
             ${nsHealthHtml}
+
           </div>
         `;
         if (rdapState.allow_expiry) {
@@ -1934,6 +1957,7 @@
     }
 
     let cachedCerts = [];
+    let certRequestID = 0;
     let certCurrentPage = 1;
     const certsPerPage = 50;
 
@@ -2069,6 +2093,7 @@
     }
 
     async function fetchCerts() {
+      const requestID = ++certRequestID;
       const select = document.getElementById('cert-domain-select');
       if (!select) return;
       const domain = select.value;
@@ -2085,7 +2110,10 @@
       container.innerHTML = '<div style="padding: 24px 0; text-align: center; color: var(--text-muted);">Loading certificate history...</div>';
       try {
         const res = await fetch('/api/certs?domain=' + encodeURIComponent(domain));
+        if (requestID !== certRequestID) return;
+        if (!res.ok) throw new Error(`Certificate request failed: ${res.status}`);
         let certs = await res.json();
+        if (requestID !== certRequestID) return;
 
         if (!certs || certs.length === 0) {
           container.innerHTML = '<div style="color: var(--text-muted); padding: 24px 0; text-align: center;">No certificates found for this domain yet.</div>';
@@ -2106,7 +2134,7 @@
         cachedCerts = certs;
         renderCertPage(1);
       } catch (err) {
-        container.innerHTML = '<span style="color: var(--error)">Failed to load certificates.</span>';
+        if (requestID === certRequestID) container.innerHTML = '<span style="color: var(--error)">Failed to load certificates.</span>';
       }
     }
 

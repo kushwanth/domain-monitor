@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,9 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/time/rate"
 )
+
+// EPPCode identifies known domain lifecycle statuses; unknown provider text stays on the wire.
+type EPPCode uint8
 
 // StringList is a slice of strings that unmarshals from either a single JSON string or an array of strings.
 type StringList []string
@@ -46,7 +51,7 @@ func (s *StringList) UnmarshalJSON(data []byte) error {
 }
 
 // StateCondition represents a typed evaluator verdict with optional context and duration tracking.
-// Code is an iota-based int (zero-allocation). Target references existing config string headers.
+// Code is a compact numeric enum; Target contains diagnostic text when needed.
 type StateCondition struct {
 	Code   ResultCode `json:"code"`
 	Target string     `json:"target,omitempty"`
@@ -73,10 +78,68 @@ func (ct *ConditionTracker) Promote(status CheckStatus, code ResultCode, target 
 // 1. Status & Priority Enums
 
 // CheckStatus represents lifecycle status of a check
-type CheckStatus string
+type CheckStatus uint8
+
+// String returns the stable API representation of a check status.
+func (s CheckStatus) String() string {
+	if int(s) < len(checkStatusNames) {
+		return checkStatusNames[s]
+	}
+	return ""
+}
+
+// MarshalText preserves readable status names at JSON boundaries.
+func (s CheckStatus) MarshalText() ([]byte, error) {
+	if int(s) >= len(checkStatusNames) {
+		return nil, fmt.Errorf("invalid check status %d", uint8(s))
+	}
+	return []byte(s.String()), nil
+}
+
+// UnmarshalJSON accepts only the stable status names stored in state files and APIs.
+func (s *CheckStatus) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := jsonv2.Unmarshal(data, &name); err != nil {
+		return err
+	}
+	for i, known := range checkStatusNames {
+		if name == known {
+			*s = CheckStatus(i)
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown check status %q", name)
+}
 
 // AlertPriority defines the urgency level of a notification alert
-type AlertPriority string
+type AlertPriority uint8
+
+// String returns the priority name accepted by notification providers.
+func (p AlertPriority) String() string {
+	if int(p) < len(alertPriorityNames) {
+		return alertPriorityNames[p]
+	}
+	return ""
+}
+
+// MarshalText preserves readable notification priorities at JSON boundaries.
+func (p AlertPriority) MarshalText() ([]byte, error) {
+	if int(p) >= len(alertPriorityNames) {
+		return nil, fmt.Errorf("invalid alert priority %d", uint8(p))
+	}
+	return []byte(p.String()), nil
+}
+
+// UnmarshalText accepts only known notification priority names.
+func (p *AlertPriority) UnmarshalText(text []byte) error {
+	for i, name := range alertPriorityNames {
+		if name == string(text) {
+			*p = AlertPriority(i)
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown alert priority %q", text)
+}
 
 // AlertTag defines the visual badge or emoji category for an alert
 type AlertTag string
@@ -176,49 +239,111 @@ type AppState struct {
 	PrerenderedJSON     atomic.Value
 	GlobalResolverIndex atomic.Uint32
 
-	Bootstrap   *Bootstrap
-	HTTPClient  HTTPDoer
-	DNSClient   Resolver
-	WHOISClient WHOISQuerier
+	Bootstrap      *Bootstrap
+	HTTPClient     HTTPDoer
+	DNSClient      Resolver
+	DNSTCPClient   Resolver
+	WHOISClient    WHOISQuerier
+	WHOISDial      func(context.Context, string) (net.Conn, error)
+	RDAPURLAllowed func(string) bool
+	TLSCheck       func(context.Context, string, []string, bool) (int, error)
+	ReadCTHistory  func(string) ([]byte, error)
+	WriteCTHistory func(string, []CTCert, string) error
+	ReadCTState    func(string) ([]byte, error)
+	WriteCTState   func(string, []byte, os.FileMode) error
 
 	RDAPLimiter *rate.Limiter
 	CTLimiter   *rate.Limiter
 	CTLogsPath  string
 }
 
-// Config returns a value copy of the application configuration loaded at startup.
-// Note: While the AppConfig struct is copied by value, callers must treat slice and pointer
-// fields as read-only to preserve internal configuration integrity across cycles.
+// Config returns an independent copy of the startup configuration.
 func (a *AppState) Config() AppConfig {
+	return cloneConfig(a.configuration())
+}
+
+// configuration shares immutable startup data with internal read-only callers.
+func (a *AppState) configuration() AppConfig {
 	if a == nil {
 		return AppConfig{}
 	}
 	return a.config
 }
 
-// Resolvers returns the runtime verified DNS resolvers (or configured/default fallback).
+// Resolvers returns an independent copy of the startup resolver list.
 func (a *AppState) Resolvers() []string {
+	return slices.Clone(a.resolvers())
+}
+
+// resolvers shares an immutable list with internal callers, avoiding per-query copies.
+func (a *AppState) resolvers() []string {
 	if a != nil && len(a.activeResolvers) > 0 {
-		return slices.Clone(a.activeResolvers)
+		return a.activeResolvers
 	}
 	if a != nil && len(a.config.Resolvers) > 0 {
-		return slices.Clone(a.config.Resolvers)
+		return a.config.Resolvers
 	}
-	return slices.Clone(DefaultResolvers())
+	return DefaultResolvers()
 }
 
 // NewAppState constructs an AppState with the provided AppConfig value.
 func NewAppState(cfg AppConfig) *AppState {
+	cfg = cloneConfig(cfg)
+	resolvers := cfg.Resolvers
+	if len(resolvers) == 0 {
+		resolvers = DefaultResolvers()
+	}
 	return &AppState{
 		config:          cfg,
-		activeResolvers: slices.Clone(cfg.Resolvers),
+		activeResolvers: resolvers,
 		Notifier:        nil,
 		Pricing:         NewPricingManager(nil),
 		Bootstrap:       NewBootstrap(nil),
 		LoopDuration:    time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
 		RDAPLimiter:     rate.NewLimiter(rate.Every(RDAPRateLimitInterval), 1),
 		CTLimiter:       rate.NewLimiter(rate.Every(CTLogsRateLimitInterval), 1),
+		WHOISDial:       dialPublicWHOIS,
+		TLSCheck:        checkSSLExpiryDays,
+		DNSClient:       &dns.Client{Timeout: DefaultDNSTimeout},
+		DNSTCPClient:    &dns.Client{Net: ProtocolTCP, Timeout: DefaultDNSTimeout},
+		RDAPURLAllowed:  IsSafeRDAPURL,
+		ReadCTState:     readBoundedCTFile,
+		ReadCTHistory:   readBoundedCTFile,
+		WriteCTHistory:  saveCertsToHistory,
+		WriteCTState:    AtomicWriteFile,
 	}
+}
+
+func cloneConfig(cfg AppConfig) AppConfig {
+	cfg.Resolvers = slices.Clone(cfg.Resolvers)
+	cfg.Domains = slices.Clone(cfg.Domains)
+	cfg.DNSRecords = slices.Clone(cfg.DNSRecords)
+	if cfg.Notifications.Ntfy != nil {
+		ntfy := *cfg.Notifications.Ntfy
+		cfg.Notifications.Ntfy = &ntfy
+	}
+	if cfg.Notifications.Telegram != nil {
+		telegram := *cfg.Notifications.Telegram
+		cfg.Notifications.Telegram = &telegram
+	}
+	for i := range cfg.Domains {
+		domain := &cfg.Domains[i]
+		domain.ExpectedNS = slices.Clone(domain.ExpectedNS)
+		domain.SecondaryNS = slices.Clone(domain.SecondaryNS)
+		domain.MXRecords = slices.Clone(domain.MXRecords)
+		domain.DKIMSelectors = slices.Clone(domain.DKIMSelectors)
+		if domain.CAA != nil {
+			caa := *domain.CAA
+			caa.Issue = slices.Clone(caa.Issue)
+			caa.IssueWild = slices.Clone(caa.IssueWild)
+			caa.IssueMail = slices.Clone(caa.IssueMail)
+			domain.CAA = &caa
+		}
+	}
+	for i := range cfg.DNSRecords {
+		cfg.DNSRecords[i].Expected = slices.Clone(cfg.DNSRecords[i].Expected)
+	}
+	return cfg
 }
 
 // SafeDispatch safely dispatches an alert via Notifier if both app and Notifier are non-nil,
@@ -289,14 +414,16 @@ type RDAPEntity struct {
 
 // RDAPDomainResponse represents an RFC 9083 domain object response.
 type RDAPDomainResponse struct {
-	Handle      string           `json:"handle,omitempty"`
-	LDHName     string           `json:"ldhName,omitempty"`
-	Status      []string         `json:"status,omitempty"`
-	Events      []RDAPEvent      `json:"events,omitempty"`
-	Nameservers []RDAPNameserver `json:"nameservers,omitempty"`
-	SecureDNS   *RDAPSecureDNS   `json:"secureDNS,omitempty"`
-	Entities    []RDAPEntity     `json:"entities,omitempty"`
-	Links       []RDAPLink       `json:"links,omitempty"`
+	ObjectClassName string           `json:"objectClassName,omitempty"`
+	Handle          string           `json:"handle,omitempty"`
+	LDHName         string           `json:"ldhName,omitempty"`
+	UnicodeName     string           `json:"unicodeName,omitempty"`
+	Status          []string         `json:"status,omitempty"`
+	Events          []RDAPEvent      `json:"events,omitempty"`
+	Nameservers     []RDAPNameserver `json:"nameservers,omitempty"`
+	SecureDNS       *RDAPSecureDNS   `json:"secureDNS,omitempty"`
+	Entities        []RDAPEntity     `json:"entities,omitempty"`
+	Links           []RDAPLink       `json:"links,omitempty"`
 }
 
 type DomainTierData struct {
@@ -369,15 +496,17 @@ type CAAEntry struct {
 }
 
 type CAAResult struct {
-	Status      CheckStatus     `json:"status"`
-	Condition   *StateCondition `json:"condition,omitempty"`
-	Valid       bool            `json:"valid"`
-	Issue       []string        `json:"issue"`
-	IssueWild   []string        `json:"issuewild"`
-	IssueMail   []string        `json:"issuemail"`
-	UnknownCAs  []string        `json:"unknown_cas,omitempty"`
-	QueryFailed bool            `json:"query_failed,omitempty"`
-	Error       string          `json:"error,omitempty"`
+	Status              CheckStatus     `json:"status"`
+	Condition           *StateCondition `json:"condition,omitempty"`
+	Valid               bool            `json:"valid"`
+	Issue               []string        `json:"issue"`
+	IssueWild           []string        `json:"issuewild"`
+	IssueMail           []string        `json:"issuemail"`
+	Entries             []CAAEntry      `json:"entries,omitempty"`
+	UnknownCriticalTags []string        `json:"unknown_critical_tags,omitempty"`
+	UnknownCAs          []string        `json:"unknown_cas,omitempty"`
+	QueryFailed         bool            `json:"query_failed,omitempty"`
+	Error               string          `json:"error,omitempty"`
 }
 
 type DNSSECResult struct {
@@ -405,14 +534,47 @@ type CTCert struct {
 	NotAfter  string `json:"not_after"`
 }
 
+// CTPending holds a committed discovery until each configured provider accepts it.
+type CTPending struct {
+	Cert         CTCert `json:"cert"`
+	NeedNtfy     bool   `json:"need_ntfy,omitempty"`
+	NeedTelegram bool   `json:"need_telegram,omitempty"`
+}
+
 type CTLogState struct {
-	LatestID         string          `json:"latest_id"`
-	BackfillCursor   string          `json:"backfill_cursor"`
-	BackfillComplete bool            `json:"backfill_complete"`
-	Status           CheckStatus     `json:"status"`
-	Condition        *StateCondition `json:"condition,omitempty"`
-	Error            string          `json:"error,omitempty"`
-	NewCerts         []CTCert        `json:"-"`
+	LatestID           string          `json:"latest_id"`
+	Initialized        bool            `json:"initialized,omitempty"`
+	BackfillCursor     string          `json:"backfill_cursor"`
+	BackfillComplete   bool            `json:"backfill_complete"`
+	ScanPages          int             `json:"scan_pages,omitempty"`
+	LastAttemptUnix    int64           `json:"last_attempt_unix,omitempty"`
+	LastSuccessUnix    int64           `json:"last_success_unix,omitempty"`
+	LastCompleteUnix   int64           `json:"last_complete_unix,omitempty"`
+	SeenIDs            []string        `json:"seen_ids,omitempty"`
+	Pending            []CTPending     `json:"pending,omitempty"`
+	CoverageIncomplete bool            `json:"coverage_incomplete,omitempty"`
+	Status             CheckStatus     `json:"status"`
+	Condition          *StateCondition `json:"condition,omitempty"`
+	Error              string          `json:"error,omitempty"`
+	NewCerts           []CTCert        `json:"-"`
+}
+
+// cloneCTLogState separates mutable checkpoint data at ownership boundaries.
+func cloneCTLogState(state CTLogState) CTLogState {
+	state.SeenIDs = slices.Clone(state.SeenIDs)
+	state.Pending = slices.Clone(state.Pending)
+	state.NewCerts = slices.Clone(state.NewCerts)
+	if state.Condition != nil {
+		condition := *state.Condition
+		state.Condition = &condition
+	}
+	return state
+}
+
+// CTStateFile is the versioned on-disk checkpoint for monitored domains.
+type CTStateFile struct {
+	Version int                   `json:"version"`
+	Domains map[string]CTLogState `json:"domains"`
 }
 
 // NSHealthServerResult stores the evaluation metrics for an individual authoritative nameserver.
@@ -484,38 +646,42 @@ func (c *CheckState) ExportCTLogs() map[string]CTLogState {
 	if c == nil {
 		return make(map[string]CTLogState)
 	}
-	return CopyMap(c.CTLogs)
+	snapshot := make(map[string]CTLogState, len(c.CTLogs))
+	for domain, state := range c.CTLogs {
+		snapshot[domain] = cloneCTLogState(state)
+	}
+	return snapshot
 }
 
-// ApplyDNSResult safely incorporates an individual DNS check result into the state.
+// ApplyDNSResult transfers an individual DNS result into the cycle-owned state.
 func (c *CheckState) ApplyDNSResult(res DNSResult) {
-	if c == nil || res.State.Status == "" || res.Name == "" {
+	if c == nil || res.State.Status == StatusUnknown || res.Name == "" {
 		return
 	}
 	InitMap(&c.DNS)[res.Name] = res.State
 }
 
-// ApplyDomainResult safely incorporates an individual domain check result into the state.
+// ApplyDomainResult transfers an individual domain result into the cycle-owned state.
 func (c *CheckState) ApplyDomainResult(res DomainResult) {
 	if c == nil || res.Domain == "" {
 		return
 	}
-	if res.RDAP.Status != "" {
+	if res.RDAP.Status != StatusUnknown {
 		InitMap(&c.RDAP)[res.Domain] = res.RDAP
 	}
-	if res.Email.Status != "" {
+	if res.Email.Status != StatusUnknown {
 		InitMap(&c.Email)[res.Domain] = res.Email
 	}
-	if res.CAA.Status != "" {
+	if res.CAA.Status != StatusUnknown {
 		InitMap(&c.CAA)[res.Domain] = res.CAA
 	}
 	if res.DNSSEC.Source != "" || res.DNSSEC.Error != "" || res.DNSSEC.Valid {
 		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
 	}
-	if res.CTLogs.Status != "" {
+	if res.CTLogs.Status != StatusUnknown {
 		InitMap(&c.CTLogs)[res.Domain] = res.CTLogs
 	}
-	if res.NSHealth.Status != "" {
+	if res.NSHealth.Status != StatusUnknown {
 		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
 	}
 }
@@ -556,14 +722,17 @@ type NSSnapshot struct {
 	SOASerial     uint32
 	HasDNSKEY     bool
 	DNSKEYs       []string
+	DNSKEYErr     error
+	PartialError  error
 	Unreachable   bool
 	Err           error
 }
 
 // DNSSnapshot holds raw DNS query results for a single record check.
 type DNSSnapshot struct {
-	Records []string
-	Err     error
+	Records         []string
+	ExpectedRecords []string
+	Err             error
 }
 
 // EmailSnapshot holds raw email security DNS lookups.
@@ -591,13 +760,21 @@ type CAASnapshot struct {
 
 // CTLogsSnapshot holds raw CT log query results.
 type CTLogsSnapshot struct {
-	Page1Err         error
-	BackfillErr      error
-	IsFirstRun       bool
-	NewCerts         []CTCert
-	CheckpointID     string
-	BackfillCursor   string
-	BackfillComplete bool
+	Page1Err           error
+	BackfillErr        error
+	IsFirstRun         bool
+	Initialized        bool
+	NewCerts           []CTCert
+	CheckpointID       string
+	BackfillCursor     string
+	BackfillComplete   bool
+	ScanPages          int
+	LastAttemptUnix    int64
+	LastSuccessUnix    int64
+	LastCompleteUnix   int64
+	SeenIDs            []string
+	Pending            []CTPending
+	CoverageIncomplete bool
 }
 
 // SSLSnapshot holds raw TLS certificate data.
@@ -610,12 +787,22 @@ type SSLSnapshot struct {
 
 // Alert represents a single notification event
 type Alert struct {
-	Message  string
-	Redacted string
-	Priority AlertPriority
-	Tag      AlertTag
-	Domain   string
-	Name     string
+	Message      string
+	Redacted     string
+	Identity     string
+	CT           bool
+	NeedNtfy     bool
+	NeedTelegram bool
+	Priority     AlertPriority
+	Tag          AlertTag
+	Domain       string
+	Name         string
+}
+
+// CTAcceptance records which configured providers accepted a CT discovery.
+type CTAcceptance struct {
+	Ntfy     bool
+	Telegram bool
 }
 
 // Notifier is the interface for dispatching alerts.
@@ -637,13 +824,17 @@ type dnsRegistry struct {
 }
 
 type dohJSONResponse struct {
-	Status int  `json:"Status"`
-	AD     bool `json:"AD"`
-}
-
-type queryResult struct {
-	raw string
-	err error
+	Status   int  `json:"Status"`
+	AD       bool `json:"AD"`
+	Question []struct {
+		Name string `json:"name"`
+		Type int    `json:"type"`
+	} `json:"Question"`
+	Answer []struct {
+		Name string `json:"name"`
+		Type int    `json:"type"`
+		Data string `json:"data"`
+	} `json:"Answer"`
 }
 
 // 6. Concurrency & Network Infrastructure

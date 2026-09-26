@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -10,8 +11,74 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miekg/dns"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestLoadConfigInjectedReader(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		readErr error
+		wantErr string
+	}{
+		{name: "valid", content: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}}}`},
+		{name: "read error", readErr: os.ErrPermission, wantErr: "read"},
+		{name: "invalid JSON", content: `{`, wantErr: "unmarshal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			cfg, err := loadConfig(context.Background(), "memory.json", func(path string) ([]byte, error) {
+				assert.Equal(t, "memory.json", path)
+				called = true
+				return []byte(tc.content), tc.readErr
+			})
+			assert.True(t, called)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				if tc.readErr != nil {
+					assert.True(t, errors.Is(err, tc.readErr))
+				}
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, DefaultServerPort, cfg.Port)
+		})
+	}
+}
+
+func FuzzNormalizeExpectedDNSValue(f *testing.F) {
+	for _, seed := range []struct{ recordType, value string }{
+		{RecordTypeA, "192.0.2.1"},
+		{RecordTypeAAAA, "2001:db8::1"},
+		{RecordTypeIP, "not-an-ip"},
+		{RecordTypeALIAS, "alias:example.com"},
+		{RecordTypeTXT, "v=spf1 -all"},
+	} {
+		f.Add(seed.recordType, seed.value)
+	}
+	f.Fuzz(func(t *testing.T, recordType, value string) {
+		switch recordType {
+		case RecordTypeA, RecordTypeAAAA, RecordTypeIP, RecordTypeALIAS, RecordTypeTXT:
+		default:
+			return
+		}
+		got, err := normalizeExpectedDNSValue(DNSTask{Type: recordType, Name: "fuzz", Hostname: "example.com"}, value)
+		if err != nil || got == "" {
+			return
+		}
+		if recordType == RecordTypeA || recordType == RecordTypeAAAA || recordType == RecordTypeIP {
+			ip := net.ParseIP(got)
+			require.NotNil(t, ip)
+			switch recordType {
+			case RecordTypeA:
+				assert.NotNil(t, ip.To4())
+			case RecordTypeAAAA:
+				assert.Nil(t, ip.To4())
+			}
+		}
+	})
+}
 
 func TestLoadConfig(t *testing.T) {
 	tests := []struct {
@@ -24,7 +91,7 @@ func TestLoadConfig(t *testing.T) {
 	}{
 		{
 			name: "Valid Config",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"port": "9090",
 				"loop_interval_days": 1.0,
 				"domains": [
@@ -87,7 +154,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "CAA Config Normalization with Deny All and Skipped Tags",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [
 					{
 						"domain": "example.com",
@@ -133,7 +200,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "RFC 7505 Null MX Normalization",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [
 					{
 						"domain": "nomail.example.com",
@@ -153,7 +220,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Missing Domain Name",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [{"domain": "example.com"}]
 			}`,
 			expectErr:   true,
@@ -161,7 +228,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Delegated Zone Missing Root Zone",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [{"domain": "api.example.com", "name": "API", "is_delegated_zone": true}]
 			}`,
 			expectErr:   true,
@@ -169,7 +236,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Mail Provider and MX Records Mutually Exclusive",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [{
 					"domain": "example.com",
 					"name": "Example",
@@ -183,7 +250,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "DNS Record Missing Name",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"dns_records": [{"hostname": "example.com", "type": "A"}]
 			}`,
 			expectErr:   true,
@@ -191,7 +258,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "DNS Record Missing Type",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"dns_records": [{"hostname": "example.com", "name": "Apex"}]
 			}`,
 			expectErr:   true,
@@ -199,7 +266,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Exceeding Max Resolvers",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"resolvers": ["1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1", "8.8.4.4", "9.9.9.10", "208.67.222.222", "208.67.220.220", "84.200.69.80", "84.200.70.40"]
 			}`,
 			expectErr:   true,
@@ -207,7 +274,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Resolvers Config",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"resolvers": ["1.1.1.1:53", "8.8.8.8", "9.9.9.9"],
 				"domains": [{"domain": "example.com", "name": "Example"}]
 			}`,
@@ -220,7 +287,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Environment Variable Overrides",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [{"domain": "example.com", "name": "Example"}]
 			}`,
 			envVars: map[string]string{
@@ -248,7 +315,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Empty Domain Rejection",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [{"domain": "", "name": "Empty"}]
 			}`,
 			expectErr:   true,
@@ -256,7 +323,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Duplicate Domain Rejection",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [
 					{"domain": "example.com", "name": "Primary"},
 					{"domain": "EXAMPLE.COM.", "name": "Secondary View"}
@@ -267,7 +334,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Multiple Unique Domain Entries Allowed",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [
 					{"domain": "example.com", "name": "Primary"},
 					{"domain": "example.net", "name": "Secondary View"}
@@ -282,7 +349,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Empty Hostname Rejection",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"dns_records": [{"hostname": "", "name": "NoHost", "type": "A"}]
 			}`,
 			expectErr:   true,
@@ -290,7 +357,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "Non-positive Durations Default Gracefully",
-			configJSON: `{
+			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"loop_interval_days": -1,
 				"domains": [{"domain": "example.com", "name": "Example"}]
 			}`,
@@ -341,64 +408,27 @@ func TestLoadConfig(t *testing.T) {
 }
 
 func TestInitializeApp_ResolverResilience(t *testing.T) {
-	mux := dns.NewServeMux()
-	mux.HandleFunc("example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		rr, _ := dns.NewRR("example.com. 300 IN A 93.184.215.14")
-		m.Answer = append(m.Answer, rr)
-		_ = w.WriteMsg(m)
-	})
-	server := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen packet: %v", err)
-	}
-	server.PacketConn = l
-	defer server.Shutdown()
-	go func() { _ = server.ActivateAndServe() }()
-
-	localAddr := l.LocalAddr().String()
-
-	// Scenario 1: One valid resolver, one invalid resolver
-	rawCfg1 := &AppConfig{
-		Resolvers: []string{localAddr, "192.0.2.1:53"}, // 192.0.2.1 is unroutable TEST-NET-1
-		Notifications: Notifications{
-			Ntfy: &NtfyConfig{URL: "https://ntfy.sh/test_topic"},
-		},
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
-	defer cancel()
-
-	app1, err := InitializeApp(ctx, *rawCfg1)
-	if err != nil {
-		t.Errorf("Expected InitializeApp to succeed with 1 healthy resolver, got error: %v", err)
-	}
-	if len(app1.Resolvers()) != 1 || app1.Resolvers()[0] != localAddr {
-		t.Errorf("Expected resolvers to contain only healthy %s, got %v", localAddr, app1.Resolvers())
-	}
-	if len(rawCfg1.Resolvers) != 2 {
-		t.Errorf("Expected rawCfg1.Resolvers to remain immutable with 2 resolvers, got %d", len(rawCfg1.Resolvers))
-	}
-
-	// Scenario 2: All resolvers invalid
-	rawCfg2 := &AppConfig{
-		Resolvers: []string{"192.0.2.1:53", "192.0.2.2:53"},
-		Notifications: Notifications{
-			Ntfy: &NtfyConfig{URL: "https://ntfy.sh/test_topic"},
-		},
-	}
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 7*time.Second)
-	defer cancel2()
-
-	_, err2 := InitializeApp(ctx2, *rawCfg2)
-	if err2 == nil {
-		t.Errorf("Expected error when all resolvers fail health check, got nil")
+	for _, tc := range []struct {
+		name          string
+		notifications Notifications
+		wantNotifier  bool
+	}{
+		{name: "none"},
+		{name: "ntfy", notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}}, wantNotifier: true},
+		{name: "telegram", notifications: Notifications{Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, wantNotifier: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := AppConfig{Resolvers: []string{"192.0.2.1:53", "192.0.2.2:53"}, Notifications: tc.notifications}
+			app, err := InitializeApp(context.Background(), cfg)
+			require.NoError(t, err)
+			assert.Equal(t, cfg.Resolvers, app.Resolvers())
+			assert.Equal(t, tc.wantNotifier, app.Notifier != nil)
+		})
 	}
 }
 
 func TestIDNNormalizationAndAliasCase(t *testing.T) {
-	configJSON := `{
+	configJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "münchen.de",
@@ -455,7 +485,7 @@ func TestConfig_RegistrarBothAllowed(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Both set -> config allows both
-	bothJSON := `{
+	bothJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -481,7 +511,7 @@ func TestConfig_RegistrarBothAllowed(t *testing.T) {
 	}
 
 	// Only ID set -> valid
-	validIDJSON := `{
+	validIDJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -501,7 +531,7 @@ func TestConfig_RegistrarBothAllowed(t *testing.T) {
 	}
 
 	// Only Name set -> valid
-	validNameJSON := `{
+	validNameJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -527,7 +557,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// 1. verify_ns_health: true but no expected_ns -> must error
-	invalidJSON1 := `{
+	invalidJSON1 := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -545,7 +575,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}
 
 	// 2. verify_ns_health: true with expected_ns but no secondary_ns -> valid (secondary_ns is optional)
-	validPrimaryOnlyJSON := `{
+	validPrimaryOnlyJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -566,7 +596,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}
 
 	// 3. verify_ns_health: true with both expected_ns and secondary_ns -> valid
-	validJSON := `{
+	validJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -588,7 +618,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}
 
 	// 4. empty entry in expected_ns -> must error
-	emptyExpectedNSJSON := `{
+	emptyExpectedNSJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -605,7 +635,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}
 
 	// 5. empty entry in secondary_ns -> must error
-	emptySecondaryNSJSON := `{
+	emptySecondaryNSJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -623,7 +653,7 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}
 
 	// 6. secondary_ns configured but no expected_ns -> must error
-	secondaryNoExpectedJSON := `{
+	secondaryNoExpectedJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
@@ -649,7 +679,7 @@ func TestSkipSSLValidation(t *testing.T) {
 			if vt == "AAAA" {
 				expectedVal = `"2001:db8::1"`
 			}
-			cfgJSON := `{"dns_records": [{"hostname": "web.example.com", "name": "Web Test", "type": "` + vt + `", "expected": [` + expectedVal + `], "skip_ssl": true}]}`
+			cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records": [{"hostname": "web.example.com", "name": "Web Test", "type": "` + vt + `", "expected": [` + expectedVal + `], "skip_ssl": true}]}`
 			tmpFile := t.TempDir() + "/valid_skip_ssl.json"
 			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 				t.Fatalf("failed to write temp file: %v", err)
@@ -668,7 +698,7 @@ func TestSkipSSLValidation(t *testing.T) {
 	invalidTypes := []string{"TXT", "MX", "CAA", "NS"}
 	for _, it := range invalidTypes {
 		t.Run("Invalid_"+it, func(t *testing.T) {
-			cfgJSON := `{"dns_records": [{"hostname": "record.example.com", "name": "Invalid Test", "type": "` + it + `", "expected": ["something"], "skip_ssl": true}]}`
+			cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records": [{"hostname": "record.example.com", "name": "Invalid Test", "type": "` + it + `", "expected": ["something"], "skip_ssl": true}]}`
 			tmpFile := t.TempDir() + "/invalid_skip_ssl.json"
 			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
 				t.Fatalf("failed to write temp file: %v", err)
@@ -685,7 +715,7 @@ func TestSkipSSLValidation(t *testing.T) {
 
 	// 3. Omitted skip_ssl defaults to false and succeeds for any valid record type
 	t.Run("Default_Omitted", func(t *testing.T) {
-		cfgJSON := `{
+		cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 			"dns_records": [
 				{
 					"hostname": "record.example.com",
@@ -710,7 +740,7 @@ func TestSkipSSLValidation(t *testing.T) {
 }
 
 func TestConfig_DuplicateDNSRecordName(t *testing.T) {
-	cfgJSON := `{
+	cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"dns_records": [
 			{
 				"hostname": "a.example.com",
@@ -741,7 +771,7 @@ func TestConfig_DuplicateDNSRecordName(t *testing.T) {
 
 func TestConfig_StringListExpected(t *testing.T) {
 	// 1. Single string in expected
-	cfgJSON := `{
+	cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"dns_records": [
 			{
 				"hostname": "single.example.com",
@@ -776,7 +806,7 @@ func TestConfig_StringListExpected(t *testing.T) {
 func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 	// A record with IPv6 should fail
 	t.Run("A_RejectIPv6", func(t *testing.T) {
-		cfgJSON := `{
+		cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 			"dns_records": [
 				{
 					"hostname": "a.example.com",
@@ -798,7 +828,7 @@ func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 
 	// AAAA record with IPv4 should fail
 	t.Run("AAAA_RejectIPv4", func(t *testing.T) {
-		cfgJSON := `{
+		cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 			"dns_records": [
 				{
 					"hostname": "aaaa.example.com",
@@ -820,7 +850,7 @@ func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 
 	// IP record accepts both IPv4 and IPv6 and canonicalizes them sorted
 	t.Run("IP_AcceptsBothIPv4AndIPv6", func(t *testing.T) {
-		cfgJSON := `{
+		cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 			"dns_records": [
 				{
 					"hostname": "dual.example.com",
@@ -875,10 +905,10 @@ func TestNilSafety_CheckState(t *testing.T) {
 		CTLogs:   CTLogState{Status: StatusOK},
 		NSHealth: NSHealthResult{Valid: true, Status: StatusOK},
 	})
-	if rdap, ok := emptyCS.RDAP["example.com"]; !ok || rdap.Status == "" {
+	if rdap, ok := emptyCS.RDAP["example.com"]; !ok || rdap.Status == StatusUnknown {
 		t.Errorf("expected RDAP result applied")
 	}
-	if email, ok := emptyCS.Email["example.com"]; !ok || email.Status == "" {
+	if email, ok := emptyCS.Email["example.com"]; !ok || email.Status == StatusUnknown {
 		t.Errorf("expected Email result applied")
 	}
 	if caa, ok := emptyCS.CAA["example.com"]; !ok || !caa.Valid {
@@ -887,7 +917,7 @@ func TestNilSafety_CheckState(t *testing.T) {
 	if dnssec, ok := emptyCS.DNSSEC["example.com"]; !ok || !dnssec.Valid {
 		t.Errorf("expected DNSSEC result applied")
 	}
-	if ctLogs, ok := emptyCS.CTLogs["example.com"]; !ok || ctLogs.Status == "" {
+	if ctLogs, ok := emptyCS.CTLogs["example.com"]; !ok || ctLogs.Status == StatusUnknown {
 		t.Errorf("expected CTLogs result applied")
 	}
 	if nsHealth, ok := emptyCS.NSHealth["example.com"]; !ok || !nsHealth.Valid {
@@ -895,7 +925,7 @@ func TestNilSafety_CheckState(t *testing.T) {
 	}
 
 	exported := emptyCS.ExportCTLogs()
-	if c, ok := exported["example.com"]; !ok || c.Status == "" {
+	if c, ok := exported["example.com"]; !ok || c.Status == StatusUnknown {
 		t.Errorf("expected ExportCTLogs to return cloned maps")
 	}
 }
@@ -915,7 +945,7 @@ func TestLoadConfig_LoopIntervalClamping(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
 
-	content := []byte(`{
+	content := []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"loop_interval_days": 0.05,
 		"domains": [{"domain": "example.com", "name": "Ex"}],
 		"dns_records": []
@@ -946,7 +976,7 @@ func TestLoadConfig_LoopIntervalMaxClamping(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.json")
 
-	content := []byte(`{
+	content := []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"loop_interval_days": 1000.0,
 		"domains": [{"domain": "example.com", "name": "Ex"}],
 		"dns_records": []
@@ -998,5 +1028,206 @@ func TestConfig_CompileTimeImmutability(t *testing.T) {
 	res[0] = "192.0.2.1"
 	if app.Resolvers()[0] == "192.0.2.1" {
 		t.Errorf("expected Resolvers() to return defensive clone, but internal slice was mutated")
+	}
+}
+
+func TestNormalizeDNSTaskRejectsUnsupportedAndVacuousChecks(t *testing.T) {
+	tests := []struct {
+		name    string
+		task    DNSTask
+		wantErr bool
+	}{
+		{"unsupported type", DNSTask{Hostname: "example.com", Name: "record", Type: "BOGUS", Expected: StringList{"x"}}, true},
+		{"unsupported match", DNSTask{Hostname: "example.com", Name: "record", Type: RecordTypeTXT, MatchType: "fuzzy", Expected: StringList{"x"}}, true},
+		{"missing expectation", DNSTask{Hostname: "example.com", Name: "record", Type: RecordTypeTXT}, true},
+		{"empty prefix", DNSTask{Hostname: "example.com", Name: "record", Type: RecordTypeTXT, MatchType: MatchPrefix, Expected: StringList{}}, true},
+		{"explicit absence", DNSTask{Hostname: "example.com", Name: "record", Type: RecordTypeTXT, MatchType: MatchExact, Expected: StringList{}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := normalizeDNSTask(&tt.task, 0, map[string]bool{})
+			if tt.wantErr && err == nil {
+				t.Fatal("expected configuration error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected configuration error: %v", err)
+			}
+		})
+	}
+}
+
+func TestEndpointAndProviderValidation(t *testing.T) {
+	for _, endpoint := range []string{"1.1.1.1", "[2001:db8::1]:5353", "dns.internal:53", "resolver.local"} {
+		if err := validateResolverEndpoint(endpoint); err != nil {
+			t.Errorf("valid resolver %q rejected: %v", endpoint, err)
+		}
+	}
+	for _, endpoint := range []string{"", "1.1.1.1:0", "dns.internal:70000", "dns.internal/path"} {
+		if err := validateResolverEndpoint(endpoint); err == nil {
+			t.Errorf("invalid resolver %q accepted", endpoint)
+		}
+	}
+	for _, endpoint := range []string{"https://dns.google/resolve", "http://localhost:8080/dns-query"} {
+		if err := validateHTTPURL(endpoint); err != nil {
+			t.Errorf("valid URL %q rejected: %v", endpoint, err)
+		}
+	}
+	for _, endpoint := range []string{"ftp://dns.example.com", "https://user:pass@dns.example.com", "http://localhost:0"} {
+		if err := validateHTTPURL(endpoint); err == nil {
+			t.Errorf("invalid URL %q accepted", endpoint)
+		}
+	}
+	domain := DomainConfig{Domain: "example.com", Name: "Example", CheckEmailSecurity: true, MailProvider: "unknown-provider"}
+	if err := normalizeDomainConfig(&domain, 0, map[string]bool{}, map[string]bool{}); err == nil {
+		t.Fatal("unknown mail provider should fail configuration")
+	}
+}
+
+func TestLoadConfigRejectsIncompleteNotifications(t *testing.T) {
+	t.Setenv(EnvPort, "")
+	t.Setenv(EnvTelegramToken, "")
+	t.Setenv(EnvTelegramChatID, "")
+	t.Setenv(EnvDoHURL, "")
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"bad port", `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"port":"0"}`},
+		{"ntfy without URL", `{"notifications":{"ntfy":{"auth":"token"}}}`},
+		{"bad DoH URL", `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"doh_url":"ftp://dns.example.com"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			require.NoError(t, os.WriteFile(path, []byte(tc.body), 0600))
+			_, err := LoadConfig(context.Background(), path)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestDomainSelfSignedOptionIsRejected(t *testing.T) {
+	target := DomainConfig{Domain: "example.com", Name: "Example", AcceptSelfSigned: true}
+	err := normalizeDomainConfig(&target, 0, make(map[string]bool), make(map[string]bool))
+	require.ErrorContains(t, err, "dns_records")
+}
+
+func TestRequiredNtfyAndOptionalTelegram(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		notifications Notifications
+		wantError     bool
+	}{
+		{"missing ntfy", Notifications{}, true},
+		{"telegram only", Notifications{Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, true},
+		{"ntfy only", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}}, false},
+		{"both", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, false},
+		{"incomplete telegram", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateNotificationEndpoints(&tc.notifications)
+			assert.Equal(t, tc.wantError, err != nil)
+		})
+	}
+}
+
+func TestConfigSnapshotOwnsNestedData(t *testing.T) {
+	config := AppConfig{
+		Resolvers:     []string{"1.1.1.1"},
+		Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}},
+		Domains:       []DomainConfig{{Domain: "example.com", ExpectedNS: []string{"ns.example.com"}, SecondaryNS: []string{"secondary.example.com"}, MXRecords: []string{"mail.example.com"}, DKIMSelectors: []string{"selector"}, CAA: &CAAConfig{Issue: []string{"ca.example"}, IssueWild: []string{"wild.example"}, IssueMail: []string{"mail-ca.example"}}}},
+		DNSRecords:    []DNSTask{{Expected: StringList{"192.0.2.1"}}},
+	}
+	app := NewAppState(config)
+	original := app.Config()
+	mutate := func(snapshot AppConfig) {
+		snapshot.Resolvers[0] = "8.8.8.8"
+		snapshot.Domains[0].ExpectedNS[0] = "changed.example"
+		snapshot.Domains[0].SecondaryNS[0] = "changed.example"
+		snapshot.Domains[0].MXRecords[0] = "changed.example"
+		snapshot.Domains[0].DKIMSelectors[0] = "changed"
+		snapshot.Domains[0].CAA.Issue[0] = "changed.example"
+		snapshot.Domains[0].CAA.IssueWild[0] = "changed.example"
+		snapshot.Domains[0].CAA.IssueMail[0] = "changed.example"
+		snapshot.DNSRecords[0].Expected[0] = "192.0.2.2"
+		snapshot.Notifications.Ntfy.URL = "https://changed.invalid"
+		snapshot.Notifications.Telegram.Token = "changed"
+	}
+	mutate(config)
+	assert.Equal(t, original, app.Config(), "startup input must not remain shared")
+	snapshot := app.Config()
+	mutate(snapshot)
+	assert.Equal(t, original, app.Config(), "returned nested config must not remain shared")
+	resolvers := app.Resolvers()
+	resolvers[0] = "9.9.9.9"
+	assert.Equal(t, original.Resolvers, app.Resolvers())
+}
+
+func TestConfigAndEnvironmentAreReadOnlyAtStartup(t *testing.T) {
+	initialDir := t.TempDir()
+	t.Setenv(EnvDataDir, initialDir)
+	reads := 0
+	cfg, err := loadConfig(context.Background(), "config.json", func(string) ([]byte, error) {
+		reads++
+		return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}}}`), nil
+	})
+	require.NoError(t, err)
+	app := NewAppState(cfg)
+	t.Setenv(EnvDataDir, t.TempDir())
+	path, _, err := initializeCTStorage(app)
+	require.NoError(t, err)
+	assert.Equal(t, initialDir, filepath.Dir(path))
+	assert.Equal(t, 1, reads)
+}
+
+func TestOptionalTelegramDoesNotBlockNtfyStartup(t *testing.T) {
+	for _, tc := range []struct {
+		name, telegram, tokenEnv, chatEnv string
+		wantTelegram                      bool
+	}{
+		{name: "omitted"},
+		{name: "empty object", telegram: `,"telegram":{}`},
+		{name: "token only", telegram: `,"telegram":{"token":"token"}`},
+		{name: "chat only", telegram: `,"telegram":{"chat_id":"chat"}`},
+		{name: "whitespace", telegram: `,"telegram":{"token":"  ","chat_id":"  "}`},
+		{name: "token environment only", tokenEnv: "token"},
+		{name: "chat environment only", chatEnv: "chat"},
+		{name: "both environment", tokenEnv: "token", chatEnv: "chat", wantTelegram: true},
+		{name: "config plus environment", telegram: `,"telegram":{"token":"token"}`, chatEnv: "chat", wantTelegram: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(EnvTelegramToken, tc.tokenEnv)
+			t.Setenv(EnvTelegramChatID, tc.chatEnv)
+			cfg, err := loadConfig(context.Background(), "unused", func(string) ([]byte, error) {
+				return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}` + tc.telegram + `}}`), nil
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantTelegram, cfg.Notifications.Telegram != nil)
+			app, err := InitializeApp(context.Background(), cfg)
+			require.NoError(t, err)
+			require.IsType(t, &NotificationManager{}, app.Notifier)
+			notifier, ok := app.Notifier.(*NotificationManager)
+			require.True(t, ok)
+			assert.Equal(t, "https://ntfy.invalid/topic", notifier.NtfyURL)
+			assert.Equal(t, tc.wantTelegram, notifier.TelegramToken != "" && notifier.TelegramChatID != "")
+		})
+	}
+}
+
+func TestExpectedTXTValuesRemainLiteral(t *testing.T) {
+	for _, literal := range []string{"verification=AbC.", "alias:LiteralValue", "."} {
+		value, err := normalizeExpectedDNSValue(DNSTask{Type: RecordTypeTXT, Hostname: "example.com"}, literal)
+		require.NoError(t, err)
+		assert.Equal(t, literal, value)
+	}
+}
+
+func TestLoadConfigRejectsUnpersistableCTDomain(t *testing.T) {
+	for _, domain := range []string{"bad/name.example", "bad..example", "-bad.example"} {
+		t.Run(domain, func(t *testing.T) {
+			_, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
+				return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"` + domain + `","name":"CT target","monitor_ct_logs":true}]}`), nil
+			})
+			require.Error(t, err)
+		})
 	}
 }

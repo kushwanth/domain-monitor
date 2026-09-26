@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -90,6 +95,7 @@ func TestRDAPValidation(t *testing.T) {
 			target := DomainConfig{
 				Domain:      "example.com",
 				Name:        "Example",
+				AllowExpiry: true,
 				ExpectedNS:  tt.targetNS,
 				SecondaryNS: tt.secondaryNS,
 			}
@@ -435,6 +441,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 1. ExpectedRegistrarID Match
 	target1 := DomainConfig{
 		Domain:              "example.com",
+		AllowExpiry:         true,
 		ExpectedRegistrarID: "292",
 	}
 	snapshot1 := RDAPSnapshot{
@@ -453,6 +460,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 2. ExpectedRegistrarID Mismatch
 	target2 := DomainConfig{
 		Domain:              "example.com",
+		AllowExpiry:         true,
 		ExpectedRegistrarID: "292",
 	}
 	snapshot2 := RDAPSnapshot{
@@ -471,6 +479,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 3. ExpectedRegistrarName Match (case-insensitive substring)
 	target3 := DomainConfig{
 		Domain:                "example.com",
+		AllowExpiry:           true,
 		ExpectedRegistrarName: "markmonitor",
 	}
 	snapshot3 := RDAPSnapshot{
@@ -488,6 +497,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 4. ExpectedRegistrarName Mismatch
 	target4 := DomainConfig{
 		Domain:                "example.com",
+		AllowExpiry:           true,
 		ExpectedRegistrarName: "markmonitor",
 	}
 	snapshot4 := RDAPSnapshot{
@@ -505,6 +515,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 5. Both set: Priority 1 (ID) matches, while Priority 2 (Name) would mismatch -> Passes on prioritized ID
 	target5 := DomainConfig{
 		Domain:                "example.com",
+		AllowExpiry:           true,
 		ExpectedRegistrarID:   "292",
 		ExpectedRegistrarName: "godaddy", // Name would mismatch, but ID 292 matches!
 	}
@@ -524,6 +535,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 6. Both set: Priority 1 (ID) mismatches, even though Priority 2 (Name) matches -> Fails on prioritized ID
 	target6 := DomainConfig{
 		Domain:                "example.com",
+		AllowExpiry:           true,
 		ExpectedRegistrarID:   "999",         // ID mismatches
 		ExpectedRegistrarName: "markmonitor", // Name matches
 	}
@@ -546,6 +558,7 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 
 	target1 := DomainConfig{
 		Domain:               "example.com",
+		AllowExpiry:          true,
 		DomainTransferLocked: false,
 	}
 	snapshot1 := RDAPSnapshot{
@@ -561,6 +574,7 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 
 	target2 := DomainConfig{
 		Domain:               "example.com",
+		AllowExpiry:          true,
 		DomainTransferLocked: true,
 	}
 	snapshot2 := RDAPSnapshot{
@@ -576,6 +590,7 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 
 	target3 := DomainConfig{
 		Domain:               "example.com",
+		AllowExpiry:          true,
 		DomainTransferLocked: true,
 	}
 	snapshot3 := RDAPSnapshot{
@@ -758,6 +773,28 @@ DNSSEC: unsigned
 	}
 }
 
+func TestSupplementThinRDAPPreservesRDAPAndFillsMissingExpiry(t *testing.T) {
+	whois := `Domain Name: EXAMPLE.COM
+Registry Expiry Date: 2028-05-10T12:00:00Z
+Registrar: WHOIS Registrar
+Name Server: ns-whois.example.com
+DNSSEC: unsigned`
+	app := getMockWHOISApp(func(_ string) (string, error) { return whois, nil })
+	rdap := RDAPSnapshot{
+		RegistryTier: &DomainTierData{Source: SourceRegistryRDAP, Registrar: "RDAP Registrar", Nameservers: []string{"ns-rdap.example.com"}},
+		Registrar:    "RDAP Registrar",
+		Nameservers:  []string{"ns-rdap.example.com"},
+		Source:       SourceRegistryRDAP,
+		ProtocolUsed: ProtocolRDAP,
+	}
+	got := supplementThinRDAP(context.Background(), app, "example.com", rdap)
+	assert.Equal(t, "2028-05-10T12:00:00Z", got.Expiration)
+	assert.Equal(t, "RDAP Registrar", got.Registrar)
+	assert.Equal(t, []string{"ns-rdap.example.com"}, got.Nameservers)
+	assert.Equal(t, ProtocolHybrid, got.ProtocolUsed)
+	assert.Contains(t, got.Source, SourceRegistryWHOIS)
+}
+
 func TestFetchWHOIS_AlternativeTemplates(t *testing.T) {
 	// Test ccTLD style with paid-till and nserver (e.g. RU/SU/ccTLDs)
 	whoisRu := `
@@ -870,10 +907,30 @@ func TestFetchWHOIS_NotFound(t *testing.T) {
 	}
 }
 
-func TestFollowRegistrarRDAPLinks(t *testing.T) {
-	AllowInsecureRDAPURLs = true
-	defer func() { AllowInsecureRDAPURLs = false }()
+func TestFallbackWHOISSnapshotDoesNotTreatTransportErrorAsMissingDomain(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, source string
+		queryErr     error
+		missing      bool
+	}{
+		{name: "missing WHOIS server", queryErr: errors.New("WHOIS server not found")},
+		{name: "missing domain", queryErr: ErrDomainNotFound, source: SourceWHOIS404, missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := NewAppState(AppConfig{})
+			app.WHOISClient = &MockWHOISClient{MockQuery: func(context.Context, string, string) (string, error) {
+				return "", tc.queryErr
+			}}
+			snapshot := fallbackWHOISSnapshot(context.Background(), app, "example.com", errors.New("RDAP unavailable"))
+			require.Error(t, snapshot.Err)
+			assert.Equal(t, tc.missing, errors.Is(snapshot.Err, ErrDomainNotFound))
+			assert.Equal(t, tc.source, snapshot.Source)
+		})
+	}
+}
 
+func TestFollowRegistrarRDAPLinks(t *testing.T) {
 	registrarServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/rdap+json")
 		_, _ = w.Write([]byte(`{
@@ -909,7 +966,7 @@ func TestFollowRegistrarRDAPLinks(t *testing.T) {
 
 	links := []string{registrarServer.URL + "/domain/example.com"}
 
-	relDomain := followRegistrarRDAPLinks(context.Background(), "example.com", links, nil)
+	relDomain := followRegistrarRDAPLinks(context.Background(), "example.com", links, registrarServer.Client(), &AppState{RDAPURLAllowed: func(string) bool { return true }})
 	if relDomain == nil {
 		t.Fatalf("Expected non-nil relDomain from registrar RDAP server")
 	}
@@ -944,6 +1001,24 @@ func TestFollowRegistrarRDAPLinks(t *testing.T) {
 	if !isTransferLocked(state.DomainStatus) {
 		t.Errorf("Expected domain to be transfer locked from registrar statuses")
 	}
+}
+
+func TestFollowRegistrarRDAPLinksSkipsWrongDomain(t *testing.T) {
+	var requested []string
+	client := &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+		requested = append(requested, req.URL.Path)
+		name := "other.example.com"
+		if req.URL.Path == "/domain/second" {
+			name = "example.com"
+		}
+		body := `{"objectClassName":"domain","ldhName":"` + name + `"}`
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}}
+	links := []string{"https://rdap.example/domain/first", "https://rdap.example/domain/second"}
+	response := followRegistrarRDAPLinks(context.Background(), "example.com", links, client, &AppState{RDAPURLAllowed: func(string) bool { return true }})
+	require.NotNil(t, response)
+	assert.Equal(t, "example.com", response.LDHName)
+	assert.Equal(t, []string{"/domain/first", "/domain/second"}, requested)
 }
 
 func TestTwoTierHierarchySynthesis(t *testing.T) {
@@ -1044,6 +1119,164 @@ func TestWHOISContextCancellation(t *testing.T) {
 	}
 }
 
+func TestDialPublicWHOISWithRejectsRestrictedAddresses(t *testing.T) {
+	lookup := func(_ context.Context, host string) ([]net.IPAddr, error) {
+		assert.Equal(t, "whois.example.com", host)
+		return []net.IPAddr{
+			{},
+			{IP: net.ParseIP("127.0.0.1")},
+			{IP: net.ParseIP("10.0.0.1")},
+			{IP: net.ParseIP("169.254.169.254")},
+		}, nil
+	}
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("restricted address reached the dialer")
+		return nil, nil
+	}
+	conn, err := dialPublicWHOISWith(context.Background(), "whois.example.com", lookup, dial)
+	require.Nil(t, conn)
+	require.ErrorContains(t, err, "no permitted public address")
+}
+
+func TestDialPublicWHOISWithUsesValidatedIPsAndRetries(t *testing.T) {
+	var dialed []string
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+	lookup := func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{
+			{IP: net.ParseIP("127.0.0.1")},
+			{IP: net.ParseIP("8.8.8.8")},
+			{IP: net.ParseIP("1.1.1.1")},
+		}, nil
+	}
+	dial := func(_ context.Context, network, address string) (net.Conn, error) {
+		assert.Equal(t, "tcp", network)
+		dialed = append(dialed, address)
+		if address == "8.8.8.8:43" {
+			return nil, errors.New("first address unavailable")
+		}
+		return client, nil
+	}
+	conn, err := dialPublicWHOISWith(context.Background(), "whois.example.com", lookup, dial)
+	require.NoError(t, err)
+	assert.Same(t, client, conn)
+	assert.Equal(t, []string{"8.8.8.8:43", "1.1.1.1:43"}, dialed)
+}
+
+func TestDialPublicWHOISWithReportsLookupAndConnectionFailures(t *testing.T) {
+	resolveErr := errors.New("resolver unavailable")
+	conn, err := dialPublicWHOISWith(context.Background(), "whois.example.com",
+		func(context.Context, string) ([]net.IPAddr, error) { return nil, resolveErr },
+		func(context.Context, string, string) (net.Conn, error) {
+			t.Fatal("dial called after lookup failure")
+			return nil, nil
+		})
+	require.Nil(t, conn)
+	require.ErrorIs(t, err, resolveErr)
+
+	dialErr := errors.New("connection refused")
+	conn, err = dialPublicWHOISWith(context.Background(), "whois.example.com",
+		func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+		},
+		func(_ context.Context, network, address string) (net.Conn, error) {
+			assert.Equal(t, "tcp", network)
+			assert.Equal(t, "8.8.8.8:43", address)
+			return nil, dialErr
+		})
+	require.Nil(t, conn)
+	require.ErrorIs(t, err, dialErr)
+}
+
+func TestWHOISTransportBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		wantErr bool
+	}{
+		{"normal", "Domain Name: example.com\r\n", false},
+		{"oversize", strings.Repeat("x", MaxWHOISResponseBytes+1), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer func() { _ = server.Close() }()
+			app := &AppState{WHOISDial: func(context.Context, string) (net.Conn, error) { return client, nil }}
+			querySeen := make(chan string, 1)
+			go func() {
+				line, _ := bufio.NewReader(server).ReadString('\n')
+				querySeen <- line
+				_, _ = server.Write([]byte(tt.payload))
+				_ = server.Close()
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			got, err := queryWHOISServer(ctx, app, "example.com", "whois.example.com")
+			assert.Equal(t, "example.com\r\n", <-querySeen)
+			if tt.wantErr {
+				require.ErrorContains(t, err, "exceeds")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, strings.TrimSpace(tt.payload), got)
+			}
+		})
+	}
+}
+
+func TestWHOISTransportCancellationAndTargets(t *testing.T) {
+	for _, server := range []string{"127.0.0.1", "whois.example.com:8443", "localhost", "whois.example.com/path"} {
+		assert.False(t, isSafeWHOISServer(server), server)
+	}
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	app := &AppState{WHOISDial: func(context.Context, string) (net.Conn, error) { return client, nil }}
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		_, err := queryWHOISServer(ctx, app, "example.com", "whois.example.com")
+		finished <- err
+	}()
+	_, _ = bufio.NewReader(server).ReadString('\n')
+	cancel()
+	select {
+	case err := <-finished:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("WHOIS transport did not stop on cancellation")
+	}
+}
+
+func TestWHOISDiscoveryUsesInjectedTransport(t *testing.T) {
+	for _, field := range []string{WHOISIANAReferralField, WHOISIANAWHOISField} {
+		t.Run(field, func(t *testing.T) {
+			var hosts []string
+			queries := make(chan string, 2)
+			app := &AppState{WHOISDial: func(_ context.Context, host string) (net.Conn, error) {
+				hosts = append(hosts, host)
+				client, server := net.Pipe()
+				go func() {
+					defer func() { _ = server.Close() }()
+					line, _ := bufio.NewReader(server).ReadString('\n')
+					queries <- line
+					if host == WHOISIANAHost {
+						_, _ = server.Write([]byte(field + ": whois.example.com\r\n"))
+					} else {
+						_, _ = server.Write([]byte("Domain Name: example.com\r\n"))
+					}
+				}()
+				return client, nil
+			}}
+			got, err := queryWHOISWithContext(context.Background(), app, "example.com")
+			require.NoError(t, err)
+			assert.Equal(t, "Domain Name: example.com", got)
+			assert.Equal(t, []string{WHOISIANAHost, "whois.example.com"}, hosts)
+			assert.Equal(t, "com\r\n", <-queries)
+			assert.Equal(t, "example.com\r\n", <-queries)
+		})
+	}
+}
+
 func TestWHOISRateLimitingClassification(t *testing.T) {
 	t.Parallel()
 
@@ -1067,47 +1300,85 @@ func TestWHOISRateLimitingClassification(t *testing.T) {
 }
 
 func TestFetchWHOIS_Extensive(t *testing.T) {
-	files, err := os.ReadDir("testdata/whois")
-	if err != nil {
-		t.Skip("testdata/whois not found, skipping extensive tests")
+	tests := []struct {
+		name       string
+		content    string
+		wantExpiry string
+	}{
+		{
+			name: "com",
+			content: `Domain Name: EXAMPLE.COM
+Registry Expiry Date: 2030-08-13T04:00:00Z
+Registrar: Example Registrar
+Name Server: ns1.example.com
+Name Server: ns2.example.com`,
+			wantExpiry: "2030-08-13",
+		},
+		{
+			name: "au",
+			content: `domain:        EXAMPLE.AU
+nserver:       ns1.example.au.
+nserver:       ns2.example.au.
+state:         REGISTERED, DELEGATED, VERIFIED
+org:           Example LLC
+registrar:     AU-REGISTRAR
+paid-till:     2030-09-15`,
+			wantExpiry: "2030-09-15",
+		},
+		{
+			name: "tv",
+			content: `    Domain name:
+        example.tv
+
+    Registrar:
+        TV Registrar
+        URL: http://www.tvregistrar.tv
+
+    Relevant dates:
+        Registered on: 01-Aug-1996
+        Expiry date:  01-Aug-2030
+        Last updated:  08-Jul-2024
+
+    Name servers:
+        ns1.tvregistrar.tv
+        ns2.tvregistrar.tv`,
+			wantExpiry: "2030-08-01",
+		},
 	}
 
-	successCount := 0
-	totalCount := 0
-
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-		name := file.Name()
-		if strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".pre") || name == "README.md" || strings.HasPrefix(name, "ac_git.ac") {
-			continue
-		}
-
-		totalCount++
-		filePath := filepath.Join("testdata/whois", name)
-		contentBytes, err := os.ReadFile(filePath)
-		if err != nil {
-			t.Fatalf("failed to read test file %s: %v", filePath, err)
-		}
-		content := string(contentBytes)
-
+	for _, tt := range tests {
 		app := getMockWHOISApp(func(_ string) (string, error) {
-			return content, nil
+			return tt.content, nil
 		})
 
-		state, err := fetchWHOIS(context.Background(), app, "example"+filepath.Ext(name))
-		if err != nil {
-			t.Logf("Failed to parse %s: %v", name, err)
-			continue
-		}
-
-		if state.Expiration != "" || state.Registrar != "" || len(state.Nameservers) > 0 {
-			successCount++
-		}
+		state, err := fetchWHOIS(context.Background(), app, "example."+tt.name)
+		require.NoError(t, err, "fixture %s", tt.name)
+		assert.True(t, strings.HasPrefix(state.Expiration, tt.wantExpiry), "fixture %s expiration: %q", tt.name, state.Expiration)
+		assert.NotEmpty(t, state.Registrar, "fixture %s registrar", tt.name)
+		assert.GreaterOrEqual(t, len(state.Nameservers), 2, "fixture %s nameservers", tt.name)
 	}
+}
 
-	t.Logf("Successfully extracted some data from %d/%d WHOIS templates", successCount, totalCount)
+func TestWHOISDoesNotFollowHTTPURLAsPort43Referral(t *testing.T) {
+	const registry = "Domain Name: EXAMPLE.ORG\nRegistry Expiry Date: 2028-12-07T17:04:26Z\nRegistrar: Example Registrar\nName Server: ns1.example.org\nName Server: ns2.example.org\nRegistrar WHOIS Server: http://whois.example.org\n"
+	calls := 0
+	app := NewAppState(AppConfig{})
+	app.RDAPLimiter = nil
+	app.WHOISClient = &MockWHOISClient{MockQuery: func(_ context.Context, domain, server string) (string, error) {
+		calls++
+		assert.Equal(t, "example.org", domain)
+		assert.Empty(t, server)
+		return registry, nil
+	}}
+	state, err := fetchWHOIS(context.Background(), app, "example.org")
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls, "HTTP registrar URL must not be queried as a port-43 host")
+	assert.Equal(t, SourceRegistryWHOIS, state.Source)
+	assert.Equal(t, "Example Registrar", state.Registrar)
+	assert.Equal(t, "2028-12-07T17:04:26Z", state.Expiration)
+	assert.Equal(t, []string{"ns1.example.org", "ns2.example.org"}, state.Nameservers)
+	assert.Nil(t, ReWHOISReferral.FindStringSubmatch("Registrar WHOIS Server: http://whois.example.org"))
+	assert.Equal(t, "whois.example.org", ReWHOISReferral.FindStringSubmatch("Registrar WHOIS Server: whois://whois.example.org")[1])
 }
 
 func FuzzFlexibleDateParsing(f *testing.F) {
@@ -1252,10 +1523,13 @@ func TestFollowRegistrarRDAPLinks_SSRFProtection(t *testing.T) {
 		"http://169.254.169.254/latest/meta-data/",
 		"http://127.0.0.1:8080/api/certs",
 		"http://[::1]:8080/api/state",
+		"https://[fe80::1%25eth0]/domain/example.com",
 		"http://10.0.0.1/admin",
 		"http://192.168.1.1/secret",
 		"http://172.16.0.1/internal",
 		"http://localhost:8080/metrics",
+		"https://localhost./domain/example.com",
+		"https://service.local./domain/example.com",
 		"http://service.local/rdap",
 		"http://metadata.google.internal/computeMetadata/v1/",
 		"ftp://rdap.example.com/domain/test",
@@ -1285,9 +1559,6 @@ func TestFollowRegistrarRDAPLinks_SSRFProtection(t *testing.T) {
 }
 
 func TestFollowRegistrarRDAPLinks_QueryParamReferral(t *testing.T) {
-	AllowInsecureRDAPURLs = true
-	defer func() { AllowInsecureRDAPURLs = false }()
-
 	var receivedPath string
 	var receivedQuery string
 
@@ -1306,7 +1577,7 @@ func TestFollowRegistrarRDAPLinks_QueryParamReferral(t *testing.T) {
 
 	// Referral URL with query parameter and base path
 	links := []string{server.URL + "/rdap_service?apiKey=secret123"}
-	res := followRegistrarRDAPLinks(context.Background(), "example.com", links, nil)
+	res := followRegistrarRDAPLinks(context.Background(), "example.com", links, server.Client(), &AppState{RDAPURLAllowed: func(string) bool { return true }})
 
 	if res == nil {
 		t.Fatalf("Expected non-nil response from referral server")
@@ -1319,10 +1590,18 @@ func TestFollowRegistrarRDAPLinks_QueryParamReferral(t *testing.T) {
 	}
 }
 
-func TestNewRDAPHTTPClient_BlocksInsecureRedirects(t *testing.T) {
-	// Insecure RDAP URLs disallowed (default)
-	AllowInsecureRDAPURLs = false
+func TestFollowRegistrarRDAPLinksRejectsWrongDomain(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/rdap+json")
+		_, _ = w.Write([]byte(`{"objectClassName":"domain","ldhName":"other.example.com"}`))
+	}))
+	defer server.Close()
+	result := followRegistrarRDAPLinks(context.Background(), "example.com", []string{server.URL + "/domain/example.com"}, server.Client(), &AppState{RDAPURLAllowed: func(string) bool { return true }})
+	assert.Nil(t, result)
+}
 
+func TestNewRDAPHTTPClient_BlocksInsecureRedirects(t *testing.T) {
 	client := NewRDAPHTTPClient(2 * time.Second)
 	if client.CheckRedirect == nil {
 		t.Fatalf("Expected client.CheckRedirect to be defined")
@@ -1472,18 +1751,6 @@ func TestValidateRDAPState_ExpiryWarning(t *testing.T) {
 	}
 }
 
-// mockAlertCollector is a test helper NotificationProvider that collects alerts via callback.
-type mockAlertCollector struct {
-	collect func(Alert)
-	mu      sync.Mutex
-}
-
-func (m *mockAlertCollector) Send(_ context.Context, alert Alert) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.collect(alert)
-}
-
 // TestSynthesizeTierData_RegistryIANAIDPreserved validates that registry IANA ID is not
 // dropped when the registrar tier provides the registrar name but lacks an IANA ID.
 func TestSynthesizeTierData_RegistryIANAIDPreserved(t *testing.T) {
@@ -1515,9 +1782,45 @@ func TestSynthesizeTierData_RegistryIANAIDPreserved(t *testing.T) {
 	}
 }
 
+func TestEvaluateRDAP_ExpiryEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		expiry string
+		allow  bool
+		want   CheckStatus
+		code   ResultCode
+	}{
+		{name: "missing", want: StatusFailed, code: CodeRDAPExpiryUnavailable},
+		{name: "malformed", expiry: "not-a-date", want: StatusFailed, code: CodeRDAPExpiryUnavailable},
+		{name: "allowed missing", allow: true, want: StatusOK, code: CodeRDAPSuccess},
+		{name: "valid", expiry: time.Now().Add(365 * 24 * time.Hour).UTC().Format(time.RFC3339), want: StatusOK, code: CodeRDAPSuccess},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, cond := EvaluateRDAP(DomainConfig{Domain: "example.com", AllowExpiry: tc.allow}, RDAPSnapshot{Expiration: tc.expiry, DomainStatus: []string{"clientTransferProhibited"}})
+			assert.Equal(t, tc.want, status)
+			require.NotNil(t, cond)
+			assert.Equal(t, tc.code, cond.Code)
+		})
+	}
+}
+
+func TestExtractWHOISTier_DNSSECTokens(t *testing.T) {
+	for _, tc := range []struct {
+		token string
+		want  bool
+	}{
+		{"unsigned", false}, {"not signed", false}, {"signed", true}, {"yes", true}, {"inactive", false},
+	} {
+		t.Run(tc.token, func(t *testing.T) {
+			tier := extractWHOISTier("DNSSEC: "+tc.token, SourceWHOIS, "whois.example")
+			assert.Equal(t, tc.want, tier.DNSSEC)
+		})
+	}
+}
+
 func TestEvaluateRDAP(t *testing.T) {
 	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{},
 	}
 	target := DomainConfig{
 		Domain:     "example.com",
@@ -1553,11 +1856,12 @@ func TestFetchRDAP(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{ "rdapConformance": [ "rdap_level_0" ], "handle": "123" }`))
+		_, _ = w.Write([]byte(`{ "rdapConformance": [ "rdap_level_0" ], "objectClassName": "domain", "ldhName": "example.com", "handle": "123" }`))
 	}))
 	defer server.Close()
 
 	app := &AppState{
+		RDAPURLAllowed: func(string) bool { return true },
 		Bootstrap: &Bootstrap{
 			url:  server.URL,
 			http: server.Client(),
@@ -1573,9 +1877,115 @@ func TestFetchRDAP(t *testing.T) {
 	assert.NotNil(t, state)
 }
 
+func TestFetchRDAPSnapshotKeepsCompleteRDAPWithoutWHOIS(t *testing.T) {
+	const body = `{"objectClassName":"domain","ldhName":"example.com","events":[{"eventAction":"expiration","eventDate":"2030-01-01T00:00:00Z"}],"entities":[{"roles":["registrar"],"vcardArray":["vcard",[["fn",{},"text","RDAP Registrar"]]]}]}`
+	whoisCalls := 0
+	app := &AppState{
+		Bootstrap:      &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()},
+		RDAPURLAllowed: func(string) bool { return true },
+		WHOISClient: &MockWHOISClient{MockQuery: func(context.Context, string, string) (string, error) {
+			whoisCalls++
+			return "", errors.New("WHOIS should not be queried")
+		}},
+	}
+	client := &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+		assert.Equal(t, "https://rdap.example/domain/example.com", req.URL.String())
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}}
+	snapshot := FetchRDAPSnapshot(context.Background(), client, app, "example.com")
+	require.NoError(t, snapshot.Err)
+	assert.Equal(t, ProtocolRDAP, snapshot.ProtocolUsed)
+	assert.Equal(t, "2030-01-01T00:00:00Z", snapshot.Expiration)
+	assert.Equal(t, "RDAP Registrar", snapshot.Registrar)
+	assert.Zero(t, whoisCalls)
+}
+
+func TestFetchRDAPSnapshotSupplementsThinRDAP(t *testing.T) {
+	const rdapBody = `{"objectClassName":"domain","ldhName":"example.com"}`
+	const whoisBody = "Domain Name: EXAMPLE.COM\nRegistry Expiry Date: 2030-01-01T00:00:00Z\nRegistrar: WHOIS Registrar\n"
+	app := &AppState{
+		Bootstrap:      &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()},
+		RDAPURLAllowed: func(string) bool { return true },
+		WHOISClient: &MockWHOISClient{MockQuery: func(_ context.Context, domain, _ string) (string, error) {
+			assert.Equal(t, "example.com", domain)
+			return whoisBody, nil
+		}},
+	}
+	client := &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(rdapBody))}, nil
+	}}
+	snapshot := FetchRDAPSnapshot(context.Background(), client, app, "example.com")
+	require.NoError(t, snapshot.Err)
+	assert.Equal(t, ProtocolHybrid, snapshot.ProtocolUsed)
+	assert.Equal(t, "2030-01-01T00:00:00Z", snapshot.Expiration)
+	assert.Equal(t, "WHOIS Registrar", snapshot.Registrar)
+}
+
+func TestFetchRDAPSnapshotFallsBackToWHOISOn404(t *testing.T) {
+	const whoisBody = "Domain Name: EXAMPLE.COM\nRegistry Expiry Date: 2030-01-01T00:00:00Z\nRegistrar: WHOIS Registrar\n"
+	app := &AppState{
+		Bootstrap:      &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()},
+		RDAPURLAllowed: func(string) bool { return true },
+		WHOISClient: &MockWHOISClient{MockQuery: func(_ context.Context, domain, _ string) (string, error) {
+			assert.Equal(t, "example.com", domain)
+			return whoisBody, nil
+		}},
+	}
+	client := &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}}
+	snapshot := FetchRDAPSnapshot(context.Background(), client, app, "example.com")
+	require.NoError(t, snapshot.Err)
+	assert.Equal(t, ProtocolWHOIS, snapshot.ProtocolUsed)
+	assert.Equal(t, "2030-01-01T00:00:00Z", snapshot.Expiration)
+	assert.Equal(t, "WHOIS Registrar", snapshot.Registrar)
+}
+
+func TestFetchRDAPRejectsWrongDomainResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{name: "wrong domain", body: `{"objectClassName":"domain","ldhName":"other.example.com","events":[{"eventAction":"expiration","eventDate":"2030-01-01T00:00:00Z"}]}`},
+		{name: "wrong object class", body: `{"objectClassName":"nameserver","ldhName":"example.com"}`},
+		{name: "missing identity", body: `{"objectClassName":"domain","events":[{"eventAction":"expiration","eventDate":"2030-01-01T00:00:00Z"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/rdap+json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			app := &AppState{
+				RDAPURLAllowed: func(string) bool { return true },
+				Bootstrap:      &Bootstrap{services: map[string][]string{"com": {server.URL + "/"}}, fetchedAt: time.Now()},
+			}
+			_, err := fetchRDAP(context.Background(), server.Client(), app, "example.com")
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestRDAPResponseReadersRejectOversizedBody(t *testing.T) {
+	t.Parallel()
+	body := `{"objectClassName":"domain","ldhName":"example.com"}` + strings.Repeat(" ", MaxBootstrapResponseSize)
+	for _, tc := range []struct {
+		name string
+		read func(*http.Response) (*RDAPDomainResponse, error)
+	}{
+		{name: "registry", read: readRDAPDomainResponse},
+		{name: "registrar", read: readRegistrarRDAPResponse},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}
+			_, err := tc.read(response)
+			require.ErrorContains(t, err, "exceeds")
+		})
+	}
+}
+
 func TestEvaluateNSDelegation(t *testing.T) {
 	app := &AppState{
-		Notifier: &NotificationManager{TestMode: true},
+		Notifier: &NotificationManager{},
 	}
 	target := DomainConfig{
 		Domain:     "example.com",
@@ -1585,6 +1995,24 @@ func TestEvaluateNSDelegation(t *testing.T) {
 	snapshot := FetchNSDelegationSnapshot(context.Background(), app, target)
 	status, _ := EvaluateNSDelegation(target, snapshot)
 	require.NotEqual(t, StatusPending, status)
+}
+
+func TestFetchNSDelegationIgnoresWrongClassAnswer(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		wrong, err := dns.NewRR("example.com. 60 CH NS rogue.example.")
+		require.NoError(t, err)
+		legitimate, err := dns.NewRR("example.com. 60 IN NS ns1.example.")
+		require.NoError(t, err)
+		response.Answer = []dns.RR{wrong}
+		response.Ns = []dns.RR{legitimate}
+		return response, 0, nil
+	}}
+	snapshot := FetchNSDelegationSnapshot(context.Background(), app, DomainConfig{Domain: "example.com"})
+	require.NoError(t, snapshot.Err)
+	assert.Equal(t, []string{"ns1.example"}, snapshot.Nameservers)
 }
 
 func TestEvaluateRDAP_MockedPaths(t *testing.T) {
@@ -1604,7 +2032,8 @@ func TestEvaluateRDAP_MockedPaths(t *testing.T) {
 
 	snapshot := FetchRDAPSnapshot(ctx, app.HTTPClient, app, "example.com")
 	st, _ := EvaluateRDAP(DomainConfig{Domain: "example.com"}, snapshot)
-	assert.Equal(t, StatusWarning, st)
+	assert.Equal(t, StatusFailed, st)
+	assert.Error(t, snapshot.Err)
 }
 
 func TestResolveRootZoneResolvers_MockedPaths(t *testing.T) {
@@ -1633,4 +2062,398 @@ func TestResolveRootZoneResolvers_MockedPaths(t *testing.T) {
 
 	res := resolveRootZoneResolvers(ctx, app, "com", []string{"1.1.1.1"})
 	assert.Contains(t, res, "1.2.3.4")
+}
+
+func TestParentDelegationDoesNotUseRecursiveFallback(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	queries := 0
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		queries++
+		response := new(dns.Msg)
+		response.SetReply(q)
+		return response, 0, nil // Parent has no NS address evidence.
+	}}
+	snapshot := FetchNSDelegationSnapshot(context.Background(), app, DomainConfig{Domain: "sub.example.com", RootZone: "example.com"})
+	require.Error(t, snapshot.Err)
+	assert.Equal(t, 1, queries)
+}
+
+func TestParentDelegationRejectsWrongAnswerOwner(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(q)
+		record, _ := dns.NewRR("other.example.com. IN NS ns1.example.com.")
+		response.Answer = []dns.RR{record}
+		return response, 0, nil
+	}}
+	target := DomainConfig{Domain: "example.com", ExpectedNS: []string{"ns1.example.com"}}
+	snapshot := FetchNSDelegationSnapshot(context.Background(), app, target)
+	assert.Empty(t, snapshot.Nameservers)
+	status, condition := EvaluateNSDelegation(target, snapshot)
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, CodeDNSLookupFailed, condition.Code)
+}
+
+func TestRDAPTLSConfig(t *testing.T) {
+	t.Parallel()
+
+	tlsCfg := RDAPTLSConfig()
+	if tlsCfg == nil {
+		t.Fatalf("RDAPTLSConfig returned nil")
+	}
+
+	if tlsCfg.MinVersion != tls.VersionTLS12 {
+		t.Errorf("Expected MinVersion to be TLS 1.2 (0x%x), got 0x%x", tls.VersionTLS12, tlsCfg.MinVersion)
+	}
+
+	if len(tlsCfg.CipherSuites) == 0 {
+		t.Fatalf("Expected CipherSuites to be populated")
+	}
+
+	// Verify modern ciphers come before legacy CBC ciphers
+	modernCount := len(tls.CipherSuites())
+	if len(tlsCfg.CipherSuites) <= modernCount {
+		t.Errorf("Expected legacy cipher suites to be appended after modern suites")
+	}
+
+	// Verify the first suite is a modern suite, not weak RSA-CBC
+	if tlsCfg.CipherSuites[0] == tls.TLS_RSA_WITH_AES_128_CBC_SHA || tlsCfg.CipherSuites[0] == tls.TLS_RSA_WITH_AES_256_CBC_SHA {
+		t.Errorf("Weak RSA-CBC cipher suite found at top priority in CipherSuites")
+	}
+}
+
+func TestBootstrapRequiresInjectedHTTPClient(t *testing.T) {
+	b := NewBootstrap(nil)
+	err := b.fetch(context.Background())
+	assert.ErrorIs(t, err, ErrBootstrapClientNil)
+}
+
+func TestNewRDAPHTTPClient(t *testing.T) {
+	t.Parallel()
+
+	timeout := 8 * time.Second
+	client := NewRDAPHTTPClient(timeout)
+	if client == nil {
+		t.Fatalf("NewRDAPHTTPClient returned nil")
+	}
+	if client.Timeout != timeout {
+		t.Errorf("Expected client timeout %v, got %v", timeout, client.Timeout)
+	}
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("Expected *http.Transport, got %T", client.Transport)
+	}
+	if transport.TLSClientConfig == nil || transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Errorf("Expected TLSClientConfig with MinVersion TLS 1.2 on transport")
+	}
+}
+
+func TestKnownWHOISServer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		domain   string
+		expected string
+	}{
+		{"example.de", "whois.denic.de"},
+		{"example.com.au", "whois.auda.org.au"},
+		{"example.co.uk", "whois.nominet.uk"},
+		{"example.ru", "whois.tcinet.ru"},
+		{"example.com", ""}, // Generic TLD not in CCTLDWHOISServers
+	}
+
+	for _, tt := range tests {
+		server := KnownWHOISServer(tt.domain)
+		if server != tt.expected {
+			t.Errorf("KnownWHOISServer(%q) = %q, expected %q", tt.domain, server, tt.expected)
+		}
+	}
+}
+
+func TestBootstrapFetchAndResolution(t *testing.T) {
+	ianaData := dnsRegistry{
+		Services: [][][]string{
+			{
+				{"com", "net"},
+				{"https://rdap.verisign.com/com/v1/"},
+			},
+			{
+				{"org"},
+				{"https://rdap.publicinterestregistry.org/rdap/"},
+			},
+			{
+				{"co.uk", "org.uk"},
+				{"https://rdap.nominet.uk/"},
+			},
+			{
+				{"xn--p1ai"}, // .рф
+				{"https://rdap.tcinet.ru/"},
+			},
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		out, _ := jsonv2.Marshal(ianaData)
+		_, _ = w.Write(out)
+	}))
+	defer server.Close()
+
+	b := NewBootstrap(server.Client())
+	b.url = server.URL
+
+	ctx := context.Background()
+
+	// 1. Standard gTLD resolution
+	comServers, err := b.ServersFor(ctx, "example.com")
+	if err != nil || len(comServers) == 0 || comServers[0] != "https://rdap.verisign.com/com/v1/" {
+		t.Errorf("Expected com server URL, got %v (err: %v)", comServers, err)
+	}
+
+	// 2. Multi-level SLD resolution (.co.uk)
+	ukServers, err := b.ServersFor(ctx, "test.co.uk")
+	if err != nil || len(ukServers) == 0 || ukServers[0] != "https://rdap.nominet.uk/" {
+		t.Errorf("Expected co.uk server URL, got %v (err: %v)", ukServers, err)
+	}
+
+	// 3. IDN Punycode resolution (.рф)
+	idnServers, err := b.ServersFor(ctx, "россия.рф")
+	if err != nil || len(idnServers) == 0 || idnServers[0] != "https://rdap.tcinet.ru/" {
+		t.Errorf("Expected .рф server URL, got %v (err: %v)", idnServers, err)
+	}
+
+	// 4. StealthSeeds fallback for TLDs not in IANA registry (e.g. .io, .ai)
+	ioServers, err := b.ServersFor(ctx, "project.io")
+	if err != nil || len(ioServers) == 0 {
+		t.Errorf("Expected StealthSeeds fallback for .io, got %v (err: %v)", ioServers, err)
+	}
+
+	// 5. Unknown non-existent TLD
+	_, err = b.ServersFor(ctx, "test.invalidrandomtld98765")
+	if err == nil {
+		t.Errorf("Expected error for non-existent TLD, got nil")
+	}
+}
+
+func TestBootstrapCacheExpiryAndFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "simulated 500 internal error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	b := NewBootstrap(server.Client())
+	b.url = server.URL
+
+	// 1. Pre-populate cache with timestamp 30 hours ago (expired TTL, but within 72h max age)
+	b.services = map[string][]string{
+		"com": {"https://rdap.verisign.com/com/v1/"},
+	}
+	b.fetchedAt = time.Now().Add(-30 * time.Hour)
+
+	// ensure() should encounter server error, but successfully fall back to cached services
+	err := b.ensure(context.Background())
+	if err != nil {
+		t.Fatalf("Expected graceful fallback to cache within 72h, got error: %v", err)
+	}
+
+	servers, err := b.ServersFor(context.Background(), "example.com")
+	if err != nil || len(servers) == 0 || servers[0] != "https://rdap.verisign.com/com/v1/" {
+		t.Errorf("Expected cached server URL, got %v (err: %v)", servers, err)
+	}
+
+	// 2. Set timestamp to 80 hours ago (beyond 72h max age)
+	b.fetchedAt = time.Now().Add(-80 * time.Hour)
+	err = b.ensure(context.Background())
+	if err == nil {
+		t.Errorf("Expected error when cache is older than 72h and IANA is down, got nil")
+	}
+}
+
+func TestBootstrapConcurrentColdStart(t *testing.T) {
+	var requestCount int
+	var countMu sync.Mutex
+
+	ianaData := dnsRegistry{
+		Services: [][][]string{
+			{
+				{"com"},
+				{"https://rdap.verisign.com/com/v1/"},
+			},
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		countMu.Lock()
+		requestCount++
+		countMu.Unlock()
+		time.Sleep(20 * time.Millisecond) // Artificial latency
+		w.Header().Set("Content-Type", "application/json")
+		out, _ := jsonv2.Marshal(ianaData)
+		_, _ = w.Write(out)
+	}))
+	defer server.Close()
+
+	b := NewBootstrap(server.Client())
+	b.url = server.URL
+
+	var wg sync.WaitGroup
+	workers := 10
+	errChan := make(chan error, workers)
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := b.ServersFor(context.Background(), "example.com")
+			if err != nil {
+				errChan <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		t.Errorf("Unexpected error in concurrent ServersFor: %v", err)
+	}
+
+	countMu.Lock()
+	totalReqs := requestCount
+	countMu.Unlock()
+
+	if totalReqs != 1 {
+		t.Errorf("Expected exactly 1 HTTP request due to singleflight double-checked fetch, got %d", totalReqs)
+	}
+}
+
+func TestNilSafety_Bootstrap(t *testing.T) {
+	var nilB *Bootstrap
+	if _, err := nilB.ServersFor(context.Background(), "example.com"); err == nil {
+		t.Errorf("expected error from ServersFor on nil Bootstrap")
+	}
+	if nilB.isFresh() {
+		t.Errorf("expected isFresh to be false for nil Bootstrap")
+	}
+	if err := nilB.ensure(context.Background()); err == nil {
+		t.Errorf("expected error from ensure on nil Bootstrap")
+	}
+	if err := nilB.fetch(context.Background()); err == nil {
+		t.Errorf("expected error from fetch on nil Bootstrap")
+	}
+}
+
+func TestNewRDAPHTTPClient_SSRFBlocked_SentinelError(t *testing.T) {
+	client := NewRDAPHTTPClient(2 * time.Second)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1:54321/domain/test", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	_, err = client.Do(req)
+	if err == nil {
+		t.Fatalf("expected request to 127.0.0.1 to be blocked, got nil error")
+	}
+	if !errors.Is(err, ErrRestrictedIP) {
+		t.Errorf("expected error to wrap ErrRestrictedIP, got: %v", err)
+	}
+}
+
+func TestEPPStatusClassificationAndExtensions(t *testing.T) {
+	assert.Equal(t, EPPClientHold, classifyEPPStatus("client hold"))
+	assert.Equal(t, EPPPendingTransfer, classifyEPPStatus("pendingTransfer"))
+	assert.Equal(t, EPPAddPeriod, classifyEPPStatus("addPeriod"))
+	assert.Equal(t, EPPUnknown, classifyEPPStatus("providerCustomStatus"))
+	assert.False(t, isTransferLocked([]string{"notTransferProhibited"}))
+	assert.True(t, isTransferLocked([]string{"clientTransferProhibited"}))
+	statuses := NormalizeDomainStatuses([]string{"providerCustomStatus", "serverHold"})
+	assert.Contains(t, statuses, "providerCustomStatus")
+	status, condition := EvaluateRDAP(DomainConfig{Domain: "example.com", AllowExpiry: true}, RDAPSnapshot{DomainStatus: statuses})
+	assert.Equal(t, StatusFailed, status)
+	require.NotNil(t, condition)
+	assert.Equal(t, CodeEPPServerHold, condition.Code)
+}
+
+func TestBootstrapRejectsOversizedValidPrefix(t *testing.T) {
+	body := `{"services":[[["com"],["https://rdap.example/"]]]}` + strings.Repeat(" ", MaxBootstrapResponseSize)
+	bootstrap := NewBootstrap(&MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}})
+	_, err := bootstrap.ServersFor(context.Background(), "example.com")
+	require.Error(t, err)
+	assert.Empty(t, bootstrap.services)
+}
+
+// TestLiveRDAPOrgRegistry compares a second registry with its direct RDAP
+// response, independent of the monitor's IANA bootstrap and referral logic.
+func TestLiveRDAPOrgRegistry(t *testing.T) {
+	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
+		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external RDAP queries")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 12 * time.Second}
+	app := NewAppState(AppConfig{})
+	app.HTTPClient = client
+	app.Bootstrap = NewBootstrap(client)
+	snapshot := FetchRDAPSnapshot(ctx, client, app, "icann.org")
+	status, condition := EvaluateRDAP(DomainConfig{Domain: "icann.org"}, snapshot)
+	t.Logf("status=%s condition=%v protocol=%s source=%s expiry=%s nameservers=%v error=%v", status, condition, snapshot.ProtocolUsed, snapshot.Source, snapshot.Expiration, snapshot.Nameservers, snapshot.Err)
+	if snapshot.Err != nil || status != StatusOK || !strings.HasPrefix(snapshot.Expiration, "2028-12-07") || !slices.Contains(snapshot.Nameservers, "ns.icann.org") {
+		t.Fatalf("monitor RDAP result disagrees with direct .org registry response")
+	}
+}
+
+// TestLiveWHOIS exercises the actual IANA discovery, registry port-43 transport,
+// optional registrar referral, and parser. Run explicitly; public servers and
+// network policy can change independently of this code.
+func TestLiveWHOIS(t *testing.T) {
+	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
+		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external WHOIS queries")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	state, err := fetchWHOIS(ctx, NewAppState(AppConfig{}), "cloudflare.com")
+	if err != nil {
+		t.Fatalf("live WHOIS lookup: %v", err)
+	}
+	if state.ProtocolUsed != ProtocolWHOIS || state.Registrar == "" || state.Expiration == "" || len(state.Nameservers) < 2 {
+		t.Fatalf("incomplete live WHOIS result: protocol=%q registrar=%q expiry=%q nameservers=%v",
+			state.ProtocolUsed, state.Registrar, state.Expiration, state.Nameservers)
+	}
+	if _, _, err := parseFlexibleDate(state.Expiration); err != nil {
+		t.Fatalf("invalid live WHOIS expiration %q: %v", state.Expiration, err)
+	}
+	t.Logf("registrar=%q expiration=%q nameservers=%d source=%q", state.Registrar, state.Expiration, len(state.Nameservers), state.Source)
+}
+
+// TestLiveWHOISOrg checks another registry's port-43 format against the
+// independent whois client output recorded in the release review.
+func TestLiveWHOISOrg(t *testing.T) {
+	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
+		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external WHOIS queries")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+	state, err := fetchWHOIS(ctx, NewAppState(AppConfig{}), "icann.org")
+	if err != nil {
+		t.Fatalf("live .org WHOIS lookup: %v", err)
+	}
+	t.Logf("registrar=%q expiration=%q nameservers=%v source=%q", state.Registrar, state.Expiration, state.Nameservers, state.Source)
+	if state.ProtocolUsed != ProtocolWHOIS || state.Registrar == "" || !strings.HasPrefix(state.Expiration, "2028-12-07") || !slices.Contains(state.Nameservers, "ns.icann.org") {
+		t.Fatalf("monitor .org WHOIS result disagrees with direct registry response")
+	}
+}
+
+func TestEPPDocumentationLinkCannotHideHold(t *testing.T) {
+	statuses := NormalizeDomainStatuses([]string{"serverHold https://icann.org/epp#ok", "providerExtension https://icann.org/epp#clientTransferProhibited"})
+	status, condition := EvaluateRDAP(DomainConfig{Domain: "example.com", AllowExpiry: true}, RDAPSnapshot{DomainStatus: statuses})
+	assert.Equal(t, StatusFailed, status)
+	require.NotNil(t, condition)
+	assert.Equal(t, CodeEPPServerHold, condition.Code)
+	assert.Contains(t, statuses, "providerExtension")
+	assert.False(t, isTransferLocked(statuses), "documentation fragments must not invent a lock")
 }

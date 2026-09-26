@@ -47,12 +47,12 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 			Timeout:   timeout,
 			KeepAlive: DefaultTCPKeepAlive,
 			Control: func(_, address string, _ syscall.RawConn) error {
-				if AllowInsecureRDAPURLs {
-					return nil
-				}
 				host, _, err := net.SplitHostPort(address)
 				if err != nil {
 					host = address
+				}
+				if strings.Contains(host, "%") {
+					return WrapError(host, ErrRestrictedIP)
 				}
 				if ip := net.ParseIP(host); ip != nil {
 					if IsRestrictedIP(ip) {
@@ -165,6 +165,10 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 		return ErrBootstrapClientNil
 	}
 	client := ResolveHTTPClient(b.http)
+	if client == nil {
+		return fmt.Errorf("fetch RDAP bootstrap registry: %w", ErrBootstrapClientNil)
+	}
+	// #nosec G704 -- bootstrap URL is a configured endpoint; callers control its HTTP transport.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.url, nil)
 	if err != nil {
 		return WrapError(MsgErrBootstrapRequestError, err)
@@ -182,10 +186,37 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	}
 
 	var registry dnsRegistry
-	if err := jsonv2.UnmarshalRead(io.LimitReader(resp.Body, MaxBootstrapResponseSize), &registry); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxBootstrapResponseSize+1))
+	if err != nil {
+		return fmt.Errorf("read RDAP bootstrap response: %w", err)
+	}
+	if len(body) > MaxBootstrapResponseSize {
+		return fmt.Errorf("RDAP bootstrap response exceeds %d bytes", MaxBootstrapResponseSize)
+	}
+	if err := jsonv2.Unmarshal(body, &registry); err != nil {
 		return WrapError(MsgErrBootstrapDecodeError, err)
 	}
 
+	services := bootstrapServices(registry)
+	if len(services) == 0 {
+		return ErrEmptyBootstrapRegistry
+	}
+
+	for tld, urls := range StealthSeeds {
+		cleanTLD := NormalizeDomain(tld)
+		if _, ok := services[cleanTLD]; !ok {
+			services[cleanTLD] = slices.Clone(urls)
+		}
+	}
+
+	b.mu.Lock()
+	b.services = services
+	b.fetchedAt = time.Now()
+	b.mu.Unlock()
+	return nil
+}
+
+func bootstrapServices(registry dnsRegistry) map[string][]string {
 	services := make(map[string][]string)
 	for _, serviceEntry := range registry.Services {
 		if len(serviceEntry) < 2 {
@@ -207,20 +238,5 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 		}
 	}
 
-	if len(services) == 0 {
-		return ErrEmptyBootstrapRegistry
-	}
-
-	for tld, urls := range StealthSeeds {
-		cleanTLD := NormalizeDomain(tld)
-		if _, ok := services[cleanTLD]; !ok {
-			services[cleanTLD] = urls
-		}
-	}
-
-	b.mu.Lock()
-	b.services = services
-	b.fetchedAt = time.Now()
-	b.mu.Unlock()
-	return nil
+	return services
 }

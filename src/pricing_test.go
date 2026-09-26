@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	jsonv2 "encoding/json/v2"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExtractTLD(t *testing.T) {
@@ -41,6 +45,12 @@ func TestExtractTLD(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPricingRequiresInjectedHTTPClient(t *testing.T) {
+	pm := NewPricingManager(nil)
+	err := pm.fetch(context.Background())
+	assert.ErrorContains(t, err, "HTTP client is not configured")
 }
 
 func TestPricingManager_FetchAndAntiDDoS(t *testing.T) {
@@ -87,9 +97,9 @@ func TestPricingManager_FetchAndAntiDDoS(t *testing.T) {
 	if price, ok := pm.GetPrice("co.uk"); !ok || price != 7.99 {
 		t.Errorf("Expected co.uk price 7.99, got %v (ok=%v)", price, ok)
 	}
-	// Fallback to registration if renewal is 0
-	if price, ok := pm.GetPrice("regonly"); !ok || price != 5.00 {
-		t.Errorf("Expected regonly price 5.00, got %v (ok=%v)", price, ok)
+	// A registration-only offer cannot be used as a renewal quote.
+	if price, ok := pm.GetPrice("regonly"); ok || price != 0 {
+		t.Errorf("Expected regonly renewal price to remain unknown, got %v (ok=%v)", price, ok)
 	}
 
 	// 2. Immediate subsequent ensure calls should hit in-memory cache (anti-DDoS protection)
@@ -149,11 +159,6 @@ func TestComputePortfolioPricing(t *testing.T) {
 	pm := NewPricingManager(server.Client())
 	pm.url = server.URL
 
-	// Temporarily override defaultPricingManager for the test
-	origManager := defaultPricingManager
-	defaultPricingManager = pm
-	defer func() { defaultPricingManager = origManager }()
-
 	app := &AppState{
 		config: AppConfig{
 			Domains: []DomainConfig{
@@ -188,17 +193,17 @@ func TestComputePortfolioPricing(t *testing.T) {
 	computePortfolioPricing(context.Background(), app, loopState, pm)
 
 	// Verify standard domain got DotSweep pricing
-	if state := loopState.RDAP["standard.com"]; state.Status == "" || state.RenewalPrice != 11.08 {
+	if state := loopState.RDAP["standard.com"]; state.Status == StatusUnknown || state.RenewalPrice != 11.08 {
 		t.Errorf("Expected standard.com renewal price 11.08, got %+v", state)
 	}
 
 	// Verify premium domain used explicit renewal_price override
-	if state := loopState.RDAP["premium.com"]; state.Status == "" || state.RenewalPrice != 299.99 {
+	if state := loopState.RDAP["premium.com"]; state.Status == StatusUnknown || state.RenewalPrice != 299.99 {
 		t.Errorf("Expected premium.com renewal price 299.99, got %+v", state)
 	}
 
 	// Verify expiring domain has no renewal price assigned
-	if state := loopState.RDAP["expiring.com"]; state.Status == "" || state.RenewalPrice != 0 {
+	if state := loopState.RDAP["expiring.com"]; state.Status == StatusUnknown || state.RenewalPrice != 0 {
 		t.Errorf("Expected expiring.com renewal price to be 0, got %+v", state)
 	}
 }
@@ -208,7 +213,7 @@ func TestLoadConfig_NegativeRenewalPrice(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "config.json")
-	configJSON := `{
+	configJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "invalid.com",
@@ -275,10 +280,6 @@ func BenchmarkComputePortfolioPricing(b *testing.B) {
 		},
 		fetchedAt: time.Now(),
 	}
-	origManager := defaultPricingManager
-	defaultPricingManager = pm
-	defer func() { defaultPricingManager = origManager }()
-
 	app := &AppState{
 		config: AppConfig{
 			Domains: []DomainConfig{
@@ -307,4 +308,28 @@ func BenchmarkComputePortfolioPricing(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		computePortfolioPricing(ctx, app, loopState, pm)
 	}
+}
+
+func TestPricingRejectsOversizedValidPrefix(t *testing.T) {
+	body := `{"tlds":[{"tld":"com","renewal":10}]}` + strings.Repeat(" ", MaxPricingResponseSize)
+	manager := NewPricingManager(&MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}})
+	require.Error(t, manager.fetch(context.Background()))
+	_, exists := manager.GetPrice("com")
+	assert.False(t, exists)
+}
+
+func TestPricingInvalidRowsPreserveStaleCache(t *testing.T) {
+	manager := NewPricingManager(&MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"tlds":[{"tld":"com","renewal":0},{"tld":"","renewal":10},{"tld":"org","renewal":-1}]}`))}, nil
+	}})
+	manager.prices = map[string]float64{"com": 11.08}
+	old := time.Now().Add(-48 * time.Hour)
+	manager.fetchedAt = old
+	require.NoError(t, manager.ensure(context.Background()))
+	price, exists := manager.GetPrice("com")
+	assert.True(t, exists)
+	assert.Equal(t, 11.08, price)
+	assert.Equal(t, old, manager.fetchedAt)
 }

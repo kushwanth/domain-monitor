@@ -3,8 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
-
 	jsonv2 "encoding/json/v2"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func evaluateCTLogsForTest(ctx context.Context, app *AppState, target DomainConfig, prevState CTLogState) CTLogState {
@@ -21,6 +26,227 @@ func evaluateCTLogsForTest(ctx context.Context, app *AppState, target DomainConf
 	res.Status = status
 	res.Condition = cond
 	return res
+}
+
+func TestSaveCertsToHistory_CorruptFilePreserved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "example.com.json")
+	original := []byte("{corrupt")
+	require.NoError(t, os.WriteFile(path, original, FilePermPublic))
+	err := saveCertsToHistory("example.com", []CTCert{{ID: "new"}}, dir)
+	require.Error(t, err)
+	actual, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	assert.Equal(t, original, actual)
+}
+
+func TestEvaluateCTLogs_BackfillFailureKeepsDiscovery(t *testing.T) {
+	snapshot := CTLogsSnapshot{CheckpointID: "new", BackfillErr: errors.New("quota exceeded"), NewCerts: []CTCert{{ID: "new"}}}
+	status, _, state := EvaluateCTLogs(DomainConfig{Domain: "example.com", MonitorCTLogs: true}, snapshot)
+	assert.Equal(t, StatusFailed, status)
+	assert.Equal(t, "new", state.LatestID)
+	require.Len(t, state.NewCerts, 1)
+}
+
+func TestCTLogs_EmptyBaselineThenFirstCertificate(t *testing.T) {
+	rows := `{"rows":[],"has_next":false}`
+	app := NewAppState(AppConfig{})
+	app.CTLimiter = nil
+	app.CTLogsPath = t.TempDir()
+	app.HTTPClient = &MockHTTPClient{MockDo: func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(rows)), Header: make(http.Header)}, nil
+	}}
+	target := DomainConfig{Domain: "example.com", MonitorCTLogs: true}
+	first := FetchCTLogsSnapshot(context.Background(), app, target, CTLogState{})
+	status, _, state := EvaluateCTLogs(target, first)
+	assert.Equal(t, StatusOK, status)
+	assert.True(t, state.Initialized)
+	assert.Empty(t, state.NewCerts)
+
+	rows = `{"rows":[{"id":"first","match":"example.com"}],"has_next":false}`
+	second := FetchCTLogsSnapshot(context.Background(), app, target, state)
+	status, _, state = EvaluateCTLogs(target, second)
+	assert.Equal(t, StatusOK, status)
+	require.Len(t, state.NewCerts, 1)
+	assert.Equal(t, "first", state.NewCerts[0].ID)
+}
+
+func TestDecodeCTState_VersionAndCorruption(t *testing.T) {
+	for _, tc := range []struct {
+		name, data      string
+		legacy, wantErr bool
+	}{
+		{name: "versioned", data: `{"version":1,"domains":{"example.com":{"latest_id":"a"}}}`},
+		{name: "legacy", data: `{"example.com":{"latest_id":"a"}}`, legacy: true},
+		{name: "unsupported", data: `{"version":2,"domains":{}}`, wantErr: true},
+		{name: "corrupt", data: `{broken`, wantErr: true},
+		{name: "null", data: `null`, wantErr: true},
+		{name: "invalid domain", data: `{"version":1,"domains":{"../bad":{"latest_id":"a"}}}`, wantErr: true},
+		{name: "duplicate seen ID", data: `{"version":1,"domains":{"example.com":{"seen_ids":["a","a"]}}}`, wantErr: true},
+		{name: "empty seen ID", data: `{"version":1,"domains":{"example.com":{"seen_ids":[""]}}}`, wantErr: true},
+		{name: "pending without seen ID", data: `{"version":1,"domains":{"example.com":{"pending":[{"cert":{"id":"a"},"need_ntfy":true}]}}}`, wantErr: true},
+		{name: "scan page limit", data: `{"version":1,"domains":{"example.com":{"scan_pages":10}}}`, wantErr: true},
+		{name: "negative attempt time", data: `{"version":1,"domains":{"example.com":{"last_attempt_unix":-1}}}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state, legacy, err := decodeCTState([]byte(tc.data))
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.legacy, legacy)
+			assert.Equal(t, "a", state["example.com"].LatestID)
+		})
+	}
+}
+
+func TestLoadCTStateFile_MigrationAndFailedCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ct_state.json")
+	legacy := []byte(`{"example.com":{"latest_id":"a"}}`)
+	require.NoError(t, os.WriteFile(path, legacy, FilePermSecret))
+	state, err := loadCTStateFile(path, os.ReadFile, AtomicWriteFile)
+	require.NoError(t, err)
+	assert.False(t, state["example.com"].Initialized)
+	backup, err := os.ReadFile(path + ".legacy.bak")
+	require.NoError(t, err)
+	assert.Equal(t, legacy, backup)
+	current, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(current), `"version":1`)
+
+	require.NoError(t, os.WriteFile(path, legacy, FilePermSecret))
+	_, err = loadCTStateFile(path, os.ReadFile, func(target string, content []byte, mode os.FileMode) error {
+		if target == path {
+			return errors.New("commit failed")
+		}
+		return AtomicWriteFile(target, content, mode)
+	})
+	require.Error(t, err)
+	current, err = os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, legacy, current)
+}
+
+func TestCTLogs_RescanFindsLateIndexedCertificate(t *testing.T) {
+	cycle := 0
+	app := NewAppState(AppConfig{Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}}})
+	app.CTLimiter = nil
+	app.CTLogsPath = t.TempDir()
+	app.HTTPClient = &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+		page := `{"rows":[{"id":"head","match":"example.com"}],"has_next":true,"next_cursor":"page-2"}`
+		if req.URL.Query().Get(ParamAfter) == "page-2" {
+			page = `{"rows":[{"id":"older","match":"example.com"}],"has_next":false}`
+			if cycle >= 3 {
+				page = `{"rows":[{"id":"older","match":"example.com"},{"id":"late","match":"example.com"}],"has_next":false}`
+			}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(page)), Header: make(http.Header)}, nil
+	}}
+	target := DomainConfig{Domain: "example.com", MonitorCTLogs: true}
+	state := CTLogState{}
+	for cycle = 0; cycle < 4; cycle++ {
+		snap := FetchCTLogsSnapshot(context.Background(), app, target, state)
+		status, cond, next := EvaluateCTLogs(target, snap)
+		if cycle == 0 {
+			assert.Equal(t, StatusWarning, status, "baseline is not complete after a page with a next cursor")
+			assert.Equal(t, CodeCTCoverageIncomplete, cond.Code)
+		} else {
+			assert.Equal(t, StatusOK, status)
+		}
+		state = next
+		if cycle < 3 {
+			assert.Empty(t, state.Pending)
+		}
+	}
+	require.Len(t, state.Pending, 1)
+	assert.Equal(t, "late", state.Pending[0].Cert.ID)
+	assert.True(t, state.Pending[0].NeedNtfy)
+	assert.Contains(t, state.SeenIDs, "late")
+}
+
+func TestCTLogs_SeenBudgetAndRepeatedCursor(t *testing.T) {
+	app := NewAppState(AppConfig{})
+	app.CTLimiter = nil
+	app.CTLogsPath = t.TempDir()
+	app.HTTPClient = &MockHTTPClient{MockDo: func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"rows":[{"id":"new"}],"has_next":true,"next_cursor":"same"}`)), Header: make(http.Header)}, nil
+	}}
+	target := DomainConfig{Domain: "example.com", MonitorCTLogs: true}
+	prev := CTLogState{Initialized: true, BackfillCursor: "same", SeenIDs: []string{"old"}}
+	snap := FetchCTLogsSnapshot(context.Background(), app, target, prev)
+	require.Error(t, snap.Page1Err)
+	assert.Equal(t, "same", snap.BackfillCursor)
+	assert.Equal(t, []string{"old"}, snap.SeenIDs)
+
+	prev.BackfillCursor = ""
+	prev.SeenIDs = make([]string, MaxCTSeenIDs)
+	for i := range prev.SeenIDs {
+		prev.SeenIDs[i] = strconv.Itoa(i)
+	}
+	snap = FetchCTLogsSnapshot(context.Background(), app, target, prev)
+	status, cond, state := EvaluateCTLogs(target, snap)
+	assert.Equal(t, StatusWarning, status)
+	assert.Equal(t, CodeCTCoverageIncomplete, cond.Code)
+	assert.Len(t, state.SeenIDs, MaxCTSeenIDs)
+	assert.Empty(t, state.NewCerts)
+}
+
+func TestCTLogs_InvalidPageDoesNotAdvanceCheckpoint(t *testing.T) {
+	app := NewAppState(AppConfig{})
+	app.CTLimiter = nil
+	app.CTLogsPath = t.TempDir()
+	app.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		body := `{"rows":[{"id":"new","match":"example.com"}],"has_next":true}`
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}}
+	prev := CTLogState{Initialized: true, LatestID: "old", BackfillCursor: "page-2", SeenIDs: []string{"old"}}
+	snap := FetchCTLogsSnapshot(context.Background(), app, DomainConfig{Domain: "example.com", MonitorCTLogs: true}, prev)
+	require.ErrorContains(t, snap.Page1Err, "without a cursor")
+	assert.Equal(t, "page-2", snap.BackfillCursor)
+	assert.Equal(t, "old", snap.CheckpointID)
+	assert.Equal(t, []string{"old"}, snap.SeenIDs)
+	assert.Empty(t, snap.NewCerts)
+}
+
+func TestCTPending_PartialAcceptanceAndCommitFailure(t *testing.T) {
+	telegramCalls := 0
+	nm := &NotificationManager{
+		NtfyURL: "https://ntfy.invalid/topic", TelegramToken: "token", TelegramChatID: "chat",
+		HTTPClient: &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+			body := `{"ok":true}`
+			if req.URL.Host != "ntfy.invalid" {
+				telegramCalls++
+				if telegramCalls == 1 {
+					body = `{"ok":false}`
+				}
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		}},
+	}
+	identity := "CT:example.com:cert"
+	alert := Alert{Identity: identity, Message: "new cert", Redacted: "new cert", Domain: "example.com", NeedNtfy: true, NeedTelegram: true}
+	nm.DispatchCT(alert)
+	nm.Flush()
+	accepted := nm.TakeCTAcceptances()
+	assert.True(t, accepted[identity].Ntfy)
+	assert.False(t, accepted[identity].Telegram)
+	state := map[string]CTLogState{"example.com": {SeenIDs: []string{"cert"}, Pending: []CTPending{{Cert: CTCert{ID: "cert"}, NeedNtfy: true, NeedTelegram: true}}}}
+	cfg := AppConfig{Domains: []DomainConfig{{Domain: "example.com", MonitorCTLogs: true}}, Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}}
+	path := filepath.Join(t.TempDir(), "ct_state.json")
+	err := commitCTAcceptances(path, state, cfg, accepted, func(string, []byte, os.FileMode) error { return errors.New("disk full") })
+	require.Error(t, err)
+	assert.True(t, state["example.com"].Pending[0].NeedNtfy)
+
+	require.NoError(t, commitCTAcceptances(path, state, cfg, accepted, AtomicWriteFile))
+	require.Len(t, state["example.com"].Pending, 1)
+	assert.False(t, state["example.com"].Pending[0].NeedNtfy)
+	assert.True(t, state["example.com"].Pending[0].NeedTelegram)
+	alert.NeedNtfy = false
+	nm.DispatchCT(alert)
+	nm.Flush()
+	require.NoError(t, commitCTAcceptances(path, state, cfg, nm.TakeCTAcceptances(), AtomicWriteFile))
+	assert.Empty(t, state["example.com"].Pending)
 }
 
 func TestEmailMXVerification(t *testing.T) {
@@ -193,10 +419,8 @@ func TestSaveCertsToHistory(t *testing.T) {
 }
 
 func TestHTTPServerRoutes(t *testing.T) {
-	app := &AppState{
-		CTLogsPath: filepath.Join(os.TempDir(), "ct_logs_server_test"),
-	}
-	defer os.RemoveAll(app.CTLogsPath)
+	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: "testdomain.com", MonitorCTLogs: true}}})
+	app.CTLogsPath = t.TempDir()
 	app.PrerenderedJSON.Store([]byte(`{"status":"prerendered"}`))
 
 	server, _ := setupHTTPServer(app, "0")
@@ -331,9 +555,12 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 		}),
 	}
 
-	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}, HTTPClient: mockClient}
+	app := NewAppState(AppConfig{})
+	app.Notifier = newRecordingNotifier()
+	app.HTTPClient = mockClient
+	app.CTLimiter = nil
+	app.CTLogsPath = t.TempDir()
 	domain := "firstrun.example.com"
-	defer func() { _ = os.Remove(filepath.Join(app.CTLogsPath, domain+".json")) }()
 
 	target := DomainConfig{
 		Domain:         domain,
@@ -343,11 +570,13 @@ func TestEvaluateCTLogs_FirstRunNoAlerts(t *testing.T) {
 	saved := evaluateCTLogsForTest(context.Background(), app, target, CTLogState{})
 
 	// First run must not emit notifications for existing cert baseline
-	if len(app.Notifier.(*NotificationManager).TestBuffer) != 0 {
-		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(app.Notifier.(*NotificationManager).TestBuffer))
+	notifier, ok := app.Notifier.(*recordingNotifier)
+	require.True(t, ok)
+	if len(notifier.alerts) != 0 {
+		t.Errorf("Expected 0 alerts on first-run baseline discovery, got %d", len(notifier.alerts))
 	}
 
-	if saved.Status == "" {
+	if saved.Status == StatusUnknown {
 		t.Fatalf("Expected CTLogState to be saved")
 	}
 	if saved.LatestID != "cert-first-1" {
@@ -378,9 +607,12 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 		}),
 	}
 
-	app := &AppState{config: AppConfig{}, Notifier: &NotificationManager{TestMode: true}, HTTPClient: mockClient}
+	app := NewAppState(AppConfig{})
+	app.Notifier = newRecordingNotifier()
+	app.HTTPClient = mockClient
+	app.CTLimiter = nil
+	app.CTLogsPath = t.TempDir()
 	domain := "ratelimit.example.com"
-	defer func() { _ = os.Remove(filepath.Join(app.CTLogsPath, domain+".json")) }()
 
 	target := DomainConfig{
 		Domain:         domain,
@@ -397,7 +629,7 @@ func TestEvaluateCTLogs_RateLimitPreservesCursor(t *testing.T) {
 
 	res := evaluateCTLogsForTest(context.Background(), app, target, existing)
 
-	if res.Status == "" {
+	if res.Status == StatusUnknown {
 		t.Fatalf("Expected CTLogState to be present")
 	}
 	if res.BackfillComplete {
@@ -440,24 +672,25 @@ func TestFetchCTPage_KeyRedaction(t *testing.T) {
 		config: AppConfig{
 			CTLogsAPIKey: apiKey,
 		},
+		HTTPClient: &MockHTTPClient{MockDo: func(r *http.Request) (*http.Response, error) {
+			assert.Equal(t, PrefixBearer+apiKey, r.Header.Get(HeaderAuthorization))
+			return &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(strings.NewReader("Invalid key: " + apiKey))}, nil
+		}},
 	}
+	_, err := fetchCTPage(context.Background(), app, "https://ct.example/lookup")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), apiKey)
+	assert.Contains(t, err.Error(), RedactedAPIKeyPlaceholder)
+}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte("Invalid key: " + apiKey))
-	}))
-	defer server.Close()
-
-	_, err := fetchCTPage(context.Background(), app, server.URL)
-	if err == nil {
-		t.Fatalf("Expected error from 401 unauthorized")
-	}
-	if strings.Contains(err.Error(), apiKey) {
-		t.Errorf("API key leaked in error message: %v", err)
-	}
-	if !strings.Contains(err.Error(), "[REDACTED_API_KEY]") {
-		t.Errorf("Expected [REDACTED_API_KEY] in error message: %v", err)
-	}
+func TestFetchCTPageRejectsOversizedValidPrefix(t *testing.T) {
+	validPage := `{"rows":[],"has_next":false}`
+	oversized := validPage + strings.Repeat(" ", MaxCTLogsResponseSize-len(validPage)+1)
+	app := &AppState{HTTPClient: &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(oversized))}, nil
+	}}}
+	_, err := fetchCTPage(context.Background(), app, "https://ct.example/lookup")
+	require.ErrorContains(t, err, "exceeds")
 }
 
 func TestSaveCertsToHistory_CapAtMaxHistory(t *testing.T) {
@@ -495,4 +728,155 @@ func TestSaveCertsToHistory_CapAtMaxHistory(t *testing.T) {
 	if len(saved) != MaxCTCertHistory {
 		t.Errorf("expected history capped at %d, got %d", MaxCTCertHistory, len(saved))
 	}
+}
+
+func TestCTScanBudgetResumesAcrossRestart(t *testing.T) {
+	app := NewAppState(AppConfig{})
+	app.CTLimiter = nil
+	app.CTLogsPath = t.TempDir()
+	app.HTTPClient = &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+		page := 0
+		if cursor := req.URL.Query().Get(ParamAfter); cursor != "" {
+			var err error
+			page, err = strconv.Atoi(cursor)
+			require.NoError(t, err)
+		}
+		body := fmt.Sprintf(`{"rows":[{"id":"%d"}],"has_next":%t,"next_cursor":"%d"}`, page, page < MaxCTScanPages+1, page+1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}}
+	target := DomainConfig{Domain: "example.com", MonitorCTLogs: true}
+	path := filepath.Join(t.TempDir(), "state.json")
+	previous := CTLogState{}
+	for cycle := 0; cycle < MaxCTScanPages+2; cycle++ {
+		snapshot := FetchCTLogsSnapshot(context.Background(), app, target, previous)
+		status, _, state := EvaluateCTLogs(target, snapshot)
+		assert.Positive(t, state.LastSuccessUnix)
+		if cycle < MaxCTScanPages+1 {
+			assert.Zero(t, state.LastCompleteUnix)
+			assert.Equal(t, StatusWarning, status)
+			assert.False(t, state.Initialized)
+			assert.False(t, state.BackfillComplete)
+			assert.Equal(t, strconv.Itoa(cycle+1), state.BackfillCursor)
+		} else {
+			assert.Equal(t, StatusOK, status)
+			assert.True(t, state.Initialized)
+			assert.True(t, state.BackfillComplete)
+			assert.False(t, state.CoverageIncomplete)
+			assert.Equal(t, state.LastSuccessUnix, state.LastCompleteUnix)
+		}
+		encoded, err := encodeCTState(map[string]CTLogState{target.Domain: state})
+		require.NoError(t, err)
+		require.NoError(t, AtomicWriteFile(path, encoded, FilePermSecret))
+		reloaded, err := loadCTStateFile(path, os.ReadFile, AtomicWriteFile)
+		require.NoError(t, err)
+		previous = reloaded[target.Domain]
+	}
+	assert.Len(t, previous.SeenIDs, MaxCTScanPages+2)
+}
+
+func TestCTAcknowledgementWriteFailureDoesNotRedeliverInProcess(t *testing.T) {
+	const domain = "example.com"
+	config := AppConfig{
+		Domains:       []DomainConfig{{Domain: domain, MonitorCTLogs: true}},
+		Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/test"}},
+	}
+	app := NewAppState(config)
+	notifier := NewNotificationManager("https://ntfy.invalid/test", "", "", "")
+	calls := 0
+	notifier.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}}
+	app.Notifier = notifier
+	committed := map[string]CTLogState{domain: {
+		Initialized: true, SeenIDs: []string{"new"},
+		Pending: []CTPending{{Cert: CTCert{ID: "new"}, NeedNtfy: true}},
+	}}
+	state := NewCheckState()
+	state.CTLogs[domain] = committed[domain]
+	path := filepath.Join(t.TempDir(), "state.json")
+	encoded, err := encodeCTState(committed)
+	require.NoError(t, err)
+	require.NoError(t, AtomicWriteFile(path, encoded, FilePermSecret))
+	app.WriteCTState = func(string, []byte, os.FileMode) error { return errors.New("disk unavailable") }
+	alert := Alert{Identity: "CT:" + domain + ":new", Domain: domain, NeedNtfy: true}
+	notifier.DispatchCT(alert)
+	finishCycleDelivery(context.Background(), app, state, path, committed, time.Hour)
+	assert.Equal(t, 1, calls)
+	require.Len(t, committed[domain].Pending, 1)
+	onDisk, err := loadCTStateFile(path, os.ReadFile, AtomicWriteFile)
+	require.NoError(t, err)
+	require.Len(t, onDisk[domain].Pending, 1, "restart must retain the unacknowledged delivery")
+
+	app.WriteCTState = AtomicWriteFile
+	notifier.DispatchCT(alert)
+	finishCycleDelivery(context.Background(), app, state, path, committed, time.Hour)
+	assert.Equal(t, 1, calls, "remote acceptance must survive a failed acknowledgement write in memory")
+	assert.Empty(t, committed[domain].Pending)
+	onDisk, err = loadCTStateFile(path, os.ReadFile, AtomicWriteFile)
+	require.NoError(t, err)
+	assert.Empty(t, onDisk[domain].Pending)
+}
+
+// TestLiveCTProviderReplay reads a real provider page, then replays the head
+// page after reconstructing app state to check that seen IDs are not alerted
+// twice. It does not establish complete or timely CT coverage.
+func TestLiveCTProviderReplay(t *testing.T) {
+	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
+		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external CT provider queries")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	target := DomainConfig{Domain: "cloudflare.com", MonitorCTLogs: true}
+	historyPath := t.TempDir()
+	newApp := func() *AppState {
+		app := NewAppState(AppConfig{})
+		app.HTTPClient = &http.Client{Timeout: 15 * time.Second}
+		app.CTLimiter = nil
+		app.CTLogsPath = historyPath
+		return app
+	}
+	first := FetchCTLogsSnapshot(ctx, newApp(), target, CTLogState{})
+	if first.Page1Err != nil {
+		t.Fatalf("first provider page: %v", first.Page1Err)
+	}
+	firstStatus, firstCondition, committed := EvaluateCTLogs(target, first)
+	if !committed.Initialized && !committed.BackfillComplete && (firstStatus != StatusWarning || firstCondition == nil || firstCondition.Code != CodeCTCoverageIncomplete) {
+		t.Fatalf("unfinished provider baseline was published as %s instead of a coverage warning", firstStatus)
+	}
+	if len(committed.SeenIDs) == 0 {
+		t.Fatal("provider returned no certificate IDs for replay")
+	}
+	seen := make(map[string]bool, len(committed.SeenIDs))
+	for _, id := range committed.SeenIDs {
+		seen[id] = true
+	}
+	checkpointPath := filepath.Join(t.TempDir(), "ct_state.json")
+	encoded, err := encodeCTState(map[string]CTLogState{target.Domain: committed})
+	if err != nil {
+		t.Fatalf("encode CT checkpoint: %v", err)
+	}
+	if err := AtomicWriteFile(checkpointPath, encoded, FilePermSecret); err != nil {
+		t.Fatalf("write CT checkpoint: %v", err)
+	}
+	reloaded, err := loadCTStateFile(checkpointPath, os.ReadFile, AtomicWriteFile)
+	if err != nil {
+		t.Fatalf("reload CT checkpoint: %v", err)
+	}
+	previous := reloaded[target.Domain]
+	previous.BackfillCursor = "" // revisit the first page after a restart
+	second := FetchCTLogsSnapshot(ctx, newApp(), target, previous)
+	if second.Page1Err != nil {
+		t.Fatalf("replayed provider page: %v", second.Page1Err)
+	}
+	secondStatus, _, replayed := EvaluateCTLogs(target, second)
+	if replayed.Initialized && !replayed.BackfillComplete && secondStatus != StatusOK {
+		t.Fatalf("post-baseline rescan should preserve healthy provider status, got %s", secondStatus)
+	}
+	for _, cert := range second.NewCerts {
+		if seen[cert.ID] {
+			t.Fatalf("previously seen certificate %q was rediscovered", cert.ID)
+		}
+	}
+	t.Logf("first_seen=%d replay_new=%d cursor_present=%t status=%s coverage_budget_exhausted=%t", len(seen), len(second.NewCerts), second.BackfillCursor != "", secondStatus, second.CoverageIncomplete)
 }
