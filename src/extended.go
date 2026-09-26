@@ -20,10 +20,10 @@ import (
 func encodeCTState(state map[string]CTLogState) ([]byte, error) {
 	b, err := jsonv2.Marshal(CTStateFile{Version: CTStateVersion, Domains: state})
 	if err != nil {
-		return nil, fmt.Errorf("encode CT checkpoint: %w", err)
+		return nil, fmt.Errorf(MsgErrEncodeCTCheckpoint, err)
 	}
 	if len(b) > MaxCTHistoryFileSize {
-		return nil, fmt.Errorf("CT checkpoint exceeds %d bytes", MaxCTHistoryFileSize)
+		return nil, fmt.Errorf(MsgErrCTCheckpointExceedsBytes, MaxCTHistoryFileSize)
 	}
 	return b, nil
 }
@@ -37,7 +37,7 @@ func decodeCTState(b []byte) (map[string]CTLogState, bool, error) {
 		if err := validateCTCheckpointEntry(domain, item); err != nil {
 			return nil, false, err
 		}
-		if item.LatestID != "" && len(item.SeenIDs) == 0 {
+		if item.LatestID != StrEmpty && len(item.SeenIDs) == 0 {
 			// Older checkpoints have no reliable ID window; scan it as a baseline.
 			item.Initialized = false
 			state[domain] = item
@@ -49,28 +49,28 @@ func decodeCTState(b []byte) (map[string]CTLogState, bool, error) {
 func decodeCTStatePayload(b []byte) (map[string]CTLogState, bool, error) {
 	var root map[string]any
 	if err := jsonv2.Unmarshal(b, &root); err != nil {
-		return nil, false, fmt.Errorf("decode CT checkpoint: %w", err)
+		return nil, false, fmt.Errorf(MsgErrDecodeCTCheckpoint, err)
 	}
 	if root == nil {
-		return nil, false, fmt.Errorf("CT checkpoint must be an object")
+		return nil, false, fmt.Errorf(MsgErrCTCheckpointMustBeAn)
 	}
-	_, versioned := root["version"]
+	_, versioned := root[StrVersion]
 	var state map[string]CTLogState
 	if versioned {
 		var file CTStateFile
 		if err := jsonv2.Unmarshal(b, &file); err != nil {
-			return nil, false, fmt.Errorf("decode versioned CT checkpoint: %w", err)
+			return nil, false, fmt.Errorf(MsgErrDecodeVersionedCTCheckpoint, err)
 		}
 		if file.Version != CTStateVersion {
-			return nil, false, fmt.Errorf("unsupported CT checkpoint version %d", file.Version)
+			return nil, false, fmt.Errorf(MsgErrUnsupportedCTCheckpointVersion, file.Version)
 		}
 		state = file.Domains
 		if state == nil {
-			return nil, false, fmt.Errorf("CT checkpoint has no domains object")
+			return nil, false, fmt.Errorf(MsgErrCTCheckpointHasNoDomains)
 		}
 	} else {
 		if err := jsonv2.Unmarshal(b, &state); err != nil {
-			return nil, false, fmt.Errorf("decode legacy CT checkpoint: %w", err)
+			return nil, false, fmt.Errorf(MsgErrDecodeLegacyCTCheckpoint, err)
 		}
 	}
 	return state, versioned, nil
@@ -78,21 +78,21 @@ func decodeCTStatePayload(b []byte) (map[string]CTLogState, bool, error) {
 
 func validateCTCheckpointEntry(domain string, item CTLogState) error {
 	if NormalizeDomain(domain) != domain || !ReValidDomain.MatchString(domain) {
-		return fmt.Errorf("invalid CT checkpoint domain %q", domain)
+		return fmt.Errorf(MsgErrInvalidCTCheckpointDomain, domain)
 	}
 	if !ctCheckpointWithinBounds(item) {
-		return fmt.Errorf("CT checkpoint for %s exceeds retention bounds", domain)
+		return fmt.Errorf(MsgErrCTCheckpointForExceedsRetention, domain)
 	}
 	seen := make(map[string]bool, len(item.SeenIDs))
 	for _, id := range item.SeenIDs {
-		if id == "" || seen[id] {
-			return fmt.Errorf("CT checkpoint for %s has invalid seen IDs", domain)
+		if id == StrEmpty || seen[id] {
+			return fmt.Errorf(MsgErrCTCheckpointForHasInvalid, domain)
 		}
 		seen[id] = true
 	}
 	for _, pending := range item.Pending {
-		if pending.Cert.ID == "" || !seen[pending.Cert.ID] {
-			return fmt.Errorf("CT checkpoint for %s has untracked pending discovery", domain)
+		if pending.Cert.ID == StrEmpty || !seen[pending.Cert.ID] {
+			return fmt.Errorf(MsgErrCTCheckpointForHasUntracked, domain)
 		}
 	}
 	return nil
@@ -111,22 +111,22 @@ func loadCTStateFile(path string, read func(string) ([]byte, error), write func(
 		return make(map[string]CTLogState), nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read CT checkpoint %s: %w", path, err)
+		return nil, fmt.Errorf(MsgErrReadCTCheckpoint, path, err)
 	}
 	state, legacy, err := decodeCTState(b)
 	if err != nil {
-		return nil, fmt.Errorf("load CT checkpoint %s: %w", path, err)
+		return nil, fmt.Errorf(MsgErrLoadCTCheckpoint, path, err)
 	}
 	if legacy {
-		if err := write(path+".legacy.bak", b, FilePermSecret); err != nil {
-			return nil, fmt.Errorf("back up legacy CT checkpoint %s: %w", path, err)
+		if err := write(path+StrLegacyBak, b, FilePermSecret); err != nil {
+			return nil, fmt.Errorf(MsgErrBackUpLegacyCTCheckpoint, path, err)
 		}
 		encoded, err := encodeCTState(state)
 		if err != nil {
 			return nil, err
 		}
 		if err := write(path, encoded, FilePermSecret); err != nil {
-			return nil, fmt.Errorf("migrate legacy CT checkpoint %s: %w", path, err)
+			return nil, fmt.Errorf(MsgErrMigrateLegacyCTCheckpoint, path, err)
 		}
 	}
 	return state, nil
@@ -136,7 +136,7 @@ func settleCTPending(domain string, state CTLogState, cfg DomainConfig, ntfyEnab
 	changed := false
 	retained := make([]CTPending, 0, len(state.Pending))
 	for _, item := range state.Pending {
-		ack := accepted["CT:"+domain+":"+item.Cert.ID]
+		ack := accepted[StrCT+domain+SymColon+item.Cert.ID]
 		before := item
 		item.NeedNtfy = item.NeedNtfy && ntfyEnabled && !cfg.SuppressAlerts && !ack.Ntfy
 		item.NeedTelegram = item.NeedTelegram && telegramEnabled && !cfg.SuppressAlerts && !ack.Telegram
@@ -156,8 +156,8 @@ func settleCTPending(domain string, state CTLogState, cfg DomainConfig, ntfyEnab
 }
 
 func commitCTAcceptances(path string, state map[string]CTLogState, cfg AppConfig, accepted map[string]CTAcceptance, write func(string, []byte, os.FileMode) error) error {
-	ntfyEnabled := cfg.Notifications.Ntfy != nil && cfg.Notifications.Ntfy.URL != ""
-	telegramEnabled := cfg.Notifications.Telegram != nil && cfg.Notifications.Telegram.Token != ""
+	ntfyEnabled := cfg.Notifications.Ntfy != nil && cfg.Notifications.Ntfy.URL != StrEmpty
+	telegramEnabled := cfg.Notifications.Telegram != nil && cfg.Notifications.Telegram.Token != StrEmpty
 	configured := make(map[string]DomainConfig, len(cfg.Domains))
 	for _, domain := range cfg.Domains {
 		configured[domain.Domain] = domain
@@ -177,7 +177,7 @@ func commitCTAcceptances(path string, state map[string]CTLogState, cfg AppConfig
 		return err
 	}
 	if err := write(path, b, FilePermSecret); err != nil {
-		return fmt.Errorf("commit CT notification acknowledgement: %w", err)
+		return fmt.Errorf(MsgErrCommitCTNotificationAcknowledgement, err)
 	}
 	for domain, updated := range candidate {
 		state[domain] = updated
@@ -185,6 +185,7 @@ func commitCTAcceptances(path string, state map[string]CTLogState, cfg AppConfig
 	return nil
 }
 
+// FetchCTLogsSnapshot ...
 func FetchCTLogsSnapshot(ctx context.Context, app *AppState, target DomainConfig, prevState CTLogState) CTLogsSnapshot {
 	if !target.MonitorCTLogs {
 		return CTLogsSnapshot{}
@@ -207,7 +208,7 @@ func FetchCTLogsSnapshot(ctx context.Context, app *AppState, target DomainConfig
 		return snap
 	}
 	if page.HasNext && page.NextCursor == snap.BackfillCursor {
-		snap.Page1Err = fmt.Errorf("CT scan cursor repeated for %s", target.Domain)
+		snap.Page1Err = fmt.Errorf(MsgErrCTScanCursorRepeatedFor, target.Domain)
 		return snap
 	}
 	discovered, ok := collectCTDiscoveries(&snap, page.Rows)
@@ -252,8 +253,8 @@ func buildCTPending(snap *CTLogsSnapshot, app *AppState, target DomainConfig, di
 		return pending, true
 	}
 	cfg := app.configuration()
-	needNtfy := cfg.Notifications.Ntfy != nil && cfg.Notifications.Ntfy.URL != ""
-	needTelegram := cfg.Notifications.Telegram != nil && cfg.Notifications.Telegram.Token != ""
+	needNtfy := cfg.Notifications.Ntfy != nil && cfg.Notifications.Ntfy.URL != StrEmpty
+	needTelegram := cfg.Notifications.Telegram != nil && cfg.Notifications.Telegram.Token != StrEmpty
 	for _, cert := range discovered {
 		if !needNtfy && !needTelegram {
 			break
@@ -272,20 +273,20 @@ func writeCTPageHistory(app *AppState, domain string, rows []CTCert) error {
 		return nil
 	}
 	if app == nil || app.WriteCTHistory == nil {
-		return fmt.Errorf("CT history writer is not configured for %s", domain)
+		return fmt.Errorf(MsgErrCTHistoryWriterIsNot, domain)
 	}
 	path := DefaultCTLogsSubdir
-	if app.CTLogsPath != "" {
+	if app.CTLogsPath != StrEmpty {
 		path = app.CTLogsPath
 	}
 	if err := app.WriteCTHistory(domain, rows, path); err != nil {
-		return fmt.Errorf("save CT history for %s: %w", domain, err)
+		return fmt.Errorf(MsgErrSaveCTHistoryFor, domain, err)
 	}
 	return nil
 }
 
 func advanceCTSnapshot(snap *CTLogsSnapshot, page *ctLogsPageResponse, discovered []CTCert, newPending []CTPending) {
-	if snap.BackfillCursor == "" && len(page.Rows) > 0 {
+	if snap.BackfillCursor == StrEmpty && len(page.Rows) > 0 {
 		snap.CheckpointID = page.Rows[0].ID
 	}
 	for _, cert := range discovered {
@@ -307,7 +308,7 @@ func advanceCTSnapshot(snap *CTLogsSnapshot, page *ctLogsPageResponse, discovere
 			snap.ScanPages = 0
 		}
 	} else {
-		snap.BackfillCursor = ""
+		snap.BackfillCursor = StrEmpty
 		snap.BackfillComplete = true
 		snap.ScanPages = 0
 		snap.Initialized = true
@@ -329,18 +330,18 @@ func newCTSnapshot(prevState CTLogState) CTLogsSnapshot {
 		SeenIDs:            slices.Clone(prevState.SeenIDs),
 		Pending:            slices.Clone(prevState.Pending),
 		CoverageIncomplete: prevState.CoverageIncomplete,
-		IsFirstRun:         !prevState.Initialized || (prevState.LatestID != "" && len(prevState.SeenIDs) == 0 && prevState.ScanPages == 0),
+		IsFirstRun:         !prevState.Initialized || (prevState.LatestID != StrEmpty && len(prevState.SeenIDs) == 0 && prevState.ScanPages == 0),
 	}
 }
 
 func ctPageURL(domain, cursor string) (string, error) {
 	apiURL := CTLogsAPIEndpoint + domain
-	if cursor == "" {
+	if cursor == StrEmpty {
 		return apiURL, nil
 	}
 	u, err := url.Parse(apiURL)
 	if err != nil {
-		return "", fmt.Errorf("build CT cursor URL for %s: %w", domain, err)
+		return StrEmpty, fmt.Errorf(MsgErrBuildCTCursorURLFor, domain, err)
 	}
 	q := u.Query()
 	q.Set(ParamAfter, cursor)
@@ -356,6 +357,7 @@ func pendingCTBytes(items []CTPending) int {
 	return size
 }
 
+// EvaluateCTLogs ...
 func EvaluateCTLogs(target DomainConfig, snapshot CTLogsSnapshot) (CheckStatus, *StateCondition, CTLogState) {
 	if !target.MonitorCTLogs {
 		return StatusOK, nil, CTLogState{}
@@ -398,11 +400,11 @@ func EvaluateCTLogs(target DomainConfig, snapshot CTLogsSnapshot) (CheckStatus, 
 	}
 
 	if state.CoverageIncomplete {
-		state.Error = "CT scan coverage is incomplete; scan, seen ID or pending budget reached"
+		state.Error = StrCTScanCoverageIs
 		return StatusWarning, &StateCondition{Code: CodeCTCoverageIncomplete, Target: state.Error}, state
 	}
 	if !state.Initialized && !state.BackfillComplete {
-		state.Error = "CT baseline backfill is still in progress"
+		state.Error = StrCTBaselineBackfillIs
 		return StatusWarning, &StateCondition{Code: CodeCTCoverageIncomplete, Target: state.Error}, state
 	}
 	return StatusOK, &StateCondition{Code: CodeCTLogsVerified}, state
@@ -411,7 +413,7 @@ func EvaluateCTLogs(target DomainConfig, snapshot CTLogsSnapshot) (CheckStatus, 
 func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPageResponse, error) {
 	if app != nil && app.CTLimiter != nil {
 		if err := app.CTLimiter.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("wait for CT request rate limit: %w", err)
+			return nil, fmt.Errorf(MsgErrWaitForCTRequestRate, err)
 		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
@@ -419,18 +421,18 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPage
 		return nil, err
 	}
 
-	apiKey := ""
+	apiKey := StrEmpty
 	if app != nil {
 		apiKey = app.configuration().CTLogsAPIKey
 	}
-	if apiKey != "" {
+	if apiKey != StrEmpty {
 		req.Header.Set(HeaderAuthorization, PrefixBearer+apiKey)
 	}
 
 	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
 	if app == nil || app.HTTPClient == nil {
-		return nil, fmt.Errorf("CT HTTP client is not configured for %s", apiURL)
+		return nil, fmt.Errorf(MsgErrCTHTTPClientIsNot, apiURL)
 	}
 	resp, err := app.HTTPClient.Do(req)
 	if err != nil {
@@ -447,7 +449,7 @@ func fetchCTPage(ctx context.Context, app *AppState, apiURL string) (*ctLogsPage
 		return nil, WrapError(MsgErrJSONParse, err)
 	}
 	if len(body) > MaxCTLogsResponseSize {
-		return nil, fmt.Errorf("CT API response exceeds %d bytes", MaxCTLogsResponseSize)
+		return nil, fmt.Errorf(MsgErrCTAPIResponseExceedsBytes, MaxCTLogsResponseSize)
 	}
 	var ctResp ctLogsPageResponse
 	if err := jsonv2.Unmarshal(body, &ctResp); err != nil {
@@ -469,23 +471,23 @@ func checkCTPageResponse(resp *http.Response, apiKey string) error {
 	}
 	bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize))
 	if readErr != nil {
-		return fmt.Errorf("read CT API error response: %w", readErr)
+		return fmt.Errorf(MsgErrReadCTAPIErrorResponse, readErr)
 	}
 	bodyStr := string(bodyBytes)
-	if apiKey != "" {
+	if apiKey != StrEmpty {
 		bodyStr = strings.ReplaceAll(bodyStr, apiKey, RedactedAPIKeyPlaceholder)
 	}
 	return fmt.Errorf(MsgErrAPIReturnedStatus, resp.StatusCode, bodyStr)
 }
 
 func validateCTPage(page ctLogsPageResponse) error {
-	if page.HasNext && page.NextCursor == "" {
-		return fmt.Errorf("CT page claims a next page without a cursor")
+	if page.HasNext && page.NextCursor == StrEmpty {
+		return fmt.Errorf(MsgErrCTPageClaimsANext)
 	}
 	seen := make(map[string]bool, len(page.Rows))
 	for _, row := range page.Rows {
-		if row.ID == "" || seen[row.ID] {
-			return fmt.Errorf("CT page has a missing or duplicate certificate ID")
+		if row.ID == StrEmpty || seen[row.ID] {
+			return fmt.Errorf(MsgErrCTPageHasAMissing)
 		}
 		seen[row.ID] = true
 	}
@@ -494,14 +496,14 @@ func validateCTPage(page ctLogsPageResponse) error {
 
 func saveCertsToHistory(domain string, certs []CTCert, logsPath string) error {
 	cleanDomain := NormalizeDomain(domain)
-	if cleanDomain == "" || !ReValidDomain.MatchString(cleanDomain) {
+	if cleanDomain == StrEmpty || !ReValidDomain.MatchString(cleanDomain) {
 		return fmt.Errorf(MsgErrInvalidDomainCertsHistory, strconv.Quote(domain))
 	}
 	// #nosec G703 -- logsPath is the operator-selected CT storage directory; domain is validated above.
 	if err := os.MkdirAll(logsPath, DirPermDefault); err != nil {
 		return err
 	}
-	filePath := filepath.Join(logsPath, cleanDomain+".json")
+	filePath := filepath.Join(logsPath, cleanDomain+StrJSON)
 	cleanPath := filepath.Clean(filePath)
 	if !IsSafeSubpath(logsPath, cleanPath) {
 		return fmt.Errorf(MsgErrInvalidFilePathCertsHistory, strconv.Quote(domain))
@@ -510,10 +512,10 @@ func saveCertsToHistory(domain string, certs []CTCert, logsPath string) error {
 	var existing []CTCert
 	if b, err := readBoundedCTFile(cleanPath); err == nil {
 		if unmarshalErr := jsonv2.Unmarshal(b, &existing); unmarshalErr != nil {
-			return fmt.Errorf("parse CT history for %s: %w", domain, unmarshalErr)
+			return fmt.Errorf(MsgErrParseCTHistoryFor, domain, unmarshalErr)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("read CT history for %s: %w", domain, err)
+		return fmt.Errorf(MsgErrReadCTHistoryFor, domain, err)
 	}
 
 	combined, addedNew := mergeCTCertHistory(existing, certs)
@@ -531,10 +533,10 @@ func saveCertsToHistory(domain string, certs []CTCert, logsPath string) error {
 	}
 	b, err := jsonv2.Marshal(combined)
 	if err != nil {
-		return fmt.Errorf("encode CT history for %s: %w", domain, err)
+		return fmt.Errorf(MsgErrEncodeCTHistoryFor, domain, err)
 	}
 	if len(b) > MaxCTHistoryFileSize {
-		return fmt.Errorf("CT history for %s exceeds %d bytes", domain, MaxCTHistoryFileSize)
+		return fmt.Errorf(MsgErrCTHistoryForExceedsBytes, domain, MaxCTHistoryFileSize)
 	}
 	return AtomicWriteFile(cleanPath, b, FilePermPublic)
 }

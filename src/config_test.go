@@ -1173,7 +1173,7 @@ func TestConfigAndEnvironmentAreReadOnlyAtStartup(t *testing.T) {
 	require.NoError(t, err)
 	app := NewAppState(cfg)
 	t.Setenv(EnvDataDir, t.TempDir())
-	path, _, err := initializeCTStorage(app)
+	path, _, err := app.InitializeCTStorage()
 	require.NoError(t, err)
 	assert.Equal(t, initialDir, filepath.Dir(path))
 	assert.Equal(t, 1, reads)

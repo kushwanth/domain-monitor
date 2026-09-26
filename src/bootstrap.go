@@ -17,7 +17,8 @@ import (
 )
 
 // RDAPTLSConfig returns a TLS configuration compatible with both modern and legacy ccTLD
-// RDAP registries (such as older RSA-CBC cipher suites). Modern AEAD ciphers are prioritized first.
+// RDAPTLSConfig RDAP registries (such as older RSA-CBC cipher suites). Modern AEAD ciphers are prioritized first.
+
 func RDAPTLSConfig() *tls.Config {
 	var ids []uint16
 	// 1. Add all secure modern cipher suites first (AES-GCM, ChaCha20-Poly1305, etc.)
@@ -51,7 +52,7 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 				if err != nil {
 					host = address
 				}
-				if strings.Contains(host, "%") {
+				if strings.Contains(host, SymPercent) {
 					return WrapError(host, ErrRestrictedIP)
 				}
 				if ip := net.ParseIP(host); ip != nil {
@@ -84,21 +85,26 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 
 // KnownWHOISServer returns a dedicated WHOIS server for a given domain suffix if known.
 func KnownWHOISServer(domain string) string {
-	asciiDomain := NormalizeDomainToASCIIText(domain)
-	labels := strings.Split(asciiDomain, ".")
-	for i := range labels {
-		suffix := strings.Join(labels[i:], ".")
+	suffix := NormalizeDomainToASCIIText(domain)
+	for {
 		if server, ok := CCTLDWHOISServers[suffix]; ok {
 			return server
 		}
+		idx := strings.IndexByte(suffix, '.')
+		if idx == -1 {
+			break
+		}
+		suffix = suffix[idx+1:]
 	}
-	return ""
+	return StrEmpty
 }
 
+// NewBootstrap ...
 func NewBootstrap(httpClient HTTPDoer) *Bootstrap {
 	return &Bootstrap{http: ResolveHTTPClient(httpClient), url: BootstrapURL}
 }
 
+// ServersFor ...
 func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, error) {
 	if b == nil {
 		return nil, ErrBootstrapClientNil
@@ -110,13 +116,16 @@ func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, er
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	asciiDomain := NormalizeDomainToASCIIText(domain)
-	labels := strings.Split(asciiDomain, ".")
-	for i := range labels {
-		suffix := strings.Join(labels[i:], ".")
+	suffix := NormalizeDomainToASCIIText(domain)
+	for {
 		if urls, ok := b.services[suffix]; ok && len(urls) > 0 {
 			return slices.Clone(urls), nil
 		}
+		idx := strings.IndexByte(suffix, '.')
+		if idx == -1 {
+			break
+		}
+		suffix = suffix[idx+1:]
 	}
 	return nil, fmt.Errorf(MsgErrNoRDAPServerForDomain, domain)
 }
@@ -152,7 +161,7 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 		b.mu.RUnlock()
 
 		if hasData && cacheAge <= BootstrapMaxAge {
-			LogWarn(MsgLogRDAPRefreshFailed, "error", err, "cache_age", cacheAge.Round(time.Minute))
+			LogWarn(MsgLogRDAPRefreshFailed, StrError, err, StrCacheAge, cacheAge.Round(time.Minute))
 			return nil
 		}
 		return WrapError(MsgErrBootstrapRegistryUnavailable, err)
@@ -166,7 +175,7 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	}
 	client := ResolveHTTPClient(b.http)
 	if client == nil {
-		return fmt.Errorf("fetch RDAP bootstrap registry: %w", ErrBootstrapClientNil)
+		return fmt.Errorf(MsgErrFetchRDAPBootstrapRegistry, ErrBootstrapClientNil)
 	}
 	// #nosec G704 -- bootstrap URL is a configured endpoint; callers control its HTTP transport.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.url, nil)
@@ -188,10 +197,10 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	var registry dnsRegistry
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxBootstrapResponseSize+1))
 	if err != nil {
-		return fmt.Errorf("read RDAP bootstrap response: %w", err)
+		return fmt.Errorf(MsgErrReadRDAPBootstrapResponse, err)
 	}
 	if len(body) > MaxBootstrapResponseSize {
-		return fmt.Errorf("RDAP bootstrap response exceeds %d bytes", MaxBootstrapResponseSize)
+		return fmt.Errorf(MsgErrRDAPBootstrapResponseExceedsBytes, MaxBootstrapResponseSize)
 	}
 	if err := jsonv2.Unmarshal(body, &registry); err != nil {
 		return WrapError(MsgErrBootstrapDecodeError, err)
@@ -231,7 +240,7 @@ func bootstrapServices(registry dnsRegistry) map[string][]string {
 		if len(validURLs) > 0 {
 			for _, tld := range serviceEntry[0] {
 				cleanTLD := NormalizeDomain(tld)
-				if cleanTLD != "" {
+				if cleanTLD != StrEmpty {
 					services[cleanTLD] = validURLs
 				}
 			}

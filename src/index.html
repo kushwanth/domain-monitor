@@ -330,6 +330,12 @@
       padding-top: 24px;
     }
 
+    .detail-column {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
     .detail-panel {
       flex: 1;
       background: transparent;
@@ -1436,17 +1442,19 @@
                   ${labelsHtml}
                 </span>
               </div>
-              <span class="domain-price" style="color: var(--text-muted); font-size: 0.85rem; white-space: nowrap;">Renewal: ${renewalPrice}</span>
               ${chevronHtml}
             </div>
           </summary>
           <div class="domain-details">
-            ${rdapHtml}
-            ${emailHtml}
-            ${dnssecHtml}
-            ${caaHtml}
-            ${nsHealthHtml}
-
+            <div class="detail-column">
+              ${rdapHtml}
+              ${caaHtml}
+            </div>
+            <div class="detail-column">
+              ${emailHtml}
+              ${dnssecHtml}
+              ${nsHealthHtml}
+            </div>
           </div>
         `;
         if (rdapState.allow_expiry) {

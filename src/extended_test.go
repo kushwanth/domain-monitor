@@ -41,7 +41,7 @@ func TestSaveCertsToHistory_CorruptFilePreserved(t *testing.T) {
 }
 
 func TestEvaluateCTLogs_BackfillFailureKeepsDiscovery(t *testing.T) {
-	snapshot := CTLogsSnapshot{CheckpointID: "new", BackfillErr: errors.New("quota exceeded"), NewCerts: []CTCert{{ID: "new"}}}
+	snapshot := CTLogsSnapshot{CheckpointID: "new", BackfillErr: errors.New(MsgErrQuotaExceeded), NewCerts: []CTCert{{ID: "new"}}}
 	status, _, state := EvaluateCTLogs(DomainConfig{Domain: "example.com", MonitorCTLogs: true}, snapshot)
 	assert.Equal(t, StatusFailed, status)
 	assert.Equal(t, "new", state.LatestID)
@@ -118,7 +118,7 @@ func TestLoadCTStateFile_MigrationAndFailedCommit(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, legacy, FilePermSecret))
 	_, err = loadCTStateFile(path, os.ReadFile, func(target string, content []byte, mode os.FileMode) error {
 		if target == path {
-			return errors.New("commit failed")
+			return errors.New(MsgErrCommitFailed)
 		}
 		return AtomicWriteFile(target, content, mode)
 	})
@@ -234,7 +234,7 @@ func TestCTPending_PartialAcceptanceAndCommitFailure(t *testing.T) {
 	state := map[string]CTLogState{"example.com": {SeenIDs: []string{"cert"}, Pending: []CTPending{{Cert: CTCert{ID: "cert"}, NeedNtfy: true, NeedTelegram: true}}}}
 	cfg := AppConfig{Domains: []DomainConfig{{Domain: "example.com", MonitorCTLogs: true}}, Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}}
 	path := filepath.Join(t.TempDir(), "ct_state.json")
-	err := commitCTAcceptances(path, state, cfg, accepted, func(string, []byte, os.FileMode) error { return errors.New("disk full") })
+	err := commitCTAcceptances(path, state, cfg, accepted, func(string, []byte, os.FileMode) error { return errors.New(MsgErrDiskFull) })
 	require.Error(t, err)
 	assert.True(t, state["example.com"].Pending[0].NeedNtfy)
 
@@ -798,7 +798,7 @@ func TestCTAcknowledgementWriteFailureDoesNotRedeliverInProcess(t *testing.T) {
 	encoded, err := encodeCTState(committed)
 	require.NoError(t, err)
 	require.NoError(t, AtomicWriteFile(path, encoded, FilePermSecret))
-	app.WriteCTState = func(string, []byte, os.FileMode) error { return errors.New("disk unavailable") }
+	app.WriteCTState = func(string, []byte, os.FileMode) error { return errors.New(MsgErrDiskUnavailable) }
 	alert := Alert{Identity: "CT:" + domain + ":new", Domain: domain, NeedNtfy: true}
 	notifier.DispatchCT(alert)
 	finishCycleDelivery(context.Background(), app, state, path, committed, time.Hour)

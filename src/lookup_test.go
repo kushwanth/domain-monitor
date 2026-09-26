@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
+
 	"slices"
 	"strings"
 	"sync"
@@ -32,7 +32,7 @@ func getMockWHOISApp(fn func(string) (string, error)) *AppState {
 		},
 		HTTPClient: &MockHTTPClient{
 			MockDo: func(req *http.Request) (*http.Response, error) {
-				return nil, errors.New("mock http error")
+				return nil, errors.New(MsgErrMockHTTPError)
 			},
 		},
 	}
@@ -914,7 +914,7 @@ func TestFallbackWHOISSnapshotDoesNotTreatTransportErrorAsMissingDomain(t *testi
 		queryErr     error
 		missing      bool
 	}{
-		{name: "missing WHOIS server", queryErr: errors.New("WHOIS server not found")},
+		{name: "missing WHOIS server", queryErr: errors.New(MsgErrWHOISServerNotFound)},
 		{name: "missing domain", queryErr: ErrDomainNotFound, source: SourceWHOIS404, missing: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -922,7 +922,7 @@ func TestFallbackWHOISSnapshotDoesNotTreatTransportErrorAsMissingDomain(t *testi
 			app.WHOISClient = &MockWHOISClient{MockQuery: func(context.Context, string, string) (string, error) {
 				return "", tc.queryErr
 			}}
-			snapshot := fallbackWHOISSnapshot(context.Background(), app, "example.com", errors.New("RDAP unavailable"))
+			snapshot := fallbackWHOISSnapshot(context.Background(), app, "example.com", errors.New(MsgErrRDAPUnavailable))
 			require.Error(t, snapshot.Err)
 			assert.Equal(t, tc.missing, errors.Is(snapshot.Err, ErrDomainNotFound))
 			assert.Equal(t, tc.source, snapshot.Source)
@@ -1154,7 +1154,7 @@ func TestDialPublicWHOISWithUsesValidatedIPsAndRetries(t *testing.T) {
 		assert.Equal(t, "tcp", network)
 		dialed = append(dialed, address)
 		if address == "8.8.8.8:43" {
-			return nil, errors.New("first address unavailable")
+			return nil, errors.New(MsgErrFirstAddressUnavailable)
 		}
 		return client, nil
 	}
@@ -1165,7 +1165,7 @@ func TestDialPublicWHOISWithUsesValidatedIPsAndRetries(t *testing.T) {
 }
 
 func TestDialPublicWHOISWithReportsLookupAndConnectionFailures(t *testing.T) {
-	resolveErr := errors.New("resolver unavailable")
+	resolveErr := errors.New(MsgErrResolverUnavailable)
 	conn, err := dialPublicWHOISWith(context.Background(), "whois.example.com",
 		func(context.Context, string) ([]net.IPAddr, error) { return nil, resolveErr },
 		func(context.Context, string, string) (net.Conn, error) {
@@ -1175,7 +1175,7 @@ func TestDialPublicWHOISWithReportsLookupAndConnectionFailures(t *testing.T) {
 	require.Nil(t, conn)
 	require.ErrorIs(t, err, resolveErr)
 
-	dialErr := errors.New("connection refused")
+	dialErr := errors.New(MsgErrConnectionRefused)
 	conn, err = dialPublicWHOISWith(context.Background(), "whois.example.com",
 		func(context.Context, string) ([]net.IPAddr, error) {
 			return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
@@ -1885,7 +1885,7 @@ func TestFetchRDAPSnapshotKeepsCompleteRDAPWithoutWHOIS(t *testing.T) {
 		RDAPURLAllowed: func(string) bool { return true },
 		WHOISClient: &MockWHOISClient{MockQuery: func(context.Context, string, string) (string, error) {
 			whoisCalls++
-			return "", errors.New("WHOIS should not be queried")
+			return "", errors.New(MsgErrWHOISShouldNotBeQueried)
 		}},
 	}
 	client := &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
@@ -2026,7 +2026,7 @@ func TestEvaluateRDAP_MockedPaths(t *testing.T) {
 	}
 	app.HTTPClient = &MockHTTPClient{
 		MockDo: func(req *http.Request) (*http.Response, error) {
-			return nil, errors.New("mock rdap rate limit error") // Simulates error in http
+			return nil, errors.New(MsgErrMockRDAPRateLimitError) // Simulates error in http
 		},
 	}
 
@@ -2056,7 +2056,7 @@ func TestResolveRootZoneResolvers_MockedPaths(t *testing.T) {
 					return m, 0, nil
 				}
 			}
-			return nil, 0, errors.New("mock error")
+			return nil, 0, errors.New(MsgErrMockError)
 		},
 	}
 

@@ -25,13 +25,13 @@ func WrapError(prefix string, err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%s: %w", prefix, err)
+	return fmt.Errorf(MsgErr, prefix, err)
 }
 
 // AnyToString converts any value or panic object into a string representation safely.
 func AnyToString(v any) string {
 	if v == nil {
-		return ""
+		return StrEmpty
 	}
 	switch val := v.(type) {
 	case string:
@@ -76,24 +76,27 @@ func CopyMap[K comparable, V any](src map[K]V) map[K]V {
 // --- 2. Domain & String Normalization Utilities ---
 
 // NormalizeDomain normalizes a domain or hostname by trimming whitespace,
-// stripping trailing dots, and converting to lowercase.
+// NormalizeDomain stripping trailing dots, and converting to lowercase.
+
 func NormalizeDomain(domain string) string {
-	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), SymDot))
 }
 
 // NormalizeDomainToASCIIText normalizes a domain name and converts internationalized
 // domain names (IDN/Punycode) to ASCII using idna.ToASCII. If conversion fails,
-// it falls back to NormalizeDomain(domain).
+// NormalizeDomainToASCIIText it falls back to NormalizeDomain(domain).
+
 func NormalizeDomainToASCIIText(domain string) string {
 	cleaned := NormalizeDomain(domain)
-	if ascii, err := idna.ToASCII(cleaned); err == nil && ascii != "" {
+	if ascii, err := idna.ToASCII(cleaned); err == nil && ascii != StrEmpty {
 		return ascii
 	}
 	return cleaned
 }
 
 // DeduplicateNonEmptyStrings trims each string in items, filters out empty strings,
-// and deduplicates the remainder while preserving order.
+// DeduplicateNonEmptyStrings and deduplicates the remainder while preserving order.
+
 func DeduplicateNonEmptyStrings(items []string) []string {
 	if len(items) == 0 {
 		return nil
@@ -102,7 +105,7 @@ func DeduplicateNonEmptyStrings(items []string) []string {
 	result := make([]string, 0, len(items))
 	for _, item := range items {
 		cleaned := strings.TrimSpace(item)
-		if cleaned == "" {
+		if cleaned == StrEmpty {
 			continue
 		}
 		if _, exists := seen[cleaned]; !exists {
@@ -116,17 +119,18 @@ func DeduplicateNonEmptyStrings(items []string) []string {
 // --- 3. Concurrency, Panic Recovery & Error Safety ---
 
 // RecoverAndLogPanic captures any active panic, logs it with context, and allows
-// the enclosing function/goroutine to terminate gracefully.
+// RecoverAndLogPanic the enclosing function/goroutine to terminate gracefully.
+
 func RecoverAndLogPanic(op string) {
 	if r := recover(); r != nil {
-		LogError(MsgLogRecoveredPanic, "operation", op, "panic", r)
+		LogError(MsgLogRecoveredPanic, StrOperation, op, StrPanic, r)
 	}
 }
 
 // TruncateRunes safely truncates s to maxRunes runes without splitting multi-byte UTF-8 sequences.
 func TruncateRunes(s string, maxRunes int) string {
 	if maxRunes <= 0 {
-		return ""
+		return StrEmpty
 	}
 	count := 0
 	for i := range s {
@@ -153,7 +157,8 @@ func ResolveHTTPClient(client HTTPDoer) HTTPDoer {
 
 // DrainAndClose reads remaining bytes from rc up to maxBytes (defaulting to 4KB if <= 0)
 // and closes rc. Draining before closing allows Go's underlying HTTP Transport to
-// reuse the established TCP/TLS connection.
+// DrainAndClose reuse the established TCP/TLS connection.
+
 func DrainAndClose(rc io.ReadCloser, maxBytes int64) {
 	if rc == nil {
 		return
@@ -168,22 +173,24 @@ func DrainAndClose(rc io.ReadCloser, maxBytes int64) {
 // --- 5. Network, Token & Filesystem Safety Utilities ---
 
 // DefaultPort ensures addr has a port component. If addr does not have a port,
-// defaultPort is appended. It correctly handles IPv4 and IPv6 addresses.
+// DefaultPort defaultPort is appended. It correctly handles IPv4 and IPv6 addresses.
+
 func DefaultPort(addr, defaultPort string) string {
 	cleanAddr := strings.TrimSpace(addr)
 	if _, _, err := net.SplitHostPort(cleanAddr); err != nil {
-		cleanAddr = strings.Trim(cleanAddr, "[]")
+		cleanAddr = strings.Trim(cleanAddr, SymBrackets)
 		return net.JoinHostPort(cleanAddr, defaultPort)
 	}
 	return cleanAddr
 }
 
 // NormalizeStatusToken cleans and standardizes status tokens by removing spaces,
-// hyphens, and underscores, and converting to lowercase using single-pass allocation-free mapping.
+// NormalizeStatusToken hyphens, and underscores, and converting to lowercase using single-pass allocation-free mapping.
+
 func NormalizeStatusToken(s string) string {
 	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
+	if s == StrEmpty {
+		return StrEmpty
 	}
 	return strings.Map(func(r rune) rune {
 		if r == ' ' || r == '-' || r == '_' {
@@ -194,7 +201,8 @@ func NormalizeStatusToken(s string) string {
 }
 
 // IsRestrictedIP reports whether ip is a private, loopback, link-local, multicast,
-// unspecified, or CGNAT IP address, suitable for SSRF and rebinding prevention.
+// IsRestrictedIP unspecified, or CGNAT IP address, suitable for SSRF and rebinding prevention.
+
 func IsRestrictedIP(ip net.IP) bool {
 	if ip == nil {
 		return false
@@ -216,7 +224,8 @@ func IsRestrictedIP(ip net.IP) bool {
 }
 
 // IsSafeSubpath reports whether targetPath is safely located strictly within baseDir,
-// preventing directory traversal attacks.
+// IsSafeSubpath preventing directory traversal attacks.
+
 func IsSafeSubpath(baseDir, targetPath string) bool {
 	cleanBase := filepath.Clean(baseDir)
 	cleanTarget := filepath.Clean(targetPath)
@@ -227,11 +236,12 @@ func IsSafeSubpath(baseDir, targetPath string) bool {
 	if err != nil {
 		return false
 	}
-	return !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+	return !strings.HasPrefix(rel, SymDoubleDot) && !filepath.IsAbs(rel)
 }
 
 // AtomicWriteFile writes data to a temporary file in the destination directory and
-// atomically renames it into place, preventing partial file corruption on process termination.
+// AtomicWriteFile atomically renames it into place, preventing partial file corruption on process termination.
+
 func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, TempFilePattern)
@@ -277,10 +287,12 @@ func NewConsoleHandler(w io.Writer) *ConsoleHandler {
 	}
 }
 
+// Enabled ...
 func (h *ConsoleHandler) Enabled(_ context.Context, _ slog.Level) bool {
 	return true
 }
 
+// Handle ...
 func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 	timestamp := r.Time.In(time.Local).Format(DefaultLogTimeFormat)
 	levelStr := r.Level.String()
@@ -290,7 +302,7 @@ func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 		attrs = append(attrs, h.attrs...)
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Key != "" {
+		if a.Key != StrEmpty {
 			attrs = append(attrs, fmt.Sprintf(LogFormatAttr, a.Key, a.Value.Any()))
 		}
 		return true
@@ -298,7 +310,7 @@ func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 
 	var line string
 	if len(attrs) > 0 {
-		line = fmt.Sprintf(LogFormatLineWithAttrs, timestamp, levelStr, r.Message, strings.Join(attrs, ", "))
+		line = fmt.Sprintf(LogFormatLineWithAttrs, timestamp, levelStr, r.Message, strings.Join(attrs, SymCommaSpace))
 	} else {
 		line = fmt.Sprintf(LogFormatLineNoAttrs, timestamp, levelStr, r.Message)
 	}
@@ -309,10 +321,11 @@ func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 	return err
 }
 
+// WithAttrs ...
 func (h *ConsoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	var formatted []string
 	for _, a := range attrs {
-		if a.Key != "" {
+		if a.Key != StrEmpty {
 			formatted = append(formatted, fmt.Sprintf(LogFormatAttr, a.Key, a.Value.Any()))
 		}
 	}
@@ -326,6 +339,7 @@ func (h *ConsoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
+// WithGroup ...
 func (h *ConsoleHandler) WithGroup(_ string) slog.Handler {
 	return h
 }
@@ -335,7 +349,8 @@ func init() {
 }
 
 // InitLocalizedLogger initializes the default slog logger to format timestamps
-// with the localized system timezone and clean human-readable output without key=value syntax or source annotations.
+// InitLocalizedLogger with the localized system timezone and clean human-readable output without key=value syntax or source annotations.
+
 func InitLocalizedLogger() {
 	slog.SetDefault(slog.New(NewConsoleHandler(os.Stderr)))
 }

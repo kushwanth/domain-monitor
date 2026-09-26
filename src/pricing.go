@@ -63,7 +63,7 @@ func (p *PricingManager) ensure(ctx context.Context) error {
 
 // normalizeTLD strips whitespace, lowercases, and removes a leading dot from a TLD string.
 func normalizeTLD(tld string) string {
-	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(tld)), ".")
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(tld)), SymDot)
 }
 
 func (p *PricingManager) fetch(ctx context.Context) error {
@@ -88,16 +88,16 @@ func (p *PricingManager) fetch(ctx context.Context) error {
 	defer DrainAndClose(resp.Body, MaxBodyDrainSize)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: %s", MsgErrDotSweepFetchFailed, resp.Status)
+		return fmt.Errorf(MsgErr2, MsgErrDotSweepFetchFailed, resp.Status)
 	}
 
 	var pResp DotSweepResponse
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxPricingResponseSize+1))
 	if err != nil {
-		return fmt.Errorf("read pricing response: %w", err)
+		return fmt.Errorf(MsgErrReadPricingResponse, err)
 	}
 	if len(body) > MaxPricingResponseSize {
-		return fmt.Errorf("pricing response exceeds %d bytes", MaxPricingResponseSize)
+		return fmt.Errorf(MsgErrPricingResponseExceedsBytes, MaxPricingResponseSize)
 	}
 	if err := jsonv2.Unmarshal(body, &pResp); err != nil {
 		return WrapError(MsgErrDotSweepParseError, err)
@@ -110,7 +110,7 @@ func (p *PricingManager) fetch(ctx context.Context) error {
 	newPrices := make(map[string]float64, len(pResp.TLDs))
 	for _, item := range pResp.TLDs {
 		tldClean := normalizeTLD(item.TLD)
-		if tldClean == "" {
+		if tldClean == StrEmpty {
 			continue
 		}
 		if item.Renewal > 0 {
@@ -144,12 +144,12 @@ func (p *PricingManager) GetPrice(tld string) (float64, bool) {
 func extractTLD(domain string) string {
 	domain = NormalizeDomain(domain)
 	ps, _ := publicsuffix.PublicSuffix(domain)
-	if ps != "" {
+	if ps != StrEmpty {
 		return ps
 	}
-	parts := strings.Split(domain, ".")
-	if len(parts) > 1 {
-		return parts[len(parts)-1]
+	idx := strings.LastIndexByte(domain, '.')
+	if idx != -1 && idx < len(domain)-1 {
+		return domain[idx+1:]
 	}
 	return domain
 }

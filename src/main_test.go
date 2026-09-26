@@ -302,7 +302,7 @@ func TestMarkCTCommitFailed_RestoresCommittedProgress(t *testing.T) {
 	state := NewCheckState()
 	state.CTLogs["example.com"] = CTLogState{LatestID: "new", BackfillCursor: "next", NewCerts: []CTCert{{ID: "new"}}, Status: StatusOK}
 	committed := map[string]CTLogState{"example.com": {LatestID: "old", BackfillCursor: "prior"}}
-	markCTCommitFailed(state, committed, errors.New("disk unavailable"))
+	markCTCommitFailed(state, committed, errors.New(MsgErrDiskUnavailable))
 	assert.Equal(t, "old", state.CTLogs["example.com"].LatestID)
 	assert.Equal(t, "prior", state.CTLogs["example.com"].BackfillCursor)
 	assert.Empty(t, state.CTLogs["example.com"].NewCerts)
@@ -319,7 +319,7 @@ func TestServeCTLogFile_AuthorizationAndReadErrors(t *testing.T) {
 		want         int
 	}{
 		{name: "unconfigured", domain: "other.com", want: http.StatusNotFound},
-		{name: "read failure", domain: "example.com", read: func(string) ([]byte, error) { return nil, errors.New("disk failed") }, want: http.StatusInternalServerError},
+		{name: "read failure", domain: "example.com", read: func(string) ([]byte, error) { return nil, errors.New(MsgErrDiskFailed) }, want: http.StatusInternalServerError},
 		{name: "corrupt", domain: "example.com", read: func(string) ([]byte, error) { return []byte("{bad"), nil }, want: http.StatusInternalServerError},
 		{name: "valid", domain: "example.com", read: func(string) ([]byte, error) { return []byte(`[{"id":"cert"}]`), nil }, want: http.StatusOK},
 	} {
@@ -468,7 +468,7 @@ func TestDaemonSixCyclesRestartWriteFailureAndRateLimit(t *testing.T) {
 	assert.Equal(t, "CT:example.com:new", notifier.alerts[0].Identity)
 
 	cycle = 3
-	app.WriteCTState = func(string, []byte, os.FileMode) error { return errors.New("disk full") }
+	app.WriteCTState = func(string, []byte, os.FileMode) error { return errors.New(MsgErrDiskFull) }
 	third := run()
 	assert.Equal(t, StatusMismatch, third.DNS["example A"].Status)
 	assert.Equal(t, StatusFailed, third.CTLogs[domain].Status)
@@ -826,12 +826,12 @@ func TestDaemonPublishesAllProtocolWorkerFailures(t *testing.T) {
 			response.Answer = []dns.RR{address}
 			return response, 0, nil
 		}
-		return nil, 0, errors.New("resolver unavailable")
+		return nil, 0, errors.New(MsgErrResolverUnavailable)
 	}}
 	app.TLSCheck = func(_ context.Context, host string, ips []string, _ bool) (int, error) {
 		assert.Equal(t, "www.example.com", host)
 		assert.Equal(t, []string{"192.0.2.10"}, ips)
-		return SSLDaysError, errors.New("untrusted chain")
+		return SSLDaysError, errors.New(MsgErrUntrustedChain)
 	}
 	state := runMonitoringCycle(context.Background(), app, nil, filepath.Join(t.TempDir(), "ct_state.json"), nil, nil, nil, nil, nil)
 	require.NotNil(t, state)
@@ -869,7 +869,7 @@ func TestDaemonPublishesRDAPAndWHOISFailure(t *testing.T) {
 	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: "example.com", Name: "Example"}}})
 	app.RDAPLimiter = nil
 	app.WHOISClient = &MockWHOISClient{MockQuery: func(context.Context, string, string) (string, error) {
-		return "", errors.New("WHOIS provider unavailable")
+		return "", errors.New(MsgErrWHOISProviderUnavailable)
 	}}
 	notifier := &assuranceNotifier{}
 	app.Notifier = notifier
@@ -975,7 +975,7 @@ func TestDaemonDNSRecordOutcomeMatrix(t *testing.T) {
 			phase := 0
 			app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 				if phase == 2 {
-					return nil, 0, errors.New("resolver unavailable")
+					return nil, 0, errors.New(MsgErrResolverUnavailable)
 				}
 				response := new(dns.Msg)
 				response.SetReply(query)
@@ -1111,8 +1111,7 @@ func TestDashboardRendersDomainsWithCTState(t *testing.T) {
    const price = {'healthy.example':'$11.08/yr', 'warning.example':'Unknown', 'let-go.example':'Not renewing', 'delegated.example':'Not applicable'}[card.dataset.search];
    for (const open of [false, true]) {
     card.open = open;
-    const summaryPrice = card.querySelector('summary .domain-price');
-    if (!summaryPrice || !summaryPrice.textContent.includes('Renewal: ' + price) || summaryPrice.getBoundingClientRect().height === 0) throw new Error('Missing visible summary renewal price');
+
     const details = card.querySelector('.domain-details');
     if (!details.textContent.includes('Renewal Price:') || !details.textContent.includes(price)) throw new Error('Missing expanded renewal price');
     if (details.textContent.includes('Certificate Transparency') || details.textContent.includes('Alerts Awaiting Acknowledgement')) throw new Error('CT block still present');

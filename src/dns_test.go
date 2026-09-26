@@ -413,7 +413,7 @@ func TestQueryIPRecords_PartialLookupDoesNotPass(t *testing.T) {
 	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
 	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 		if msg.Question[0].Qtype == dns.TypeAAAA {
-			return nil, 0, errors.New("IPv6 resolver timeout")
+			return nil, 0, errors.New(MsgErrIPv6ResolverTimeout)
 		}
 		response := new(dns.Msg)
 		response.SetReply(msg)
@@ -433,7 +433,7 @@ func TestQueryIPRecords_PartialLookupDoesNotPass(t *testing.T) {
 func TestEvaluateEmailSecurity_DMARCFailurePromotesSPFWarning(t *testing.T) {
 	status, cond, state := EvaluateEmailSecurity(DomainConfig{Domain: "example.com", CheckEmailSecurity: true}, EmailSnapshot{
 		MXRecords: []string{"mx.example.com"},
-		DMARCErr:  errors.New("resolver timeout"),
+		DMARCErr:  errors.New(MsgErrResolverTimeout),
 	})
 	assert.Equal(t, StatusFailed, status)
 	assert.Equal(t, StatusFailed, state.Status)
@@ -857,7 +857,7 @@ func TestCAATransientAliasLookupDoesNotVerifyParentPolicy(t *testing.T) {
 	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 		question := query.Question[0]
 		if question.Name == "child.example.com." && question.Qtype == dns.TypeCNAME {
-			return nil, 0, errors.New("CNAME lookup timed out")
+			return nil, 0, errors.New(MsgErrCNAMELookupTimedOut)
 		}
 		response := new(dns.Msg)
 		response.SetReply(query)
@@ -2486,9 +2486,9 @@ func TestEvaluateSSLStatuses(t *testing.T) {
 		code     ResultCode
 	}{
 		{name: "skipped", snapshot: SSLSnapshot{ExpiryDays: SSLDaysNotApplicable}, status: StatusOK},
-		{name: "validation failed", snapshot: SSLSnapshot{ExpiryDays: 30, Err: errors.New("untrusted chain")}, status: StatusFailed, code: CodeSSLValidationFailed},
-		{name: "expired certificate error", snapshot: SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf("tls: %w", x509.CertificateInvalidError{Cert: &x509.Certificate{NotAfter: time.Now().Add(-time.Hour)}, Reason: x509.Expired})}, status: StatusFailed, code: CodeSSLExpired},
-		{name: "not yet valid certificate error", snapshot: SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf("tls: %w", x509.CertificateInvalidError{Cert: &x509.Certificate{NotAfter: time.Now().Add(time.Hour)}, Reason: x509.Expired})}, status: StatusFailed, code: CodeSSLValidationFailed},
+		{name: "validation failed", snapshot: SSLSnapshot{ExpiryDays: 30, Err: errors.New(MsgErrUntrustedChain)}, status: StatusFailed, code: CodeSSLValidationFailed},
+		{name: "expired certificate error", snapshot: SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf(MsgErrTLS, x509.CertificateInvalidError{Cert: &x509.Certificate{NotAfter: time.Now().Add(-time.Hour)}, Reason: x509.Expired})}, status: StatusFailed, code: CodeSSLExpired},
+		{name: "not yet valid certificate error", snapshot: SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf(MsgErrTLS, x509.CertificateInvalidError{Cert: &x509.Certificate{NotAfter: time.Now().Add(time.Hour)}, Reason: x509.Expired})}, status: StatusFailed, code: CodeSSLValidationFailed},
 		{name: "expired", snapshot: SSLSnapshot{ExpiryDays: -1}, status: StatusFailed, code: CodeSSLExpired},
 		{name: "expiring", snapshot: SSLSnapshot{ExpiryDays: DefaultSSLExpiryWarningDays}, status: StatusWarning, code: CodeSSLExpiringSoon},
 		{name: "healthy", snapshot: SSLSnapshot{ExpiryDays: DefaultSSLExpiryWarningDays + 1}, status: StatusOK, code: CodeSSLVerified},
@@ -2624,7 +2624,7 @@ func TestEvaluateDNSSEC_MockedPaths(t *testing.T) {
 							Body:       io.NopCloser(strings.NewReader(`{"Status": 0, "AD": true}`)),
 						}, nil
 					}
-					return nil, errors.New("mock doh error")
+					return nil, errors.New(MsgErrMockDohError)
 				},
 			}
 			app.DNSClient = &MockDNSResolver{
@@ -2641,7 +2641,7 @@ func TestEvaluateDNSSEC_MockedPaths(t *testing.T) {
 							resp.Answer = append(resp.Answer, rr)
 						}
 					} else {
-						return nil, 0, errors.New("mock DNSSEC error")
+						return nil, 0, errors.New(MsgErrMockDNSSECError)
 					}
 					return resp, 0, nil
 				},
@@ -2701,7 +2701,7 @@ func TestEvaluateDNS_MockedPaths(t *testing.T) {
 		mockErr error
 		expect  CheckStatus
 	}{
-		{"Error", nil, errors.New("resolution failed"), StatusFailed},
+		{"Error", nil, errors.New(MsgErrResolutionFailed), StatusFailed},
 		{"NoRecords", []string{}, nil, StatusMismatch},
 		{"Valid", []string{"1.2.3.4"}, nil, StatusOK},
 	}
@@ -2735,7 +2735,7 @@ func TestResolveTarget_MockedPaths(t *testing.T) {
 	app.DNSClient = &MockDNSResolver{
 		MockExchangeContext: func(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
 			if len(msg.Question) == 0 {
-				return nil, 0, errors.New("mock error")
+				return nil, 0, errors.New(MsgErrMockError)
 			}
 			hostname := msg.Question[0].Name
 			m := new(dns.Msg)
@@ -2747,13 +2747,13 @@ func TestResolveTarget_MockedPaths(t *testing.T) {
 				return m, 0, nil
 			}
 			if normalized == "cname-loop.com" {
-				return nil, 0, errors.New("resolver error: CNAME loop detected")
+				return nil, 0, errors.New(MsgErrResolverErrorCNAMELoopDetected)
 			}
 			if normalized == "target.com" || normalized == "example.com" {
 				m.Answer = append(m.Answer, &dns.A{Hdr: dns.RR_Header{Name: hostname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300}, A: net.ParseIP("1.2.3.4")})
 				return m, 0, nil
 			}
-			return nil, 0, errors.New("mock error")
+			return nil, 0, errors.New(MsgErrMockError)
 		},
 	}
 
@@ -2781,7 +2781,7 @@ func TestEvaluateEmailSecurity_MockedPaths(t *testing.T) {
 	app.DNSClient = &MockDNSResolver{
 		MockExchangeContext: func(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
 			if len(msg.Question) == 0 {
-				return nil, 0, errors.New("mock error")
+				return nil, 0, errors.New(MsgErrMockError)
 			}
 			hostname := msg.Question[0].Name
 			qtype := msg.Question[0].Qtype
@@ -2808,7 +2808,7 @@ func TestEvaluateEmailSecurity_MockedPaths(t *testing.T) {
 				m.Answer = append(m.Answer, &dns.TXT{Hdr: dns.RR_Header{Name: "google._domainkey.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300}, Txt: []string{"v=DKIM1; k=ed25519; p=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=;"}})
 				return m, 0, nil
 			}
-			return nil, 0, errors.New("mock error")
+			return nil, 0, errors.New(MsgErrMockError)
 		},
 	}
 
@@ -2906,7 +2906,7 @@ func TestDMARCTransientFailureStopsParentDiscovery(t *testing.T) {
 		name := q.Question[0].Name
 		if strings.HasPrefix(name, "_dmarc.") {
 			dmarcQueries = append(dmarcQueries, name)
-			return nil, 0, errors.New("temporary DNS failure")
+			return nil, 0, errors.New(MsgErrTemporaryDNSFailure)
 		}
 		response := new(dns.Msg)
 		response.SetReply(q)
@@ -3046,7 +3046,7 @@ func TestEmailUnavailableSelectorCannotHideBehindValidKey(t *testing.T) {
 	snapshot := EmailSnapshot{
 		MXRecords: []string{"mail.example.com"}, SPFRecords: []string{"v=spf1 -all"},
 		DMARCRecords: []string{"v=DMARC1; p=reject"},
-		DKIMResults:  map[string]bool{"good": true}, DKIMErrs: map[string]error{"other": errors.New("DNS timeout")},
+		DKIMResults:  map[string]bool{"good": true}, DKIMErrs: map[string]error{"other": errors.New(MsgErrDNSTimeout)},
 	}
 	target := DomainConfig{CheckEmailSecurity: true, DKIMSelectors: []string{"good", "other"}}
 	status, condition, state := EvaluateEmailSecurity(target, snapshot)

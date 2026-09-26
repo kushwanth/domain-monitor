@@ -302,14 +302,14 @@ func TestRecoverAndLogPanic(t *testing.T) {
 
 func TestLoggingUtilities(_ *testing.T) {
 	// Ensure standardized logging helpers execute without issue
-	LogInfo("Test info message", "key", "value")
-	LogInfof("Test infof %s", "formatted")
-	LogWarn("Test warn message", "code", 123)
-	LogWarnf("Test warnf %d", 456)
-	LogError("Test error message", "error", "mock error")
-	LogErrorf("Test errorf %s", "detailed error")
-	LogDebug("Test debug message", "trace", "id-789")
-	LogDebugf("Test debugf %s", "debug detail")
+	LogInfo(MsgLogTestInfoMessage, "key", "value")
+	LogInfof(MsgLogTestInfof, "formatted")
+	LogWarn(MsgLogTestWarnMessage, "code", 123)
+	LogWarnf(MsgLogTestWarnf, 456)
+	LogError(MsgLogTestErrorMessage, "error", "mock error")
+	LogErrorf(MsgLogTestErrorf, "detailed error")
+	LogDebug(MsgLogTestDebugMessage, "trace", "id-789")
+	LogDebugf(MsgLogTestDebugf, "debug detail")
 }
 
 func TestLogUtil_CleanFormattingAndNoSource(t *testing.T) {
@@ -319,7 +319,7 @@ func TestLogUtil_CleanFormattingAndNoSource(t *testing.T) {
 	defer slog.SetDefault(oldLogger)
 	slog.SetDefault(slog.New(handler))
 
-	LogInfo("Sample localized message", "test_attr", 42)
+	LogInfo(MsgLogSampleLocalizedMessage, "test_attr", 42)
 
 	output := buf.String()
 	zone, _ := time.Now().In(time.Local).Zone()
@@ -342,7 +342,7 @@ func TestWrapError(t *testing.T) {
 		t.Errorf("expected WrapError on nil to return nil")
 	}
 
-	root := errors.New("root cause")
+	root := errors.New(MsgErrRootCause)
 	wrapped := WrapError("operation failed", root)
 	if wrapped == nil {
 		t.Fatalf("expected wrapped error, got nil")
@@ -369,7 +369,7 @@ func TestAnyToString(t *testing.T) {
 	if got := AnyToString("hello"); got != "hello" {
 		t.Errorf("AnyToString(string) = %q, expected %q", got, "hello")
 	}
-	if got := AnyToString(errors.New("custom error")); got != "custom error" {
+	if got := AnyToString(errors.New(MsgErrCustomError)); got != "custom error" {
 		t.Errorf("AnyToString(error) = %q, expected %q", got, "custom error")
 	}
 	if got := AnyToString(dummyStringer{}); got != "dummy-string" {

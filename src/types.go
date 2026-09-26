@@ -25,12 +25,13 @@ type EPPCode uint8
 // StringList is a slice of strings that unmarshals from either a single JSON string or an array of strings.
 type StringList []string
 
+// UnmarshalJSON ...
 func (s *StringList) UnmarshalJSON(data []byte) error {
 	if s == nil {
 		return errors.New(MsgErrNilStringListReceiver)
 	}
 	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte(StrNull)) {
 		*s = nil
 		return nil
 	}
@@ -51,7 +52,8 @@ func (s *StringList) UnmarshalJSON(data []byte) error {
 }
 
 // StateCondition represents a typed evaluator verdict with optional context and duration tracking.
-// Code is a compact numeric enum; Target contains diagnostic text when needed.
+// StateCondition Code is a compact numeric enum; Target contains diagnostic text when needed.
+
 type StateCondition struct {
 	Code   ResultCode `json:"code"`
 	Target string     `json:"target,omitempty"`
@@ -85,13 +87,13 @@ func (s CheckStatus) String() string {
 	if int(s) < len(checkStatusNames) {
 		return checkStatusNames[s]
 	}
-	return ""
+	return StrEmpty
 }
 
 // MarshalText preserves readable status names at JSON boundaries.
 func (s CheckStatus) MarshalText() ([]byte, error) {
 	if int(s) >= len(checkStatusNames) {
-		return nil, fmt.Errorf("invalid check status %d", uint8(s))
+		return nil, fmt.Errorf(MsgErrInvalidCheckStatus, uint8(s))
 	}
 	return []byte(s.String()), nil
 }
@@ -108,7 +110,7 @@ func (s *CheckStatus) UnmarshalJSON(data []byte) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("unknown check status %q", name)
+	return fmt.Errorf(MsgErrUnknownCheckStatus, name)
 }
 
 // AlertPriority defines the urgency level of a notification alert
@@ -119,13 +121,13 @@ func (p AlertPriority) String() string {
 	if int(p) < len(alertPriorityNames) {
 		return alertPriorityNames[p]
 	}
-	return ""
+	return StrEmpty
 }
 
 // MarshalText preserves readable notification priorities at JSON boundaries.
 func (p AlertPriority) MarshalText() ([]byte, error) {
 	if int(p) >= len(alertPriorityNames) {
-		return nil, fmt.Errorf("invalid alert priority %d", uint8(p))
+		return nil, fmt.Errorf(MsgErrInvalidAlertPriority, uint8(p))
 	}
 	return []byte(p.String()), nil
 }
@@ -138,7 +140,7 @@ func (p *AlertPriority) UnmarshalText(text []byte) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("unknown alert priority %q", text)
+	return fmt.Errorf(MsgErrUnknownAlertPriority, text)
 }
 
 // AlertTag defines the visual badge or emoji category for an alert
@@ -146,27 +148,32 @@ type AlertTag string
 
 // 2. Configuration Models
 
+// CAAConfig ...
 type CAAConfig struct {
 	Issue     []string `json:"issue"`
 	IssueWild []string `json:"issuewild"`
 	IssueMail []string `json:"issuemail"`
 }
 
+// NtfyConfig ...
 type NtfyConfig struct {
 	URL  string `json:"url"`
 	Auth string `json:"auth"`
 }
 
+// TelegramConfig ...
 type TelegramConfig struct {
 	Token  string `json:"token"`
 	ChatID string `json:"chat_id"`
 }
 
+// Notifications ...
 type Notifications struct {
 	Ntfy     *NtfyConfig     `json:"ntfy"`
 	Telegram *TelegramConfig `json:"telegram"`
 }
 
+// AppConfig ...
 type AppConfig struct {
 	Port             string         `json:"port"`
 	DataDir          string         `json:"data_dir,omitempty"`
@@ -179,6 +186,7 @@ type AppConfig struct {
 	DNSRecords       []DNSTask      `json:"dns_records"`
 }
 
+// DomainConfig ...
 type DomainConfig struct {
 	Domain                string     `json:"domain"`
 	Name                  string     `json:"name"`
@@ -203,6 +211,7 @@ type DomainConfig struct {
 	SuppressAlerts        bool       `json:"suppress_alerts"`
 }
 
+// DNSTask ...
 type DNSTask struct {
 	Hostname         string     `json:"hostname"`
 	Name             string     `json:"name"`
@@ -347,16 +356,17 @@ func cloneConfig(cfg AppConfig) AppConfig {
 }
 
 // SafeDispatch safely dispatches an alert via Notifier if both app and Notifier are non-nil,
-// while always logging the alert message.
+// SafeDispatch while always logging the alert message.
+
 func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
 	if a == nil || a.Notifier == nil {
 		switch priority {
 		case PriorityUrgent, PriorityHigh:
-			LogError(message, "domain", domain, "priority", priority, "tag", tag)
+			LogError(message, StrDomain2, domain, StrPriority, priority, StrTag, tag)
 		case PriorityWarning:
-			LogWarn(message, "domain", domain, "priority", priority, "tag", tag)
+			LogWarn(message, StrDomain2, domain, StrPriority, priority, StrTag, tag)
 		default:
-			LogInfo(message, "domain", domain, "priority", priority, "tag", tag)
+			LogInfo(message, StrDomain2, domain, StrPriority, priority, StrTag, tag)
 		}
 		return
 	}
@@ -426,6 +436,7 @@ type RDAPDomainResponse struct {
 	Links           []RDAPLink       `json:"links,omitempty"`
 }
 
+// DomainTierData ...
 type DomainTierData struct {
 	Source       string   `json:"source,omitempty"`
 	Server       string   `json:"server,omitempty"`
@@ -440,6 +451,7 @@ type DomainTierData struct {
 	Raw          string   `json:"-"`
 }
 
+// RDAPState ...
 type RDAPState struct {
 	Status            CheckStatus     `json:"status"`
 	Condition         *StateCondition `json:"condition,omitempty"`
@@ -464,6 +476,7 @@ type RDAPState struct {
 	Discrepancies     []string        `json:"discrepancies,omitempty"`
 }
 
+// DNSState ...
 type DNSState struct {
 	Hostname  string          `json:"hostname"`
 	Name      string          `json:"name"`
@@ -477,6 +490,7 @@ type DNSState struct {
 	Error     string          `json:"error,omitempty"`
 }
 
+// EmailState ...
 type EmailState struct {
 	Provider     string          `json:"provider,omitempty"`
 	Status       CheckStatus     `json:"status"`
@@ -489,12 +503,14 @@ type EmailState struct {
 	Error        string          `json:"error,omitempty"`
 }
 
+// CAAEntry ...
 type CAAEntry struct {
 	Flag  uint8
 	Tag   string
 	Value string
 }
 
+// CAAResult ...
 type CAAResult struct {
 	Status              CheckStatus     `json:"status"`
 	Condition           *StateCondition `json:"condition,omitempty"`
@@ -509,6 +525,7 @@ type CAAResult struct {
 	Error               string          `json:"error,omitempty"`
 }
 
+// DNSSECResult ...
 type DNSSECResult struct {
 	Status          CheckStatus     `json:"status"`
 	Condition       *StateCondition `json:"condition,omitempty"`
@@ -526,6 +543,7 @@ type DNSSECResult struct {
 	Error           string          `json:"error,omitempty"`
 }
 
+// CTCert ...
 type CTCert struct {
 	ID        string `json:"id"`
 	Match     string `json:"match"`
@@ -541,6 +559,7 @@ type CTPending struct {
 	NeedTelegram bool   `json:"need_telegram,omitempty"`
 }
 
+// CTLogState ...
 type CTLogState struct {
 	LatestID           string          `json:"latest_id"`
 	Initialized        bool            `json:"initialized,omitempty"`
@@ -642,6 +661,7 @@ func NewCheckState() *CheckState {
 	}
 }
 
+// ExportCTLogs ...
 func (c *CheckState) ExportCTLogs() map[string]CTLogState {
 	if c == nil {
 		return make(map[string]CTLogState)
@@ -655,7 +675,7 @@ func (c *CheckState) ExportCTLogs() map[string]CTLogState {
 
 // ApplyDNSResult transfers an individual DNS result into the cycle-owned state.
 func (c *CheckState) ApplyDNSResult(res DNSResult) {
-	if c == nil || res.State.Status == StatusUnknown || res.Name == "" {
+	if c == nil || res.State.Status == StatusUnknown || res.Name == StrEmpty {
 		return
 	}
 	InitMap(&c.DNS)[res.Name] = res.State
@@ -663,7 +683,7 @@ func (c *CheckState) ApplyDNSResult(res DNSResult) {
 
 // ApplyDomainResult transfers an individual domain result into the cycle-owned state.
 func (c *CheckState) ApplyDomainResult(res DomainResult) {
-	if c == nil || res.Domain == "" {
+	if c == nil || res.Domain == StrEmpty {
 		return
 	}
 	if res.RDAP.Status != StatusUnknown {
@@ -675,7 +695,7 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 	if res.CAA.Status != StatusUnknown {
 		InitMap(&c.CAA)[res.Domain] = res.CAA
 	}
-	if res.DNSSEC.Source != "" || res.DNSSEC.Error != "" || res.DNSSEC.Valid {
+	if res.DNSSEC.Source != StrEmpty || res.DNSSEC.Error != StrEmpty || res.DNSSEC.Valid {
 		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
 	}
 	if res.CTLogs.Status != StatusUnknown {
@@ -689,7 +709,8 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 // 7. Pipeline Snapshot Structs (Phase 2 Fetcher Outputs)
 
 // RDAPSnapshot holds raw registry/registrar data fetched from RDAP or WHOIS.
-// Fields mirror RDAPState for direct assembly.
+// RDAPSnapshot Fields mirror RDAPState for direct assembly.
+
 type RDAPSnapshot struct {
 	Registrar       string
 	RegistrarIANAID string

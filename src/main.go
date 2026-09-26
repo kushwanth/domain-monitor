@@ -39,9 +39,9 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 // serveCTLogFile serves the CT log history JSON file for the given domain.
 func serveCTLogFile(app *AppState, w http.ResponseWriter, domain string) {
 	w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-	w.Header().Set(HeaderCacheControl, "no-store")
+	w.Header().Set(HeaderCacheControl, StrNoStore)
 	domain = NormalizeDomain(domain)
-	if domain == "" || !ReValidDomain.MatchString(domain) {
+	if domain == StrEmpty || !ReValidDomain.MatchString(domain) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(JSONResponseInvalidDomain))
@@ -49,15 +49,15 @@ func serveCTLogFile(app *AppState, w http.ResponseWriter, domain string) {
 	}
 	if !isCTMonitored(app, domain) {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"error":"domain is not monitored"}`))
+		_, _ = w.Write([]byte(StrErrorDomainIsNot))
 		return
 	}
 
 	logsPath := DefaultCTLogsSubdir
-	if app != nil && app.CTLogsPath != "" {
+	if app != nil && app.CTLogsPath != StrEmpty {
 		logsPath = app.CTLogsPath
 	}
-	filePath := filepath.Join(logsPath, domain+".json")
+	filePath := filepath.Join(logsPath, domain+StrJSON)
 	cleanPath := filepath.Clean(filePath)
 	if !IsSafeSubpath(logsPath, cleanPath) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
@@ -68,7 +68,7 @@ func serveCTLogFile(app *AppState, w http.ResponseWriter, domain string) {
 
 	if app.ReadCTHistory == nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"CT history reader unavailable"}`))
+		_, _ = w.Write([]byte(StrErrorCTHistoryReader))
 		return
 	}
 	b, err := app.ReadCTHistory(cleanPath)
@@ -79,7 +79,7 @@ func serveCTLogFile(app *AppState, w http.ResponseWriter, domain string) {
 		}
 		LogWarn(MsgLogReadCTLogFailed, FieldDomain, domain, FieldPath, cleanPath, FieldError, err)
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"CT history unavailable"}`))
+		_, _ = w.Write([]byte(StrErrorCTHistoryUnavailable))
 		return
 	}
 	if len(b) == 0 {
@@ -89,7 +89,7 @@ func serveCTLogFile(app *AppState, w http.ResponseWriter, domain string) {
 	var parsed []CTCert
 	if err := jsonv2.Unmarshal(b, &parsed); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"CT history is invalid"}`))
+		_, _ = w.Write([]byte(StrErrorCTHistoryIs))
 		return
 	}
 	_, _ = w.Write(b)
@@ -111,15 +111,15 @@ func readBoundedCTFile(path string) ([]byte, error) {
 	// #nosec G304 G703 -- path is the configured CT history location; caller validates domain filenames.
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open CT file %s: %w", path, err)
+		return nil, fmt.Errorf(MsgErrOpenCTFile, path, err)
 	}
 	defer func() { _ = f.Close() }()
 	b, err := io.ReadAll(io.LimitReader(f, MaxCTHistoryFileSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("read CT file %s: %w", path, err)
+		return nil, fmt.Errorf(MsgErrReadCTFile, path, err)
 	}
 	if len(b) > MaxCTHistoryFileSize {
-		return nil, fmt.Errorf("CT file %s exceeds %d bytes", path, MaxCTHistoryFileSize)
+		return nil, fmt.Errorf(MsgErrCTFileExceedsBytes, path, MaxCTHistoryFileSize)
 	}
 	return b, nil
 }
@@ -154,8 +154,8 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 		serveCTLogFile(app, w, r.PathValue(ParamDomain))
 	})
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
+	mux.HandleFunc(SymSlash, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != SymSlash {
 			http.NotFound(w, r)
 			return
 		}
@@ -163,13 +163,13 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 		_, _ = w.Write(indexHTML)
 	})
 
-	cleanPort := strings.TrimPrefix(strings.TrimSpace(port), ":")
-	if cleanPort == "" {
+	cleanPort := strings.TrimPrefix(strings.TrimSpace(port), SymColon)
+	if cleanPort == StrEmpty {
 		cleanPort = DefaultServerPort
 	}
 
 	server := &http.Server{
-		Addr:                ":" + cleanPort,
+		Addr:                SymColon + cleanPort,
 		Handler:             securityHeadersMiddleware(mux),
 		ReadTimeout:         DefaultDNSTimeout,
 		ReadHeaderTimeout:   DefaultDNSTimeout,
@@ -230,7 +230,7 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 							Expected:  slices.Clone(record.Expected),
 							Status:    StatusFailed,
 							Error:     fmt.Sprintf(MsgErrInternalDNSCheckPanic, AnyToString(r)),
-							Condition: &StateCondition{Code: CodeDNSLookupFailed, Target: "internal DNS check panic"},
+							Condition: &StateCondition{Code: CodeDNSLookupFailed, Target: StrInternalDNSCheckPanic},
 							SkipSSL:   record.SkipSSL,
 						},
 					}
@@ -261,12 +261,12 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 						cond = sslCond
 					} else {
 						// Append to target for legacy support
-						cond.Target += " | " + sslCond.Target
+						cond.Target += SymPipeSpaced + sslCond.Target
 					}
 				}
 			}
 
-			errStr := ""
+			errStr := StrEmpty
 			if cond != nil && cond.Code != CodeDNSMatchVerified && cond.Code != CodeSSLVerified {
 				errStr = cond.Target
 			}
@@ -346,7 +346,7 @@ func executeFastDomainChecks(ctx context.Context, app *AppState, domains []Domai
 
 					var servers []NSHealthServerResult
 					for idx, srvSnap := range snapshots {
-						errStr := ""
+						errStr := StrEmpty
 						if combined := errors.Join(srvSnap.Err, srvSnap.PartialError, srvSnap.DNSKEYErr); combined != nil {
 							errStr = combined.Error()
 						}
@@ -430,7 +430,7 @@ func executeRateLimitedChecks(
 						rdapResults[i] = RDAPState{
 							Status:    StatusFailed,
 							Error:     fmt.Sprintf(MsgErrInternalRDAPCheckPanic, AnyToString(r)),
-							Condition: &StateCondition{Code: CodeRDAPHTTPError, Target: "internal RDAP check panic"},
+							Condition: &StateCondition{Code: CodeRDAPHTTPError, Target: StrInternalRDAPCheckPanic},
 						}
 					}
 				}()
@@ -493,7 +493,7 @@ func executeRateLimitedChecks(
 						ctResults[i] = ctLogPersist[domainConfig.Domain]
 						ctResults[i].Status = StatusFailed
 						ctResults[i].Error = fmt.Sprintf(MsgErrInternalCTLogsPanic, AnyToString(r))
-						ctResults[i].Condition = &StateCondition{Code: CodeCTLogsHTTPError, Target: "internal CT check panic"}
+						ctResults[i].Condition = &StateCondition{Code: CodeCTLogsHTTPError, Target: StrInternalCTCheckPanic}
 					}
 				}()
 				ctSnap := FetchCTLogsSnapshot(ctx, app, domainConfig, ctLogPersist[domainConfig.Domain])
@@ -506,7 +506,7 @@ func executeRateLimitedChecks(
 				for _, j := range order[position+1:] {
 					ctResults[j] = ctLogPersist[domains[j].Domain]
 					ctResults[j].Status = StatusWarning
-					ctResults[j].Error = "CT quota exhausted; deferred until next cycle"
+					ctResults[j].Error = StrCTQuotaExhaustedDeferred
 					ctResults[j].Condition = &StateCondition{Code: CodeCTLogsRateLimited}
 				}
 				return nil
@@ -659,7 +659,7 @@ func commitCycleCTState(app *AppState, state *CheckState, path string, committed
 		err = write(path, b, FilePermSecret)
 	}
 	if err != nil {
-		markCTCommitFailed(state, committed, fmt.Errorf("commit CT state %s: %w", path, err))
+		markCTCommitFailed(state, committed, fmt.Errorf(MsgErrCommitCTState, path, err))
 		return
 	}
 	for domain := range committed {
@@ -750,7 +750,7 @@ func applyConditionSince(cond *StateCondition, key string, prev map[string]State
 func formatDurationSince(since time.Time) string {
 	d := time.Since(since).Round(time.Minute)
 	if d < time.Minute {
-		return "just now"
+		return StrJustNow
 	}
 	return d.String()
 }
@@ -777,7 +777,7 @@ func processConditionsAndAlerts(app *AppState, state *CheckState, domains []Doma
 }
 
 func appendConditionAlert(alerts []Alert, name, domain, check string, cond *StateCondition, status CheckStatus, suppress bool, prev map[string]StateCondition, active map[string]bool) []Alert {
-	key := check + ":" + domain
+	key := check + SymColon + domain
 	if cond == nil || (status != StatusFailed && status != StatusMismatch && status != StatusHijacked && status != StatusWarning) {
 		delete(prev, key)
 		return alerts
@@ -786,7 +786,7 @@ func appendConditionAlert(alerts []Alert, name, domain, check string, cond *Stat
 	if suppress {
 		return alerts
 	}
-	identity := key + ":" + cond.Code.String() + ":" + status.String()
+	identity := key + SymColon + cond.Code.String() + SymColon + status.String()
 	active[identity] = true
 	priority := PriorityWarning
 	if status != StatusWarning {
@@ -820,10 +820,10 @@ func collectDomainAlerts(app *AppState, state *CheckState, cfg DomainConfig, pre
 		if !suppress && app.Notifier != nil {
 			for _, pending := range st.Pending {
 				issuer := pending.Cert.Issuer
-				if issuer == "" {
+				if issuer == StrEmpty {
 					issuer = DefaultUnknownCA
 				}
-				identity := AlertCTIdentityPrefix + domain + ":" + pending.Cert.ID
+				identity := AlertCTIdentityPrefix + domain + SymColon + pending.Cert.ID
 				alerts = append(alerts, Alert{Message: AlertNewCertificatePrefix + issuer, Redacted: AlertNewCertificateRedacted, Identity: identity, CT: true, NeedNtfy: pending.NeedNtfy, NeedTelegram: pending.NeedTelegram, Priority: PriorityWarning, Tag: TagSkull, Domain: domain, Name: name})
 			}
 		}
@@ -855,11 +855,11 @@ func main() {
 
 func mainExitCode() int {
 	var configPath string
-	flag.StringVar(&configPath, FlagConfig, "", FlagConfigUsage)
-	flag.StringVar(&configPath, FlagConfigShort, "", FlagConfigShortUsage)
+	flag.StringVar(&configPath, FlagConfig, StrEmpty, FlagConfigUsage)
+	flag.StringVar(&configPath, FlagConfigShort, StrEmpty, FlagConfigShortUsage)
 	flag.Parse()
 
-	if configPath == "" {
+	if configPath == StrEmpty {
 		configPath = os.Getenv(EnvConfigPath)
 	}
 
@@ -878,22 +878,22 @@ func run(parent context.Context, configPath string) error {
 
 	rawCfg, err := LoadConfig(ctx, configPath)
 	if err != nil {
-		return fmt.Errorf("load configuration: %w", err)
+		return fmt.Errorf(MsgErrLoadConfiguration, err)
 	}
 
 	app, err := InitializeApp(ctx, rawCfg)
 	if err != nil {
-		return fmt.Errorf("initialize application: %w", err)
+		return fmt.Errorf(MsgErrInitializeApplication, err)
 	}
 
-	ctStatePath, ctLogPersist, err := initializeCTStorage(app)
+	ctStatePath, ctLogPersist, err := app.InitializeCTStorage()
 	if err != nil {
 		return err
 	}
 
 	rdapHTTPClient := NewRDAPHTTPClient(10 * time.Second)
 	LogInfof(MsgLogStartup, len(app.configuration().Domains), len(app.configuration().DNSRecords))
-	publishInitialState(app)
+	app.PublishInitialState()
 
 	server, serverErrChan := setupHTTPServer(app, app.configuration().Port)
 
@@ -925,13 +925,13 @@ func run(parent context.Context, configPath string) error {
 	var runErr error
 	select {
 	case <-ctx.Done():
-		LogInfof(MsgLogShutdownSignal, "termination signal")
+		LogInfof(MsgLogShutdownSignal, StrTerminationSignal)
 	case sErr := <-serverErrChan:
 		LogError(MsgLogHTTPServerStopped, FieldError, sErr)
-		runErr = fmt.Errorf("HTTP server stopped: %w", sErr)
+		runErr = fmt.Errorf(MsgErrHTTPServerStopped, sErr)
 	case <-engineDone:
 		LogError(MsgLogMonitoringEngineStopped)
-		runErr = fmt.Errorf("%s: %s", NameOpMonitoringEngine, MsgErrMonitoringEngineExited)
+		runErr = fmt.Errorf(MsgErr2, NameOpMonitoringEngine, MsgErrMonitoringEngineExited)
 	}
 
 	// Trigger cancellation for engines
@@ -943,7 +943,7 @@ func run(parent context.Context, configPath string) error {
 	if server != nil {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			LogError(MsgLogHTTPServerStopped, FieldError, err)
-			runErr = errors.Join(runErr, fmt.Errorf("shut down HTTP server: %w", err))
+			runErr = errors.Join(runErr, fmt.Errorf(MsgErrShutDownHTTPServer, err))
 		}
 	}
 
@@ -952,19 +952,20 @@ func run(parent context.Context, configPath string) error {
 	case <-engineDone:
 	case <-time.After(5 * time.Second):
 		LogWarn(MsgLogMonitoringEngineTimeout)
-		runErr = errors.Join(runErr, fmt.Errorf("%s: %s", NameOpMonitoringEngine, MsgErrMonitoringEngineShutdownTimeout))
+		runErr = errors.Join(runErr, fmt.Errorf(MsgErr2, NameOpMonitoringEngine, MsgErrMonitoringEngineShutdownTimeout))
 	}
 
 	LogInfo(MsgLogShutdownComplete)
 	return runErr
 }
 
-func publishInitialState(app *AppState) {
+// PublishInitialState ...
+func (a *AppState) PublishInitialState() {
 	initialState := NewCheckState()
-	for _, domainCfg := range app.configuration().Domains {
+	for _, domainCfg := range a.configuration().Domains {
 		initialState.RDAP[domainCfg.Domain] = RDAPState{Status: StatusPending}
 	}
-	for _, dnsRecord := range app.configuration().DNSRecords {
+	for _, dnsRecord := range a.configuration().DNSRecords {
 		initialState.DNS[dnsRecord.Name] = DNSState{
 			Hostname: dnsRecord.Hostname, Name: dnsRecord.Name,
 			Type: dnsRecord.Type, Expected: dnsRecord.Expected,
@@ -972,14 +973,15 @@ func publishInitialState(app *AppState) {
 		}
 	}
 	if b, err := jsonv2.Marshal(initialState); err == nil {
-		app.PrerenderedJSON.Store(b)
+		a.PrerenderedJSON.Store(b)
 	}
 
 }
 
-func initializeCTStorage(app *AppState) (string, map[string]CTLogState, error) {
-	dataDir := app.configuration().DataDir
-	if dataDir == "" {
+// InitializeCTStorage ...
+func (a *AppState) InitializeCTStorage() (string, map[string]CTLogState, error) {
+	dataDir := a.configuration().DataDir
+	if dataDir == StrEmpty {
 		dataDir = DefaultDataDir
 		if _, err := os.Stat(DirContainerApp); os.IsNotExist(err) {
 			dataDir = DefaultLocalDataDir
@@ -987,18 +989,18 @@ func initializeCTStorage(app *AppState) (string, map[string]CTLogState, error) {
 	}
 	// #nosec G703 -- dataDir is deliberately configurable by the operator.
 	if err := os.MkdirAll(dataDir, DirPermDefault); err != nil {
-		return "", nil, fmt.Errorf("create data directory %s: %w", dataDir, err)
+		return StrEmpty, nil, WrapError(MsgErrCreateDataDirectory, err)
 	}
 	ctLogsDir := filepath.Join(dataDir, DefaultCTLogsSubdir)
-	app.CTLogsPath = ctLogsDir
+	a.CTLogsPath = ctLogsDir
 	// #nosec G703 -- ctLogsDir is a fixed child of the operator-selected dataDir.
 	if err := os.MkdirAll(ctLogsDir, DirPermDefault); err != nil {
-		return "", nil, fmt.Errorf("create CT logs directory %s: %w", ctLogsDir, err)
+		return StrEmpty, nil, WrapError(MsgErrCreateCTLogsDirectory, err)
 	}
 	ctStatePath := filepath.Join(dataDir, DefaultCTStateFileName)
-	ctLogPersist, err := loadCTStateFile(ctStatePath, app.ReadCTState, app.WriteCTState)
+	ctLogPersist, err := loadCTStateFile(ctStatePath, a.ReadCTState, a.WriteCTState)
 	if err != nil {
-		return "", nil, fmt.Errorf("load CT state %s: %w", ctStatePath, err)
+		return StrEmpty, nil, WrapError(MsgErrLoadCTState, err)
 	}
 
 	return ctStatePath, ctLogPersist, nil
