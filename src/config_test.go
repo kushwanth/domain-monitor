@@ -670,75 +670,6 @@ func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
 	}
 }
 
-func TestCheckSSLValidation(t *testing.T) {
-	// 1. Valid record types that can have SSL: A, AAAA, CNAME, ALIAS, IP
-	validTypes := []string{"A", "AAAA", "CNAME", "ALIAS", "IP"}
-	for _, vt := range validTypes {
-		t.Run("Valid_"+vt, func(t *testing.T) {
-			expectedVal := `"1.2.3.4"`
-			if vt == "AAAA" {
-				expectedVal = `"2001:db8::1"`
-			}
-			cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records": [{"hostname": "web.example.com", "name": "Web Test", "type": "` + vt + `", "expected": [` + expectedVal + `], "check_ssl": true}]}`
-			tmpFile := t.TempDir() + "/valid_check_ssl.json"
-			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
-				t.Fatalf("failed to write temp file: %v", err)
-			}
-			cfg, err := LoadConfig(context.Background(), tmpFile)
-			if err != nil {
-				t.Fatalf("expected valid config for check_ssl with type %s, got error: %v", vt, err)
-			}
-			if !cfg.DNSRecords[0].CheckSSL {
-				t.Errorf("expected CheckSSL to be true for %s", vt)
-			}
-		})
-	}
-
-	// 2. Invalid record types for check_ssl: TXT, MX, CAA, NS
-	invalidTypes := []string{"TXT", "MX", "CAA", "NS"}
-	for _, it := range invalidTypes {
-		t.Run("Invalid_"+it, func(t *testing.T) {
-			cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records": [{"hostname": "record.example.com", "name": "Invalid Test", "type": "` + it + `", "expected": ["something"], "check_ssl": true}]}`
-			tmpFile := t.TempDir() + "/invalid_check_ssl.json"
-			if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
-				t.Fatalf("failed to write temp file: %v", err)
-			}
-			_, err := LoadConfig(context.Background(), tmpFile)
-			if err == nil {
-				t.Fatalf("expected validation error when check_ssl is configured on %s, got nil", it)
-			}
-			if !strings.Contains(err.Error(), "check_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types") {
-				t.Errorf("expected error message to mention allowed types, got: %v", err)
-			}
-		})
-	}
-
-	// 3. Omitted check_ssl defaults to false and succeeds for any valid record type
-	t.Run("Default_Omitted", func(t *testing.T) {
-		cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-			"dns_records": [
-				{
-					"hostname": "record.example.com",
-					"name": "Default Test",
-					"type": "TXT",
-					"expected": ["hello"]
-				}
-			]
-		}`
-		tmpFile := t.TempDir() + "/default_check_ssl.json"
-		if err := os.WriteFile(tmpFile, []byte(cfgJSON), 0644); err != nil {
-			t.Fatalf("failed to write temp file: %v", err)
-		}
-		cfg, err := LoadConfig(context.Background(), tmpFile)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if cfg.DNSRecords[0].CheckSSL {
-			t.Errorf("expected CheckSSL to default to false")
-		}
-	})
-}
-
 func TestConfig_DuplicateDNSRecordName(t *testing.T) {
 	cfgJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"dns_records": [
@@ -1105,11 +1036,7 @@ func TestLoadConfigRejectsIncompleteNotifications(t *testing.T) {
 	}
 }
 
-func TestDomainSelfSignedOptionIsRejected(t *testing.T) {
-	target := DomainConfig{Domain: "example.com", Name: "Example", AcceptSelfSigned: true}
-	err := normalizeDomainConfig(&target, 0, make(map[string]bool), make(map[string]bool))
-	require.ErrorContains(t, err, "dns_records")
-}
+
 
 func TestRequiredNtfyAndOptionalTelegram(t *testing.T) {
 	for _, tc := range []struct {

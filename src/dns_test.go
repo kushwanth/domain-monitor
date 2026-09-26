@@ -11,11 +11,8 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/big"
 	"net"
 	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -56,7 +53,7 @@ func TestDNSCheck(t *testing.T) {
 func TestGenericCAARecordUsesRDATAWithoutTTL(t *testing.T) {
 	const hostname = "example.com"
 	target := DNSTask{Hostname: hostname, Name: "CAA record", Type: RecordTypeCAA,
-		Expected: []string{`0 issue "letsencrypt.org; validationmethods=dns-01"`}, CheckSSL: true}
+		Expected: []string{`0 issue "letsencrypt.org; validationmethods=dns-01"`}}
 	require.NoError(t, normalizeDNSTask(&target, 0, map[string]bool{}))
 	assert.Equal(t, `0 issue "letsencrypt.org; validationmethods=dns-01"`, target.Expected[0])
 	app := NewAppState(AppConfig{Resolvers: testResolvers()})
@@ -442,41 +439,6 @@ func TestEvaluateEmailSecurity_DMARCFailurePromotesSPFWarning(t *testing.T) {
 	assert.Contains(t, cond.Target, "DMARC")
 }
 
-func TestVerifyObservedCertificate_SelfSignedTimeAndHostname(t *testing.T) {
-	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	require.NoError(t, err)
-	now := time.Now()
-	for _, tc := range []struct {
-		name          string
-		before, after time.Time
-		hostname      string
-		extKeyUsage   []x509.ExtKeyUsage
-		allow         bool
-		wantErr       bool
-	}{
-		{name: "accepted current", before: now.Add(-time.Hour), after: now.Add(time.Hour), hostname: "example.com", allow: true},
-		{name: "untrusted by default", before: now.Add(-time.Hour), after: now.Add(time.Hour), hostname: "example.com", wantErr: true},
-		{name: "future leaf", before: now.Add(time.Hour), after: now.Add(2 * time.Hour), hostname: "example.com", allow: true, wantErr: true},
-		{name: "expired leaf", before: now.Add(-2 * time.Hour), after: now.Add(-time.Hour), hostname: "example.com", allow: true, wantErr: true},
-		{name: "wrong hostname", before: now.Add(-time.Hour), after: now.Add(time.Hour), hostname: "other.example.com", allow: true, wantErr: true},
-		{name: "client authentication only", before: now.Add(-time.Hour), after: now.Add(time.Hour), hostname: "example.com", extKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, allow: true, wantErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			template := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{"example.com"}, NotBefore: tc.before, NotAfter: tc.after, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: tc.extKeyUsage}
-			der, err := x509.CreateCertificate(rand.Reader, template, template, privateKey.Public(), privateKey)
-			require.NoError(t, err)
-			cert, err := x509.ParseCertificate(der)
-			require.NoError(t, err)
-			err = verifyObservedCertificate([]*x509.Certificate{cert}, tc.hostname, tc.allow)
-			if tc.wantErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-		})
-	}
-}
-
 func FuzzParseCAAIssuer(f *testing.F) {
 	seeds := []string{
 		";",
@@ -553,39 +515,6 @@ func TestValidateRecords_MatchTypes(t *testing.T) {
 	unauthA := []string{"1.2.3.4", "5.6.7.8"}
 	if validateRecords(exactTask, unauthA) {
 		t.Errorf("Expected exact match to fail due to unauthorized IP")
-	}
-}
-
-func TestSSLSentinels(t *testing.T) {
-	t.Parallel()
-
-	app := &AppState{
-		config: AppConfig{
-			Resolvers: testResolvers(),
-		},
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
-
-	// 1. Non-SSL record type should return SSLDaysNotApplicable (-9999)
-	txtTask := DNSTask{
-		Hostname: "example.com",
-		Type:     "TXT",
-		Expected: []string{"test"},
-	}
-	res := FetchSSLSnapshot(context.Background(), app, txtTask, []string{"v=spf1 ~all"}).ExpiryDays
-	if res != SSLDaysNotApplicable {
-		t.Errorf("Expected SSLDaysNotApplicable (%d) for TXT record, got %d", SSLDaysNotApplicable, res)
-	}
-
-	// 2. Empty IPs should return SSLDaysError (-9998)
-	aTask := DNSTask{
-		Hostname: "example.com",
-		Type:     "A",
-		Expected: []string{"1.2.3.4"},
-	}
-	resEmpty := FetchSSLSnapshot(context.Background(), app, aTask, []string{}).ExpiryDays
-	if resEmpty != SSLDaysError {
-		t.Errorf("Expected SSLDaysError (%d) for empty IPs, got %d", SSLDaysError, resEmpty)
 	}
 }
 
@@ -1898,74 +1827,6 @@ func TestNSHealthIgnoresWrongClassSOAAndDNSKEY(t *testing.T) {
 	assert.Equal(t, CodeNSMissingSOA, condition.Code)
 }
 
-func TestEvaluateDNS_CheckSSL(t *testing.T) {
-	mux := dns.NewServeMux()
-	mux.HandleFunc("web.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		m.Answer = append(m.Answer, &dns.A{
-			Hdr: dns.RR_Header{Name: "web.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
-			A:   net.ParseIP("127.0.0.1"),
-		})
-		_ = w.WriteMsg(m)
-	})
-
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen packet: %v", err)
-	}
-	srv := &dns.Server{PacketConn: l, Handler: mux}
-	go func() { _ = srv.ActivateAndServe() }()
-	defer func() { _ = srv.Shutdown() }()
-
-	pAddr := l.LocalAddr().String()
-	app := &AppState{
-		config: AppConfig{
-			Resolvers: []string{pAddr},
-		},
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
-
-	state := &CheckState{
-		DNS: make(map[string]DNSState),
-	}
-
-	// 1. Task with CheckSSL = false (default): port 443 should NOT be dialed at all, SSLDays should be SSLDaysNotApplicable (-9999)
-	taskSkip := DNSTask{
-		Hostname: "web.example.com",
-		Name:     "Web Server No SSL",
-		Type:     "A",
-		Expected: []string{"127.0.0.1"},
-	}
-
-	resSkip := evaluateDNSForTest(context.Background(), app, taskSkip)
-
-	state.DNS[taskSkip.Name] = resSkip
-	resSkip = state.DNS["Web Server No SSL"]
-
-	if resSkip.Status == StatusUnknown {
-		t.Fatalf("expected DNS state to be recorded for taskSkip")
-	}
-	if resSkip.Status != StatusOK {
-		t.Errorf("expected StatusOK, got %v", resSkip.Status)
-	}
-	if resSkip.CheckSSL {
-		t.Errorf("expected DNSState.CheckSSL to be false")
-	}
-	if resSkip.SSLDays != nil {
-		t.Errorf("expected SSLDays to be nil, got %d", *resSkip.SSLDays)
-	}
-	if resSkip.Error != "" {
-		t.Errorf("expected no error, got %s", resSkip.Error)
-	}
-
-	// 2. Direct call to FetchSSLSnapshot: when CheckSSL is false, immediately returns SSLDaysNotApplicable
-	days := FetchSSLSnapshot(context.Background(), app, taskSkip, []string{"127.0.0.1"}).ExpiryDays
-	if days != SSLDaysNotApplicable {
-		t.Errorf("FetchSSLSnapshot expected SSLDaysNotApplicable, got %d", days)
-	}
-}
-
 func TestDNS_MultiIPCanonicalSorting(t *testing.T) {
 	mux := dns.NewServeMux()
 	mux.HandleFunc("multi.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
@@ -2302,28 +2163,6 @@ func TestDNS_ResolverIndexOverflow(t *testing.T) {
 	}
 }
 
-func TestCheckSSLExpiryDays_ErrSSLValidationChaining(t *testing.T) {
-	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer ts.Close()
-
-	u, err := url.Parse(ts.URL)
-	if err != nil {
-		t.Fatalf("failed to parse test server URL: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	// Dial with mismatched hostname to verify ErrSSLValidation is preserved in the error chain
-	_, err = checkSSLExpiryDays(ctx, "mismatch.invalid.domain", []string{u.Host}, false)
-	if err == nil {
-		t.Fatalf("expected SSL error for mismatched hostname, got nil")
-	}
-	if !errors.Is(err, ErrSSLValidation) {
-		t.Errorf("expected error to wrap ErrSSLValidation, got: %v", err)
-	}
-}
-
 func TestEvaluateDNSSECExtensive(t *testing.T) {
 	status, condition, _ := EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, DNSSECSnapshot{})
 	assert.Equal(t, StatusFailed, status)
@@ -2366,176 +2205,6 @@ func TestEvaluateDNSSECConditions(t *testing.T) {
 			assert.Equal(t, tc.code, condition.Code)
 		})
 	}
-}
-
-func TestCheckSSLExpiryDaysExtensive(t *testing.T) {
-	days, err := checkSSLExpiryDays(context.Background(), "invalid.localhost", []string{"127.0.0.1"}, true)
-	assert.Error(t, err)
-	assert.Equal(t, -9998, days)
-
-	days, err = checkSSLExpiryDays(context.Background(), "invalid.localhost", []string{}, true)
-	assert.Error(t, err)
-	assert.Equal(t, SSLDaysError, days)
-
-	// Test internal method
-	days, err = checkSSLExpiryDays(context.Background(), "invalid.localhost", []string{"invalid_ip"}, true)
-	assert.Error(t, err)
-	assert.Equal(t, SSLDaysError, days)
-}
-
-func TestFetchSSLSnapshotUsesInjectedChecker(t *testing.T) {
-	tests := []struct {
-		name       string
-		checker    func(context.Context, string, []string, bool) (int, error)
-		wantDays   int
-		wantErr    bool
-		wantCalled bool
-	}{
-		{
-			name: "injected checker",
-			checker: func(_ context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
-				assert.Equal(t, "example.com", hostname)
-				assert.Equal(t, []string{"192.0.2.10"}, ips)
-				assert.True(t, acceptSelfSigned)
-				return 30, nil
-			},
-			wantDays:   30,
-			wantCalled: true,
-		},
-		{name: "missing checker", wantDays: SSLDaysError, wantErr: true},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			called := false
-			app := &AppState{TLSCheck: tc.checker}
-			if tc.checker != nil {
-				app.TLSCheck = func(ctx context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
-					called = true
-					return tc.checker(ctx, hostname, ips, acceptSelfSigned)
-				}
-			}
-			snapshot := FetchSSLSnapshot(context.Background(), app, DNSTask{Hostname: "example.com", Type: RecordTypeA, AcceptSelfSigned: true}, []string{"192.0.2.10"})
-			assert.Equal(t, tc.wantDays, snapshot.ExpiryDays)
-			assert.Equal(t, tc.wantCalled, called)
-			if tc.wantErr {
-				assert.ErrorContains(t, snapshot.Err, "TLS checker is not configured")
-			} else {
-				assert.NoError(t, snapshot.Err)
-			}
-		})
-	}
-	assert.NotNil(t, NewAppState(AppConfig{}).TLSCheck)
-	nilAppSnapshot := FetchSSLSnapshot(context.Background(), nil, DNSTask{Hostname: "alias.example.com", Type: RecordTypeCNAME}, nil)
-	assert.Equal(t, SSLDaysError, nilAppSnapshot.ExpiryDays)
-	assert.ErrorContains(t, nilAppSnapshot.Err, "TLS checker is not configured")
-}
-
-func TestFetchSSLSnapshotResolvesAliasBeforeTLSCheck(t *testing.T) {
-	var resolverAddresses []string
-	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, msg *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
-		resolverAddresses = append(resolverAddresses, address)
-		response := new(dns.Msg)
-		response.SetReply(msg)
-		if msg.Question[0].Qtype == dns.TypeA {
-			rr, err := dns.NewRR(msg.Question[0].Name + " 60 IN A 192.0.2.10")
-			require.NoError(t, err)
-			response.Answer = []dns.RR{rr}
-		}
-		return response, 0, nil
-	}}
-	app.TLSCheck = func(_ context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
-		assert.Equal(t, "alias.example.com", hostname)
-		assert.Equal(t, []string{"192.0.2.10"}, ips)
-		assert.False(t, acceptSelfSigned)
-		return 45, nil
-	}
-	snapshot := FetchSSLSnapshot(context.Background(), app, DNSTask{
-		Hostname: "alias.example.com", Type: RecordTypeCNAME, CustomResolver: "198.51.100.53:53",
-	}, []string{"target.example.com"})
-	require.NoError(t, snapshot.Err)
-	assert.Equal(t, 45, snapshot.ExpiryDays)
-	assert.Equal(t, []string{"198.51.100.53:53", "198.51.100.53:53"}, resolverAddresses)
-}
-
-func TestFetchSSLSnapshotRejectsAliasWithoutAddresses(t *testing.T) {
-	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
-		response := new(dns.Msg)
-		response.SetReply(msg)
-		return response, 0, nil
-	}}
-	app.TLSCheck = func(context.Context, string, []string, bool) (int, error) {
-		t.Fatal("TLS checker called without an address")
-		return 0, nil
-	}
-	snapshot := FetchSSLSnapshot(context.Background(), app, DNSTask{Hostname: "alias.example.com", Type: RecordTypeALIAS}, nil)
-	assert.Equal(t, SSLDaysError, snapshot.ExpiryDays)
-	require.ErrorContains(t, snapshot.Err, "no IP addresses found")
-}
-
-func TestEvaluateSSLStatuses(t *testing.T) {
-	tests := []struct {
-		name     string
-		snapshot SSLSnapshot
-		status   CheckStatus
-		code     ResultCode
-	}{
-		{name: "skipped", snapshot: SSLSnapshot{ExpiryDays: SSLDaysNotApplicable}, status: StatusOK},
-		{name: "validation failed", snapshot: SSLSnapshot{ExpiryDays: 30, Err: errors.New(MsgErrUntrustedChain)}, status: StatusFailed, code: CodeSSLValidationFailed},
-		{name: "expired certificate error", snapshot: SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf(MsgErrTLS, x509.CertificateInvalidError{Cert: &x509.Certificate{NotAfter: time.Now().Add(-time.Hour)}, Reason: x509.Expired})}, status: StatusFailed, code: CodeSSLExpired},
-		{name: "not yet valid certificate error", snapshot: SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf(MsgErrTLS, x509.CertificateInvalidError{Cert: &x509.Certificate{NotAfter: time.Now().Add(time.Hour)}, Reason: x509.Expired})}, status: StatusFailed, code: CodeSSLValidationFailed},
-		{name: "expired", snapshot: SSLSnapshot{ExpiryDays: -1}, status: StatusFailed, code: CodeSSLExpired},
-		{name: "expiring", snapshot: SSLSnapshot{ExpiryDays: DefaultSSLExpiryWarningDays}, status: StatusWarning, code: CodeSSLExpiringSoon},
-		{name: "healthy", snapshot: SSLSnapshot{ExpiryDays: DefaultSSLExpiryWarningDays + 1}, status: StatusOK, code: CodeSSLVerified},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			status, condition := EvaluateSSL(DNSTask{Hostname: "example.com", Type: RecordTypeA}, tc.snapshot)
-			assert.Equal(t, tc.status, status)
-			if tc.code == CodeNone {
-				assert.Nil(t, condition)
-			} else {
-				require.NotNil(t, condition)
-				assert.Equal(t, tc.code, condition.Code)
-			}
-		})
-	}
-}
-
-func TestSelfSignedTLSOptInKeepsHostnameValidation(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	defer server.Close()
-	address := server.Listener.Addr().String()
-
-	_, err := checkSSLExpiryDays(context.Background(), "127.0.0.1", []string{address}, false)
-	require.ErrorIs(t, err, ErrSSLValidation)
-
-	days, err := checkSSLExpiryDays(context.Background(), "127.0.0.1", []string{address}, true)
-	require.NoError(t, err)
-	assert.Positive(t, days)
-
-	_, err = checkSSLExpiryDays(context.Background(), "wrong.local", []string{address}, true)
-	require.ErrorIs(t, err, ErrSSLValidation)
-	assert.ErrorContains(t, err, "certificate is valid for")
-}
-
-func TestValidateCertificateExtensive(t *testing.T) {
-	app := &AppState{
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
-
-	target := DNSTask{
-		Hostname: "localhost",
-		Type:     "A",
-	}
-
-	days := FetchSSLSnapshot(context.Background(), app, target, []string{"127.0.0.1"}).ExpiryDays
-	assert.Equal(t, -9998, days)
-
-	target.CheckSSL = false
-	days = FetchSSLSnapshot(context.Background(), app, target, []string{"127.0.0.1"}).ExpiryDays
-	assert.Equal(t, -9999, days)
 }
 
 func TestResolveTargetExtensive(t *testing.T) {
@@ -2815,25 +2484,8 @@ func TestEvaluateEmailSecurity_MockedPaths(t *testing.T) {
 func evaluateDNSForTest(ctx context.Context, app *AppState, record DNSTask) DNSState {
 	dnsSnap := FetchDNSSnapshot(ctx, app, record)
 	status, cond := EvaluateDNS(record, dnsSnap)
-	var sslDays *int
-	if record.CheckSSL {
-		sslSnap := FetchSSLSnapshot(ctx, app, record, dnsSnap.Records)
-		sslStatus, sslCond := EvaluateSSL(record, sslSnap)
-		if sslSnap.ExpiryDays != SSLDaysError && sslSnap.ExpiryDays != SSLDaysNotApplicable {
-			d := sslSnap.ExpiryDays
-			sslDays = &d
-		}
-		if sslStatus != StatusOK {
-			if status == StatusOK || status == StatusWarning {
-				status = sslStatus
-			}
-			if cond == nil || cond.Code == CodeDNSMatchVerified {
-				cond = sslCond
-			}
-		}
-	}
 	errStr := ""
-	if cond != nil && cond.Code != CodeDNSMatchVerified && cond.Code != CodeSSLVerified {
+	if cond != nil && cond.Code != CodeDNSMatchVerified {
 		errStr = cond.Target
 	}
 	return DNSState{
@@ -2844,9 +2496,8 @@ func evaluateDNSForTest(ctx context.Context, app *AppState, record DNSTask) DNSS
 		Status:    status,
 		Condition: cond,
 		Found:     dnsSnap.Records,
-		SSLDays:   sslDays,
-		CheckSSL:  record.CheckSSL,
-		Error:     errStr,
+
+		Error: errStr,
 	}
 }
 
@@ -3105,34 +2756,6 @@ func TestLiveCAADiscoveryMatrix(t *testing.T) {
 			t.Logf("status=%s condition=%v issuers=%v error=%q", status, condition, result.Issue, result.Error)
 			if status != StatusOK || condition == nil || condition.Code != CodeCAAVerified {
 				t.Fatalf("expected verified CAA issuers %v; got status=%s condition=%v", test.issue, status, condition)
-			}
-		})
-	}
-}
-
-// TestLiveTLSFailureMatrix checks public certificate failure fixtures whose
-// failure classes are independently observable with openssl s_client.
-func TestLiveTLSFailureMatrix(t *testing.T) {
-	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
-		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external TLS queries")
-	}
-	for _, test := range []struct {
-		host   string
-		reason string
-		code   ResultCode
-	}{
-		{host: "wrong.host.badssl.com", reason: "certificate is valid for", code: CodeSSLValidationFailed},
-		{host: "untrusted-root.badssl.com", reason: "unknown authority", code: CodeSSLValidationFailed},
-		{host: "expired.badssl.com", reason: "outside its validity period", code: CodeSSLExpired},
-	} {
-		t.Run(test.host, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			days, err := checkSSLExpiryDays(ctx, test.host, nil, false)
-			status, condition := EvaluateSSL(DNSTask{Hostname: test.host, Type: RecordTypeA}, SSLSnapshot{ExpiryDays: days, Err: err})
-			t.Logf("status=%s condition=%v error=%v", status, condition, err)
-			if status != StatusFailed || condition == nil || condition.Code != test.code || err == nil || !strings.Contains(err.Error(), test.reason) {
-				t.Fatalf("expected %q TLS validation failure", test.reason)
 			}
 		})
 	}

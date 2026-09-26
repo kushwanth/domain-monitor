@@ -130,7 +130,6 @@ owner. Bootstrap cache access returns a copy and pricing access returns values.
 | `renewal_price` | float | No | Manual renewal price override (e.g. for premium domains or custom contracts). If omitted or `0`, the daemon looks for a renewal price in the DotSweep TLD catalog; unavailable prices remain unknown. |
 | `allow_expiry` | bool | No | If `true`, suppresses expiration warnings and excludes domain from renewal pricing calculations. |
 | `verify_ns_health` | bool | No | Queries primary/secondary NS for reachability and SOA consistency. |
-| `accept_self_signed` | bool | No | Deprecated domain field: `true` is rejected. Move it to the DNS record that requires the per-record option below. |
 | `suppress_alerts` | bool | No | Mutes notification alerts for this domain. |
 
 ### DNS Record Options (`dns_records[]`)
@@ -143,8 +142,6 @@ owner. Bootstrap cache access returns a copy and pricing access returns values.
 | `expected` | array | **Yes** | List of expected values. An explicit empty list with exact matching monitors for absence. TXT values preserve case, punctuation, and literal `alias:` prefixes; surrounding whitespace is trimmed. |
 | `match_type` | string | No | Strategy: `"exact"` (default), `"prefix"`, `"contains"`, `"any_of"`. |
 | `custom_resolver` | string | No | Custom resolver IP for this record. |
-| `accept_self_signed` | bool | No | Accepts a current, hostname-matching, directly self-signed leaf certificate for this record. |
-| `check_ssl` | bool | No | Checks TLS/SSL certificate expiry and validity (default: false). |
 
 ---
 

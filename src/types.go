@@ -207,20 +207,17 @@ type DomainConfig struct {
 	DNSSEC                bool       `json:"dnssec"`
 	MonitorCTLogs         bool       `json:"monitor_ct_logs"`
 	CAA                   *CAAConfig `json:"caa,omitempty"`
-	AcceptSelfSigned      bool       `json:"accept_self_signed"`
 	SuppressAlerts        bool       `json:"suppress_alerts"`
 }
 
 // DNSTask ...
 type DNSTask struct {
-	Hostname         string     `json:"hostname"`
-	Name             string     `json:"name"`
-	Type             string     `json:"type"`
-	Expected         StringList `json:"expected"`
-	MatchType        string     `json:"match_type,omitempty"`
-	CustomResolver   string     `json:"custom_resolver,omitempty"`
-	AcceptSelfSigned bool       `json:"accept_self_signed,omitempty"`
-	CheckSSL         bool       `json:"check_ssl,omitempty"`
+	Hostname       string     `json:"hostname"`
+	Name           string     `json:"name"`
+	Type           string     `json:"type"`
+	Expected       StringList `json:"expected"`
+	MatchType      string     `json:"match_type,omitempty"`
+	CustomResolver string     `json:"custom_resolver,omitempty"`
 }
 
 // HTTPDoer defines an interface for executing HTTP requests, allowing for mocking in tests.
@@ -255,7 +252,6 @@ type AppState struct {
 	WHOISClient    WHOISQuerier
 	WHOISDial      func(context.Context, string) (net.Conn, error)
 	RDAPURLAllowed func(string) bool
-	TLSCheck       func(context.Context, string, []string, bool) (int, error)
 	ReadCTHistory  func(string) ([]byte, error)
 	WriteCTHistory func(string, []CTCert, string) error
 	ReadCTState    func(string) ([]byte, error)
@@ -312,7 +308,6 @@ func NewAppState(cfg AppConfig) *AppState {
 		RDAPLimiter:     rate.NewLimiter(rate.Every(RDAPRateLimitInterval), 1),
 		CTLimiter:       rate.NewLimiter(rate.Every(CTLogsRateLimitInterval), 1),
 		WHOISDial:       dialPublicWHOIS,
-		TLSCheck:        checkSSLExpiryDays,
 		DNSClient:       &dns.Client{Timeout: DefaultDNSTimeout},
 		DNSTCPClient:    &dns.Client{Net: ProtocolTCP, Timeout: DefaultDNSTimeout},
 		RDAPURLAllowed:  IsSafeRDAPURL,
@@ -485,8 +480,6 @@ type DNSState struct {
 	Status    CheckStatus     `json:"status"`
 	Condition *StateCondition `json:"condition,omitempty"`
 	Found     []string        `json:"found,omitempty"`
-	SSLDays   *int            `json:"ssl_days,omitempty"`
-	CheckSSL  bool            `json:"check_ssl,omitempty"`
 	Error     string          `json:"error,omitempty"`
 }
 
@@ -796,12 +789,6 @@ type CTLogsSnapshot struct {
 	SeenIDs            []string
 	Pending            []CTPending
 	CoverageIncomplete bool
-}
-
-// SSLSnapshot holds raw TLS certificate data.
-type SSLSnapshot struct {
-	ExpiryDays int
-	Err        error
 }
 
 // 4. Notification Models & Interfaces

@@ -231,7 +231,6 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 							Status:    StatusFailed,
 							Error:     fmt.Sprintf(MsgErrInternalDNSCheckPanic, AnyToString(r)),
 							Condition: &StateCondition{Code: CodeDNSLookupFailed, Target: StrInternalDNSCheckPanic},
-							CheckSSL:  record.CheckSSL,
 						},
 					}
 				}
@@ -239,35 +238,8 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 			dnsSnap := FetchDNSSnapshot(ctx, app, record)
 			status, cond := EvaluateDNS(record, dnsSnap)
 
-			var sslDays *int
-			if record.CheckSSL {
-				// We fetch SSL snapshot regardless of DNS match as long as it's not a complete lookup failure,
-				// but wait, if it's a lookup failure we still might want to try?
-				// The original code did: sslDays = validateCertificate(ctx, app, target, foundRecords) unconditionally if CheckSSL.
-				sslSnap := FetchSSLSnapshot(ctx, app, record, dnsSnap.Records)
-				sslStatus, sslCond := EvaluateSSL(record, sslSnap)
-
-				if sslSnap.ExpiryDays != SSLDaysError && sslSnap.ExpiryDays != SSLDaysNotApplicable {
-					d := sslSnap.ExpiryDays
-					sslDays = &d
-				}
-
-				if sslStatus != StatusOK {
-					if status == StatusOK || status == StatusWarning {
-						status = sslStatus
-					}
-					// Only overwrite condition if it was purely OK
-					if cond == nil || cond.Code == CodeDNSMatchVerified {
-						cond = sslCond
-					} else {
-						// Append to target for legacy support
-						cond.Target += SymPipeSpaced + sslCond.Target
-					}
-				}
-			}
-
 			errStr := StrEmpty
-			if cond != nil && cond.Code != CodeDNSMatchVerified && cond.Code != CodeSSLVerified {
+			if cond != nil && cond.Code != CodeDNSMatchVerified {
 				errStr = cond.Target
 			}
 
@@ -279,8 +251,6 @@ func executeDNSChecks(ctx context.Context, app *AppState, dnsRecords []DNSTask) 
 				Status:    status,
 				Condition: cond,
 				Found:     dnsSnap.Records,
-				SSLDays:   sslDays,
-				CheckSSL:  record.CheckSSL,
 				Error:     errStr,
 			}
 			dnsResults[index] = DNSResult{Name: record.Name, State: res}
@@ -969,7 +939,7 @@ func (a *AppState) PublishInitialState() {
 		initialState.DNS[dnsRecord.Name] = DNSState{
 			Hostname: dnsRecord.Hostname, Name: dnsRecord.Name,
 			Type: dnsRecord.Type, Expected: dnsRecord.Expected,
-			Status: StatusPending, CheckSSL: dnsRecord.CheckSSL,
+			Status: StatusPending,
 		}
 	}
 	if b, err := jsonv2.Marshal(initialState); err == nil {

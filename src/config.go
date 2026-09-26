@@ -210,9 +210,6 @@ func validateHTTPURL(raw string) error {
 }
 
 func normalizeDomainConfig(domainCfg *DomainConfig, i int, seenDomains map[string]bool, seenDomainNames map[string]bool) error {
-	if domainCfg.AcceptSelfSigned {
-		return fmt.Errorf(MsgErrDomainlevelAcceptselfsignedIsUnsupportedConfigure)
-	}
 	if err := normalizeDomainName(domainCfg, i, seenDomains); err != nil {
 		return err
 	}
@@ -407,19 +404,7 @@ func validateDNSTaskOptions(dnsRecord *DNSTask) error {
 			return fmt.Errorf(MsgErrInvalidCustomResolverFor, dnsRecord.Hostname, err)
 		}
 	}
-	if dnsRecord.CheckSSL && !supportsSSLCheck(dnsRecord.Type) {
-		return fmt.Errorf(MsgErrCheckSSLNotApplicable, dnsRecord.Hostname, dnsRecord.Type)
-	}
 	return nil
-}
-
-func supportsSSLCheck(recordType string) bool {
-	switch recordType {
-	case RecordTypeA, RecordTypeAAAA, RecordTypeCNAME, RecordTypeALIAS, RecordTypeIP:
-		return true
-	default:
-		return false
-	}
 }
 
 func normalizeDNSTaskExpected(dnsRecord *DNSTask) error {

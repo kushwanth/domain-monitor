@@ -4,15 +4,15 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
+	"net"
+
 	"encoding/base64"
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
-	"math"
-	"net"
+
 	"net/http"
 	"net/url"
 	"slices"
@@ -22,111 +22,6 @@ import (
 
 	"github.com/miekg/dns"
 )
-
-func checkSSLExpiryDays(ctx context.Context, hostname string, ips []string, acceptSelfSigned bool) (int, error) {
-	dialHost := hostname
-	if strings.HasPrefix(dialHost, PrefixWildcard) {
-		// Replace *. with www. to ensure a valid FQDN is used for DNS resolution and SNI
-		dialHost = strings.Replace(dialHost, PrefixWildcard, PrefixWWW, 1)
-	}
-
-	targets := []string{}
-	for _, ipStr := range ips {
-		clean := strings.TrimSpace(ipStr)
-		if host, _, err := net.SplitHostPort(clean); err == nil {
-			if net.ParseIP(host) != nil {
-				targets = append(targets, clean)
-			}
-		} else if net.ParseIP(clean) != nil {
-			targets = append(targets, DefaultPort(clean, DefaultHTTPSPort))
-		}
-	}
-
-	if len(targets) == 0 {
-		targets = []string{DefaultPort(dialHost, DefaultHTTPSPort)}
-	}
-
-	minDays := MaxSSLDaysSentinel
-	hasDays := false
-	var validationErrors []error
-
-	for _, targetAddr := range targets {
-		dialer := &tls.Dialer{
-			NetDialer: &net.Dialer{Timeout: DefaultDNSTimeout},
-			// #nosec G402 -- the observed chain is verified by verifyObservedCertificate below.
-			Config: &tls.Config{ServerName: dialHost, InsecureSkipVerify: true},
-		}
-		conn, err := dialer.DialContext(ctx, StrTCP, targetAddr)
-		if err != nil {
-			validationErrors = append(validationErrors, fmt.Errorf(MsgErrTLSDial, targetAddr, err))
-			continue
-		}
-		if conn == nil {
-			validationErrors = append(validationErrors, fmt.Errorf(MsgErrNilConnection, targetAddr))
-			continue
-		}
-
-		tlsConn, ok := conn.(*tls.Conn)
-		if !ok {
-			_ = conn.Close()
-			validationErrors = append(validationErrors, fmt.Errorf(MsgErrNonTLSConnection, targetAddr))
-			continue
-		}
-		state := tlsConn.ConnectionState()
-		_ = conn.Close()
-
-		if len(state.PeerCertificates) == 0 {
-			validationErrors = append(validationErrors, fmt.Errorf(MsgErrNoPeerCertsFound, targetAddr))
-			continue
-		}
-
-		cert := state.PeerCertificates[0]
-		days := int(math.Floor(time.Until(cert.NotAfter).Hours() / 24))
-		if !hasDays || days < minDays {
-			minDays = days
-			hasDays = true
-		}
-		if err := verifyObservedCertificate(state.PeerCertificates, dialHost, acceptSelfSigned); err != nil {
-			validationErrors = append(validationErrors, fmt.Errorf(MsgErrTLSCertificateAt, targetAddr, err))
-		}
-	}
-
-	if !hasDays {
-		return SSLDaysError, errors.Join(validationErrors...)
-	}
-
-	return minDays, errors.Join(validationErrors...)
-}
-
-func verifyObservedCertificate(chain []*x509.Certificate, hostname string, acceptSelfSigned bool) error {
-	leaf := chain[0]
-	if err := leaf.VerifyHostname(hostname); err != nil {
-		return fmt.Errorf(MsgErrHostname, hostname, ErrSSLValidation, err)
-	}
-	now := time.Now()
-	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
-		return fmt.Errorf(MsgErrLeafCertificateIsOutsideIts, ErrSSLValidation, x509.CertificateInvalidError{Cert: leaf, Reason: x509.Expired})
-	}
-	opts := x509.VerifyOptions{DNSName: hostname, Intermediates: x509.NewCertPool(), CurrentTime: now}
-	for _, cert := range chain[1:] {
-		opts.Intermediates.AddCert(cert)
-	}
-	if _, err := leaf.Verify(opts); err != nil {
-		var unknown x509.UnknownAuthorityError
-		if acceptSelfSigned && errors.As(err, &unknown) && len(chain) == 1 && string(leaf.RawIssuer) == string(leaf.RawSubject) && leaf.CheckSignature(leaf.SignatureAlgorithm, leaf.RawTBSCertificate, leaf.Signature) == nil {
-			roots := x509.NewCertPool()
-			roots.AddCert(leaf)
-			opts.Roots = roots
-			if _, selfSignedErr := leaf.Verify(opts); selfSignedErr == nil {
-				return nil
-			} else {
-				return fmt.Errorf(MsgErrSelfsignedServerCertificate, ErrSSLValidation, selfSignedErr)
-			}
-		}
-		return fmt.Errorf(MsgErrCertificateChain, ErrSSLValidation, err)
-	}
-	return nil
-}
 
 // queryDNSMsg queries the given resolvers for the specified hostname and record type using miekg/dns.
 // It retries on network errors and SERVFAIL using the next resolver in round-robin order.
@@ -922,62 +817,6 @@ func EvaluateDNS(target DNSTask, snapshot DNSSnapshot) (CheckStatus, *StateCondi
 	}
 
 	return StatusOK, &StateCondition{Code: CodeDNSMatchVerified}
-}
-
-// FetchSSLSnapshot connects to the target on port 443 and fetches the certificate
-func FetchSSLSnapshot(ctx context.Context, app *AppState, target DNSTask, foundRecords []string) SSLSnapshot {
-	if !target.CheckSSL || (target.Type != RecordTypeA && target.Type != RecordTypeAAAA && target.Type != RecordTypeIP && target.Type != RecordTypeCNAME && target.Type != RecordTypeALIAS) {
-		return SSLSnapshot{ExpiryDays: SSLDaysNotApplicable}
-	}
-	if app == nil || app.TLSCheck == nil {
-		return SSLSnapshot{ExpiryDays: SSLDaysError, Err: fmt.Errorf(MsgErrTLSCheckerNotConfigured, target.Hostname)}
-	}
-
-	var sslIPs []string
-	if target.Type == RecordTypeCNAME || target.Type == RecordTypeALIAS {
-		resolversToUse := app.resolvers()
-		if target.CustomResolver != StrEmpty {
-			resolversToUse = []string{target.CustomResolver}
-		}
-		var ipErr error
-		sslIPs, ipErr = queryIPRecords(ctx, app, target.Hostname, resolversToUse)
-		if ipErr != nil {
-			LogWarn(MsgLogSSLResolveIPsFailed, FieldDomain, target.Hostname, FieldError, ipErr)
-		}
-	} else {
-		sslIPs = foundRecords
-	}
-
-	if len(sslIPs) == 0 {
-		return SSLSnapshot{ExpiryDays: SSLDaysError, Err: errors.New(MsgErrNoIPAddressesFoundFor)}
-	}
-
-	days, err := app.TLSCheck(ctx, target.Hostname, sslIPs, target.AcceptSelfSigned)
-	return SSLSnapshot{
-		ExpiryDays: days,
-		Err:        err,
-	}
-}
-
-// EvaluateSSL evaluates the SSL certificate expiry
-func EvaluateSSL(target DNSTask, snapshot SSLSnapshot) (CheckStatus, *StateCondition) {
-	if snapshot.ExpiryDays == SSLDaysNotApplicable {
-		return StatusOK, nil
-	}
-	if snapshot.Err != nil {
-		var certErr x509.CertificateInvalidError
-		if errors.As(snapshot.Err, &certErr) && certErr.Reason == x509.Expired && certErr.Cert != nil && time.Now().After(certErr.Cert.NotAfter) {
-			return StatusFailed, &StateCondition{Code: CodeSSLExpired, Target: snapshot.Err.Error()}
-		}
-		return StatusFailed, &StateCondition{Code: CodeSSLValidationFailed, Target: snapshot.Err.Error()}
-	}
-	if snapshot.ExpiryDays < 0 {
-		return StatusFailed, &StateCondition{Code: CodeSSLExpired}
-	}
-	if snapshot.ExpiryDays <= DefaultSSLExpiryWarningDays {
-		return StatusWarning, &StateCondition{Code: CodeSSLExpiringSoon}
-	}
-	return StatusOK, &StateCondition{Code: CodeSSLVerified}
 }
 
 func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string, error) {

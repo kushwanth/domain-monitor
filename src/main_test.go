@@ -817,7 +817,7 @@ func TestDaemonPublishesAllProtocolWorkerFailures(t *testing.T) {
 	app := NewAppState(config)
 	notifier := &assuranceNotifier{}
 	app.Notifier = notifier
-	address, err := dns.NewRR("www.example.com. 60 IN A 192.0.2.10")
+	address, err := dns.NewRR("www.example.com. 60 IN A 192.0.2.11")
 	require.NoError(t, err)
 	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 		if query.Question[0].Qtype == dns.TypeA && query.Question[0].Name == "www.example.com." {
@@ -828,11 +828,6 @@ func TestDaemonPublishesAllProtocolWorkerFailures(t *testing.T) {
 		}
 		return nil, 0, errors.New(MsgErrResolverUnavailable)
 	}}
-	app.TLSCheck = func(_ context.Context, host string, ips []string, _ bool) (int, error) {
-		assert.Equal(t, "www.example.com", host)
-		assert.Equal(t, []string{"192.0.2.10"}, ips)
-		return SSLDaysError, errors.New(MsgErrUntrustedChain)
-	}
 	state := runMonitoringCycle(context.Background(), app, nil, filepath.Join(t.TempDir(), "ct_state.json"), nil, nil, nil, nil, nil)
 	require.NotNil(t, state)
 	checks := map[string]CheckStatus{
@@ -841,9 +836,13 @@ func TestDaemonPublishesAllProtocolWorkerFailures(t *testing.T) {
 		"CAA": state.CAA["example.com"].Status, "NSHealth": state.NSHealth["example.com"].Status,
 	}
 	for name, status := range checks {
-		assert.Equal(t, StatusFailed, status, "%s must not publish healthy after its dependency fails", name)
+		expected := StatusFailed
+		if name == "DNS" {
+			expected = StatusMismatch
+		}
+		assert.Equal(t, expected, status, "%s must not publish healthy after its dependency fails", name)
 	}
-	assert.Equal(t, CodeSSLValidationFailed, state.DNS["web A"].Condition.Code)
+	assert.Equal(t, CodeDNSMismatch, state.DNS["web A"].Condition.Code)
 	encoded, ok := app.PrerenderedJSON.Load().([]byte)
 	require.True(t, ok)
 	var published CheckState

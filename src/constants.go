@@ -72,7 +72,6 @@ const (
 	MaxResolversLimit                 = 9
 	MaxNotificationTags               = 5
 	MaxCNAMEAliasTraversals           = 5
-	DefaultSSLExpiryWarningDays       = 14
 	DefaultRDAPExpiryWarningDays      = 30
 	AutoRenewGracePeriodThresholdDays = 45.0
 	DefaultLoopIntervalDays           = 0.25
@@ -85,7 +84,6 @@ const (
 	MaxTelegramAlertRunes             = 400
 	MaxAlertNameRunes                 = 80
 	AlertTruncationNotice             = " [truncated; see local state]"
-	MaxSSLDaysSentinel                = 999999
 	HoursPerDay                       = 24
 	DirPermDefault                    = 0750
 	FilePermSecret                    = 0600
@@ -380,12 +378,6 @@ const (
 	CodeCTPersistenceFailed
 	CodeCTCoverageIncomplete
 
-	// SSL
-	CodeSSLVerified
-	CodeSSLResolveFailed
-	CodeSSLValidationFailed
-	CodeSSLExpired
-	CodeSSLExpiringSoon
 
 	// App-level
 	CodeCheckTimeout
@@ -475,12 +467,6 @@ var resultCodeNames = [...]string{
 	CodeCTPersistenceFailed:  "ctPersistenceFailed",
 	CodeCTCoverageIncomplete: "ctCoverageIncomplete",
 
-	// SSL
-	CodeSSLVerified:         "sslVerified",
-	CodeSSLResolveFailed:    "sslResolveFailed",
-	CodeSSLValidationFailed: "sslValidationFailed",
-	CodeSSLExpired:          "sslExpired",
-	CodeSSLExpiringSoon:     "sslExpiringSoon",
 
 	// App-level
 	CodeCheckTimeout: "checkTimeout",
@@ -495,10 +481,7 @@ func (r ResultCode) String() string {
 	return ""
 }
 
-// SSL Expiration Sentinel Values
 const (
-	SSLDaysNotApplicable = -9999
-	SSLDaysError         = -9998
 )
 
 // System Errors
@@ -506,7 +489,6 @@ var (
 	ErrDNSResolution          = errors.New("dns resolution failed")
 	ErrNXDOMAIN               = errors.New("no such host (NXDOMAIN)")
 	ErrSERVFAIL               = errors.New("server failure (SERVFAIL)")
-	ErrSSLValidation          = errors.New("ssl validation failed")
 	ErrRDAPNotFound           = errors.New("RDAP domain not found (404)")
 	ErrRDAPRateLimited        = errors.New("RDAP rate limited (429)")
 	ErrWHOISRateLimited       = errors.New("whois rate limited (429)")
@@ -864,10 +846,6 @@ const (
 	MsgAlertDNSSECRRSIGFailed  = "DNSSEC: dns.RRSIG verification failed for %s"
 	MsgAlertDNSSECChainBroken  = "DNSSEC: Full chain of trust validation failed (AD flag missing) for %s"
 
-	// SSL Alerts
-	MsgAlertSSLError   = "SSL Validation Error for %s: %v"
-	MsgAlertSSLExpired = "SSL Certificate for %s is EXPIRED! (%d days)"
-	MsgAlertSSLExpiry  = "SSL Certificate for %s expires in %d days"
 
 	// CAA Alerts
 	MsgAlertCAAMissing      = "CAA: No %s records found for %s"
@@ -927,9 +905,6 @@ const (
 	MsgRedactedDNSSECRRSIGFailed    = "DNSSEC dns.RRSIG verification failed or expired."
 	MsgRedactedDNSSECChainFailed    = "DNSSEC Full chain of trust validation failed."
 
-	MsgRedactedSSLValidationFailed = "SSL Certificate Validation Failed."
-	MsgRedactedSSLExpired          = "SSL Certificate is EXPIRED."
-	MsgRedactedSSLExpires          = "SSL Certificate expires in %d days."
 
 	MsgRedactedEmailNoMX           = "No MX records found. Email delivery is broken."
 	MsgRedactedEmailMXMissing      = "Expected MX record is missing."
@@ -1262,7 +1237,7 @@ const (
 	MsgErrDNSMissingName                     = "dns record %s (%s) is missing a mandatory 'name' field"
 	MsgErrDuplicateDNSName                   = "duplicate dns record name %s; each dns record must have a unique name"
 	MsgErrDNSMissingType                     = "dns record %s is missing a type (e.g. A, CNAME)"
-	MsgErrCheckSSLNotApplicable              = "dns record %s (%s) has check_ssl enabled; check_ssl is only applicable for A, AAAA, CNAME, ALIAS, and IP record types"
+
 	MsgErrExpectedIPv6ForTypeA               = "dns record %s (%s): expected %s is an IPv6 address, but record type is A (requires IPv4)"
 	MsgErrExpectedNotValidIPv4               = "dns record %s (%s): expected %s is not a valid IPv4 address for type A"
 	MsgErrExpectedIPv4ForTypeAAAA            = "dns record %s (%s): expected %s is an IPv4 address, but record type is AAAA (requires IPv6)"
@@ -1276,8 +1251,6 @@ const (
 	MsgErrInitAppNil                         = "cannot initialize dependencies: app is nil"
 	MsgErrInitConfigNil                      = "cannot initialize dependencies: config is nil"
 	MsgErrInitNotifierNil                    = "cannot initialize dependencies: notifier is nil"
-	MsgErrSSLInvalid                         = "%w: invalid for %s on %s: %w"
-	MsgErrSSLCertValidationFailed            = "%w: certificate validation failed for %s on %s: %w"
 	MsgErrNilStringListReceiver              = "nil StringList receiver"
 	MsgPrefixLookupOn                        = "lookup %s on %s"
 	MsgPrefixLookupOnWithRcode               = "lookup %s on %s (%s)"
@@ -1299,12 +1272,11 @@ const (
 	MsgErrDNSSECValidationFailed             = "DNSSEC Validation Failed"
 	MsgErrValidateDNSSECNil                  = "validateDNSSEC returned nil"
 	MsgErrDNSSECResolverNotConfigured        = "DNSSEC resolver is not configured"
-	MsgErrTLSCheckerNotConfigured            = "TLS checker is not configured for %s"
+
 	MsgErrPricingHTTPClientNotConfigured     = "fetch DotSweep pricing: HTTP client is not configured"
 	MsgErrSPFLookupError                     = "SPF lookup error: %s"
 	MsgErrDMARCLookupError                   = "DMARC lookup error: %s"
 	MsgErrDKIMLookupError                    = "DKIM lookup error: %s"
-	MsgLogSSLResolveIPsFailed                = "Failed to resolve IPs for SSL certificate check"
 	MsgErrSOALookupFailed                    = "SOA lookup failed: %s"
 	MsgErrPrimaryNSNotAuthoritative          = "Primary nameserver not authoritative (AA flag missing)"
 	MsgErrSecondaryNSNotAuthoritative        = "Secondary nameserver not authoritative (AA flag missing)"
@@ -1371,7 +1343,6 @@ const (
 	MsgErrNameserverAddressDidNotReturn                     = "nameserver address %s did not return an authoritative SOA for %s"
 	MsgErrNameserverAddressReturnedANil                     = "nameserver address %s returned a nil SOA response"
 	MsgErrNilDnskeyResponseFor                              = "nil DNSKEY response for %s"
-	MsgErrNoIPAddressesFoundFor                             = "no IP addresses found for SSL validation"
 	MsgErr                                                  = "%s: %w"
 	MsgErrDiskFailed                                        = "disk failed"
 	MsgErrResolverUnavailable                               = "resolver unavailable"
@@ -1441,7 +1412,7 @@ const (
 	MsgErrExpectedAnIPAddressOr                             = "expected an IP address or host:port: %w"
 	MsgErrResolverEndpointHasAnInvalid                      = "resolver endpoint %q has an invalid host"
 	MsgErrExpectedAnHTTPSURLWith                            = "expected an http(s) URL with a host"
-	MsgErrDomainlevelAcceptselfsignedIsUnsupportedConfigure = "domain-level accept_self_signed is unsupported; configure it on dns_records instead"
+
 	MsgErrInvalidMonitoredDomain                            = "invalid monitored domain %q"
 	MsgErrRootZoneIsNotA                                    = "root zone %q is not a parent of delegated zone %q"
 	MsgErrUnknownMailProviderFor                            = "unknown mail provider %q for %s"
