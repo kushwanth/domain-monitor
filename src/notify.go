@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -26,7 +25,6 @@ type NotificationManager struct {
 	sentState  map[string]time.Time
 	alertBatch []Alert
 	nextAlert  int
-	ctAccepted map[string]CTAcceptance
 
 	// Dependencies for network/IO
 	HTTPClient HTTPDoer
@@ -92,12 +90,6 @@ func (nm *NotificationManager) DispatchIdentified(identity, message, redacted st
 	nm.enqueueAlert(Alert{Message: message, Redacted: redacted, Identity: identity, Priority: priority, Tag: tag, Domain: domain, Name: name})
 }
 
-// DispatchCT queues a committed CT discovery for its outstanding providers.
-func (nm *NotificationManager) DispatchCT(alert Alert) {
-	alert.CT = true
-	nm.enqueueAlert(alert)
-}
-
 func (nm *NotificationManager) enqueueAlert(alert Alert) {
 	logQueuedAlert(alert)
 	if nm == nil || (nm.NtfyURL == StrEmpty && nm.TelegramToken == StrEmpty) {
@@ -109,13 +101,11 @@ func (nm *NotificationManager) enqueueAlert(alert Alert) {
 	now := time.Now()
 	nm.pruneExpiredCooldowns(now)
 
-	if !alert.CT {
-		ntfyDue := nm.NtfyURL != StrEmpty && now.Sub(nm.sentState[StrNtfy+alert.Identity]) >= DefaultAlertCooldown
-		telegramDue := nm.TelegramToken != StrEmpty && now.Sub(nm.sentState[StrTelegram+alert.Identity]) >= DefaultAlertCooldown
-		if !ntfyDue && !telegramDue {
-			nm.mu.Unlock()
-			return
-		}
+	ntfyDue := nm.NtfyURL != StrEmpty && now.Sub(nm.sentState[StrNtfy+alert.Identity]) >= DefaultAlertCooldown
+	telegramDue := nm.TelegramToken != StrEmpty && now.Sub(nm.sentState[StrTelegram+alert.Identity]) >= DefaultAlertCooldown
+	if !ntfyDue && !telegramDue {
+		nm.mu.Unlock()
+		return
 	}
 	for _, queued := range nm.alertBatch {
 		if queued.Identity == alert.Identity {
@@ -211,20 +201,13 @@ func (nm *NotificationManager) deliverAlert(ctx context.Context, alert Alert) bo
 }
 
 func (nm *NotificationManager) deliverNtfy(ctx context.Context, alert Alert) bool {
-	if alert.CT && nm.ctProviderAccepted(alert.Identity, true) {
-		return false
-	}
-	if nm.NtfyURL != StrEmpty && (!alert.CT || alert.NeedNtfy) && (alert.CT || nm.shouldDeliver(StrNtfy+alert.Identity)) {
+	if nm.NtfyURL != StrEmpty && nm.shouldDeliver(StrNtfy+alert.Identity) {
 		attemptCtx, cancel := context.WithTimeout(ctx, DefaultHTTPTimeout)
 		accepted := nm.sendNtfyBatchContext(attemptCtx, []Alert{alert})
 		cancel()
 		if accepted {
-			if alert.CT {
-				nm.recordCTAccepted(alert.Identity, true)
-			} else {
-				nm.markDelivered(StrNtfy + alert.Identity)
-			}
-		} else if !alert.CT {
+			nm.markDelivered(StrNtfy + alert.Identity)
+		} else {
 			return true
 		}
 	}
@@ -232,20 +215,13 @@ func (nm *NotificationManager) deliverNtfy(ctx context.Context, alert Alert) boo
 }
 
 func (nm *NotificationManager) deliverTelegram(ctx context.Context, alert Alert) bool {
-	if alert.CT && nm.ctProviderAccepted(alert.Identity, false) {
-		return false
-	}
-	if nm.TelegramToken != StrEmpty && (!alert.CT || alert.NeedTelegram) && (alert.CT || nm.shouldDeliver(StrTelegram+alert.Identity)) {
+	if nm.TelegramToken != StrEmpty && nm.shouldDeliver(StrTelegram+alert.Identity) {
 		attemptCtx, cancel := context.WithTimeout(ctx, DefaultHTTPTimeout)
 		accepted := nm.sendTelegramBatchContext(attemptCtx, []Alert{alert})
 		cancel()
 		if accepted {
-			if alert.CT {
-				nm.recordCTAccepted(alert.Identity, false)
-			} else {
-				nm.markDelivered(StrTelegram + alert.Identity)
-			}
-		} else if !alert.CT {
+			nm.markDelivered(StrTelegram + alert.Identity)
+		} else {
 			return true
 		}
 	}
@@ -280,52 +256,6 @@ func (nm *NotificationManager) markDelivered(key string) {
 	InitMap(&nm.sentState)
 	nm.sentState[key] = time.Now()
 	nm.mu.Unlock()
-}
-
-func (nm *NotificationManager) recordCTAccepted(identity string, ntfy bool) {
-	nm.mu.Lock()
-	InitMap(&nm.ctAccepted)
-	accepted := nm.ctAccepted[identity]
-	if ntfy {
-		accepted.Ntfy = true
-	} else {
-		accepted.Telegram = true
-	}
-	nm.ctAccepted[identity] = accepted
-	nm.mu.Unlock()
-}
-
-func (nm *NotificationManager) ctProviderAccepted(identity string, ntfy bool) bool {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
-	accepted := nm.ctAccepted[identity]
-	if ntfy {
-		return accepted.Ntfy
-	}
-	return accepted.Telegram
-}
-
-// TakeCTAcceptances snapshots provider acceptances until they are durably committed.
-func (nm *NotificationManager) TakeCTAcceptances() map[string]CTAcceptance {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
-	return maps.Clone(nm.ctAccepted)
-}
-
-// ForgetCTAcceptances releases only the acceptances included in a successful commit.
-func (nm *NotificationManager) ForgetCTAcceptances(committed map[string]CTAcceptance) {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
-	for identity, accepted := range committed {
-		current := nm.ctAccepted[identity]
-		current.Ntfy = current.Ntfy && !accepted.Ntfy
-		current.Telegram = current.Telegram && !accepted.Telegram
-		if current.Ntfy || current.Telegram {
-			nm.ctAccepted[identity] = current
-		} else {
-			delete(nm.ctAccepted, identity)
-		}
-	}
 }
 
 // RetainIdentities clears cooldowns for conditions that recovered.

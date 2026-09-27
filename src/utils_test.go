@@ -526,11 +526,6 @@ func (n *recordingNotifier) DispatchIdentified(identity, message, redacted strin
 	n.captureAndFlush()
 }
 
-func (n *recordingNotifier) DispatchCT(alert Alert) {
-	n.NotificationManager.DispatchCT(alert)
-	n.captureAndFlush()
-}
-
 func (n *recordingNotifier) captureAndFlush() {
 	n.alerts = append(n.alerts, n.alertBatch...)
 	n.Flush()
@@ -547,8 +542,7 @@ func TestStateEnumWireCompatibility(t *testing.T) {
 		require.NoError(t, jsonv2.Unmarshal(encoded, &wire))
 		assert.IsType(t, "", wire["status"], "API statuses must remain strings")
 	}
-	_, _, err := decodeCTState([]byte(`{"version":1,"domains":{"example.com":{"status":"future-unknown-status"}}}`))
-	require.Error(t, err, "unknown persisted statuses must not become silent healthy state")
+
 }
 
 func TestRuntimeViewsAvoidAllocations(t *testing.T) {

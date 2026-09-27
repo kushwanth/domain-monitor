@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"embed"
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -50,9 +52,6 @@ func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte,
 }
 
 func applyConfigOverrides(rawCfg *AppConfig) {
-	if dir := strings.TrimSpace(os.Getenv(EnvDataDir)); dir != StrEmpty {
-		rawCfg.DataDir = dir
-	}
 	if p := strings.TrimSpace(os.Getenv(EnvPort)); p != StrEmpty {
 		rawCfg.Port = p
 	}
@@ -73,9 +72,6 @@ func applyConfigOverrides(rawCfg *AppConfig) {
 			rawCfg.Notifications.Telegram = &TelegramConfig{}
 		}
 		rawCfg.Notifications.Telegram.ChatID = id
-	}
-	if k := strings.TrimSpace(os.Getenv(EnvCTLogsAPIKey)); k != StrEmpty {
-		rawCfg.CTLogsAPIKey = k
 	}
 	if u := strings.TrimSpace(os.Getenv(EnvDoHURL)); u != StrEmpty {
 		rawCfg.DoHURL = u
@@ -219,7 +215,6 @@ func normalizeDomainConfig(domainCfg *DomainConfig, i int, seenDomains map[strin
 	if err := normalizeDomainMetadata(domainCfg, seenDomainNames); err != nil {
 		return err
 	}
-	normalizeDomainCAA(domainCfg)
 	return normalizeDomainEmail(domainCfg)
 }
 
@@ -294,48 +289,12 @@ func normalizeDomainMetadata(domainCfg *DomainConfig, seenDomainNames map[string
 	return nil
 }
 
-func normalizeCAAList(list []string) []string {
-	if list == nil {
-		return nil
-	}
-	var res []string
-	for _, item := range list {
-		val := parseCAAIssuer(item)
-		if val != StrEmpty && val != CAAIssuerDenyAll {
-			res = append(res, val)
-		}
-	}
-	if len(res) == 0 {
-		return []string{} // non-nil empty slice represents explicit deny-all
-	}
-	return res
-}
-
-func normalizeDomainCAA(domainCfg *DomainConfig) {
-	if domainCfg.CAA != nil {
-		if domainCfg.CAA.Issue != nil {
-			domainCfg.CAA.Issue = normalizeCAAList(domainCfg.CAA.Issue)
-		}
-		if domainCfg.CAA.IssueWild != nil {
-			domainCfg.CAA.IssueWild = normalizeCAAList(domainCfg.CAA.IssueWild)
-		}
-		if domainCfg.CAA.IssueMail != nil {
-			domainCfg.CAA.IssueMail = normalizeCAAList(domainCfg.CAA.IssueMail)
-		}
-	}
-}
-
 func normalizeDomainEmail(domainCfg *DomainConfig) error {
 	if domainCfg.CheckEmailSecurity {
 		if domainCfg.MailProvider != StrEmpty && len(domainCfg.MXRecords) > 0 {
 			return fmt.Errorf(MsgErrMailProviderAndMXMutuallyExclusive, domainCfg.Domain)
 		}
 		domainCfg.MailProvider = strings.ToLower(strings.TrimSpace(domainCfg.MailProvider))
-		if domainCfg.MailProvider != StrEmpty {
-			if _, known := ProviderMXMap[domainCfg.MailProvider]; !known {
-				return fmt.Errorf(MsgErrUnknownMailProviderFor, domainCfg.MailProvider, domainCfg.Domain)
-			}
-		}
 		for j := range domainCfg.MXRecords {
 			rawMX := strings.TrimSpace(domainCfg.MXRecords[j])
 			var mxClean string
@@ -527,5 +486,35 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 		app.Notifier = notifier
 	}
 
+	app.EmailProviders = loadEmailProviders()
+
 	return app, nil
+}
+
+//go:embed data/email_providers/*.json
+var emailProvidersFS embed.FS
+
+func loadEmailProviders() map[string]ProviderConfig {
+	providers := make(map[string]ProviderConfig)
+	entries, err := emailProvidersFS.ReadDir("data/email_providers")
+	if err != nil {
+		return providers
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		p := path.Join("data", "email_providers", entry.Name())
+		b, err := emailProvidersFS.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var cfg ProviderConfig
+		if err := jsonv2.Unmarshal(b, &cfg); err != nil {
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), ".json")
+		providers[name] = cfg
+	}
+	return providers
 }

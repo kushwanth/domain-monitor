@@ -12,11 +12,10 @@ It runs as one process with bounded concurrency, resource limits, an embedded da
 ## Key Features
 
 *   **RDAP & WHOIS Monitoring:** IANA RDAP bootstrap discovery with registry exceptions and fallback to port-43 WHOIS. Monitors registration, expiry and nameserver evidence.
-*   **DNS Record Integrity:** Validates `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, `IP`, and `ALIAS` records. Supports `exact`, `prefix`, `contains`, and `any_of` matching strategies, CNAME flattening, and per-record custom resolver overrides.
+*   **DNS Record Integrity:** Validates `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `IP`, and `ALIAS` records. Supports `exact`, `prefix`, `contains`, and `any_of` matching strategies, CNAME flattening, and per-record custom resolver overrides.
 *   **SSL/TLS Expiration Tracking:** Automatically performs TLS handshakes on web-facing records to track certificate validity, warning on approaching expirations (<= 14 days).
-*   **Email Security Suite:** Checks MX records against configured providers, discovers SPF and DMARC records, and checks configured DKIM selectors. It does not evaluate complete mail authentication policy.
+*   **Email Security Suite:** Checks MX records against configured providers, discovers SPF and DMARC records, and checks configured DKIM selectors. It does not evaluate complete mail authentication policy. Mail providers can be extended via JSON configs in `./data/email_providers/`.
 *   **2-Tier DNSSEC Verification:** Checks local DS/DNSKEY and RRSIG evidence and requires an authenticated DNS-over-HTTPS (DoH) response for a verified result.
-*   **Certificate Transparency (CT) Logs:** Periodically rescans `api.ctlogs.dev`, stores a bounded local display history, and persists scan progress, seen IDs, and provider-specific pending alerts. Each cycle fetches one page; after a 10-page budget the scan warns and resumes from its saved cursor. State retains at most 1,000 seen IDs per domain and bounded pending alerts; exhausted retention budgets report incomplete coverage. The state API exposes poll/scan freshness and unacknowledged alerts. The API's validity-date ordering still prevents a guarantee that every late-indexed certificate will be found.
 *   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Alerts are deduplicated and throttled, with domain-name redaction supported.
 *   **Embedded Web Dashboard:** A single-page dashboard with Dark and Light modes, periodic state polling, and a `/health` liveness endpoint. Provider quotas can still defer checks despite local rate limiting.
 
@@ -33,7 +32,6 @@ and initializes an owned configuration snapshot. Changes require a restart.
 {
   "port": "8080",
   "loop_interval_days": 0.25,
-  "data_dir": "./data",
   "notifications": {
     "ntfy": {"url": "https://ntfy.sh/your-private-topic"}
   },
@@ -47,10 +45,7 @@ and initializes an owned configuration snapshot. Changes require a restart.
       "domain_transfer_locked": true,
       "check_email_security": true,
       "dnssec": true,
-      "monitor_ct_logs": true,
-      "caa": {
-        "issue": ["letsencrypt.org", "digicert.com"]
-      }
+
     }
   ],
   "dns_records": [
@@ -77,15 +72,7 @@ and initializes an owned configuration snapshot. Changes require a restart.
 | `data_dir` | string | Container: `/app/data`; local: `./data` | Path to persist CT histories and state. `DATA_DIR` overrides it at startup. |
 | `resolvers` | array | `["1.1.1.1"...]` | List of up to 9 custom global DNS resolver IPs, retained for runtime failover. |
 | `doh_url` | string | `"https://dns.google/resolve"` | Trusted upstream JSON DoH validator used to corroborate local DNSSEC evidence; this daemon is not an independent root-to-zone validator. |
-| `ctlogs_api_key` | string | `""` | Optional Bearer API key for `api.ctlogs.dev`. |
 | `notifications` | object | Required | Must contain `ntfy.url`, a valid HTTP(S) URL. Optional `ntfy.auth`. Telegram is enabled only when both `token` and `chat_id` are nonempty after config/environment overrides. Missing or incomplete credentials disable Telegram with a warning; Ntfy remains active. Reachability is checked during delivery. |
-
-Run one daemon instance per `data_dir`. CT state writes are atomic for process crashes; they do not provide a transaction across history and state files or a power-loss durability guarantee.
-
-CT discoveries are committed before delivery. Provider acceptance is retained in memory until its acknowledgement is written successfully, avoiding repeat delivery during a temporary write failure. A crash after remote acceptance but before that write can still cause a duplicate on restart; delivery is not exactly once.
-Disabling CT or removing a domain at restart stops its CT alerts and removes its
-checkpoint at the next successful commit. Re-enabling starts a new baseline;
-existing display history remains on disk.
 
 RDAP requests honor `HTTP_PROXY` and `HTTPS_PROXY`. With a proxy configured, the proxy resolves destination hostnames, so the daemon's local destination IP check applies to the proxy connection; use a trusted proxy with its own outbound restrictions.
 

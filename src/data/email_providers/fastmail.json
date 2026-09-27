@@ -1,0 +1,4 @@
+{
+  "mx_records": ["messagingengine.com"],
+  "dkim_selectors": ["fm1", "fm2", "fm3", "mesmtp"]
+}

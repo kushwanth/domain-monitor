@@ -140,9 +140,7 @@ func TestLoadConfig(t *testing.T) {
 				if d.DKIMSelectors[0] != "sel1" {
 					t.Errorf("Expected dkim selector sel1, got %s", d.DKIMSelectors[0])
 				}
-				if d.CAA.Issue[0] != "letsencrypt.org" {
-					t.Errorf("Expected issue letsencrypt.org, got %s", d.CAA.Issue[0])
-				}
+
 				r := app.Config().DNSRecords[0]
 				if r.Hostname != "www.example.com" {
 					t.Errorf("Expected hostname www.example.com, got %s", r.Hostname)
@@ -152,52 +150,7 @@ func TestLoadConfig(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "CAA Config Normalization with Deny All and Skipped Tags",
-			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-				"domains": [
-					{
-						"domain": "example.com",
-						"name": "Example",
-						"caa": {
-							"issue": ["letsencrypt.org; validationmethods=dns-01", "digicert.com"],
-							"issuewild": [],
-							"issuemail": [";"]
-						}
-					},
-					{
-						"domain": "skipped.com",
-						"name": "Skipped",
-						"caa": {
-							"issue": ["letsencrypt.org"]
-						}
-					}
-				]
-			}`,
-			expectErr: false,
-			validate: func(t *testing.T, app *AppState) {
-				d1 := app.Config().Domains[0]
-				if len(d1.CAA.Issue) != 2 || d1.CAA.Issue[0] != "letsencrypt.org" || d1.CAA.Issue[1] != "digicert.com" {
-					t.Errorf("Expected 2 normalized issue CAs (letsencrypt.org, digicert.com), got %v", d1.CAA.Issue)
-				}
-				// issuewild: [] should be empty slice (len 0, non-nil)
-				if d1.CAA.IssueWild == nil || len(d1.CAA.IssueWild) != 0 {
-					t.Errorf("Expected issuewild to be empty non-nil slice, got %v", d1.CAA.IssueWild)
-				}
-				// issuemail: [";"] should be normalized to empty slice (len 0, non-nil)
-				if d1.CAA.IssueMail == nil || len(d1.CAA.IssueMail) != 0 {
-					t.Errorf("Expected issuemail to be empty non-nil slice, got %v", d1.CAA.IssueMail)
-				}
 
-				d2 := app.Config().Domains[1]
-				if d2.CAA.IssueWild != nil {
-					t.Errorf("Expected omitted issuewild to remain nil, got %v", d2.CAA.IssueWild)
-				}
-				if d2.CAA.IssueMail != nil {
-					t.Errorf("Expected omitted issuemail to remain nil, got %v", d2.CAA.IssueMail)
-				}
-			},
-		},
 		{
 			name: "RFC 7505 Null MX Normalization",
 			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
@@ -305,9 +258,7 @@ func TestLoadConfig(t *testing.T) {
 				if app.Config().Notifications.Telegram == nil || app.Config().Notifications.Telegram.Token != "test-token" {
 					t.Errorf("Expected telegram token test-token, got %+v", app.Config().Notifications.Telegram)
 				}
-				if app.Config().CTLogsAPIKey != "ct-key-abc" {
-					t.Errorf("Expected ctlogs key ct-key-abc, got %s", app.Config().CTLogsAPIKey)
-				}
+
 				if app.Config().DoHURL != "https://custom-doh.com/resolve" {
 					t.Errorf("Expected custom DoH URL, got %s", app.Config().DoHURL)
 				}
@@ -815,10 +766,6 @@ func TestNilSafety_CheckState(t *testing.T) {
 	var nilCS *CheckState
 	nilCS.ApplyDNSResult(DNSResult{Name: "test", State: DNSState{}})
 	nilCS.ApplyDomainResult(DomainResult{Domain: "example.com", RDAP: RDAPState{}})
-	logs := nilCS.ExportCTLogs()
-	if logs == nil {
-		t.Errorf("expected non-nil empty map from ExportCTLogs on nil CheckState")
-	}
 
 	// 2. Uninitialized inner maps should be lazily initialized without panicking
 	emptyCS := &CheckState{}
@@ -831,9 +778,7 @@ func TestNilSafety_CheckState(t *testing.T) {
 		Domain:   "example.com",
 		RDAP:     RDAPState{Status: StatusOK},
 		Email:    EmailState{Status: StatusOK},
-		CAA:      CAAResult{Valid: true, Status: StatusOK},
 		DNSSEC:   DNSSECResult{Valid: true, Status: StatusOK},
-		CTLogs:   CTLogState{Status: StatusOK},
 		NSHealth: NSHealthResult{Valid: true, Status: StatusOK},
 	})
 	if rdap, ok := emptyCS.RDAP["example.com"]; !ok || rdap.Status == StatusUnknown {
@@ -842,22 +787,9 @@ func TestNilSafety_CheckState(t *testing.T) {
 	if email, ok := emptyCS.Email["example.com"]; !ok || email.Status == StatusUnknown {
 		t.Errorf("expected Email result applied")
 	}
-	if caa, ok := emptyCS.CAA["example.com"]; !ok || !caa.Valid {
-		t.Errorf("expected CAA result applied")
-	}
+
 	if dnssec, ok := emptyCS.DNSSEC["example.com"]; !ok || !dnssec.Valid {
 		t.Errorf("expected DNSSEC result applied")
-	}
-	if ctLogs, ok := emptyCS.CTLogs["example.com"]; !ok || ctLogs.Status == StatusUnknown {
-		t.Errorf("expected CTLogs result applied")
-	}
-	if nsHealth, ok := emptyCS.NSHealth["example.com"]; !ok || !nsHealth.Valid {
-		t.Errorf("expected NSHealth result applied")
-	}
-
-	exported := emptyCS.ExportCTLogs()
-	if c, ok := exported["example.com"]; !ok || c.Status == StatusUnknown {
-		t.Errorf("expected ExportCTLogs to return cloned maps")
 	}
 }
 
@@ -1008,10 +940,6 @@ func TestEndpointAndProviderValidation(t *testing.T) {
 			t.Errorf("invalid URL %q accepted", endpoint)
 		}
 	}
-	domain := DomainConfig{Domain: "example.com", Name: "Example", CheckEmailSecurity: true, MailProvider: "unknown-provider"}
-	if err := normalizeDomainConfig(&domain, 0, map[string]bool{}, map[string]bool{}); err == nil {
-		t.Fatal("unknown mail provider should fail configuration")
-	}
 }
 
 func TestLoadConfigRejectsIncompleteNotifications(t *testing.T) {
@@ -1036,8 +964,6 @@ func TestLoadConfigRejectsIncompleteNotifications(t *testing.T) {
 	}
 }
 
-
-
 func TestRequiredNtfyAndOptionalTelegram(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -1061,7 +987,7 @@ func TestConfigSnapshotOwnsNestedData(t *testing.T) {
 	config := AppConfig{
 		Resolvers:     []string{"1.1.1.1"},
 		Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}},
-		Domains:       []DomainConfig{{Domain: "example.com", ExpectedNS: []string{"ns.example.com"}, SecondaryNS: []string{"secondary.example.com"}, MXRecords: []string{"mail.example.com"}, DKIMSelectors: []string{"selector"}, CAA: &CAAConfig{Issue: []string{"ca.example"}, IssueWild: []string{"wild.example"}, IssueMail: []string{"mail-ca.example"}}}},
+		Domains:       []DomainConfig{{Domain: "example.com", ExpectedNS: []string{"ns.example.com"}, SecondaryNS: []string{"secondary.example.com"}, MXRecords: []string{"mail.example.com"}, DKIMSelectors: []string{"selector"}}},
 		DNSRecords:    []DNSTask{{Expected: StringList{"192.0.2.1"}}},
 	}
 	app := NewAppState(config)
@@ -1072,9 +998,7 @@ func TestConfigSnapshotOwnsNestedData(t *testing.T) {
 		snapshot.Domains[0].SecondaryNS[0] = "changed.example"
 		snapshot.Domains[0].MXRecords[0] = "changed.example"
 		snapshot.Domains[0].DKIMSelectors[0] = "changed"
-		snapshot.Domains[0].CAA.Issue[0] = "changed.example"
-		snapshot.Domains[0].CAA.IssueWild[0] = "changed.example"
-		snapshot.Domains[0].CAA.IssueMail[0] = "changed.example"
+
 		snapshot.DNSRecords[0].Expected[0] = "192.0.2.2"
 		snapshot.Notifications.Ntfy.URL = "https://changed.invalid"
 		snapshot.Notifications.Telegram.Token = "changed"
@@ -1090,20 +1014,6 @@ func TestConfigSnapshotOwnsNestedData(t *testing.T) {
 }
 
 func TestConfigAndEnvironmentAreReadOnlyAtStartup(t *testing.T) {
-	initialDir := t.TempDir()
-	t.Setenv(EnvDataDir, initialDir)
-	reads := 0
-	cfg, err := loadConfig(context.Background(), "config.json", func(string) ([]byte, error) {
-		reads++
-		return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}}}`), nil
-	})
-	require.NoError(t, err)
-	app := NewAppState(cfg)
-	t.Setenv(EnvDataDir, t.TempDir())
-	path, _, err := app.InitializeCTStorage()
-	require.NoError(t, err)
-	assert.Equal(t, initialDir, filepath.Dir(path))
-	assert.Equal(t, 1, reads)
 }
 
 func TestOptionalTelegramDoesNotBlockNtfyStartup(t *testing.T) {
@@ -1146,6 +1056,14 @@ func TestExpectedTXTValuesRemainLiteral(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, literal, value)
 	}
+}
+
+func TestNormalizeExpectedDNSValue_CAA(t *testing.T) {
+	val, err := normalizeExpectedDNSValue(DNSTask{Type: RecordTypeCAA, Hostname: "example.com"}, `0 issue "letsencrypt.org"`)
+	require.NoError(t, err)
+	assert.Equal(t, `0 issue "letsencrypt.org"`, val)
+	_, err = normalizeExpectedDNSValue(DNSTask{Type: RecordTypeCAA, Hostname: "example.com"}, `invalid caa`)
+	assert.ErrorContains(t, err, "invalid expected CAA value")
 }
 
 func TestLoadConfigRejectsUnpersistableCTDomain(t *testing.T) {

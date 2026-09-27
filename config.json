@@ -1,7 +1,6 @@
 {
   "port": "8080",
   "loop_interval_days": 0.25,
-  "data_dir": "./data",
   "notifications": {
     "ntfy": {
       "url": "https://ntfy.sh/example_domain_monitor_topic"
@@ -27,7 +26,6 @@
       "verify_ns_health": true,
       "domain_transfer_locked": true,
       "check_email_security": false,
-      "monitor_ct_logs": true,
       "dnssec": true,
       "caa": {
         "issue": [
@@ -68,7 +66,6 @@
       "verify_ns_health": true,
       "check_email_security": true,
       "mail_provider": "google",
-      "monitor_ct_logs": true,
       "dnssec": true,
       "caa": {
         "issue": [
@@ -96,7 +93,6 @@
       "dkim_selectors": [
         "default"
       ],
-      "monitor_ct_logs": true,
       "dnssec": true,
       "caa": {
         "issue": [

@@ -50,78 +50,9 @@ func TestDNSCheck(t *testing.T) {
 	}
 }
 
-func TestGenericCAARecordUsesRDATAWithoutTTL(t *testing.T) {
-	const hostname = "example.com"
-	target := DNSTask{Hostname: hostname, Name: "CAA record", Type: RecordTypeCAA,
-		Expected: []string{`0 issue "letsencrypt.org; validationmethods=dns-01"`}}
-	require.NoError(t, normalizeDNSTask(&target, 0, map[string]bool{}))
-	assert.Equal(t, `0 issue "letsencrypt.org; validationmethods=dns-01"`, target.Expected[0])
-	app := NewAppState(AppConfig{Resolvers: testResolvers()})
-	answer := `example.com. 60 IN CAA 0 issue "letsencrypt.org; validationmethods=dns-01"`
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
-		response := new(dns.Msg)
-		response.SetReply(query)
-		rr, err := dns.NewRR(answer)
-		require.NoError(t, err)
-		response.Answer = []dns.RR{rr}
-		return response, 0, nil
-	}}
-	check := func(want CheckStatus, code ResultCode) {
-		t.Helper()
-		status, condition := EvaluateDNS(target, FetchDNSSnapshot(context.Background(), app, target))
-		assert.Equal(t, want, status)
-		require.NotNil(t, condition)
-		assert.Equal(t, code, condition.Code)
-	}
-	check(StatusOK, CodeDNSMatchVerified)
-	answer = `example.com. 3600 IN CAA 0 issue "letsencrypt.org; validationmethods=dns-01"`
-	check(StatusOK, CodeDNSMatchVerified)
-	answer = `example.com. 3600 IN CAA 0 issue "other.example"`
-	check(StatusMismatch, CodeDNSMismatch)
-	answer = `other.example. 60 IN CAA 0 issue "letsencrypt.org; validationmethods=dns-01"`
-	check(StatusMismatch, CodeDNSMismatch)
-	answer = `example.com. 60 CH CAA 0 issue "letsencrypt.org; validationmethods=dns-01"`
-	check(StatusMismatch, CodeDNSMismatch)
-	mixedCase, err := normalizeExpectedDNSValue(target, `0 IODEF "https://example.com/CaseSensitive"`)
-	require.NoError(t, err)
-	assert.Equal(t, `0 iodef "https://example.com/CaseSensitive"`, mixedCase)
-	_, err = normalizeExpectedDNSValue(target, `not a valid CAA value`)
-	assert.Error(t, err)
-}
-
 // testResolvers supplies documentation addresses; test queries use injected resolvers.
 func testResolvers() []string {
 	return []string{"192.0.2.53"}
-}
-
-func TestFetchCAA(t *testing.T) {
-	app := caaFixtureApp(t, "example.com.")
-	res, found := fetchCAA(context.Background(), app, "example.com", testResolvers())
-	require.True(t, found)
-	require.Empty(t, res.Error)
-	assert.Equal(t, []string{"ca.example"}, res.Issue)
-}
-
-func TestFetchCAATreeClimbing(t *testing.T) {
-	app := caaFixtureApp(t, "example.com.")
-	res, found := fetchCAA(context.Background(), app, "sub.example.com", testResolvers())
-	require.True(t, found)
-	require.Empty(t, res.Error)
-	assert.Equal(t, []string{"ca.example"}, res.Issue)
-}
-
-func caaFixtureApp(t *testing.T, owner string) *AppState {
-	t.Helper()
-	return &AppState{DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
-		response := new(dns.Msg)
-		response.SetReply(query)
-		if query.Question[0].Qtype == dns.TypeCAA && query.Question[0].Name == owner {
-			record, err := dns.NewRR(owner + ` 60 IN CAA 0 issue "ca.example"`)
-			require.NoError(t, err)
-			response.Answer = []dns.RR{record}
-		}
-		return response, 0, nil
-	}}}
 }
 
 func TestValidateDNSSECOfflineChain(t *testing.T) {
@@ -213,187 +144,9 @@ func TestValidateDNSSECOfflineChain(t *testing.T) {
 	}
 }
 
-func TestValidateCAATag(t *testing.T) {
-	t.Parallel()
+// Empty domain
 
-	app := &AppState{
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
-	_ = app
-
-	tests := []struct {
-		name        string
-		target      DomainConfig
-		tag         string
-		expected    []string
-		live        map[string]bool
-		expectValid bool
-		expectUnk   []string
-	}{
-		{
-			name: "Valid Exact Match",
-			target: DomainConfig{
-				Domain:         "example.com",
-				Name:           "Example",
-				SuppressAlerts: true,
-			},
-			tag:         "issue",
-			expected:    []string{"letsencrypt.org", "digicert.com"},
-			live:        map[string]bool{"letsencrypt.org": true, "digicert.com": true},
-			expectValid: true,
-		},
-		{
-			name: "Missing Expected CA",
-			target: DomainConfig{
-				Domain:         "example.com",
-				Name:           "Example",
-				SuppressAlerts: true,
-			},
-			tag:         "issue",
-			expected:    []string{"letsencrypt.org", "digicert.com"},
-			live:        map[string]bool{"letsencrypt.org": true},
-			expectValid: false,
-		},
-		{
-			name: "Unauthorized CA Detected",
-			target: DomainConfig{
-				Domain:         "example.com",
-				Name:           "Example",
-				SuppressAlerts: true,
-			},
-			tag:         "issue",
-			expected:    []string{"letsencrypt.org"},
-			live:        map[string]bool{"letsencrypt.org": true, "rogue-ca.com": true},
-			expectValid: false,
-		},
-		{
-			name: "Valid Deny All With Semicolon Record",
-			target: DomainConfig{
-				Domain:         "example.com",
-				Name:           "Example",
-				SuppressAlerts: true,
-			},
-			tag:         "issuewild",
-			expected:    []string{},
-			live:        map[string]bool{";": true},
-			expectValid: true,
-		},
-		{
-			name: "Deny All Failed Due To Unauthorized CA",
-			target: DomainConfig{
-				Domain:         "example.com",
-				Name:           "Example",
-				SuppressAlerts: true,
-			},
-			tag:         "issuewild",
-			expected:    []string{},
-			live:        map[string]bool{"letsencrypt.org": true},
-			expectValid: false,
-		},
-		{
-			name: "Deny All Failed Due To Missing CAA Record",
-			target: DomainConfig{
-				Domain:         "example.com",
-				Name:           "Example",
-				SuppressAlerts: true,
-			},
-			tag:         "issuewild",
-			expected:    []string{},
-			live:        map[string]bool{},
-			expectValid: false,
-		},
-		{
-			name: "Skipped Tag (nil)",
-			target: DomainConfig{
-				Domain:         "example.com",
-				Name:           "Example",
-				SuppressAlerts: true,
-			},
-			tag:         "issuemail",
-			expected:    nil,
-			live:        map[string]bool{"any-mail-ca.com": true},
-			expectValid: true,
-		},
-		{
-			name: "Deny All Unauthorized CA Populates UnknownCAs",
-			target: DomainConfig{
-				Domain:         "example.com",
-				Name:           "Example",
-				SuppressAlerts: true,
-			},
-			tag:         "issue",
-			expected:    []string{},
-			live:        map[string]bool{";": true, "unauth-ca.com": true},
-			expectValid: false,
-			expectUnk:   []string{"unauth-ca.com"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			res := CAAResult{Valid: true}
-			res, _ = evaluateCAATag(tt.target, tt.tag, tt.expected, tt.live, res, nil)
-			if res.Valid != tt.expectValid {
-				t.Errorf("Expected Valid: %v, got %v", tt.expectValid, res.Valid)
-			}
-			if len(tt.expectUnk) > 0 {
-				for _, unk := range tt.expectUnk {
-					found := slices.Contains(res.UnknownCAs, unk)
-					if !found {
-						t.Errorf("Expected UnknownCA %s in %v", unk, res.UnknownCAs)
-					}
-				}
-			}
-		})
-	}
-}
-
-func TestParseCAAIssuer(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{";", ";"},
-		{"", ";"},
-		{"\";\"", ";"},
-		{"\"\"", ";"},
-		{" ; ", ";"},
-		{"; policy=ev", ";"},
-		{"; accounturi=https://example.com/acct/123", ";"},
-		{"letsencrypt.org", "letsencrypt.org"},
-		{"\"letsencrypt.org\"", "letsencrypt.org"},
-		{"LETSENCRYPT.ORG", "letsencrypt.org"},
-		{"letsencrypt.org; accounturi=https://example.com", "letsencrypt.org"},
-		{"digicert.com; validationmethods=dns-01", "digicert.com"},
-	}
-
-	for _, tt := range tests {
-		actual := parseCAAIssuer(tt.input)
-		if actual != tt.expected {
-			t.Errorf("parseCAAIssuer(%q) = %q, expected %q", tt.input, actual, tt.expected)
-		}
-	}
-}
-
-func TestFetchCAABoundaries(t *testing.T) {
-	app := caaFixtureApp(t, "example.com.")
-	resolvers := testResolvers()
-
-	// Empty domain
-	res, _ := fetchCAA(context.Background(), app, "", resolvers)
-	if res.Error == "" {
-		t.Errorf("Expected error for empty domain, got none")
-	}
-
-	// Single label domain
-	res, _ = fetchCAA(context.Background(), app, "localhost", resolvers)
-	if res.Error != "" {
-		t.Fatalf("fetchCAA returned nil")
-	}
-}
+// Single label domain
 
 func TestDNSSECValidationFallback(t *testing.T) {
 	assert.False(t, verifyDNSSECDoH(context.Background(), &AppState{}, "https://doh.example/resolve", "example.com", "example.com."))
@@ -431,7 +184,7 @@ func TestEvaluateEmailSecurity_DMARCFailurePromotesSPFWarning(t *testing.T) {
 	status, cond, state := EvaluateEmailSecurity(DomainConfig{Domain: "example.com", CheckEmailSecurity: true}, EmailSnapshot{
 		MXRecords: []string{"mx.example.com"},
 		DMARCErr:  errors.New(MsgErrResolverTimeout),
-	})
+	}, nil)
 	assert.Equal(t, StatusFailed, status)
 	assert.Equal(t, StatusFailed, state.Status)
 	require.NotNil(t, cond)
@@ -439,24 +192,7 @@ func TestEvaluateEmailSecurity_DMARCFailurePromotesSPFWarning(t *testing.T) {
 	assert.Contains(t, cond.Target, "DMARC")
 }
 
-func FuzzParseCAAIssuer(f *testing.F) {
-	seeds := []string{
-		";",
-		"letsencrypt.org",
-		"\"letsencrypt.org\"",
-		"digicert.com; validationmethods=dns-01",
-		"; policy=ev",
-		"",
-	}
-	for _, seed := range seeds {
-		f.Add(seed)
-	}
-
-	f.Fuzz(func(_ *testing.T, rawVal string) {
-		// Should never panic regardless of arbitrary input
-		_ = parseCAAIssuer(rawVal)
-	})
-}
+// Should never panic regardless of arbitrary input
 
 func TestValidateRecords_MatchTypes(t *testing.T) {
 	t.Parallel()
@@ -724,130 +460,6 @@ func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
 	if savedState.Error != "" {
 		t.Errorf("Expected empty error, got %q", savedState.Error)
 	}
-}
-
-func TestFetchCAA_CNAMEAliasFollowing(t *testing.T) {
-	mux := dns.NewServeMux()
-
-	cnameRR := &dns.CNAME{
-		Hdr:    dns.RR_Header{Name: "alias.example.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300},
-		Target: "target.cdn.net.",
-	}
-	caaRR := &dns.CAA{
-		Hdr:   dns.RR_Header{Name: "target.cdn.net.", Rrtype: dns.TypeCAA, Class: dns.ClassINET, Ttl: 300},
-		Tag:   "issue",
-		Value: "letsencrypt.org",
-	}
-
-	mux.HandleFunc("alias.example.com.", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		if len(r.Question) > 0 {
-			if r.Question[0].Qtype == dns.TypeCNAME {
-				m.Answer = append(m.Answer, cnameRR)
-			}
-		}
-		_ = w.WriteMsg(m)
-	})
-
-	mux.HandleFunc("target.cdn.net.", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		if len(r.Question) > 0 {
-			if r.Question[0].Qtype == dns.TypeCAA {
-				m.Answer = append(m.Answer, caaRR)
-			}
-		}
-		_ = w.WriteMsg(m)
-	})
-
-	server := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen packet: %v", err)
-	}
-	server.PacketConn = l
-	defer func() { _ = server.Shutdown() }()
-	go func() { _ = server.ActivateAndServe() }()
-
-	app := &AppState{config: AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
-	res, _ := fetchCAA(context.Background(), app, "alias.example.com", []string{l.LocalAddr().String()})
-
-	if res.Error != "" {
-		t.Errorf("Unexpected error: %v", res.Error)
-	}
-	if len(res.Issue) != 1 || res.Issue[0] != "letsencrypt.org" {
-		t.Errorf("Expected CAA issue 'letsencrypt.org' from CNAME target, got %v", res.Issue)
-	}
-}
-
-func TestCAATransientAliasLookupDoesNotVerifyParentPolicy(t *testing.T) {
-	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
-		question := query.Question[0]
-		if question.Name == "child.example.com." && question.Qtype == dns.TypeCNAME {
-			return nil, 0, errors.New(MsgErrCNAMELookupTimedOut)
-		}
-		response := new(dns.Msg)
-		response.SetReply(query)
-		if question.Name == "example.com." && question.Qtype == dns.TypeCAA {
-			rr, err := dns.NewRR(`example.com. 60 IN CAA 0 issue "ca.example"`)
-			require.NoError(t, err)
-			response.Answer = []dns.RR{rr}
-		}
-		return response, 0, nil
-	}}
-	target := DomainConfig{Domain: "child.example.com", CAA: &CAAConfig{Issue: []string{"ca.example"}}}
-	snapshot := FetchCAASnapshot(context.Background(), app, target)
-	status, condition, _ := EvaluateCAA(target, snapshot)
-	assert.Equal(t, StatusFailed, status)
-	require.NotNil(t, condition)
-	assert.Equal(t, CodeDNSLookupFailed, condition.Code)
-	assert.Contains(t, snapshot.Result.Error, "CNAME lookup timed out")
-}
-
-func TestCAAAliasLimitDoesNotVerifyParentPolicy(t *testing.T) {
-	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
-		question := query.Question[0]
-		response := new(dns.Msg)
-		response.SetReply(query)
-		if question.Name == "example.com." && question.Qtype == dns.TypeCAA {
-			rr, err := dns.NewRR(`example.com. 60 IN CAA 0 issue "ca.example"`)
-			require.NoError(t, err)
-			response.Answer = []dns.RR{rr}
-		} else if question.Qtype == dns.TypeCNAME && strings.HasPrefix(question.Name, "alias") {
-			var index int
-			_, err := fmt.Sscanf(question.Name, "alias%d.example.com.", &index)
-			require.NoError(t, err)
-			rr, err := dns.NewRR(fmt.Sprintf("%s 60 IN CNAME alias%d.example.com.", question.Name, index+1))
-			require.NoError(t, err)
-			response.Answer = []dns.RR{rr}
-		}
-		return response, 0, nil
-	}}
-	res, found := fetchCAA(context.Background(), app, "alias0.example.com", app.Resolvers())
-	assert.True(t, found)
-	assert.Contains(t, res.Error, "alias traversal limit")
-}
-
-func TestCAADeepNameStillFindsParentPolicy(t *testing.T) {
-	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53:53"}})
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
-		response := new(dns.Msg)
-		response.SetReply(query)
-		if query.Question[0].Name == "example.com." && query.Question[0].Qtype == dns.TypeCAA {
-			rr, err := dns.NewRR(`example.com. 60 IN CAA 0 issue "ca.example"`)
-			require.NoError(t, err)
-			response.Answer = []dns.RR{rr}
-		}
-		return response, 0, nil
-	}}
-	domain := strings.Repeat("sub.", MaxCNAMEAliasTraversals+1) + "example.com"
-	res, found := fetchCAA(context.Background(), app, domain, app.Resolvers())
-	assert.True(t, found)
-	assert.Empty(t, res.Error)
-	assert.Equal(t, []string{"ca.example"}, res.Issue)
 }
 
 func TestMultipleSameTypeDNSTasks_NoKeyCollision(t *testing.T) {
@@ -1290,7 +902,6 @@ func TestDNSAnswerOwnerFiltering(t *testing.T) {
 		qtype   uint16
 		answers []string
 		want    []string
-		wantCAA []CAAEntry
 	}{
 		{
 			name: "direct A ignores unrelated answer", qtype: dns.TypeA,
@@ -1316,19 +927,6 @@ func TestDNSAnswerOwnerFiltering(t *testing.T) {
 			answers: []string{"host.example. 60 IN CNAME middle.example.", "middle.example. 60 IN CNAME final.example."},
 			want:    []string{"middle.example"},
 		},
-		{
-			name: "unrelated CAA cannot satisfy policy", qtype: dns.TypeCAA,
-			answers: []string{"other.example. 60 IN CAA 0 issue \"rogue.example\""},
-		},
-		{
-			name: "CAA at CNAME target is accepted", qtype: dns.TypeCAA,
-			answers: []string{"host.example. 60 IN CNAME policy.example.", "policy.example. 60 IN CAA 0 issue \"ca.example\""},
-			wantCAA: []CAAEntry{{Tag: CAATagIssue, Value: "ca.example"}},
-		},
-		{
-			name: "wrong-class CAA cannot satisfy policy", qtype: dns.TypeCAA,
-			answers: []string{"host.example. 60 CH CAA 0 issue \"rogue.example\""},
-		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1342,12 +940,7 @@ func TestDNSAnswerOwnerFiltering(t *testing.T) {
 				}
 				return response, 0, nil
 			}}}
-			if tc.qtype == dns.TypeCAA {
-				got, err := queryCAARecords(context.Background(), app, "host.example", []string{"192.0.2.53"})
-				require.NoError(t, err)
-				assert.Equal(t, tc.wantCAA, got)
-				return
-			}
+
 			got, err := queryDNS(context.Background(), app, "host.example", tc.qtype, []string{"192.0.2.53"})
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
@@ -1355,45 +948,9 @@ func TestDNSAnswerOwnerFiltering(t *testing.T) {
 	}
 }
 
-func TestFetchCAA_CNAMELoopTermination(t *testing.T) {
-	t.Parallel()
+// Create a cycle between loop.example. and alias.example.
 
-	mux := dns.NewServeMux()
-	mux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		if len(r.Question) > 0 {
-			q := r.Question[0]
-			if q.Qtype == dns.TypeCNAME {
-				// Create a cycle between loop.example. and alias.example.
-				target := "alias.example."
-				if strings.HasPrefix(q.Name, "alias") {
-					target = "loop.example."
-				}
-				rr, _ := dns.NewRR(q.Name + " 300 IN CNAME " + target)
-				m.Answer = append(m.Answer, rr)
-			}
-			// For CAA or other types, return empty Answer (NODATA)
-		}
-		_ = w.WriteMsg(m)
-	})
-
-	server := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen packet: %v", err)
-	}
-	server.PacketConn = l
-	defer func() { _ = server.Shutdown() }()
-	go func() { _ = server.ActivateAndServe() }()
-
-	app := &AppState{config: AppConfig{Resolvers: []string{l.LocalAddr().String()}}}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	res, _ := fetchCAA(ctx, app, "loop.example.com", []string{l.LocalAddr().String()})
-	assert.Contains(t, res.Error, "cyclic CNAME")
-}
+// For CAA or other types, return empty Answer (NODATA)
 
 func evaluateNSHealthForTest(ctx context.Context, app *AppState, target DomainConfig) NSHealthResult {
 	if !target.VerifyNSHealth || len(target.ExpectedNS) == 0 {
@@ -2014,20 +1571,6 @@ func TestNilSafety_EvaluationsWithNilApp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// 1. evaluateCAA with nil app and active CAA config
-	caaCfg := DomainConfig{
-		Domain: "example.com",
-		CAA: &CAAConfig{
-			Issue: []string{"letsencrypt.org"},
-		},
-	}
-	caaRes := evaluateCAAForTest(ctx, nil, caaCfg)
-	if caaRes.Error == "" {
-		t.Errorf("expected CAAResult to contain error for nil app")
-	}
-
-	// 2. evaluateCAATag with nil res
-	evaluateCAATag(caaCfg, "issue", []string{"letsencrypt.org"}, nil, CAAResult{}, nil)
 	// 3. evaluateDNSSEC with nil app
 	dnssecCfg := DomainConfig{
 		Domain: "example.com",
@@ -2243,14 +1786,6 @@ func TestResolveTargetExtensive(t *testing.T) {
 	}
 }
 
-func TestEvaluateCAAExtensive(t *testing.T) {
-	app := &AppState{
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
-	target := DomainConfig{Domain: "example.com"}
-	_ = evaluateCAAForTest(context.Background(), app, target)
-}
-
 func TestValidateEmailSecurity(t *testing.T) {
 	app := &AppState{
 		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
@@ -2313,45 +1848,6 @@ func TestEvaluateDNSSEC_MockedPaths(t *testing.T) {
 			}
 			res := evaluateDNSSECForTest(ctx, app, DomainConfig{Domain: "example.com", DNSSEC: true, Name: "Test"})
 			assert.Equal(t, tt.expectedValid, res.Valid)
-		})
-	}
-}
-
-func TestEvaluateCAA_MockedPaths(t *testing.T) {
-	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
-	ctx := context.Background()
-
-	tests := []struct {
-		name       string
-		mockFound  bool
-		mockIssues []CAAEntry
-		cfg        DomainConfig
-	}{
-		{"NotFound", false, nil, DomainConfig{Domain: "example.com", CAA: &CAAConfig{}}},
-		{"FoundValid", true, []CAAEntry{{Tag: "issue", Value: "letsencrypt.org"}}, DomainConfig{Domain: "example.com", CAA: &CAAConfig{Issue: []string{"letsencrypt.org"}}}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			app.DNSClient = &MockDNSResolver{
-				MockExchangeContext: func(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
-					resp := new(dns.Msg)
-					resp.SetReply(msg)
-					if !tt.mockFound {
-						return resp, 0, nil
-					}
-					for _, issue := range tt.mockIssues {
-						caa := &dns.CAA{
-							Hdr:   dns.RR_Header{Name: dns.Fqdn("example.com"), Rrtype: dns.TypeCAA, Class: dns.ClassINET, Ttl: 300},
-							Value: issue.Value,
-							Tag:   issue.Tag,
-						}
-						resp.Answer = append(resp.Answer, caa)
-					}
-					return resp, 0, nil
-				},
-			}
-			evaluateCAAForTest(ctx, app, tt.cfg)
 		})
 	}
 }
@@ -2477,6 +1973,9 @@ func TestEvaluateEmailSecurity_MockedPaths(t *testing.T) {
 		},
 	}
 
+	app.EmailProviders = map[string]ProviderConfig{
+		"google": {MXRecords: []string{"aspmx.l.google.com"}},
+	}
 	res := evaluateEmailSecurityForTest(ctx, app, DomainConfig{Domain: "example.com", CheckEmailSecurity: true, MailProvider: "google", DKIMSelectors: []string{"google"}})
 	assert.Equal(t, StatusOK, res.Status)
 }
@@ -2503,7 +2002,7 @@ func evaluateDNSForTest(ctx context.Context, app *AppState, record DNSTask) DNSS
 
 func evaluateEmailSecurityForTest(ctx context.Context, app *AppState, target DomainConfig) EmailState {
 	snap := FetchEmailSnapshot(ctx, app, target)
-	_, cond, state := EvaluateEmailSecurity(target, snap)
+	_, cond, state := EvaluateEmailSecurity(target, snap, nil)
 	state.Condition = cond
 	return state
 }
@@ -2511,14 +2010,6 @@ func evaluateEmailSecurityForTest(ctx context.Context, app *AppState, target Dom
 func evaluateDNSSECForTest(ctx context.Context, app *AppState, target DomainConfig) DNSSECResult {
 	snap := FetchDNSSECSnapshot(ctx, app, target)
 	status, cond, res := EvaluateDNSSEC(target, snap)
-	res.Status = status
-	res.Condition = cond
-	return res
-}
-
-func evaluateCAAForTest(ctx context.Context, app *AppState, target DomainConfig) CAAResult {
-	snap := FetchCAASnapshot(ctx, app, target)
-	status, cond, res := EvaluateCAA(target, snap)
 	res.Status = status
 	res.Condition = cond
 	return res
@@ -2602,69 +2093,6 @@ func TestMalformedDMARCDoesNotInheritParentPolicy(t *testing.T) {
 	assert.Equal(t, []string{"_dmarc.sub.example.com."}, dmarcQueries)
 }
 
-func TestCAAClimbsOriginalNameAfterAlias(t *testing.T) {
-	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
-	queried := make(map[string]bool)
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
-		name, qtype := q.Question[0].Name, q.Question[0].Qtype
-		queried[name] = true
-		response := new(dns.Msg)
-		response.SetReply(q)
-		var record string
-		switch {
-		case qtype == dns.TypeCNAME && name == "foo.example.com.":
-			record = "foo.example.com. IN CNAME bar.other.test."
-		case qtype == dns.TypeCAA && name == "other.test.":
-			record = "other.test. IN CAA 0 issue \"wrong.example\""
-		case qtype == dns.TypeCAA && name == "example.com.":
-			record = "example.com. IN CAA 0 issue \"right.example\""
-		}
-		if record != "" {
-			rr, err := dns.NewRR(record)
-			require.NoError(t, err)
-			response.Answer = []dns.RR{rr}
-		}
-		return response, 0, nil
-	}}
-	result, found := fetchCAA(context.Background(), app, "foo.example.com", app.Resolvers())
-	assert.True(t, found)
-	assert.Equal(t, []string{"right.example"}, result.Issue)
-	assert.False(t, queried["other.test."])
-}
-
-func TestCAAQueriesTLDAndRejectsUnknownCriticalTag(t *testing.T) {
-	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
-		response := new(dns.Msg)
-		response.SetReply(q)
-		if q.Question[0].Qtype == dns.TypeCAA && q.Question[0].Name == "com." {
-			record, err := dns.NewRR("com. IN CAA 128 future \"opaque\"")
-			require.NoError(t, err)
-			response.Answer = []dns.RR{record}
-		}
-		return response, 0, nil
-	}}
-	target := DomainConfig{Domain: "foo.example.com", CAA: &CAAConfig{}}
-	snapshot := FetchCAASnapshot(context.Background(), app, target)
-	assert.True(t, snapshot.Found)
-	assert.Equal(t, []string{"future"}, snapshot.Result.UnknownCriticalTags)
-	status, condition, _ := EvaluateCAA(target, snapshot)
-	assert.Equal(t, StatusFailed, status)
-	assert.Equal(t, CodeCAAQueryFailed, condition.Code)
-}
-
-func TestCAANoPolicyDiffersFromLookupError(t *testing.T) {
-	target := DomainConfig{Domain: "example.com", CAA: &CAAConfig{Issue: []string{"example-ca.com"}}}
-	status, condition, result := EvaluateCAA(target, CAASnapshot{})
-	assert.Equal(t, StatusFailed, status)
-	assert.Equal(t, CodeCAAMissingIssuer, condition.Code)
-	assert.Empty(t, result.Error)
-	status, condition, result = EvaluateCAA(target, CAASnapshot{Found: true, Result: CAAResult{Error: "DNS timeout"}})
-	assert.Equal(t, StatusFailed, status)
-	assert.Equal(t, CodeDNSLookupFailed, condition.Code)
-	assert.Equal(t, "DNS timeout", result.Error)
-}
-
 func TestDNSSECRejectsOversizedValidPrefix(t *testing.T) {
 	key := &dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET}, Flags: 257, Protocol: 3, Algorithm: dns.ED25519, PublicKey: "AQID"}
 	valid := `{"Status":0,"AD":true,"Question":[{"name":"example.com.","type":48}],"Answer":[{"name":"example.com.","type":48,"data":"257 3 15 AQID"}]}`
@@ -2696,7 +2124,7 @@ func TestEmailUnavailableSelectorCannotHideBehindValidKey(t *testing.T) {
 		DKIMResults:  map[string]bool{"good": true}, DKIMErrs: map[string]error{"other": errors.New(MsgErrDNSTimeout)},
 	}
 	target := DomainConfig{CheckEmailSecurity: true, DKIMSelectors: []string{"good", "other"}}
-	status, condition, state := EvaluateEmailSecurity(target, snapshot)
+	status, condition, state := EvaluateEmailSecurity(target, snapshot, nil)
 	assert.Equal(t, StatusWarning, status)
 	require.NotNil(t, condition)
 	assert.Equal(t, CodeDNSLookupFailed, condition.Code)
@@ -2736,30 +2164,6 @@ func TestLiveDNSSECMatrix(t *testing.T) {
 
 // TestLiveCAADiscoveryMatrix checks parent-policy and alias-policy discovery
 // against issuer sets observed with dig on the review date.
-func TestLiveCAADiscoveryMatrix(t *testing.T) {
-	if os.Getenv("DOMAIN_MONITOR_LIVE") != "1" {
-		t.Skip("set DOMAIN_MONITOR_LIVE=1 for external CAA queries")
-	}
-	for _, test := range []struct {
-		domain string
-		issue  []string
-	}{
-		{domain: "www.cloudflare.com", issue: []string{"comodoca.com", "digicert.com", "letsencrypt.org", "pki.goog", "ssl.com"}},
-		{domain: "www.github.com", issue: []string{"digicert.com", "globalsign.com", "letsencrypt.org", "sectigo.com"}},
-	} {
-		t.Run(test.domain, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			target := DomainConfig{Domain: test.domain, CAA: &CAAConfig{Issue: test.issue}}
-			app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1", "8.8.8.8"}})
-			status, condition, result := EvaluateCAA(target, FetchCAASnapshot(ctx, app, target))
-			t.Logf("status=%s condition=%v issuers=%v error=%q", status, condition, result.Issue, result.Error)
-			if status != StatusOK || condition == nil || condition.Code != CodeCAAVerified {
-				t.Fatalf("expected verified CAA issuers %v; got status=%s condition=%v", test.issue, status, condition)
-			}
-		})
-	}
-}
 
 // TestLiveNullMX compares a public preference-zero null MX with direct dig
 // output. Other email policy records are evaluated by their own checks.
@@ -2772,9 +2176,20 @@ func TestLiveNullMX(t *testing.T) {
 	target := DomainConfig{Domain: "example.com", CheckEmailSecurity: true, MXRecords: []string{"."}}
 	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1", "8.8.8.8"}})
 	snapshot := FetchEmailSnapshot(ctx, app, target)
-	status, condition, state := EvaluateEmailSecurity(target, snapshot)
+	status, condition, state := EvaluateEmailSecurity(target, snapshot, nil)
 	t.Logf("status=%s condition=%v mx=%v spf=%t dmarc=%t", status, condition, state.MX, state.SPF, state.DMARC)
 	if snapshot.MXErr != nil || !slices.Equal(snapshot.MXRecords, []string{"."}) || !slices.Equal(state.MX, []string{"."}) {
 		t.Fatalf("monitor did not preserve the public null MX: records=%v error=%v", snapshot.MXRecords, snapshot.MXErr)
 	}
 }
+func TestCanonicalCAARecordValue(t *testing.T) {
+	record, err := dns.NewRR(`example.com. 300 IN CAA 0 issue "letsencrypt.org"`)
+	require.NoError(t, err)
+	caa := record.(*dns.CAA)
+	val := canonicalCAARecordValue(caa)
+	assert.Equal(t, `0 issue "letsencrypt.org"`, val)
+	val2, ok := dnsAnswerText(caa, dns.TypeCAA)
+	assert.True(t, ok)
+	assert.Equal(t, `0 issue "letsencrypt.org"`, val2)
+}
+

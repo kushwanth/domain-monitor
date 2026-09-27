@@ -7,14 +7,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -36,94 +33,6 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// serveCTLogFile serves the CT log history JSON file for the given domain.
-func serveCTLogFile(app *AppState, w http.ResponseWriter, domain string) {
-	w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-	w.Header().Set(HeaderCacheControl, StrNoStore)
-	domain = NormalizeDomain(domain)
-	if domain == StrEmpty || !ReValidDomain.MatchString(domain) {
-		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(JSONResponseInvalidDomain))
-		return
-	}
-	if !isCTMonitored(app, domain) {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(StrErrorDomainIsNot))
-		return
-	}
-
-	logsPath := DefaultCTLogsSubdir
-	if app != nil && app.CTLogsPath != StrEmpty {
-		logsPath = app.CTLogsPath
-	}
-	filePath := filepath.Join(logsPath, domain+StrJSON)
-	cleanPath := filepath.Clean(filePath)
-	if !IsSafeSubpath(logsPath, cleanPath) {
-		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(JSONResponseInvalidDomain))
-		return
-	}
-
-	if app.ReadCTHistory == nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(StrErrorCTHistoryReader))
-		return
-	}
-	b, err := app.ReadCTHistory(cleanPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			_, _ = w.Write([]byte(JSONResponseEmptyArray))
-			return
-		}
-		LogWarn(MsgLogReadCTLogFailed, FieldDomain, domain, FieldPath, cleanPath, FieldError, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(StrErrorCTHistoryUnavailable))
-		return
-	}
-	if len(b) == 0 {
-		_, _ = w.Write([]byte(JSONResponseEmptyArray))
-		return
-	}
-	var parsed []CTCert
-	if err := jsonv2.Unmarshal(b, &parsed); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(StrErrorCTHistoryIs))
-		return
-	}
-	_, _ = w.Write(b)
-}
-
-func isCTMonitored(app *AppState, domain string) bool {
-	if app == nil {
-		return false
-	}
-	for _, configured := range app.configuration().Domains {
-		if configured.MonitorCTLogs && configured.Domain == domain {
-			return true
-		}
-	}
-	return false
-}
-
-func readBoundedCTFile(path string) ([]byte, error) {
-	// #nosec G304 G703 -- path is the configured CT history location; caller validates domain filenames.
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf(MsgErrOpenCTFile, path, err)
-	}
-	defer func() { _ = f.Close() }()
-	b, err := io.ReadAll(io.LimitReader(f, MaxCTHistoryFileSize+1))
-	if err != nil {
-		return nil, fmt.Errorf(MsgErrReadCTFile, path, err)
-	}
-	if len(b) > MaxCTHistoryFileSize {
-		return nil, fmt.Errorf(MsgErrCTFileExceedsBytes, path, MaxCTHistoryFileSize)
-	}
-	return b, nil
-}
-
 func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 	mux := http.NewServeMux()
 
@@ -142,16 +51,6 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 			}
 		}
 		_, _ = w.Write([]byte(JSONResponseStatusInit))
-	})
-
-	mux.HandleFunc(RouteAPICerts, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		serveCTLogFile(app, w, r.URL.Query().Get(ParamDomain))
-	})
-
-	mux.HandleFunc(RouteAPICTLogs, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
-		serveCTLogFile(app, w, r.PathValue(ParamDomain))
 	})
 
 	mux.HandleFunc(SymSlash, func(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +179,7 @@ func executeFastDomainChecks(ctx context.Context, app *AppState, domains []Domai
 			res := &domainResults[index]
 
 			emailSnap := FetchEmailSnapshot(ctx, app, domain)
-			_, cond, emailState := EvaluateEmailSecurity(domain, emailSnap)
+			_, cond, emailState := EvaluateEmailSecurity(domain, emailSnap, app)
 			emailState.Condition = cond
 			res.Email = emailState
 
@@ -303,12 +202,6 @@ func executeFastDomainChecks(ctx context.Context, app *AppState, domains []Domai
 				dnssecRes.Status = dnssecStatus
 				dnssecRes.Condition = dnssecCond
 				res.DNSSEC = dnssecRes
-
-				caaSnap := FetchCAASnapshot(ctx, app, domain)
-				caaStatus, caaCond, caaRes := EvaluateCAA(domain, caaSnap)
-				caaRes.Status = caaStatus
-				caaRes.Condition = caaCond
-				res.CAA = caaRes
 
 				if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
 					snapshots := FetchNSHealthSnapshots(ctx, app, domain)
@@ -366,9 +259,7 @@ func fillPanicDomainResults(domain DomainConfig, res *DomainResult, recovered an
 	if domain.DNSSEC && res.DNSSEC.Status == StatusUnknown {
 		res.DNSSEC = DNSSECResult{Status: StatusFailed, Error: message, Condition: &StateCondition{Code: CodeDNSSECNetworkError, Target: message}}
 	}
-	if domain.CAA != nil && res.CAA.Status == StatusUnknown {
-		res.CAA = CAAResult{Status: StatusFailed, Error: message, Condition: &StateCondition{Code: CodeCAAQueryFailed, Target: message}}
-	}
+
 	if domain.VerifyNSHealth && res.NSHealth.Status == StatusUnknown {
 		res.NSHealth = NSHealthResult{Status: StatusFailed, Condition: &StateCondition{Code: CodeNSUnreachable, Target: message}}
 	}
@@ -379,10 +270,8 @@ func executeRateLimitedChecks(
 	app *AppState,
 	domains []DomainConfig,
 	rdapHTTPClient *http.Client,
-	ctLogPersist map[string]CTLogState,
-) ([]RDAPState, []CTLogState) {
+) []RDAPState {
 	rdapResults := make([]RDAPState, len(domains))
-	ctResults := make([]CTLogState, len(domains))
 
 	gRateLimitedChecks, _ := errgroup.WithContext(ctx)
 
@@ -442,60 +331,14 @@ func executeRateLimitedChecks(
 		return nil
 	})
 
-	// CT Logs pipeline: evaluates monitored domains with 5s token bucket
-	gRateLimitedChecks.Go(func() error {
-		defer RecoverAndLogPanic(NameOpCTLogsWorker)
-		order := make([]int, 0, len(domains))
-		for i := range domains {
-			if domains[i].MonitorCTLogs {
-				order = append(order, i)
-			}
-		}
-		sort.SliceStable(order, func(a, b int) bool {
-			return ctLogPersist[domains[order[a]].Domain].LastAttemptUnix < ctLogPersist[domains[order[b]].Domain].LastAttemptUnix
-		})
-		for position, i := range order {
-			domainConfig := domains[i]
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						LogError(MsgLogPanicCTLogs, FieldDomain, domainConfig.Domain, FieldPanic, r)
-						ctResults[i] = ctLogPersist[domainConfig.Domain]
-						ctResults[i].Status = StatusFailed
-						ctResults[i].Error = fmt.Sprintf(MsgErrInternalCTLogsPanic, AnyToString(r))
-						ctResults[i].Condition = &StateCondition{Code: CodeCTLogsHTTPError, Target: StrInternalCTCheckPanic}
-					}
-				}()
-				ctSnap := FetchCTLogsSnapshot(ctx, app, domainConfig, ctLogPersist[domainConfig.Domain])
-				ctStatus, ctCond, ctRes := EvaluateCTLogs(domainConfig, ctSnap)
-				ctRes.Status = ctStatus
-				ctRes.Condition = ctCond
-				ctResults[i] = ctRes
-			}()
-			if ctResults[i].Condition != nil && ctResults[i].Condition.Code == CodeCTLogsRateLimited {
-				for _, j := range order[position+1:] {
-					ctResults[j] = ctLogPersist[domains[j].Domain]
-					ctResults[j].Status = StatusWarning
-					ctResults[j].Error = StrCTQuotaExhaustedDeferred
-					ctResults[j].Condition = &StateCondition{Code: CodeCTLogsRateLimited}
-				}
-				return nil
-			}
-		}
-		return nil
-	})
-
 	_ = gRateLimitedChecks.Wait()
-	return rdapResults, ctResults
+	return rdapResults
 }
 
-// runMonitoringCycle executes a single complete monitoring pass across all configured DNS tasks and domains.
 func runMonitoringCycle(
 	ctx context.Context,
 	app *AppState,
 	rdapHTTPClient *http.Client,
-	ctStatePath string,
-	ctLogPersist map[string]CTLogState,
 	prevRDAPStatus map[string]CheckStatus,
 	prevDNSStatus map[string]CheckStatus,
 	prevEmailStatus map[string]CheckStatus,
@@ -523,9 +366,6 @@ func runMonitoringCycle(
 	cycleCtx, cycleCancel := context.WithTimeout(ctx, cycleMaxTimeout)
 	defer cycleCancel()
 
-	if ctLogPersist == nil {
-		ctLogPersist = make(map[string]CTLogState)
-	}
 	if prevRDAPStatus == nil {
 		prevRDAPStatus = make(map[string]CheckStatus)
 	}
@@ -539,7 +379,7 @@ func runMonitoringCycle(
 		prevConditions = make(map[string]StateCondition)
 	}
 
-	loopState, activeDomains := prepareCycleState(domains, ctLogPersist)
+	loopState := prepareCycleState(domains)
 
 	// 1. Dispatch DNS Records
 	dnsResults := executeDNSChecks(cycleCtx, app, dnsRecords)
@@ -548,26 +388,21 @@ func runMonitoringCycle(
 	domainResults := executeFastDomainChecks(cycleCtx, app, domains)
 
 	// 3. Dispatch Slow, Rate-Limited External Checks Concurrently (RDAP and CT Logs)
-	rdapResults, ctResults := executeRateLimitedChecks(cycleCtx, app, domains, rdapHTTPClient, ctLogPersist)
+	rdapResults := executeRateLimitedChecks(cycleCtx, app, domains, rdapHTTPClient)
 
 	for i := range domains {
 		if rdapResults[i].Status != StatusUnknown {
 			domainResults[i].RDAP = rdapResults[i]
 		}
-		if ctResults[i].Status != StatusUnknown {
-			domainResults[i].CTLogs = ctResults[i]
-		}
 	}
 
-	// 3. Assemble CheckState using clean helper methods
+	// 4. Assemble CheckState using clean helper methods
 	for _, res := range dnsResults {
 		loopState.ApplyDNSResult(res)
 	}
 	for _, res := range domainResults {
 		loopState.ApplyDomainResult(res)
 	}
-
-	commitCycleCTState(app, loopState, ctStatePath, ctLogPersist, activeDomains)
 
 	computePortfolioPricing(cycleCtx, app, loopState, app.Pricing)
 
@@ -590,55 +425,7 @@ func runMonitoringCycle(
 		FieldDNSRecordsChecked, len(dnsRecords),
 	)
 
-	finishCycleDelivery(cycleCtx, app, loopState, ctStatePath, ctLogPersist, loopDur)
-
 	return loopState
-}
-
-func prepareCycleState(domains []DomainConfig, committed map[string]CTLogState) (*CheckState, map[string]bool) {
-	state := NewCheckState()
-	active := make(map[string]bool, len(domains))
-	for _, domain := range domains {
-		if domain.MonitorCTLogs {
-			active[domain.Domain] = true
-		}
-		state.RDAP[domain.Domain] = RDAPState{Status: StatusPending}
-	}
-	for domain, previous := range committed {
-		if active[domain] && previous.Status != StatusUnknown {
-			state.CTLogs[domain] = cloneCTLogState(previous)
-		}
-	}
-	return state, active
-}
-
-func commitCycleCTState(app *AppState, state *CheckState, path string, committed map[string]CTLogState, active map[string]bool) {
-	candidate := maps.Clone(committed)
-	maps.Copy(candidate, state.CTLogs)
-	for domain := range candidate {
-		if !active[domain] {
-			delete(candidate, domain)
-		}
-	}
-	write := AtomicWriteFile
-	if app != nil && app.WriteCTState != nil {
-		write = app.WriteCTState
-	}
-	b, err := encodeCTState(candidate)
-	if err == nil {
-		err = write(path, b, FilePermSecret)
-	}
-	if err != nil {
-		markCTCommitFailed(state, committed, fmt.Errorf(MsgErrCommitCTState, path, err))
-		return
-	}
-	for domain := range committed {
-		delete(committed, domain)
-	}
-	for domain, current := range candidate {
-		current.NewCerts = nil
-		committed[domain] = cloneCTLogState(current)
-	}
 }
 
 func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) {
@@ -654,53 +441,12 @@ func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) 
 	app.PrerenderedJSON.Store(encoded)
 }
 
-func finishCycleDelivery(ctx context.Context, app *AppState, state *CheckState, path string, committed map[string]CTLogState, loopDur time.Duration) {
-	if app == nil {
-		return
+func prepareCycleState(domains []DomainConfig) *CheckState {
+	state := NewCheckState()
+	for _, domain := range domains {
+		state.RDAP[domain.Domain] = RDAPState{Status: StatusPending}
 	}
-	if app.Notifier != nil {
-		if notifier, ok := app.Notifier.(interface{ FlushContext(context.Context) }); ok {
-			notifier.FlushContext(ctx)
-		} else {
-			app.Notifier.Flush()
-		}
-	}
-	var accepted map[string]CTAcceptance
-	if notifier, ok := app.Notifier.(interface {
-		TakeCTAcceptances() map[string]CTAcceptance
-	}); ok {
-		accepted = notifier.TakeCTAcceptances()
-	}
-	write := AtomicWriteFile
-	if app.WriteCTState != nil {
-		write = app.WriteCTState
-	}
-	if err := commitCTAcceptances(path, committed, app.configuration(), accepted, write); err != nil {
-		LogWarn(MsgLogCTAcknowledgementPending, FieldError, err)
-	} else {
-		if notifier, ok := app.Notifier.(interface{ ForgetCTAcceptances(map[string]CTAcceptance) }); ok {
-			notifier.ForgetCTAcceptances(accepted)
-		}
-		for domain, previous := range committed {
-			if current, ok := state.CTLogs[domain]; ok {
-				current.Pending = slices.Clone(previous.Pending)
-				state.CTLogs[domain] = current
-			}
-		}
-	}
-	publishCycleState(app, state, loopDur)
-}
-
-func markCTCommitFailed(state *CheckState, committed map[string]CTLogState, err error) {
-	LogWarn(MsgLogWriteCTStateFailed, FieldError, err)
-	for domain := range state.CTLogs {
-		previous := committed[domain]
-		current := cloneCTLogState(previous)
-		current.Status = StatusFailed
-		current.Error = err.Error()
-		current.Condition = &StateCondition{Code: CodeCTPersistenceFailed, Target: current.Error}
-		state.CTLogs[domain] = current
-	}
+	return state
 }
 
 func applyConditionSince(cond *StateCondition, key string, prev map[string]StateCondition) {
@@ -776,39 +522,19 @@ func collectDomainAlerts(app *AppState, state *CheckState, cfg DomainConfig, pre
 	if st, ok := state.Email[domain]; ok {
 		alerts = appendConditionAlert(alerts, name, domain, CheckTypeEmail, st.Condition, st.Status, suppress, prev, active)
 	}
-	if st, ok := state.CAA[domain]; ok {
-		alerts = appendConditionAlert(alerts, name, domain, CheckTypeCAA, st.Condition, st.Status, suppress, prev, active)
-	}
+
 	if st, ok := state.DNSSEC[domain]; ok {
 		alerts = appendConditionAlert(alerts, name, domain, CheckTypeDNSSEC, st.Condition, st.Status, suppress, prev, active)
 	}
 	if st, ok := state.NSHealth[domain]; ok {
 		alerts = appendConditionAlert(alerts, name, domain, CheckTypeNSHealth, st.Condition, st.Status, suppress, prev, active)
 	}
-	if st, ok := state.CTLogs[domain]; ok && cfg.MonitorCTLogs {
-		alerts = appendConditionAlert(alerts, name, domain, CheckTypeCTLogs, st.Condition, st.Status, suppress, prev, active)
-		if !suppress && app.Notifier != nil {
-			for _, pending := range st.Pending {
-				issuer := pending.Cert.Issuer
-				if issuer == StrEmpty {
-					issuer = DefaultUnknownCA
-				}
-				identity := AlertCTIdentityPrefix + domain + SymColon + pending.Cert.ID
-				alerts = append(alerts, Alert{Message: AlertNewCertificatePrefix + issuer, Redacted: AlertNewCertificateRedacted, Identity: identity, CT: true, NeedNtfy: pending.NeedNtfy, NeedTelegram: pending.NeedTelegram, Priority: PriorityWarning, Tag: TagSkull, Domain: domain, Name: name})
-			}
-		}
-	}
 	return alerts
 }
 
 func dispatchCycleAlerts(app *AppState, cycleAlerts []Alert) {
 	for _, alert := range cycleAlerts {
-		if alert.CT {
-			if notifier, ok := app.Notifier.(interface{ DispatchCT(Alert) }); ok {
-				notifier.DispatchCT(alert)
-			}
-			continue
-		}
+
 		if notifier, ok := app.Notifier.(interface {
 			DispatchIdentified(string, string, string, AlertPriority, AlertTag, string, string)
 		}); ok {
@@ -856,11 +582,6 @@ func run(parent context.Context, configPath string) error {
 		return fmt.Errorf(MsgErrInitializeApplication, err)
 	}
 
-	ctStatePath, ctLogPersist, err := app.InitializeCTStorage()
-	if err != nil {
-		return err
-	}
-
 	rdapHTTPClient := NewRDAPHTTPClient(10 * time.Second)
 	LogInfof(MsgLogStartup, len(app.configuration().Domains), len(app.configuration().DNSRecords))
 	app.PublishInitialState()
@@ -879,7 +600,7 @@ func run(parent context.Context, configPath string) error {
 		prevConditions := make(map[string]StateCondition)
 
 		for {
-			_ = runMonitoringCycle(ctx, app, rdapHTTPClient, ctStatePath, ctLogPersist, prevRDAPStatus, prevDNSStatus, prevEmailStatus, prevConditions)
+			_ = runMonitoringCycle(ctx, app, rdapHTTPClient, prevRDAPStatus, prevDNSStatus, prevEmailStatus, prevConditions)
 
 			timer := time.NewTimer(app.LoopDuration)
 			select {
@@ -946,32 +667,4 @@ func (a *AppState) PublishInitialState() {
 		a.PrerenderedJSON.Store(b)
 	}
 
-}
-
-// InitializeCTStorage ...
-func (a *AppState) InitializeCTStorage() (string, map[string]CTLogState, error) {
-	dataDir := a.configuration().DataDir
-	if dataDir == StrEmpty {
-		dataDir = DefaultDataDir
-		if _, err := os.Stat(DirContainerApp); os.IsNotExist(err) {
-			dataDir = DefaultLocalDataDir
-		}
-	}
-	// #nosec G703 -- dataDir is deliberately configurable by the operator.
-	if err := os.MkdirAll(dataDir, DirPermDefault); err != nil {
-		return StrEmpty, nil, WrapError(MsgErrCreateDataDirectory, err)
-	}
-	ctLogsDir := filepath.Join(dataDir, DefaultCTLogsSubdir)
-	a.CTLogsPath = ctLogsDir
-	// #nosec G703 -- ctLogsDir is a fixed child of the operator-selected dataDir.
-	if err := os.MkdirAll(ctLogsDir, DirPermDefault); err != nil {
-		return StrEmpty, nil, WrapError(MsgErrCreateCTLogsDirectory, err)
-	}
-	ctStatePath := filepath.Join(dataDir, DefaultCTStateFileName)
-	ctLogPersist, err := loadCTStateFile(ctStatePath, a.ReadCTState, a.WriteCTState)
-	if err != nil {
-		return StrEmpty, nil, WrapError(MsgErrLoadCTState, err)
-	}
-
-	return ctStatePath, ctLogPersist, nil
 }

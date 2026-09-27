@@ -1,0 +1,4 @@
+{
+  "mx_records": ["mail.protection.outlook.com"],
+  "dkim_selectors": ["selector1"]
+}

@@ -1,0 +1,4 @@
+{
+  "mx_records": ["protonmail.ch"],
+  "dkim_selectors": ["protonmail", "protonmail2", "protonmail3"]
+}

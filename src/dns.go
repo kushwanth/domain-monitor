@@ -5,14 +5,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
-	"net"
-
 	"encoding/base64"
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
-
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -190,42 +188,6 @@ func canonicalCAARecordValue(record *dns.CAA) string {
 	return fmt.Sprintf(StrDSQ, record.Flag, strings.ToLower(record.Tag), record.Value)
 }
 
-// queryCAARecords queries CAA records and returns structured entries
-// instead of raw string representations that require brittle re-parsing.
-func queryCAARecords(ctx context.Context, app *AppState, hostname string, resolvers []string) ([]CAAEntry, error) {
-	r, err := queryDNSMsg(ctx, app, hostname, dns.TypeCAA, resolvers)
-	if err != nil {
-		return nil, err
-	}
-	if r == nil {
-		return nil, ErrEmptyDNSResponse
-	}
-
-	allowedOwners := dnsAnswerOwners(r.Answer, hostname)
-	var entries []CAAEntry
-	for _, ans := range r.Answer {
-		if ans.Header().Class != dns.ClassINET {
-			continue
-		}
-		if !allowedOwners[strings.ToLower(dns.Fqdn(ans.Header().Name))] {
-			continue
-		}
-		if caa, ok := ans.(*dns.CAA); ok {
-			val := strings.Trim(strings.TrimSpace(caa.Value), SymQuote)
-			val = strings.TrimSpace(val)
-			if val == StrEmpty || val == CAADenyAll {
-				val = CAADenyAll
-			}
-			entries = append(entries, CAAEntry{
-				Flag:  caa.Flag,
-				Tag:   strings.ToLower(caa.Tag),
-				Value: val,
-			})
-		}
-	}
-	return entries, nil
-}
-
 // dnsAnswerOwners follows CNAMEs in the answer section so only records for the
 // queried name or its bounded alias chain are accepted.
 func dnsAnswerOwners(answers []dns.RR, hostname string) map[string]bool {
@@ -253,28 +215,6 @@ func dnsAnswerOwners(answers []dns.RR, hostname string) map[string]bool {
 	return owners
 }
 
-// parseCAAIssuer extracts the CA domain from a CAA value string.
-// Returns ";" if the record is an explicit deny-all (e.g. ";", "", "\";\"", or "; parameter=val").
-func parseCAAIssuer(rawVal string) string {
-	val := strings.Trim(strings.TrimSpace(rawVal), SymQuote)
-	val = strings.TrimSpace(val)
-	if val == StrEmpty || val == CAADenyAll {
-		return CAADenyAll
-	}
-	var part1 string
-	if idx := strings.IndexByte(val, ';'); idx != -1 {
-		part1 = val[:idx]
-	} else {
-		part1 = val
-	}
-	issuer := strings.Trim(strings.TrimSpace(part1), SymQuote)
-	issuer = strings.TrimSpace(issuer)
-	if issuer == StrEmpty || issuer == CAADenyAll {
-		return CAADenyAll
-	}
-	return strings.ToLower(issuer)
-}
-
 func queryIPRecords(ctx context.Context, app *AppState, hostname string, resolvers []string) ([]string, error) {
 	aRecords, aErr := queryDNS(ctx, app, hostname, dns.TypeA, resolvers)
 	aaaaRecords, aaaaErr := queryDNS(ctx, app, hostname, dns.TypeAAAA, resolvers)
@@ -290,206 +230,6 @@ func queryIPRecords(ctx context.Context, app *AppState, hostname string, resolve
 		return found, WrapError(MsgErrLookupFailedAandAAAA, errors.Join(aErr, aaaaErr))
 	}
 	return found, nil
-}
-
-// FetchCAASnapshot ...
-func FetchCAASnapshot(ctx context.Context, app *AppState, target DomainConfig) CAASnapshot {
-	if target.CAA == nil {
-		return CAASnapshot{}
-	}
-	if app == nil {
-		return CAASnapshot{Found: true, Result: CAAResult{Error: StrAppStateIsNil}}
-	}
-	res, found := fetchCAA(ctx, app, target.Domain, app.resolvers())
-	return CAASnapshot{Found: found, Result: res}
-}
-
-// EvaluateCAA ...
-func EvaluateCAA(target DomainConfig, snapshot CAASnapshot) (CheckStatus, *StateCondition, CAAResult) {
-	if target.CAA == nil {
-		return StatusUnknown, nil, CAAResult{}
-	}
-	if !snapshot.Found {
-		return StatusFailed, &StateCondition{Code: CodeCAAMissingIssuer, Target: StrNoCAAPolicyFound}, CAAResult{Valid: false}
-	}
-	res := snapshot.Result
-	if res.Error != StrEmpty {
-		res.Valid = false
-		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: res.Error}, res
-	}
-	if len(res.UnknownCriticalTags) > 0 {
-		res.Valid = false
-		res.Error = StrUnknownCriticalCAATags + strings.Join(res.UnknownCriticalTags, SymCommaSpace)
-		return StatusFailed, &StateCondition{Code: CodeCAAQueryFailed, Target: res.Error}, res
-	}
-
-	liveIssue := caaIssuerSet(res.Issue)
-	liveIssueWild := caaIssuerSet(res.IssueWild)
-	liveIssueMail := caaIssuerSet(res.IssueMail)
-
-	res.Valid = true
-	var cond *StateCondition
-	status := StatusOK
-
-	if target.CAA.Issue != nil {
-		res, cond = evaluateCAATag(target, CAATagIssue, target.CAA.Issue, liveIssue, res, cond)
-	}
-	if target.CAA.IssueWild != nil {
-		res, cond = evaluateCAATag(target, CAATagIssueWild, target.CAA.IssueWild, liveIssueWild, res, cond)
-	}
-	if target.CAA.IssueMail != nil {
-		res, cond = evaluateCAATag(target, CAATagIssueMail, target.CAA.IssueMail, liveIssueMail, res, cond)
-	}
-
-	if !res.Valid {
-		status = StatusFailed
-	} else {
-		cond = &StateCondition{Code: CodeCAAVerified}
-	}
-
-	return status, cond, res
-}
-
-func caaIssuerSet(values []string) map[string]bool {
-	issuers := make(map[string]bool, len(values))
-	for _, value := range values {
-		if issuer := parseCAAIssuer(value); issuer != StrEmpty {
-			issuers[issuer] = true
-		}
-	}
-	return issuers
-}
-
-func evaluateCAATag(target DomainConfig, tag string, expected []string, live map[string]bool, res CAAResult, cond *StateCondition) (CAAResult, *StateCondition) {
-	if expected == nil {
-		return res, cond
-	}
-
-	if len(expected) == 0 {
-		if len(live) == 0 {
-			res.Valid = false
-			return res, &StateCondition{Code: CodeCAAMissingDenyAll, Target: tag}
-		}
-
-		for liveCA := range live {
-			if liveCA != CAADenyAll {
-				if !slices.Contains(res.UnknownCAs, liveCA) {
-					res.UnknownCAs = append(res.UnknownCAs, liveCA)
-				}
-				res.Valid = false
-				if cond == nil {
-					cond = &StateCondition{Code: CodeCAAUnexpectedIssuer, Target: liveCA + StrIn + tag}
-				}
-			}
-		}
-		return res, cond
-	}
-
-	expectedMap := make(map[string]bool)
-	for _, v := range expected {
-		expectedMap[v] = true
-	}
-
-	if len(live) == 0 {
-		res.Valid = false
-		return res, &StateCondition{Code: CodeCAAMissingIssuer, Target: tag}
-	}
-
-	for _, exp := range expected {
-		if !live[exp] {
-			res.Valid = false
-			if cond == nil {
-				cond = &StateCondition{Code: CodeCAAMissingIssuer, Target: exp + StrIn + tag}
-			}
-		}
-	}
-
-	for liveCA := range live {
-		if !expectedMap[liveCA] {
-			if !slices.Contains(res.UnknownCAs, liveCA) {
-				res.UnknownCAs = append(res.UnknownCAs, liveCA)
-			}
-			res.Valid = false
-			if cond == nil {
-				cond = &StateCondition{Code: CodeCAAUnexpectedIssuer, Target: liveCA + StrIn + tag}
-			}
-		}
-	}
-	return res, cond
-}
-
-func fetchCAANode(ctx context.Context, app *AppState, domain string, resolvers []string, visitedAliases map[string]bool) (CAAResult, bool) {
-	entries, err := queryCAARecords(ctx, app, domain, resolvers)
-	if err != nil && !errors.Is(err, ErrNXDOMAIN) {
-		return CAAResult{Error: fmt.Sprintf(MsgErrFailedToQueryCAAPattern, domain, err.Error())}, true
-	}
-
-	if len(entries) > 0 {
-		return caaResultFromEntries(entries), true
-	}
-
-	// Check for CNAME alias traversal per RFC 8659 Section 3
-	if len(visitedAliases) >= MaxCNAMEAliasTraversals {
-		return CAAResult{Error: fmt.Sprintf(StrCAAAliasTraversalLimit, domain)}, true
-	}
-	visitedAliases[domain] = true
-	cnames, cErr := queryDNS(ctx, app, domain, dns.TypeCNAME, resolvers)
-	if cErr != nil && !errors.Is(cErr, ErrNXDOMAIN) {
-		return CAAResult{Error: fmt.Sprintf(StrFailedToQueryCNAME, domain, cErr)}, true
-	}
-	if cErr == nil && len(cnames) > 0 {
-		target := NormalizeDomain(cnames[0])
-		if target == StrEmpty || visitedAliases[target] {
-			return CAAResult{Error: fmt.Sprintf(StrInvalidOrCyclicCNAME, domain)}, true
-		}
-		// Follow aliases at this lookup name, then climb the original name's tree.
-		return fetchCAANode(ctx, app, target, resolvers, visitedAliases)
-	}
-	return CAAResult{}, false
-}
-
-func caaResultFromEntries(entries []CAAEntry) CAAResult {
-	res := CAAResult{Entries: entries}
-	for _, entry := range entries {
-		switch entry.Tag {
-		case CAATagIssue:
-			res.Issue = append(res.Issue, entry.Value)
-		case CAATagIssueWild:
-			res.IssueWild = append(res.IssueWild, entry.Value)
-		case CAATagIssueMail:
-			res.IssueMail = append(res.IssueMail, entry.Value)
-		default:
-			if entry.Flag&CAACriticalFlag != 0 {
-				res.UnknownCriticalTags = append(res.UnknownCriticalTags, entry.Tag)
-			}
-		}
-	}
-	return res
-}
-
-func fetchCAATree(ctx context.Context, app *AppState, domain string, resolvers []string) (CAAResult, bool) {
-	currentDomain := domain
-	for {
-		if res, found := fetchCAANode(ctx, app, currentDomain, resolvers, make(map[string]bool)); found {
-			return res, true
-		}
-
-		// Tree climbing: strip leftmost label
-		_, parent, found := strings.Cut(currentDomain, SymDot)
-		if !found || parent == StrEmpty {
-			break // The current lookup already included the TLD.
-		}
-		currentDomain = parent
-	}
-	return CAAResult{}, false
-}
-
-func fetchCAA(ctx context.Context, app *AppState, domain string, resolvers []string) (CAAResult, bool) {
-	currentDomain := NormalizeDomain(domain)
-	if currentDomain == StrEmpty {
-		return CAAResult{Error: MsgErrInvalidEmptyDomainCAA}, true
-	}
-	return fetchCAATree(ctx, app, currentDomain, resolvers)
 }
 
 func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers []string, dohURLTemplate string) DNSSECResult {
@@ -1178,7 +918,7 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 }
 
 // EvaluateEmailSecurity ...
-func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot) (CheckStatus, *StateCondition, EmailState) {
+func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, app *AppState) (CheckStatus, *StateCondition, EmailState) {
 	if !target.CheckEmailSecurity {
 		return StatusOK, nil, EmailState{}
 	}
@@ -1218,7 +958,13 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot) (CheckStatus
 				emailStatus = StatusMismatch
 			}
 		} else if target.MailProvider != StrEmpty {
-			safe, known := isProviderMXSafe(liveMXs, target.MailProvider)
+			var safe, known bool
+			if app != nil {
+				if provider, ok := app.EmailProviders[target.MailProvider]; ok {
+					known = true
+					safe = isProviderMXSafeDynamic(liveMXs, provider)
+				}
+			}
 			if !known {
 				LogWarnf(MsgLogEmailUnknownProvider, target.MailProvider, target.Domain)
 			} else if !safe {
@@ -1360,14 +1106,10 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot) (CheckStatus
 	return emailStatus, finalCond, state
 }
 
-// isProviderMXSafe checks whether all live MX hostnames match the expected provider's domain suffixes.
-func isProviderMXSafe(liveMXs []string, provider string) (isSafe bool, knownProvider bool) {
-	suffixes, ok := ProviderMXMap[strings.ToLower(strings.TrimSpace(provider))]
-	if !ok {
-		return false, false
-	}
+func isProviderMXSafeDynamic(liveMXs []string, provider ProviderConfig) bool {
+	suffixes := provider.MXRecords
 	if len(liveMXs) == 0 {
-		return false, true
+		return false
 	}
 
 	for _, mx := range liveMXs {
@@ -1380,10 +1122,10 @@ func isProviderMXSafe(liveMXs []string, provider string) (isSafe bool, knownProv
 			}
 		}
 		if !matched {
-			return false, true
+			return false
 		}
 	}
-	return true, true
+	return true
 }
 
 // FetchNSSnapshot ...

@@ -25,7 +25,6 @@ src/src
 ct_logs/
 ct_state.json
 domain_snapshots.json
-data/
 
 # Antigravity Customizations
 .agents/

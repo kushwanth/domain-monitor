@@ -1,0 +1,4 @@
+{
+  "mx_records": ["aspmx.l.google.com", "smtp.google.com", "googlemail.com", "google.com"],
+  "dkim_selectors": ["google"]
+}

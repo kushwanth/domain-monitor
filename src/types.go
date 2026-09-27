@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -146,14 +145,13 @@ func (p *AlertPriority) UnmarshalText(text []byte) error {
 // AlertTag defines the visual badge or emoji category for an alert
 type AlertTag string
 
-// 2. Configuration Models
-
-// CAAConfig ...
-type CAAConfig struct {
-	Issue     []string `json:"issue"`
-	IssueWild []string `json:"issuewild"`
-	IssueMail []string `json:"issuemail"`
+// ProviderConfig represents dynamic provider data (MX and DKIM selectors)
+type ProviderConfig struct {
+	MXRecords     []string `json:"mx_records"`
+	DKIMSelectors []string `json:"dkim_selectors"`
 }
+
+// 2. Configuration Models
 
 // NtfyConfig ...
 type NtfyConfig struct {
@@ -175,39 +173,37 @@ type Notifications struct {
 
 // AppConfig ...
 type AppConfig struct {
-	Port             string         `json:"port"`
-	DataDir          string         `json:"data_dir,omitempty"`
-	LoopIntervalDays float64        `json:"loop_interval_days"`
-	Notifications    Notifications  `json:"notifications"`
-	Resolvers        []string       `json:"resolvers"`
-	DoHURL           string         `json:"doh_url,omitempty"`
-	CTLogsAPIKey     string         `json:"ctlogs_api_key,omitempty"`
-	Domains          []DomainConfig `json:"domains"`
-	DNSRecords       []DNSTask      `json:"dns_records"`
+	Port             string        `json:"port"`
+	LoopIntervalDays float64       `json:"loop_interval_days"`
+	Notifications    Notifications `json:"notifications"`
+	Resolvers        []string      `json:"resolvers"`
+	DoHURL           string        `json:"doh_url,omitempty"`
+
+	Domains    []DomainConfig `json:"domains"`
+	DNSRecords []DNSTask      `json:"dns_records"`
 }
 
 // DomainConfig ...
 type DomainConfig struct {
-	Domain                string     `json:"domain"`
-	Name                  string     `json:"name"`
-	IsDelegatedZone       bool       `json:"is_delegated_zone"`
-	RootZone              string     `json:"root_zone"`
-	ExpectedNS            []string   `json:"expected_ns"`
-	SecondaryNS           []string   `json:"secondary_ns,omitempty"`
-	ExpectedRegistrarID   string     `json:"expected_registrar_id,omitempty"`
-	ExpectedRegistrarName string     `json:"expected_registrar_name,omitempty"`
-	AllowExpiry           bool       `json:"allow_expiry,omitempty"`
-	RenewalPrice          float64    `json:"renewal_price,omitempty"`
-	DomainTransferLocked  bool       `json:"domain_transfer_locked,omitempty"`
-	VerifyNSHealth        bool       `json:"verify_ns_health,omitempty"`
-	CheckEmailSecurity    bool       `json:"check_email_security"`
-	MailProvider          string     `json:"mail_provider"`
-	MXRecords             []string   `json:"mx_records"`
-	DKIMSelectors         []string   `json:"dkim_selectors"`
-	DNSSEC                bool       `json:"dnssec"`
-	MonitorCTLogs         bool       `json:"monitor_ct_logs"`
-	CAA                   *CAAConfig `json:"caa,omitempty"`
-	SuppressAlerts        bool       `json:"suppress_alerts"`
+	Domain                string   `json:"domain"`
+	Name                  string   `json:"name"`
+	IsDelegatedZone       bool     `json:"is_delegated_zone"`
+	RootZone              string   `json:"root_zone"`
+	ExpectedNS            []string `json:"expected_ns"`
+	SecondaryNS           []string `json:"secondary_ns,omitempty"`
+	ExpectedRegistrarID   string   `json:"expected_registrar_id,omitempty"`
+	ExpectedRegistrarName string   `json:"expected_registrar_name,omitempty"`
+	AllowExpiry           bool     `json:"allow_expiry,omitempty"`
+	RenewalPrice          float64  `json:"renewal_price,omitempty"`
+	DomainTransferLocked  bool     `json:"domain_transfer_locked,omitempty"`
+	VerifyNSHealth        bool     `json:"verify_ns_health,omitempty"`
+	CheckEmailSecurity    bool     `json:"check_email_security"`
+	MailProvider          string   `json:"mail_provider"`
+	MXRecords             []string `json:"mx_records"`
+	DKIMSelectors         []string `json:"dkim_selectors"`
+	DNSSEC                bool     `json:"dnssec"`
+
+	SuppressAlerts bool `json:"suppress_alerts"`
 }
 
 // DNSTask ...
@@ -252,14 +248,9 @@ type AppState struct {
 	WHOISClient    WHOISQuerier
 	WHOISDial      func(context.Context, string) (net.Conn, error)
 	RDAPURLAllowed func(string) bool
-	ReadCTHistory  func(string) ([]byte, error)
-	WriteCTHistory func(string, []CTCert, string) error
-	ReadCTState    func(string) ([]byte, error)
-	WriteCTState   func(string, []byte, os.FileMode) error
+	RDAPLimiter    *rate.Limiter
 
-	RDAPLimiter *rate.Limiter
-	CTLimiter   *rate.Limiter
-	CTLogsPath  string
+	EmailProviders map[string]ProviderConfig
 }
 
 // Config returns an independent copy of the startup configuration.
@@ -306,15 +297,10 @@ func NewAppState(cfg AppConfig) *AppState {
 		Bootstrap:       NewBootstrap(nil),
 		LoopDuration:    time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
 		RDAPLimiter:     rate.NewLimiter(rate.Every(RDAPRateLimitInterval), 1),
-		CTLimiter:       rate.NewLimiter(rate.Every(CTLogsRateLimitInterval), 1),
 		WHOISDial:       dialPublicWHOIS,
 		DNSClient:       &dns.Client{Timeout: DefaultDNSTimeout},
 		DNSTCPClient:    &dns.Client{Net: ProtocolTCP, Timeout: DefaultDNSTimeout},
 		RDAPURLAllowed:  IsSafeRDAPURL,
-		ReadCTState:     readBoundedCTFile,
-		ReadCTHistory:   readBoundedCTFile,
-		WriteCTHistory:  saveCertsToHistory,
-		WriteCTState:    AtomicWriteFile,
 	}
 }
 
@@ -336,13 +322,7 @@ func cloneConfig(cfg AppConfig) AppConfig {
 		domain.SecondaryNS = slices.Clone(domain.SecondaryNS)
 		domain.MXRecords = slices.Clone(domain.MXRecords)
 		domain.DKIMSelectors = slices.Clone(domain.DKIMSelectors)
-		if domain.CAA != nil {
-			caa := *domain.CAA
-			caa.Issue = slices.Clone(caa.Issue)
-			caa.IssueWild = slices.Clone(caa.IssueWild)
-			caa.IssueMail = slices.Clone(caa.IssueMail)
-			domain.CAA = &caa
-		}
+
 	}
 	for i := range cfg.DNSRecords {
 		cfg.DNSRecords[i].Expected = slices.Clone(cfg.DNSRecords[i].Expected)
@@ -496,28 +476,6 @@ type EmailState struct {
 	Error        string          `json:"error,omitempty"`
 }
 
-// CAAEntry ...
-type CAAEntry struct {
-	Flag  uint8
-	Tag   string
-	Value string
-}
-
-// CAAResult ...
-type CAAResult struct {
-	Status              CheckStatus     `json:"status"`
-	Condition           *StateCondition `json:"condition,omitempty"`
-	Valid               bool            `json:"valid"`
-	Issue               []string        `json:"issue"`
-	IssueWild           []string        `json:"issuewild"`
-	IssueMail           []string        `json:"issuemail"`
-	Entries             []CAAEntry      `json:"entries,omitempty"`
-	UnknownCriticalTags []string        `json:"unknown_critical_tags,omitempty"`
-	UnknownCAs          []string        `json:"unknown_cas,omitempty"`
-	QueryFailed         bool            `json:"query_failed,omitempty"`
-	Error               string          `json:"error,omitempty"`
-}
-
 // DNSSECResult ...
 type DNSSECResult struct {
 	Status          CheckStatus     `json:"status"`
@@ -534,59 +492,6 @@ type DNSSECResult struct {
 	NetworkError    bool            `json:"network_error,omitempty"`
 	Disabled        bool            `json:"disabled,omitempty"`
 	Error           string          `json:"error,omitempty"`
-}
-
-// CTCert ...
-type CTCert struct {
-	ID        string `json:"id"`
-	Match     string `json:"match"`
-	Issuer    string `json:"issuer"`
-	NotBefore string `json:"not_before"`
-	NotAfter  string `json:"not_after"`
-}
-
-// CTPending holds a committed discovery until each configured provider accepts it.
-type CTPending struct {
-	Cert         CTCert `json:"cert"`
-	NeedNtfy     bool   `json:"need_ntfy,omitempty"`
-	NeedTelegram bool   `json:"need_telegram,omitempty"`
-}
-
-// CTLogState ...
-type CTLogState struct {
-	LatestID           string          `json:"latest_id"`
-	Initialized        bool            `json:"initialized,omitempty"`
-	BackfillCursor     string          `json:"backfill_cursor"`
-	BackfillComplete   bool            `json:"backfill_complete"`
-	ScanPages          int             `json:"scan_pages,omitempty"`
-	LastAttemptUnix    int64           `json:"last_attempt_unix,omitempty"`
-	LastSuccessUnix    int64           `json:"last_success_unix,omitempty"`
-	LastCompleteUnix   int64           `json:"last_complete_unix,omitempty"`
-	SeenIDs            []string        `json:"seen_ids,omitempty"`
-	Pending            []CTPending     `json:"pending,omitempty"`
-	CoverageIncomplete bool            `json:"coverage_incomplete,omitempty"`
-	Status             CheckStatus     `json:"status"`
-	Condition          *StateCondition `json:"condition,omitempty"`
-	Error              string          `json:"error,omitempty"`
-	NewCerts           []CTCert        `json:"-"`
-}
-
-// cloneCTLogState separates mutable checkpoint data at ownership boundaries.
-func cloneCTLogState(state CTLogState) CTLogState {
-	state.SeenIDs = slices.Clone(state.SeenIDs)
-	state.Pending = slices.Clone(state.Pending)
-	state.NewCerts = slices.Clone(state.NewCerts)
-	if state.Condition != nil {
-		condition := *state.Condition
-		state.Condition = &condition
-	}
-	return state
-}
-
-// CTStateFile is the versioned on-disk checkpoint for monitored domains.
-type CTStateFile struct {
-	Version int                   `json:"version"`
-	Domains map[string]CTLogState `json:"domains"`
 }
 
 // NSHealthServerResult stores the evaluation metrics for an individual authoritative nameserver.
@@ -616,9 +521,7 @@ type CheckState struct {
 	RDAP        map[string]RDAPState      `json:"rdap_checks"`
 	DNS         map[string]DNSState       `json:"dns_checks"`
 	Email       map[string]EmailState     `json:"email_checks"`
-	CAA         map[string]CAAResult      `json:"caa_checks,omitempty"`
 	DNSSEC      map[string]DNSSECResult   `json:"dnssec_checks,omitempty"`
-	CTLogs      map[string]CTLogState     `json:"ct_logs,omitempty"`
 	NSHealth    map[string]NSHealthResult `json:"ns_health,omitempty"`
 	LastUpdated string                    `json:"last_updated"`
 	NextRefresh string                    `json:"next_refresh"`
@@ -629,9 +532,7 @@ type DomainResult struct {
 	Domain   string
 	RDAP     RDAPState
 	Email    EmailState
-	CAA      CAAResult
 	DNSSEC   DNSSECResult
-	CTLogs   CTLogState
 	NSHealth NSHealthResult
 }
 
@@ -647,23 +548,9 @@ func NewCheckState() *CheckState {
 		RDAP:     make(map[string]RDAPState),
 		DNS:      make(map[string]DNSState),
 		Email:    make(map[string]EmailState),
-		CAA:      make(map[string]CAAResult),
 		DNSSEC:   make(map[string]DNSSECResult),
-		CTLogs:   make(map[string]CTLogState),
 		NSHealth: make(map[string]NSHealthResult),
 	}
-}
-
-// ExportCTLogs ...
-func (c *CheckState) ExportCTLogs() map[string]CTLogState {
-	if c == nil {
-		return make(map[string]CTLogState)
-	}
-	snapshot := make(map[string]CTLogState, len(c.CTLogs))
-	for domain, state := range c.CTLogs {
-		snapshot[domain] = cloneCTLogState(state)
-	}
-	return snapshot
 }
 
 // ApplyDNSResult transfers an individual DNS result into the cycle-owned state.
@@ -685,14 +572,8 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 	if res.Email.Status != StatusUnknown {
 		InitMap(&c.Email)[res.Domain] = res.Email
 	}
-	if res.CAA.Status != StatusUnknown {
-		InitMap(&c.CAA)[res.Domain] = res.CAA
-	}
 	if res.DNSSEC.Source != StrEmpty || res.DNSSEC.Error != StrEmpty || res.DNSSEC.Valid {
 		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
-	}
-	if res.CTLogs.Status != StatusUnknown {
-		InitMap(&c.CTLogs)[res.Domain] = res.CTLogs
 	}
 	if res.NSHealth.Status != StatusUnknown {
 		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
@@ -766,51 +647,24 @@ type DNSSECSnapshot struct {
 	Result DNSSECResult
 }
 
-// CAASnapshot holds raw CAA record data.
-type CAASnapshot struct {
-	Found  bool
-	Result CAAResult
-}
-
-// CTLogsSnapshot holds raw CT log query results.
-type CTLogsSnapshot struct {
-	Page1Err           error
-	BackfillErr        error
-	IsFirstRun         bool
-	Initialized        bool
-	NewCerts           []CTCert
-	CheckpointID       string
-	BackfillCursor     string
-	BackfillComplete   bool
-	ScanPages          int
-	LastAttemptUnix    int64
-	LastSuccessUnix    int64
-	LastCompleteUnix   int64
-	SeenIDs            []string
-	Pending            []CTPending
-	CoverageIncomplete bool
+// SSLSnapshot holds the certificate expiry data.
+type SSLSnapshot struct {
+	ExpiryDays int
+	Err        error
 }
 
 // 4. Notification Models & Interfaces
 
 // Alert represents a single notification event
 type Alert struct {
-	Message      string
-	Redacted     string
-	Identity     string
-	CT           bool
-	NeedNtfy     bool
-	NeedTelegram bool
-	Priority     AlertPriority
-	Tag          AlertTag
-	Domain       string
-	Name         string
-}
+	Message  string
+	Redacted string
+	Identity string
 
-// CTAcceptance records which configured providers accepted a CT discovery.
-type CTAcceptance struct {
-	Ntfy     bool
-	Telegram bool
+	Priority AlertPriority
+	Tag      AlertTag
+	Domain   string
+	Name     string
 }
 
 // Notifier is the interface for dispatching alerts.
@@ -820,12 +674,6 @@ type Notifier interface {
 }
 
 // 5. External API & Response Payloads
-
-type ctLogsPageResponse struct {
-	Rows       []CTCert `json:"rows"`
-	HasNext    bool     `json:"has_next"`
-	NextCursor string   `json:"next_cursor"`
-}
 
 type dnsRegistry struct {
 	Services [][][]string `json:"services"`
