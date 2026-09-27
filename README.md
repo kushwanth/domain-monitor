@@ -11,8 +11,9 @@ It runs as one process with bounded concurrency, resource limits, an embedded da
 
 ## Key Features
 
-*   **RDAP & WHOIS Monitoring:** IANA RDAP bootstrap discovery with registry exceptions and fallback to port-43 WHOIS. Monitors registration, expiry and nameserver evidence.
-*   **DNS Record Integrity:** Validates `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `IP`, and `ALIAS` records. Supports `exact`, `prefix`, `contains`, and `any_of` matching strategies, CNAME flattening, and per-record custom resolver overrides.
+*   **RDAP & WHOIS Monitoring:** IANA RDAP bootstrap discovery with registry exceptions and fallback to port-43 WHOIS. Thin RDAP responses missing expiry or registrar data are supplemented from WHOIS; successful RDAP evidence survives WHOIS failures. Monitors registration, expiry and nameserver evidence.
+*   **DNS Record Integrity:** Validates `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, `IP`, and `ALIAS` records. Supports `exact`, `prefix`, `contains`, and `any_of` matching strategies, CNAME flattening, and per-record custom resolver overrides.
+*   **CAA Publication Checks:** Compares configured issuer-tag values and supports explicit deny-all lists. This monitors DNS publication; it does not verify certificates or evaluate CA issuance policy.
 *   **Email Security Suite:** Checks MX records against configured providers, discovers SPF and DMARC records, and checks configured DKIM selectors. It does not evaluate complete mail authentication policy. Bundled provider presets can be extended or overridden at startup using JSON files in `./data/email_providers/` or `email_providers_dir`. Both MX suffixes and DKIM selectors come from those files.
 *   **2-Tier DNSSEC Verification:** Checks local DS/DNSKEY and RRSIG evidence and requires an authenticated DNS-over-HTTPS (DoH) response for a verified result.
 *   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Each cycle delivers its alerts, with domain-name redaction supported. Persistent problems alert again on subsequent cycles; failed deliveries are logged.
@@ -85,9 +86,21 @@ keeps only codes and start times, avoiding retention of old error messages.
 Domain names, DNS values and diagnostics still need strings; variable-sized
 results need bounded slices/maps. Optional condition pointers avoid embedding
 large unused diagnostics in healthy results. Configuration snapshots own their
-CAA policy slices. Worker results transfer ownership to the cycle collector;
-mutable cycle maps have one owner. Completed cycles publish one cached JSON
-snapshot. Bootstrap and pricing cache access return independent copies.
+CAA policy slices. Worker results are deeply copied into cycle state, whose
+mutable maps have one owner. DNS and fast-domain results are assembled after
+each phase, so their temporary buffers can be collected before the slow RDAP
+phase. Serial RDAP checks write directly into cycle state without a second
+portfolio-sized result buffer. Completed cycles publish one immutable cached
+JSON snapshot; in-progress changes do not affect HTTP readers.
+
+Between cycles, the engine retains status/condition history and the latest JSON
+snapshot rather than prior result trees. Bootstrap access returns independent
+server lists. Pricing refreshes replace an immutable catalog; callers receive
+scalar prices without copying or exposing its map. Existing catalog readers
+remain stable across refreshes, with the same freshness and stale-data limits.
+State, condition ages, pricing/bootstrap caches, and notification queues are
+in memory only. Restarting rebuilds them; the daemon does not persist check
+history or retry failed notification deliveries. Alerts are delivered in descending priority order, with a separate timeout for each provider attempt, bounded by cycle cancellation.
 
 Provider files use the filename as the provider name, for example `custom.json`:
 
@@ -127,14 +140,20 @@ files are read once; changes require a restart.
 | `verify_ns_health` | bool | No | Queries primary/secondary NS for reachability and SOA consistency. |
 | `suppress_alerts` | bool | No | Mutes notification alerts for this domain. |
 
+CAA tag lists distinguish omission from explicit denial. For example,
+`"caa": {"issue": ["ca.example"], "issuewild": []}` expects the configured issuer
+and `0 issuewild ";"`. Omitted or null tags are unconstrained. An empty CAA
+object adds no check. Only tags included in the policy constrain matching;
+other observed tags remain visible without causing a mismatch.
+
 ### DNS Record Options (`dns_records[]`)
 
 | Parameter | Type | Required | Description |
 | :--- | :--- | :---: | :--- |
 | `hostname` | string | **Yes** | Hostname / FQDN to query. |
-| `name` | string | **Yes** | Human-readable identifier. |
+| `name` | string | **Yes** | Human-readable identifier; the `__caa__` prefix is reserved for generated domain policies. |
 | `type` | string | **Yes** | Record type (`A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, `IP`, `ALIAS`). |
-| `expected` | array | **Yes** | List of expected values. An explicit empty list with exact matching monitors for absence. TXT values preserve case, punctuation, and literal `alias:` prefixes; surrounding whitespace is trimmed. |
+| `expected` | array | **Yes** | List of expected values. An explicit empty list with exact matching monitors for absence. Explicit CAA DNS tasks compare the full record set; omitted-tag relaxation applies only to domain `caa` policies. TXT values preserve case, punctuation, and literal `alias:` prefixes; surrounding whitespace is trimmed. |
 | `match_type` | string | No | Strategy: `"exact"` (default), `"prefix"`, `"contains"`, `"any_of"`. |
 | `custom_resolver` | string | No | Custom resolver IP for this record. |
 
@@ -161,7 +180,7 @@ The daemon provides an embedded Web UI and JSON API:
 
 *   **`GET /`:** Interactive Web Dashboard displaying the latest completed check and connection state. Domain cards show annual renewal prices when collapsed and expanded.
 *   **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
-*   **`GET /api/state`:** Real-time JSON snapshot of the full monitoring evaluation state.
+*   **`GET /api/state`:** Latest completed-cycle JSON snapshot; pending checks are published at startup.
 
 ---
 
@@ -229,12 +248,24 @@ The single [protocol reference](src/docs/protocols.md) links the RFCs and states
 
 The test suite uses injected clients, local HTTP/DNS fixtures, and a committed synthetic WHOIS corpus.
 
-To run the test suite:
+Run the local release checks from the repository root:
+
 ```bash
-go test -v -race ./src/...
+go test -race -coverprofile=coverage.out ./...
+go vet ./...
+golangci-lint run --config .golangci.yml
+gofmt -l src
+go tool cover -func=coverage.out
 ```
 
-A dashboard regression runs in headless Chromium when it is installed; it skips otherwise.
+Require no formatting differences and at least 83% total statement coverage.
+Install `golangci-lint` separately using a version built for the repository's Go
+toolchain. The repository supplies its lint configuration but currently pins
+no linter executable version. Clock-dependent code still uses system time;
+full clock injection remains an architecture improvement.
+
+The dashboard regression runs in headless Chromium when installed and skips
+otherwise. Install Chromium when verifying dashboard behavior for a release.
 
 Live tests are colocated with their protocol tests and skip unless explicitly
 enabled: `DOMAIN_MONITOR_LIVE=1 go test ./src -run '^TestLive' -count=1`.

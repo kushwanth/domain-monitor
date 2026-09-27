@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -60,28 +59,6 @@ func TestInitMap(t *testing.T) {
 	res := InitMap(&m3)
 	if res["orig"] != 1 {
 		t.Errorf("InitMap mutated existing map contents")
-	}
-}
-
-func TestCopyMap(t *testing.T) {
-	t.Parallel()
-
-	var nilMap map[string]int
-	copiedNil := CopyMap(nilMap)
-	if copiedNil == nil || len(copiedNil) != 0 {
-		t.Errorf("CopyMap(nil) expected non-nil empty map")
-	}
-
-	orig := map[string]int{"a": 1, "b": 2}
-	cp := CopyMap(orig)
-	if len(cp) != 2 || cp["a"] != 1 || cp["b"] != 2 {
-		t.Errorf("CopyMap failed to copy entries correctly")
-	}
-
-	// Mutate copy, ensure orig is untouched
-	cp["c"] = 3
-	if _, exists := orig["c"]; exists {
-		t.Errorf("Mutating copy affected original map")
 	}
 }
 
@@ -188,58 +165,6 @@ func TestDefaultPort(t *testing.T) {
 		if got := DefaultPort(tt.addr, tt.defaultPort); got != tt.expected {
 			t.Errorf("DefaultPort(%q, %q) = %q, expected %q", tt.addr, tt.defaultPort, got, tt.expected)
 		}
-	}
-}
-
-func TestIsSafeSubpath(t *testing.T) {
-	t.Parallel()
-
-	baseDir := "/app/data"
-
-	tests := []struct {
-		target   string
-		expected bool
-	}{
-		{"/app/data/ct_logs", true},
-		{"/app/data/ct_logs/example.com.json", true},
-		{"/app/data", false}, // exactly the same as baseDir
-		{"/app/data/../etc/passwd", false},
-		{"/etc/passwd", false},
-		{"/app/data_leak", false},
-	}
-
-	for _, tt := range tests {
-		if got := IsSafeSubpath(baseDir, tt.target); got != tt.expected {
-			t.Errorf("IsSafeSubpath(%q, %q) = %v, expected %v", baseDir, tt.target, got, tt.expected)
-		}
-	}
-}
-
-func TestAtomicWriteFile(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	filePath := filepath.Join(tmpDir, "test.txt")
-
-	data1 := []byte("first content")
-	if err := AtomicWriteFile(filePath, data1, 0600); err != nil {
-		t.Fatalf("AtomicWriteFile failed: %v", err)
-	}
-
-	read1, err := os.ReadFile(filePath)
-	if err != nil || string(read1) != string(data1) {
-		t.Fatalf("ReadFile got %q, expected %q (err: %v)", read1, data1, err)
-	}
-
-	// Overwrite atomically
-	data2 := []byte("second updated content")
-	if err := AtomicWriteFile(filePath, data2, 0600); err != nil {
-		t.Fatalf("AtomicWriteFile overwrite failed: %v", err)
-	}
-
-	read2, err := os.ReadFile(filePath)
-	if err != nil || string(read2) != string(data2) {
-		t.Fatalf("ReadFile after overwrite got %q, expected %q (err: %v)", read2, data2, err)
 	}
 }
 
@@ -380,11 +305,6 @@ func TestAnyToString(t *testing.T) {
 	}
 }
 
-func TestAtomicWriteFile_Coverage(t *testing.T) {
-	err := AtomicWriteFile("/invalid/path/that/does/not/exist", []byte("test"), 0644)
-	assert.Error(t, err)
-}
-
 func TestIsRestrictedIP(t *testing.T) {
 	assert.True(t, IsRestrictedIP(net.ParseIP("127.0.0.1")))
 	assert.True(t, IsRestrictedIP(net.ParseIP("10.0.0.1")))
@@ -521,8 +441,8 @@ func newRecordingNotifier() *recordingNotifier {
 	return &recordingNotifier{NotificationManager: notifier}
 }
 
-func (n *recordingNotifier) DispatchIdentified(identity, message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
-	n.NotificationManager.DispatchIdentified(identity, message, redacted, priority, tag, domain, name)
+func (n *recordingNotifier) Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
+	n.NotificationManager.Dispatch(message, redacted, priority, tag, domain, name)
 	n.captureAndFlush()
 }
 

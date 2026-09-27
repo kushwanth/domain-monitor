@@ -197,11 +197,6 @@ func TestEvaluateEmailSecurity_DMARCFailurePromotesSPFWarning(t *testing.T) {
 func TestValidateRecords_MatchTypes(t *testing.T) {
 	t.Parallel()
 
-	app := &AppState{
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
-	_ = app
-
 	// 1. Prefix match (e.g. SPF TXT records where other TXT records exist)
 	spfTask := DNSTask{
 		Hostname:  "google.com",
@@ -1512,12 +1507,6 @@ func TestDNS_CNAMEFlattening_DirectIPExpected(t *testing.T) {
 }
 
 func TestDNS_ValidateRecords_MultiIPConsolidatedAlert(t *testing.T) {
-	app := &AppState{
-		config:   AppConfig{},
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
-	_ = app
-
 	task := DNSTask{
 		Hostname: "cluster.example.com",
 		Name:     "Cluster Multi IP",
@@ -1643,12 +1632,6 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 }
 
 func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
-	app := &AppState{
-		config:   AppConfig{},
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
-	_ = app
-
 	task := DNSTask{
 		Hostname: "test.example.com",
 		Name:     "Test Mismatch Task",
@@ -1682,10 +1665,7 @@ func TestDNSState_ErrorPopulatedOnMismatch(t *testing.T) {
 }
 
 func TestDNS_ResolverIndexOverflow(t *testing.T) {
-	app := &AppState{
-		config:   AppConfig{},
-		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
-	}
+	app := &AppState{}
 
 	resolvers := []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 	// Set index near max uint32 boundary where signed int overflow would occur on 32-bit systems
@@ -2191,4 +2171,15 @@ func TestCanonicalCAARecordValue(t *testing.T) {
 	val2, ok := dnsAnswerText(caa, dns.TypeCAA)
 	assert.True(t, ok)
 	assert.Equal(t, `0 issue "letsencrypt.org"`, val2)
+}
+
+func TestSOALookupPreservesErrorCause(t *testing.T) {
+	app := NewAppState(AppConfig{})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(context.Context, *dns.Msg, string) (*dns.Msg, time.Duration, error) {
+		return nil, 0, io.ErrUnexpectedEOF
+	}}
+	_, _, err := selectNSSOA(context.Background(), app, "example.com", []string{"192.0.2.53:53"})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("SOA error lost its cause: %v", err)
+	}
 }

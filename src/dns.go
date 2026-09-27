@@ -456,7 +456,7 @@ func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn 
 	return false
 }
 
-// FetchDNSSECSnapshot ...
+// FetchDNSSECSnapshot fetches DNSSEC evidence when the check is enabled.
 func FetchDNSSECSnapshot(ctx context.Context, app *AppState, target DomainConfig) DNSSECSnapshot {
 	if !target.DNSSEC {
 		return DNSSECSnapshot{}
@@ -465,14 +465,14 @@ func FetchDNSSECSnapshot(ctx context.Context, app *AppState, target DomainConfig
 		return DNSSECSnapshot{Result: DNSSECResult{Source: DNSSECSourceLocalOnly, NetworkError: true, Error: MsgErrDNSSECResolverNotConfigured}}
 	}
 	dohURL := DefaultDoHURL
-	if app != nil && app.configuration().DoHURL != StrEmpty {
+	if app.configuration().DoHURL != StrEmpty {
 		dohURL = app.configuration().DoHURL
 	}
 	res := validateDNSSEC(ctx, app, target.Domain, app.resolvers(), dohURL)
 	return DNSSECSnapshot{Result: res}
 }
 
-// EvaluateDNSSEC ...
+// EvaluateDNSSEC evaluates fetched local and upstream DNSSEC evidence.
 func EvaluateDNSSEC(target DomainConfig, snapshot DNSSECSnapshot) (CheckStatus, *StateCondition, DNSSECResult) {
 	if !target.DNSSEC {
 		return StatusOK, nil, DNSSECResult{}
@@ -690,22 +690,8 @@ func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, str
 		var unauthorized []string
 		for _, found := range foundRecords {
 			if !slices.Contains(target.Expected, found) {
-				if target.Type == "CAA" {
-					parts := strings.SplitN(found, " ", 3)
-					if len(parts) == 3 {
-						tag := strings.ToLower(parts[1])
-						hasTagInExpected := false
-						for _, exp := range target.Expected {
-							expParts := strings.SplitN(exp, " ", 3)
-							if len(expParts) == 3 && strings.ToLower(expParts[1]) == tag {
-								hasTagInExpected = true
-								break
-							}
-						}
-						if !hasTagInExpected {
-							continue
-						}
-					}
+				if target.domainCAA && target.Type == RecordTypeCAA && caaTagIsUnconstrained(found, target.Expected) {
+					continue
 				}
 				unauthorized = append(unauthorized, found)
 				allMatch = false
@@ -720,6 +706,21 @@ func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, str
 		}
 		return true, StrEmpty, CodeDNSMatchVerified
 	}
+}
+
+// caaTagIsUnconstrained reports whether a well-formed record uses an omitted policy tag.
+func caaTagIsUnconstrained(record string, expected []string) bool {
+	parts := strings.SplitN(record, SymSpace, 3)
+	if len(parts) != 3 {
+		return false
+	}
+	for _, value := range expected {
+		expectedParts := strings.SplitN(value, SymSpace, 3)
+		if len(expectedParts) == 3 && strings.EqualFold(expectedParts[1], parts[1]) {
+			return false
+		}
+	}
+	return true
 }
 
 func hasUsableDKIMKey(record string) bool {
@@ -825,7 +826,7 @@ func hasValidDMARCPolicy(record string) bool {
 	return true
 }
 
-// FetchEmailSnapshot ...
+// FetchEmailSnapshot queries MX, SPF, DMARC, and configured DKIM selectors.
 func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig) EmailSnapshot {
 	snap := EmailSnapshot{
 		DKIMResults: make(map[string]bool),
@@ -932,7 +933,7 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 	return snap
 }
 
-// EvaluateEmailSecurity ...
+// EvaluateEmailSecurity evaluates published email records without sending alerts.
 func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, app *AppState) (CheckStatus, *StateCondition, EmailState) {
 	if !target.CheckEmailSecurity {
 		return StatusOK, nil, EmailState{}
@@ -1146,7 +1147,7 @@ func isProviderMXSafeDynamic(liveMXs []string, provider ProviderConfig) bool {
 	return true
 }
 
-// FetchNSSnapshot ...
+// FetchNSSnapshot queries SOA and optional DNSKEY evidence for one nameserver.
 func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimary bool, target DomainConfig) NSSnapshot {
 	srv := NSSnapshot{Nameserver: nsName, IsPrimary: isPrimary}
 	addresses, partial, err := resolveNSAddresses(ctx, app, nsName)
@@ -1231,7 +1232,7 @@ func selectNSSOA(ctx context.Context, app *AppState, domain string, addresses []
 		if err == nil {
 			err = fmt.Errorf(MsgErrNameserverAddressReturnedANil, address)
 		}
-		partial = fmt.Errorf(MsgErrSOALookupFailed, err.Error())
+		partial = fmt.Errorf(MsgErrSOALookupFailed, err)
 	}
 	return firstResponse, firstAddress, partial
 }
@@ -1275,7 +1276,7 @@ func fetchNSDNSKEY(ctx context.Context, app *AppState, domain, address string, s
 	}
 }
 
-// FetchNSHealthSnapshots ...
+// FetchNSHealthSnapshots queries each distinct configured nameserver in order.
 func FetchNSHealthSnapshots(ctx context.Context, app *AppState, target DomainConfig) []NSSnapshot {
 	if !target.VerifyNSHealth || len(target.ExpectedNS) == 0 {
 		return nil
@@ -1296,7 +1297,7 @@ func FetchNSHealthSnapshots(ctx context.Context, app *AppState, target DomainCon
 	return snapshots
 }
 
-// EvaluateNSHealth ...
+// EvaluateNSHealth checks authority, SOA consistency, and optional DNSKEY agreement.
 func EvaluateNSHealth(target DomainConfig, snapshots []NSSnapshot) (CheckStatus, *StateCondition) {
 	if len(snapshots) == 0 {
 		return StatusOK, nil

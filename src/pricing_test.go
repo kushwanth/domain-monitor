@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	jsonv2 "encoding/json/v2"
+	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -81,15 +85,15 @@ func TestPricingManager_Fetch(t *testing.T) {
 
 	ctx := context.Background()
 
-	prices, err := pm.fetch(ctx)
+	catalog, err := pm.fetch(ctx)
 	if err != nil {
 		t.Fatalf("fetch() returned unexpected error: %v", err)
 	}
 
-	if price, ok := prices["com"]; !ok || price != 11.08 {
+	if price, ok := catalog.price("com"); !ok || price != 11.08 {
 		t.Errorf("Expected com price 11.08, got %v", price)
 	}
-	if price, ok := prices["regonly"]; ok {
+	if price, ok := catalog.price("regonly"); ok {
 		t.Errorf("Expected regonly to be missing, got %v", price)
 	}
 }
@@ -206,16 +210,138 @@ func TestPricingStaleFallbackAndSnapshotIsolation(t *testing.T) {
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"tlds":[{"tld":"com","renewal":12}]}`))}, nil
 	}})
-	prices, err := manager.cachedPrices(context.Background())
+	catalog, err := manager.cachedCatalog(context.Background())
 	require.NoError(t, err)
-	prices["com"] = 999
+	original := catalog
 	fail = true
-	manager.fetchedAt = time.Now().Add(-2 * PricingCacheTTL)
-	prices, err = manager.cachedPrices(context.Background())
+	manager.catalog = &pricingCatalog{prices: catalog.prices, fetchedAt: time.Now().Add(-2 * PricingCacheTTL)}
+	catalog, err = manager.cachedCatalog(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, float64(12), prices["com"])
-	manager.fetchedAt = time.Now().Add(-PricingMaxStaleAge - time.Hour)
-	prices, err = manager.cachedPrices(context.Background())
+	price, ok := catalog.price("com")
+	require.True(t, ok)
+	assert.Equal(t, float64(12), price)
+	assert.NotSame(t, original, catalog)
+	assert.Equal(t, float64(12), original.prices["com"])
+	manager.catalog = &pricingCatalog{prices: catalog.prices, fetchedAt: time.Now().Add(-PricingMaxStaleAge - time.Hour)}
+	catalog, err = manager.cachedCatalog(context.Background())
 	require.Error(t, err)
-	assert.Nil(t, prices)
+	assert.Nil(t, catalog)
+}
+
+func TestPricingCatalogRefreshKeepsExistingReadersStable(t *testing.T) {
+	var requests atomic.Int32
+	manager := NewPricingManager(&MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		price := 12
+		if requests.Add(1) > 1 {
+			price = 24
+		}
+		body := fmt.Sprintf(`{"tlds":[{"tld":"com","renewal":%d}]}`, price)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}})
+	original, err := manager.cachedCatalog(context.Background())
+	require.NoError(t, err)
+	manager.catalog = &pricingCatalog{prices: original.prices, fetchedAt: time.Now().Add(-2 * PricingCacheTTL)}
+	var readers sync.WaitGroup
+	for range 8 {
+		readers.Go(func() {
+			for range 1000 {
+				price, ok := original.price("com")
+				if !ok || price != 12 {
+					t.Error("refresh mutated an existing catalog")
+				}
+			}
+		})
+	}
+	updated, err := manager.cachedCatalog(context.Background())
+	readers.Wait()
+	require.NoError(t, err)
+	price, ok := updated.price("com")
+	require.True(t, ok)
+	assert.Equal(t, float64(24), price)
+	assert.Equal(t, int32(2), requests.Load())
+	cached, err := manager.cachedCatalog(context.Background())
+	require.NoError(t, err)
+	assert.Same(t, updated, cached)
+	assert.Equal(t, int32(2), requests.Load())
+}
+
+func BenchmarkPricingCatalogRead(b *testing.B) {
+	prices := make(map[string]float64, 2000)
+	for i := range 2000 {
+		prices[fmt.Sprintf("tld%d", i)] = 12
+	}
+	manager := &PricingManager{catalog: &pricingCatalog{prices: prices, fetchedAt: time.Now()}}
+	b.Run("copied_catalog", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			manager.mu.Lock()
+			copyPrices := maps.Clone(manager.catalog.prices)
+			manager.mu.Unlock()
+			if copyPrices["tld0"] != 12 {
+				b.Fatal("missing price")
+			}
+		}
+	})
+	b.Run("immutable_catalog", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			catalog, err := manager.cachedCatalog(context.Background())
+			if err != nil {
+				b.Fatal(err)
+			}
+			if price, ok := catalog.price("tld0"); !ok || price != 12 {
+				b.Fatal("missing price")
+			}
+		}
+	})
+}
+
+func TestPricingFetchFailuresDoNotPublishCatalog(t *testing.T) {
+	for _, failure := range []string{"invalid URL", "transport", "read", "invalid JSON", "empty catalog", "unusable prices"} {
+		t.Run(failure, func(t *testing.T) {
+			pm := NewPricingManager(&MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+				if failure == "transport" {
+					return nil, errors.New("offline")
+				}
+				body := `{"tlds":[]}`
+				if failure == "invalid JSON" {
+					body = "invalid"
+				}
+				if failure == "unusable prices" {
+					body = `{"tlds":[{"tld":" ","renewal":12},{"tld":"com","renewal":0},{"tld":"org","renewal":-1}]}`
+				}
+				var reader io.Reader = strings.NewReader(body)
+				if failure == "read" {
+					reader = failingProviderReader{}
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(reader)}, nil
+			}})
+			if failure == "invalid URL" {
+				pm.url = "://invalid"
+			}
+			catalog, err := pm.cachedCatalog(context.Background())
+			require.Error(t, err)
+			assert.Nil(t, catalog)
+			assert.Nil(t, pm.catalog)
+		})
+	}
+	var absent *PricingManager
+	_, err := absent.fetch(context.Background())
+	assert.ErrorIs(t, err, ErrPricingManagerNil)
+	_, err = absent.cachedCatalog(context.Background())
+	assert.ErrorIs(t, err, ErrPricingManagerNil)
+}
+
+func TestPortfolioPricingUnavailableKeepsManualPrice(t *testing.T) {
+	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: "manual.com", RenewalPrice: 42}, {Domain: "automatic.com"}}})
+	for _, pm := range []*PricingManager{nil, NewPricingManager(nil)} {
+		state := NewCheckState()
+		state.RDAP["manual.com"] = RDAPState{Status: StatusOK}
+		state.RDAP["automatic.com"] = RDAPState{Status: StatusOK}
+		computePortfolioPricing(context.Background(), app, state, pm)
+		assert.Equal(t, float64(42), state.RDAP["manual.com"].RenewalPrice)
+		assert.Zero(t, state.RDAP["automatic.com"].RenewalPrice)
+	}
+	computePortfolioPricing(context.Background(), nil, NewCheckState(), nil)
+	computePortfolioPricing(context.Background(), app, nil, nil)
 }

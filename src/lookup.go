@@ -291,8 +291,7 @@ func normalizeEPPStatus(raw string) string {
 
 // NormalizeDomainStatuses deduplicates and normalizes status strings.
 // It also removes redundant generic status tokens (e.g. "transferProhibited", "deleteProhibited")
-// NormalizeDomainStatuses when a more specific client/server status (e.g. "clientTransferProhibited", "serverTransferProhibited") is present.
-
+// when a more specific client/server status (e.g. "clientTransferProhibited", "serverTransferProhibited") is present.
 func NormalizeDomainStatuses(statuses []string) []string {
 	seen := make(map[string]bool)
 	var normalized []string
@@ -890,8 +889,7 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RD
 }
 
 // FetchRDAPSnapshot fetches raw registry data via RDAP, falling back to WHOIS.
-// FetchRDAPSnapshot Returns raw data only — no business logic, no alerting.
-
+// Returns raw data only — no business logic, no alerting.
 func FetchRDAPSnapshot(ctx context.Context, httpClient HTTPDoer, app *AppState, domain string) RDAPSnapshot {
 	var snapshot RDAPSnapshot
 	var err error
@@ -899,7 +897,10 @@ func FetchRDAPSnapshot(ctx context.Context, httpClient HTTPDoer, app *AppState, 
 	for attempts := 1; attempts <= 3; attempts++ {
 		snapshot, err = fetchRDAP(ctx, httpClient, app, domain)
 		if err == nil {
-			return snapshot // Return immediately on success, no WHOIS fallback
+			if snapshot.RegistrarTier == nil && (snapshot.Expiration == StrEmpty || snapshot.Registrar == StrEmpty) {
+				return supplementThinRDAP(ctx, app, domain, snapshot)
+			}
+			return snapshot
 		}
 
 		errStr := err.Error()
@@ -953,10 +954,65 @@ func fallbackWHOISSnapshot(ctx context.Context, app *AppState, domain string, rd
 	return RDAPSnapshot{ProtocolUsed: ProtocolWHOISFailed, Err: fmt.Errorf(MsgErrRDAPAndWHOIS, rdapErr, whoisErr)}
 }
 
+func supplementThinRDAP(ctx context.Context, app *AppState, domain string, snapshot RDAPSnapshot) RDAPSnapshot {
+	whoisSnapshot, whoisErr := fetchWHOIS(ctx, app, domain)
+	if whoisErr != nil {
+		return snapshot
+	}
+	if whoisSnapshot.RegistrarTier != nil {
+		snapshot.RegistrarTier = whoisSnapshot.RegistrarTier
+	} else if whoisSnapshot.RegistryTier != nil && snapshot.RegistryTier == nil {
+		snapshot.RegistryTier = whoisSnapshot.RegistryTier
+	}
+	synthesized, discrepancies := synthesizeTierData(snapshot.RegistryTier, snapshot.RegistrarTier)
+	if snapshot.Expiration == StrEmpty {
+		snapshot.Expiration = firstNonEmptyString(synthesized.Expiration, whoisSnapshot.Expiration)
+	}
+	if snapshot.Registrar == StrEmpty {
+		snapshot.Registrar = firstNonEmptyString(synthesized.Registrar, whoisSnapshot.Registrar)
+	}
+	if snapshot.RegistrarIANAID == StrEmpty {
+		snapshot.RegistrarIANAID = firstNonEmptyString(synthesized.RegistrarIANAID, whoisSnapshot.RegistrarIANAID)
+	}
+	if len(snapshot.Nameservers) == 0 {
+		snapshot.Nameservers = firstNonEmptyStrings(synthesized.Nameservers, whoisSnapshot.Nameservers)
+	}
+	if len(snapshot.DomainStatus) == 0 {
+		snapshot.DomainStatus = firstNonEmptyStrings(synthesized.DomainStatus, whoisSnapshot.DomainStatus)
+	}
+	if !snapshot.DNSSEC {
+		snapshot.DNSSEC = synthesized.DNSSEC || whoisSnapshot.DNSSEC
+	}
+	snapshot.Discrepancies = discrepancies
+	snapshot.Source = supplementedRDAPSource(synthesized.Source, snapshot.RegistryTier, whoisSnapshot)
+	snapshot.ProtocolUsed = ProtocolHybrid
+	return snapshot
+}
+
+func supplementedRDAPSource(source string, registry *DomainTierData, whois RDAPSnapshot) string {
+	if whois.RegistrarTier == nil && whois.RegistryTier != nil && registry != whois.RegistryTier {
+		return source + SymPlus + whois.Source
+	}
+	return source
+}
+
+func firstNonEmptyString(primary, fallback string) string {
+	if primary != StrEmpty {
+		return primary
+	}
+	return fallback
+}
+
+func firstNonEmptyStrings(primary, fallback []string) []string {
+	if len(primary) > 0 {
+		return primary
+	}
+	return fallback
+}
+
 // EvaluateRDAP compares expected config against fetched RDAP snapshot.
 // Pure CPU — no network calls, no alerting.
-// EvaluateRDAP Returns (CheckStatus, *StateCondition).
-
+// Returns (CheckStatus, *StateCondition).
 func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *StateCondition) {
 	if target.Domain == StrEmpty {
 		return StatusPending, nil
@@ -1211,8 +1267,7 @@ func validateRDAPDomainIdentity(response *RDAPDomainResponse, expected string) e
 }
 
 // IsSafeRDAPURL validates that candidate registrar RDAP referral URLs are safe to query,
-// IsSafeRDAPURL blocking loopback, private, link-local, multicast, and cloud metadata destinations (RFC 7480 Section 5.3).
-
+// blocking loopback, private, link-local, multicast, and cloud metadata destinations (RFC 7480 Section 5.3).
 func IsSafeRDAPURL(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -1454,7 +1509,7 @@ func resolveRootZoneResolvers(ctx context.Context, app *AppState, rootZone strin
 	return rootIPs
 }
 
-// FetchNSDelegationSnapshot ...
+// FetchNSDelegationSnapshot fetches delegation evidence from the configured parent zone.
 func FetchNSDelegationSnapshot(ctx context.Context, app *AppState, target DomainConfig) NSDelegationSnapshot {
 	var snapshot NSDelegationSnapshot
 
@@ -1501,7 +1556,7 @@ func FetchNSDelegationSnapshot(ctx context.Context, app *AppState, target Domain
 	return snapshot
 }
 
-// EvaluateNSDelegation ...
+// EvaluateNSDelegation compares observed delegation with configured nameservers.
 func EvaluateNSDelegation(target DomainConfig, snapshot NSDelegationSnapshot) (CheckStatus, *StateCondition) {
 	if snapshot.Err != nil {
 		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: snapshot.Err.Error()}

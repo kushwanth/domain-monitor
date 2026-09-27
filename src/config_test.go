@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -883,7 +884,7 @@ func TestConfig_CompileTimeImmutability(t *testing.T) {
 	copied := app.Config()
 	copied.Port = "9999"
 	if app.Config().Port != "8080" {
-		t.Errorf("expected internal config port to remain 8080, got %s", app.Config().Port)
+		t.Errorf("changing copied port to %s changed internal port: got %s, want 8080", copied.Port, app.Config().Port)
 	}
 
 	// activeResolvers holds a cloned slice
@@ -1105,4 +1106,60 @@ func TestExternalEmailProvidersOverrideAndStayOwned(t *testing.T) {
 	assert.Contains(t, app.EmailProviders, "fastmail")
 	require.NoError(t, os.WriteFile(providerPath, []byte(`{}`), 0600))
 	assert.Equal(t, []string{"custom"}, app.EmailProviders["google"].DKIMSelectors, "provider files are read only at startup")
+}
+
+func TestEmailProviderFilesystemFailures(t *testing.T) {
+	providers := make(map[string]ProviderConfig)
+	require.Error(t, readEmailProviders(os.DirFS(filepath.Join(t.TempDir(), "missing")), providers))
+	_, err := readEmailProvider(fstest.MapFS{}, "missing.json")
+	require.ErrorIs(t, err, os.ErrNotExist)
+	source := fstest.MapFS{
+		"nested":        &fstest.MapFile{Mode: os.ModeDir},
+		"notes.txt":     &fstest.MapFile{Data: []byte("not a provider")},
+		"bad name.json": &fstest.MapFile{Data: []byte(`{"mx_records":["mail.example.com"]}`)},
+	}
+	require.ErrorContains(t, readEmailProviders(source, providers), "name")
+	assert.Empty(t, providers)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file")
+	require.NoError(t, os.WriteFile(file, []byte("not a directory"), 0600))
+	_, err = InitializeApp(context.Background(), AppConfig{EmailProvidersDir: file})
+	require.Error(t, err)
+}
+
+func TestLoadConfigAdditionalValidationFailures(t *testing.T) {
+	for _, env := range []string{EnvPort, EnvNtfyAuth, EnvTelegramToken, EnvTelegramChatID, EnvDoHURL} {
+		t.Setenv(env, "")
+	}
+	for _, tc := range []struct{ name, checks, want string }{
+		{"duplicate names", `"domains":[{"domain":"one.example","name":"same"},{"domain":"two.example","name":"same"}]`, "duplicate"},
+		{"health without primary", `"domains":[{"domain":"example.com","name":"example","verify_ns_health":true}]`, "expected_ns"},
+		{"wrong parent zone", `"domains":[{"domain":"example.com","name":"example","is_delegated_zone":true,"root_zone":"example.org"}]`, "root zone"},
+		{"invalid resolver port", `"dns_records":[{"hostname":"example.com","name":"web","type":"A","expected":[],"custom_resolver":"192.0.2.1:0"}]`, "resolver"},
+		{"invalid IPv6", `"dns_records":[{"hostname":"example.com","name":"web","type":"AAAA","expected":["invalid"]}]`, "IPv6"},
+		{"invalid IP", `"dns_records":[{"hostname":"example.com","name":"web","type":"IP","expected":["invalid"]}]`, "IP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},` + tc.checks + `}`
+			_, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) { return []byte(content), nil })
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := loadConfig(ctx, "", func(string) ([]byte, error) { t.Error("canceled load must not read files"); return nil, nil })
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = InitializeApp(ctx, AppConfig{})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestConfigRejectsReservedDNSTaskNames(t *testing.T) {
+	for _, env := range []string{EnvPort, EnvNtfyAuth, EnvTelegramToken, EnvTelegramChatID, EnvDoHURL} {
+		t.Setenv(env, "")
+	}
+	_, err := loadConfig(context.Background(), "memory", func(string) ([]byte, error) {
+		return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records":[{"hostname":"example.com","name":" __caa__web ","type":"A","expected":["192.0.2.1"]}]}`), nil
+	})
+	require.ErrorContains(t, err, "reserved")
 }

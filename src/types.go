@@ -18,13 +18,24 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// ResultCode represents a typed, zero-allocation condition code for protocol-level evaluator verdicts.
+type ResultCode int16
+
+// String returns the diagnostic name of a ResultCode.
+func (r ResultCode) String() string {
+	if int(r) >= 0 && int(r) < len(resultCodeNames) {
+		return resultCodeNames[r]
+	}
+	return ""
+}
+
 // EPPCode identifies known domain lifecycle statuses; unknown provider text stays on the wire.
 type EPPCode uint8
 
 // StringList is a slice of strings that unmarshals from either a single JSON string or an array of strings.
 type StringList []string
 
-// UnmarshalJSON ...
+// UnmarshalJSON accepts a single string, a string array, or null.
 func (s *StringList) UnmarshalJSON(data []byte) error {
 	if s == nil {
 		return errors.New(MsgErrNilStringListReceiver)
@@ -51,8 +62,7 @@ func (s *StringList) UnmarshalJSON(data []byte) error {
 }
 
 // StateCondition represents a typed evaluator verdict with optional context and duration tracking.
-// StateCondition Code is a compact numeric enum; Target contains diagnostic text when needed.
-
+// Code is a compact numeric enum; Target contains diagnostic text when needed.
 type StateCondition struct {
 	Code   ResultCode `json:"code"`
 	Target string     `json:"target,omitempty"`
@@ -153,25 +163,25 @@ type ProviderConfig struct {
 
 // 2. Configuration Models
 
-// NtfyConfig ...
+// NtfyConfig contains the notification topic URL and optional authorization.
 type NtfyConfig struct {
 	URL  string `json:"url"`
 	Auth string `json:"auth"`
 }
 
-// TelegramConfig ...
+// TelegramConfig contains the optional bot token and destination chat ID.
 type TelegramConfig struct {
 	Token  string `json:"token"`
 	ChatID string `json:"chat_id"`
 }
 
-// Notifications ...
+// Notifications contains the configured delivery providers.
 type Notifications struct {
 	Ntfy     *NtfyConfig     `json:"ntfy"`
 	Telegram *TelegramConfig `json:"telegram"`
 }
 
-// AppConfig ...
+// AppConfig defines startup settings and the checks to run.
 type AppConfig struct {
 	Port              string        `json:"port"`
 	LoopIntervalDays  float64       `json:"loop_interval_days"`
@@ -184,7 +194,7 @@ type AppConfig struct {
 	DNSRecords []DNSTask      `json:"dns_records"`
 }
 
-// DomainConfig ...
+// DomainConfig defines expected registration, DNS, and email evidence for a domain.
 type DomainConfig struct {
 	Domain                string     `json:"domain"`
 	Name                  string     `json:"name"`
@@ -227,8 +237,9 @@ type CAAResult struct {
 	Error      string          `json:"error,omitempty"`
 }
 
-// DNSTask ...
+// DNSTask defines a DNS record query and its expected values.
 type DNSTask struct {
+	domainCAA      bool       // Generated domain policy; omitted issuer tags are unconstrained.
 	Hostname       string     `json:"hostname"`
 	Name           string     `json:"name"`
 	Type           string     `json:"type"`
@@ -358,8 +369,7 @@ func cloneConfig(cfg AppConfig) AppConfig {
 }
 
 // SafeDispatch safely dispatches an alert via Notifier if both app and Notifier are non-nil,
-// SafeDispatch while always logging the alert message.
-
+// while always logging the alert message.
 func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
 	if a == nil || a.Notifier == nil {
 		switch priority {
@@ -432,7 +442,7 @@ type RDAPDomainResponse struct {
 	Links           []RDAPLink       `json:"links,omitempty"`
 }
 
-// DomainTierData ...
+// DomainTierData stores evidence from one registry or registrar response.
 type DomainTierData struct {
 	Source       string   `json:"source,omitempty"`
 	Server       string   `json:"server,omitempty"`
@@ -447,7 +457,7 @@ type DomainTierData struct {
 	Raw          string   `json:"-"`
 }
 
-// RDAPState ...
+// RDAPState stores evaluated registration evidence and renewal pricing.
 type RDAPState struct {
 	Status            CheckStatus     `json:"status"`
 	Condition         *StateCondition `json:"condition,omitempty"`
@@ -472,7 +482,7 @@ type RDAPState struct {
 	Discrepancies     []string        `json:"discrepancies,omitempty"`
 }
 
-// DNSState ...
+// DNSState stores expected and observed DNS records with their verdict.
 type DNSState struct {
 	Hostname  string          `json:"hostname"`
 	Name      string          `json:"name"`
@@ -484,7 +494,7 @@ type DNSState struct {
 	Error     string          `json:"error,omitempty"`
 }
 
-// EmailState ...
+// EmailState stores evaluated MX, SPF, DMARC, and DKIM publication evidence.
 type EmailState struct {
 	Provider     string          `json:"provider,omitempty"`
 	Status       CheckStatus     `json:"status"`
@@ -497,7 +507,7 @@ type EmailState struct {
 	Error        string          `json:"error,omitempty"`
 }
 
-// DNSSECResult ...
+// DNSSECResult stores local cryptographic and upstream validation evidence.
 type DNSSECResult struct {
 	Status          CheckStatus     `json:"status"`
 	Condition       *StateCondition `json:"condition,omitempty"`
@@ -576,41 +586,84 @@ func NewCheckState() *CheckState {
 	}
 }
 
-// ApplyDNSResult transfers an individual DNS result into the cycle-owned state.
+// ApplyDNSResult stores an independent copy of a worker result in cycle-owned state.
 func (c *CheckState) ApplyDNSResult(res DNSResult) {
 	if c == nil || res.State.Status == StatusUnknown || res.Name == StrEmpty {
 		return
 	}
+	res.State.Expected = slices.Clone(res.State.Expected)
+	res.State.Found = slices.Clone(res.State.Found)
+	res.State.Condition = clonePointer(res.State.Condition)
 	InitMap(&c.DNS)[res.Name] = res.State
 }
 
-// ApplyDomainResult transfers an individual domain result into the cycle-owned state.
+// ApplyDomainResult isolates all mutable worker data before storing it in cycle-owned state.
 func (c *CheckState) ApplyDomainResult(res DomainResult) {
 	if c == nil || res.Domain == StrEmpty {
 		return
 	}
 	if res.RDAP.Status != StatusUnknown {
-		InitMap(&c.RDAP)[res.Domain] = res.RDAP
+		InitMap(&c.RDAP)[res.Domain] = cloneRDAPState(res.RDAP)
 	}
 	if res.Email.Status != StatusUnknown {
+		res.Email.Condition = clonePointer(res.Email.Condition)
+		res.Email.MX = slices.Clone(res.Email.MX)
+		res.Email.DKIMValid = slices.Clone(res.Email.DKIMValid)
 		InitMap(&c.Email)[res.Domain] = res.Email
 	}
 	if res.DNSSEC.Source != StrEmpty || res.DNSSEC.Error != StrEmpty || res.DNSSEC.Valid {
+		res.DNSSEC.Condition = clonePointer(res.DNSSEC.Condition)
+		res.DNSSEC.Algorithms = slices.Clone(res.DNSSEC.Algorithms)
 		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
 	}
 	if res.NSHealth.Status != StatusUnknown {
+		res.NSHealth.Condition = clonePointer(res.NSHealth.Condition)
+		res.NSHealth.Servers = slices.Clone(res.NSHealth.Servers)
 		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
 	}
 	if res.CAA != nil {
-		InitMap(&c.CAA)[res.Domain] = res.CAA
+		caa := *res.CAA
+		caa.Condition = clonePointer(caa.Condition)
+		caa.Issue = slices.Clone(caa.Issue)
+		caa.IssueWild = slices.Clone(caa.IssueWild)
+		caa.IssueMail = slices.Clone(caa.IssueMail)
+		caa.UnknownCAs = slices.Clone(caa.UnknownCAs)
+		InitMap(&c.CAA)[res.Domain] = &caa
 	}
+}
+
+// clonePointer copies scalar-only pointed-to values; nested mutable fields need explicit cloning.
+func clonePointer[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
+}
+
+func cloneDomainTier(tier *DomainTierData) *DomainTierData {
+	cloned := clonePointer(tier)
+	if cloned != nil {
+		cloned.Nameservers = slices.Clone(cloned.Nameservers)
+		cloned.DomainStatus = slices.Clone(cloned.DomainStatus)
+	}
+	return cloned
+}
+
+func cloneRDAPState(state RDAPState) RDAPState {
+	state.Condition = clonePointer(state.Condition)
+	state.Nameservers = slices.Clone(state.Nameservers)
+	state.DomainStatus = slices.Clone(state.DomainStatus)
+	state.Discrepancies = slices.Clone(state.Discrepancies)
+	state.RegistryTier = cloneDomainTier(state.RegistryTier)
+	state.RegistrarTier = cloneDomainTier(state.RegistrarTier)
+	return state
 }
 
 // 7. Pipeline Snapshot Structs (Phase 2 Fetcher Outputs)
 
 // RDAPSnapshot holds raw registry/registrar data fetched from RDAP or WHOIS.
-// RDAPSnapshot Fields mirror RDAPState for direct assembly.
-
+// Fields mirror RDAPState for direct assembly.
 type RDAPSnapshot struct {
 	Registrar       string
 	RegistrarIANAID string
@@ -679,7 +732,6 @@ type DNSSECSnapshot struct {
 type Alert struct {
 	Message  string
 	Redacted string
-	Identity string
 
 	Priority AlertPriority
 	Tag      AlertTag
@@ -740,11 +792,21 @@ type DotSweepResponse struct {
 
 // PricingManager caches TLD renewal prices and bounds stale-data retention.
 type PricingManager struct {
-	http      HTTPDoer
-	url       string
-	mu        sync.Mutex
+	http    HTTPDoer
+	url     string
+	mu      sync.Mutex
+	catalog *pricingCatalog
+}
+
+// pricingCatalog is immutable after construction; refreshes replace the entire catalog.
+type pricingCatalog struct {
 	prices    map[string]float64
 	fetchedAt time.Time
+}
+
+func (c *pricingCatalog) price(tld string) (float64, bool) {
+	price, ok := c.prices[tld]
+	return price, ok
 }
 
 // NotificationManager sends alerts directly.

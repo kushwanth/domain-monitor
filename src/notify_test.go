@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -225,5 +227,140 @@ func TestTelegramRequestCreationRedactsToken(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), MsgLogTelegramRequestFailed) && !strings.Contains(output.String(), "missing") {
 		t.Fatalf("Expected failure log")
+	}
+}
+
+func TestNotificationProviderFailures(t *testing.T) {
+	// Serial because the captured logger is shared by the process.
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(previous)
+	for _, provider := range []string{"ntfy", "telegram"} {
+		for _, failure := range []string{"missing client", "invalid URL", "transport", "status", "invalid JSON", "rejected", "read"} {
+			if provider == "ntfy" && (failure == "invalid JSON" || failure == "rejected" || failure == "read") {
+				continue
+			}
+			t.Run(provider+"/"+failure, func(t *testing.T) {
+				logs.Reset()
+				nm := NewNotificationManager("https://ntfy.invalid/topic", "secret-auth", "secret-token", "chat")
+				calls := 0
+				nm.HTTPClient = &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+					calls++
+					if req.Method != http.MethodPost || req.Header.Get(HeaderUserAgent) != DefaultUserAgent {
+						t.Error("missing provider request method or user agent")
+					}
+					if provider == "ntfy" && req.Header.Get(HeaderAuthorization) != nm.NtfyAuth {
+						t.Error("missing authentication")
+					}
+					if failure == "transport" {
+						return nil, errors.New("transport failed: secret-auth secret-token")
+					}
+					status, body := http.StatusOK, `{"ok":true}`
+					switch failure {
+					case "status":
+						status = http.StatusServiceUnavailable
+					case "invalid JSON":
+						body = "invalid"
+					case "rejected":
+						body = `{"ok":false}`
+					}
+					var reader io.Reader = strings.NewReader(body)
+					if failure == "read" {
+						reader = failingProviderReader{}
+					}
+					return &http.Response{StatusCode: status, Body: io.NopCloser(reader)}, nil
+				}}
+				if failure == "missing client" {
+					nm.HTTPClient = nil
+				}
+				if failure == "invalid URL" {
+					nm.NtfyURL = "://invalid"
+					nm.TelegramToken = "secret-token%zz"
+				}
+				alert := Alert{Message: "test", Priority: PriorityHigh}
+				var delivered bool
+				if provider == "ntfy" {
+					delivered = nm.sendNtfyBatchContext(context.Background(), alert)
+				} else {
+					delivered = nm.sendTelegramBatchContext(context.Background(), alert)
+				}
+				if delivered {
+					t.Fatal("failure must not be reported as delivered")
+				}
+				wantCalls := 1
+				if failure == "missing client" || failure == "invalid URL" {
+					wantCalls = 0
+				}
+				if calls != wantCalls {
+					t.Errorf("transport calls = %d, want %d", calls, wantCalls)
+				}
+				secret := nm.NtfyAuth
+				if provider == "telegram" {
+					secret = nm.TelegramToken
+				}
+				if strings.Contains(logs.String(), secret) {
+					t.Fatal("provider credential leaked to logs")
+				}
+			})
+		}
+	}
+}
+
+type failingProviderReader struct{}
+
+func (failingProviderReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestNotificationFormattingAndPayloadLimits(t *testing.T) {
+	text := formatNtfyMessage(Alert{Message: strings.Repeat("x", MaxAlertMessageRunes+100)})
+	if len(text) > MaxAlertMessageRunes || !strings.HasSuffix(text, AlertTruncationNotice) {
+		t.Fatal("long ntfy message must be bounded with a truncation notice")
+	}
+	text = formatTelegramMessage(Alert{Message: strings.Repeat("&", MaxTelegramAlertRunes), Name: strings.Repeat("&", MaxAlertNameRunes)})
+	if len(text) > MaxProviderMessageBytes || strings.Contains(text, "&&") {
+		t.Fatal("escaped Telegram message exceeds limits or contains unescaped HTML")
+	}
+	var absent *NotificationManager
+	absent.FlushContext(context.Background())
+}
+
+func TestNotificationFlushPriorityAndIndependentAttempts(t *testing.T) {
+	for range 2 {
+		nm := NewNotificationManager("https://ntfy.invalid/topic", "", "token", "chat")
+		var previous context.Context
+		var attempts []string
+		nm.HTTPClient = &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+			if previous != nil && previous.Err() == nil {
+				t.Error("previous attempt context was not canceled before next delivery")
+			}
+			if req.Context().Err() != nil {
+				t.Error("previous failure canceled a subsequent attempt")
+			}
+			previous = req.Context()
+			if req.URL.Host == "ntfy.invalid" {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					return nil, err
+				}
+				attempts = append(attempts, string(body))
+				return nil, context.DeadlineExceeded
+			}
+			attempts = append(attempts, "telegram")
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true}`))}, nil
+		}}
+		for _, alert := range []Alert{{Message: "warning", Priority: PriorityWarning}, {Message: "critical", Priority: PriorityHigh}, {Message: "urgent", Priority: PriorityUrgent}, {Message: "critical second", Priority: PriorityHigh}} {
+			nm.Dispatch(alert.Message, "", alert.Priority, "", "", "")
+		}
+		nm.FlushContext(context.Background())
+		want := []string{"urgent", "telegram", "critical", "telegram", "critical second", "telegram", "warning", "telegram"}
+		if !slices.Equal(attempts, want) {
+			t.Errorf("delivery order = %v, want %v", attempts, want)
+		}
+		if previous == nil || previous.Err() == nil {
+			t.Error("last attempt context was not released")
+		}
+		if len(nm.takeAlertBatch()) != 0 {
+			t.Error("completed attempts retained in queue")
+		}
 	}
 }

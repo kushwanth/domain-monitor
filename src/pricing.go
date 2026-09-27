@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -27,29 +26,28 @@ func normalizeTLD(tld string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(tld)), SymDot)
 }
 
-func (p *PricingManager) cachedPrices(ctx context.Context) (map[string]float64, error) {
+func (p *PricingManager) cachedCatalog(ctx context.Context) (*pricingCatalog, error) {
 	if p == nil {
 		return nil, ErrPricingManagerNil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.prices) > 0 && time.Since(p.fetchedAt) < PricingCacheTTL {
-		return maps.Clone(p.prices), nil
+	if p.catalog != nil && time.Since(p.catalog.fetchedAt) < PricingCacheTTL {
+		return p.catalog, nil
 	}
-	prices, err := p.fetch(ctx)
+	catalog, err := p.fetch(ctx)
 	if err != nil {
-		if len(p.prices) > 0 && time.Since(p.fetchedAt) <= PricingMaxStaleAge {
+		if p.catalog != nil && time.Since(p.catalog.fetchedAt) <= PricingMaxStaleAge {
 			LogWarn(MsgLogPricingFetchFailed, FieldError, err)
-			return maps.Clone(p.prices), nil
+			return p.catalog, nil
 		}
 		return nil, err
 	}
-	p.prices = prices
-	p.fetchedAt = time.Now()
-	return maps.Clone(p.prices), nil
+	p.catalog = catalog
+	return p.catalog, nil
 }
 
-func (p *PricingManager) fetch(ctx context.Context) (map[string]float64, error) {
+func (p *PricingManager) fetch(ctx context.Context) (*pricingCatalog, error) {
 	if p == nil {
 		return nil, ErrPricingManagerNil
 	}
@@ -105,7 +103,7 @@ func (p *PricingManager) fetch(ctx context.Context) (map[string]float64, error) 
 		return nil, errors.New(MsgErrDotSweepNoData)
 	}
 
-	return newPrices, nil
+	return &pricingCatalog{prices: newPrices, fetchedAt: time.Now()}, nil
 }
 
 // extractTLD resolves the public suffix/TLD of a domain name using the public suffix list.
@@ -152,7 +150,7 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 		return
 	}
 
-	prices, err := pm.cachedPrices(ctx)
+	catalog, err := pm.cachedCatalog(ctx)
 	if err != nil {
 		LogWarn(MsgLogPricingFetchFailed, FieldError, err)
 		return
@@ -167,7 +165,7 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 			continue
 		}
 		tld := extractTLD(domainCfg.Domain)
-		if price, ok := prices[tld]; ok && price > 0 {
+		if price, ok := catalog.price(tld); ok && price > 0 {
 			state.RenewalPrice = price
 			loopState.RDAP[domainCfg.Domain] = state
 		}

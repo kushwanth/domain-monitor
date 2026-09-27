@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -65,27 +63,17 @@ func InitMap[K comparable, V any](m *map[K]V) map[K]V {
 	return *m
 }
 
-// CopyMap returns a shallow copy of src using maps.Clone. If src is nil, it returns an initialized empty map.
-func CopyMap[K comparable, V any](src map[K]V) map[K]V {
-	if src == nil {
-		return make(map[K]V)
-	}
-	return maps.Clone(src)
-}
-
 // --- 2. Domain & String Normalization Utilities ---
 
 // NormalizeDomain normalizes a domain or hostname by trimming whitespace,
-// NormalizeDomain stripping trailing dots, and converting to lowercase.
-
+// stripping trailing dots, and converting to lowercase.
 func NormalizeDomain(domain string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), SymDot))
 }
 
 // NormalizeDomainToASCIIText normalizes a domain name and converts internationalized
 // domain names (IDN/Punycode) to ASCII using idna.ToASCII. If conversion fails,
-// NormalizeDomainToASCIIText it falls back to NormalizeDomain(domain).
-
+// it falls back to NormalizeDomain(domain).
 func NormalizeDomainToASCIIText(domain string) string {
 	cleaned := NormalizeDomain(domain)
 	if ascii, err := idna.ToASCII(cleaned); err == nil && ascii != StrEmpty {
@@ -95,8 +83,7 @@ func NormalizeDomainToASCIIText(domain string) string {
 }
 
 // DeduplicateNonEmptyStrings trims each string in items, filters out empty strings,
-// DeduplicateNonEmptyStrings and deduplicates the remainder while preserving order.
-
+// and deduplicates the remainder while preserving order.
 func DeduplicateNonEmptyStrings(items []string) []string {
 	if len(items) == 0 {
 		return nil
@@ -119,8 +106,7 @@ func DeduplicateNonEmptyStrings(items []string) []string {
 // --- 3. Concurrency, Panic Recovery & Error Safety ---
 
 // RecoverAndLogPanic captures any active panic, logs it with context, and allows
-// RecoverAndLogPanic the enclosing function/goroutine to terminate gracefully.
-
+// the enclosing function/goroutine to terminate gracefully.
 func RecoverAndLogPanic(op string) {
 	if r := recover(); r != nil {
 		LogError(MsgLogRecoveredPanic, StrOperation, op, StrPanic, r)
@@ -157,8 +143,7 @@ func ResolveHTTPClient(client HTTPDoer) HTTPDoer {
 
 // DrainAndClose reads remaining bytes from rc up to maxBytes (defaulting to 4KB if <= 0)
 // and closes rc. Draining before closing allows Go's underlying HTTP Transport to
-// DrainAndClose reuse the established TCP/TLS connection.
-
+// reuse the established TCP/TLS connection.
 func DrainAndClose(rc io.ReadCloser, maxBytes int64) {
 	if rc == nil {
 		return
@@ -170,11 +155,10 @@ func DrainAndClose(rc io.ReadCloser, maxBytes int64) {
 	_ = rc.Close()
 }
 
-// --- 5. Network, Token & Filesystem Safety Utilities ---
+// --- 5. Network & Token Safety Utilities ---
 
 // DefaultPort ensures addr has a port component. If addr does not have a port,
-// DefaultPort defaultPort is appended. It correctly handles IPv4 and IPv6 addresses.
-
+// defaultPort is appended. It correctly handles IPv4 and IPv6 addresses.
 func DefaultPort(addr, defaultPort string) string {
 	cleanAddr := strings.TrimSpace(addr)
 	if _, _, err := net.SplitHostPort(cleanAddr); err != nil {
@@ -185,8 +169,7 @@ func DefaultPort(addr, defaultPort string) string {
 }
 
 // NormalizeStatusToken cleans and standardizes status tokens by removing spaces,
-// NormalizeStatusToken hyphens, and underscores, and converting to lowercase using single-pass allocation-free mapping.
-
+// hyphens, and underscores, and converting to lowercase using a single mapping pass.
 func NormalizeStatusToken(s string) string {
 	s = strings.TrimSpace(s)
 	if s == StrEmpty {
@@ -201,8 +184,7 @@ func NormalizeStatusToken(s string) string {
 }
 
 // IsRestrictedIP reports whether ip is a private, loopback, link-local, multicast,
-// IsRestrictedIP unspecified, or CGNAT IP address, suitable for SSRF and rebinding prevention.
-
+// unspecified, or CGNAT IP address, suitable for SSRF and rebinding prevention.
 func IsRestrictedIP(ip net.IP) bool {
 	if ip == nil {
 		return false
@@ -223,60 +205,6 @@ func IsRestrictedIP(ip net.IP) bool {
 	return false
 }
 
-// IsSafeSubpath reports whether targetPath is safely located strictly within baseDir,
-// IsSafeSubpath preventing directory traversal attacks.
-
-func IsSafeSubpath(baseDir, targetPath string) bool {
-	cleanBase := filepath.Clean(baseDir)
-	cleanTarget := filepath.Clean(targetPath)
-	if cleanTarget == cleanBase {
-		return false
-	}
-	rel, err := filepath.Rel(cleanBase, cleanTarget)
-	if err != nil {
-		return false
-	}
-	return !strings.HasPrefix(rel, SymDoubleDot) && !filepath.IsAbs(rel)
-}
-
-// AtomicWriteFile writes data to a temporary file in the destination directory and
-// AtomicWriteFile atomically renames it into place, preventing partial file corruption on process termination.
-
-func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, TempFilePattern)
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		if err != nil {
-			_ = tmp.Close()
-			// #nosec G703 -- tmpName is created by os.CreateTemp above.
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	// #nosec G703 -- tmpName is created by os.CreateTemp in the destination directory.
-	if err = os.Chmod(tmpName, perm); err != nil {
-		return err
-	}
-	if _, err = tmp.Write(data); err != nil {
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	// #nosec G703 -- tmpName is a fresh temp file and path is the caller-selected destination.
-	if err = os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	return nil
-}
-
 // --- 6. Standardized Logging Utilities with Localized Timezone (No k=v syntax, No Source) ---
 
 // NewConsoleHandler creates a new ConsoleHandler writing to w.
@@ -287,12 +215,12 @@ func NewConsoleHandler(w io.Writer) *ConsoleHandler {
 	}
 }
 
-// Enabled ...
+// Enabled accepts all log levels.
 func (h *ConsoleHandler) Enabled(_ context.Context, _ slog.Level) bool {
 	return true
 }
 
-// Handle ...
+// Handle formats a record and serializes writes to the shared output.
 func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 	timestamp := r.Time.In(time.Local).Format(DefaultLogTimeFormat)
 	levelStr := r.Level.String()
@@ -321,7 +249,7 @@ func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 	return err
 }
 
-// WithAttrs ...
+// WithAttrs returns a handler with independently owned formatted attributes.
 func (h *ConsoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	var formatted []string
 	for _, a := range attrs {
@@ -339,7 +267,7 @@ func (h *ConsoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
-// WithGroup ...
+// WithGroup preserves the flat attribute format used by this handler.
 func (h *ConsoleHandler) WithGroup(_ string) slog.Handler {
 	return h
 }
@@ -349,8 +277,7 @@ func init() {
 }
 
 // InitLocalizedLogger initializes the default slog logger to format timestamps
-// InitLocalizedLogger with the localized system timezone and clean human-readable output without key=value syntax or source annotations.
-
+// with the localized system timezone and clean human-readable output without key=value syntax or source annotations.
 func InitLocalizedLogger() {
 	slog.SetDefault(slog.New(NewConsoleHandler(os.Stderr)))
 }
@@ -363,7 +290,7 @@ func logWithLevel(ctx context.Context, level slog.Level, msg string, args ...any
 	}
 	r := slog.NewRecord(time.Now().In(time.Local), level, msg, 0)
 	r.Add(args...)
-	_ = logger.Handler().Handle(ctx, r)
+	_ = logger.Handler().Handle(ctx, r) // Logging failures must not interrupt monitoring.
 }
 
 // LogInfo logs an informational message with structured key-value attributes.

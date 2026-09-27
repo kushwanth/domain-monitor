@@ -2429,3 +2429,39 @@ func TestDialPublicWHOIS_MockLookup(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "mock dial failure")
 }
+
+func TestThinRDAPSupplementationPreservesEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, whois         string
+		whoisErr                  error
+		wantExpiry, wantRegistrar string
+		wantWHOIS                 bool
+	}{
+		{name: "missing expiration", body: `{"objectClassName":"domain","ldhName":"example.com","nameservers":[{"ldhName":"ns.rdap.example"}]}`, whois: "Domain Name: EXAMPLE.COM\nRegistry Expiry Date: 2030-01-01T00:00:00Z\nRegistrar: WHOIS Registrar\nName Server: ns.whois.example", wantExpiry: "2030-01-01T00:00:00Z", wantRegistrar: "WHOIS Registrar", wantWHOIS: true},
+		{name: "missing registrar", body: `{"objectClassName":"domain","ldhName":"example.com","events":[{"eventAction":"expiration","eventDate":"2030-01-01T00:00:00Z"}]}`, whois: "Domain Name: EXAMPLE.COM\nRegistry Expiry Date: 2031-01-01T00:00:00Z\nRegistrar: WHOIS Registrar", wantExpiry: "2030-01-01T00:00:00Z", wantRegistrar: "WHOIS Registrar", wantWHOIS: true},
+		{name: "WHOIS failure", body: `{"objectClassName":"domain","ldhName":"example.com","nameservers":[{"ldhName":"ns.rdap.example"}]}`, whoisErr: io.ErrUnexpectedEOF, wantWHOIS: true},
+		{name: "WHOIS absent domain", body: `{"objectClassName":"domain","ldhName":"example.com","nameservers":[{"ldhName":"ns.rdap.example"}]}`, whois: "No match for EXAMPLE.COM", wantWHOIS: true},
+		{name: "complete RDAP", body: `{"objectClassName":"domain","ldhName":"example.com","events":[{"eventAction":"expiration","eventDate":"2030-01-01T00:00:00Z"}],"entities":[{"roles":["registrar"],"handle":"RDAP-Registrar"}]}`, wantExpiry: "2030-01-01T00:00:00Z", wantRegistrar: "RDAP-Registrar"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			app := &AppState{Bootstrap: &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()}, RDAPURLAllowed: func(string) bool { return true }, WHOISClient: &MockWHOISClient{MockQuery: func(context.Context, string, string) (string, error) { calls++; return tc.whois, tc.whoisErr }}}
+			client := &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			}}
+			snapshot := FetchRDAPSnapshot(context.Background(), client, app, "example.com")
+			require.NoError(t, snapshot.Err)
+			assert.Equal(t, tc.wantExpiry, snapshot.Expiration)
+			assert.Equal(t, tc.wantRegistrar, snapshot.Registrar)
+			assert.Equal(t, tc.wantWHOIS, calls > 0)
+			require.NotNil(t, snapshot.RegistryTier)
+			assert.Equal(t, SourceRegistryRDAP, snapshot.RegistryTier.Source)
+			if strings.Contains(tc.body, "ns.rdap.example") {
+				assert.Equal(t, []string{"ns.rdap.example"}, snapshot.Nameservers)
+			}
+			if tc.wantWHOIS && tc.wantExpiry != "" {
+				assert.Contains(t, snapshot.Source, SourceRegistryWHOIS)
+			}
+		})
+	}
+}

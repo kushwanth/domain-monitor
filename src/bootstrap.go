@@ -17,8 +17,7 @@ import (
 )
 
 // RDAPTLSConfig returns a TLS configuration compatible with both modern and legacy ccTLD
-// RDAPTLSConfig RDAP registries (such as older RSA-CBC cipher suites). Modern AEAD ciphers are prioritized first.
-
+// RDAP registries (such as older RSA-CBC cipher suites). Modern AEAD ciphers are prioritized first.
 func RDAPTLSConfig() *tls.Config {
 	var ids []uint16
 	// 1. Add all secure modern cipher suites first (AES-GCM, ChaCha20-Poly1305, etc.)
@@ -99,12 +98,12 @@ func KnownWHOISServer(domain string) string {
 	return StrEmpty
 }
 
-// NewBootstrap ...
+// NewBootstrap creates a bootstrap cache using the injected HTTP client.
 func NewBootstrap(httpClient HTTPDoer) *Bootstrap {
 	return &Bootstrap{http: ResolveHTTPClient(httpClient), url: BootstrapURL}
 }
 
-// ServersFor ...
+// ServersFor returns an independent server list for the longest matching domain suffix.
 func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, error) {
 	if b == nil {
 		return nil, ErrBootstrapClientNil
@@ -155,10 +154,7 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 	}
 
 	if err := b.fetch(ctx); err != nil {
-		b.mu.RLock()
-		hasData := len(b.services) > 0
-		cacheAge := time.Since(b.fetchedAt)
-		b.mu.RUnlock()
+		hasData, cacheAge := b.cachedRegistryAge()
 
 		if hasData && cacheAge <= BootstrapMaxAge {
 			LogWarn(MsgLogRDAPRefreshFailed, StrError, err, StrCacheAge, cacheAge.Round(time.Minute))
@@ -167,6 +163,12 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 		return WrapError(MsgErrBootstrapRegistryUnavailable, err)
 	}
 	return nil
+}
+
+func (b *Bootstrap) cachedRegistryAge() (bool, time.Duration) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.services) > 0, time.Since(b.fetchedAt)
 }
 
 func (b *Bootstrap) fetch(ctx context.Context) error {
@@ -219,9 +221,9 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	}
 
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.services = services
 	b.fetchedAt = time.Now()
-	b.mu.Unlock()
 	return nil
 }
 

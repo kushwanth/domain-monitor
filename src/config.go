@@ -131,6 +131,11 @@ func validateNotificationEndpoints(notifications *Notifications) error {
 }
 
 func normalizeConfiguredChecks(rawCfg *AppConfig) error {
+	for _, task := range rawCfg.DNSRecords {
+		if strings.HasPrefix(strings.TrimSpace(task.Name), InternalCAATaskPrefix) {
+			return fmt.Errorf(MsgErrReservedDNSName, task.Name, InternalCAATaskPrefix)
+		}
+	}
 	seenDomains := make(map[string]bool, len(rawCfg.Domains))
 	seenDomainNames := make(map[string]bool, len(rawCfg.Domains))
 	for i := range rawCfg.Domains {
@@ -171,10 +176,11 @@ func normalizeConfiguredChecks(rawCfg *AppConfig) error {
 
 			if len(expected) > 0 {
 				task := DNSTask{
-					Hostname: d.Domain,
-					Name:     fmt.Sprintf("__caa__%s", d.Domain),
-					Type:     RecordTypeCAA,
-					Expected: expected,
+					domainCAA: true,
+					Hostname:  d.Domain,
+					Name:      InternalCAATaskPrefix + d.Domain,
+					Type:      RecordTypeCAA,
+					Expected:  expected,
 				}
 				rawCfg.DNSRecords = append(rawCfg.DNSRecords, task)
 			}
@@ -534,8 +540,7 @@ func normalizeExpectedIPValue(record DNSTask, rawVal string, parsedIP net.IP) (s
 }
 
 // InitializeApp wires the application without requiring upstream services to be reachable.
-// InitializeApp It does not mutate the provided AppConfig.
-
+// It does not mutate the provided AppConfig.
 func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf(MsgErrInitializeApplication, err)
@@ -585,9 +590,9 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 var emailProvidersFS embed.FS
 
 func loadEmailProviders(directory string) (map[string]ProviderConfig, error) {
-	builtin, err := fs.Sub(emailProvidersFS, "data/email_providers")
+	builtin, err := fs.Sub(emailProvidersFS, DefaultEmailProvidersDir)
 	if err != nil {
-		return nil, fmt.Errorf("open embedded email providers: %w", err)
+		return nil, fmt.Errorf(MsgErrOpenEmbeddedEmailProviders, err)
 	}
 	providers := make(map[string]ProviderConfig)
 	if err := readEmailProviders(builtin, providers); err != nil {
@@ -595,16 +600,16 @@ func loadEmailProviders(directory string) (map[string]ProviderConfig, error) {
 	}
 	explicit := strings.TrimSpace(directory) != StrEmpty
 	if !explicit {
-		directory = "data/email_providers"
+		directory = DefaultEmailProvidersDir
 	}
 	if _, err := os.Stat(directory); err != nil {
 		if !explicit && errors.Is(err, os.ErrNotExist) {
 			return providers, nil
 		}
-		return nil, fmt.Errorf("open email provider directory %s: %w", directory, err)
+		return nil, fmt.Errorf(MsgErrOpenEmailProviderDirectory, directory, err)
 	}
 	if err := readEmailProviders(os.DirFS(directory), providers); err != nil {
-		return nil, fmt.Errorf("load email providers from %s: %w", directory, err)
+		return nil, fmt.Errorf(MsgErrLoadEmailProviders, directory, err)
 	}
 	return providers, nil
 }
@@ -612,7 +617,7 @@ func loadEmailProviders(directory string) (map[string]ProviderConfig, error) {
 func readEmailProviders(source fs.FS, providers map[string]ProviderConfig) error {
 	entries, err := fs.ReadDir(source, ".")
 	if err != nil {
-		return fmt.Errorf("list email providers: %w", err)
+		return fmt.Errorf(MsgErrListEmailProviders, err)
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
@@ -624,7 +629,7 @@ func readEmailProviders(source fs.FS, providers map[string]ProviderConfig) error
 		}
 		name := strings.ToLower(strings.TrimSuffix(entry.Name(), ".json"))
 		if !ReValidDomain.MatchString(name + ".example") {
-			return fmt.Errorf("invalid email provider name %q", name)
+			return fmt.Errorf(MsgErrInvalidEmailProviderName, name)
 		}
 		providers[name] = cfg
 	}
@@ -634,35 +639,34 @@ func readEmailProviders(source fs.FS, providers map[string]ProviderConfig) error
 func readEmailProvider(source fs.FS, name string) (ProviderConfig, error) {
 	file, err := source.Open(name)
 	if err != nil {
-		return ProviderConfig{}, fmt.Errorf("open email provider %s: %w", name, err)
+		return ProviderConfig{}, fmt.Errorf(MsgErrOpenEmailProvider, name, err)
 	}
 	defer func() { _ = file.Close() }() // read-only close
-	const maxProviderBytes = 64 << 10
-	body, err := io.ReadAll(io.LimitReader(file, maxProviderBytes+1))
+	body, err := io.ReadAll(io.LimitReader(file, MaxEmailProviderResponseSize+1))
 	if err != nil {
-		return ProviderConfig{}, fmt.Errorf("read email provider %s: %w", name, err)
+		return ProviderConfig{}, fmt.Errorf(MsgErrReadEmailProvider, name, err)
 	}
-	if len(body) > maxProviderBytes {
-		return ProviderConfig{}, fmt.Errorf("email provider %s exceeds %d bytes", name, maxProviderBytes)
+	if len(body) > MaxEmailProviderResponseSize {
+		return ProviderConfig{}, fmt.Errorf(MsgErrEmailProviderExceedsBytes, name, MaxEmailProviderResponseSize)
 	}
 	var cfg ProviderConfig
 	if err := jsonv2.Unmarshal(body, &cfg); err != nil {
-		return cfg, fmt.Errorf("decode email provider %s: %w", name, err)
+		return cfg, fmt.Errorf(MsgErrDecodeEmailProvider, name, err)
 	}
 	if len(cfg.MXRecords) == 0 {
-		return cfg, fmt.Errorf("email provider %s has no MX records", name)
+		return cfg, fmt.Errorf(MsgErrEmailProviderMissingMX, name)
 	}
 	for i, mx := range cfg.MXRecords {
 		mx = NormalizeDomainToASCIIText(mx)
 		if !ReValidDomain.MatchString(mx) || len(mx) > 253 {
-			return cfg, fmt.Errorf("email provider %s has invalid MX suffix %q", name, mx)
+			return cfg, fmt.Errorf(MsgErrEmailProviderInvalidMX, name, mx)
 		}
 		cfg.MXRecords[i] = mx
 	}
 	for i, selector := range cfg.DKIMSelectors {
 		selector = strings.ToLower(strings.TrimSpace(selector))
 		if !ReValidDomain.MatchString(selector+".example") || len(selector) > 200 {
-			return cfg, fmt.Errorf("email provider %s has invalid DKIM selector %q", name, selector)
+			return cfg, fmt.Errorf(MsgErrEmailProviderInvalidSelector, name, selector)
 		}
 		cfg.DKIMSelectors[i] = selector
 	}

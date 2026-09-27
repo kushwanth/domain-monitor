@@ -738,12 +738,7 @@
     }
 
     function switchView(view) {
-      if (view === 'nshealth') {
-        const nsHealthChecks = appState.ns_health || appState.ns_health_checks || {};
-        if (Object.keys(nsHealthChecks).length === 0) {
-          view = 'domains';
-        }
-      }
+      if (view !== 'domains' && view !== 'dns') view = 'domains';
       if (currentView !== view) {
         currentFilter = 'all'; // reset filter on view switch
         currentPage = 1;
@@ -766,8 +761,9 @@
         history.replaceState(null, '', '#' + view);
       }
       document.getElementById('nav-domains').classList.toggle('active', view === 'domains');
-      document.getElementById('nav-dns').classList.toggle('active', view === 'dns');document.getElementById('view-domains').classList.toggle('hidden', view !== 'domains');
-      document.getElementById('view-dns').classList.toggle('hidden', view !== 'dns');const controlsBar = document.getElementById('controls-bar');
+      document.getElementById('nav-dns').classList.toggle('active', view === 'dns');
+      document.getElementById('view-domains').classList.toggle('hidden', view !== 'domains');
+      document.getElementById('view-dns').classList.toggle('hidden', view !== 'dns');
 
       // Update stats on view switch without requiring a full fetch
       if (view === 'domains') {
@@ -790,7 +786,7 @@
       }
     }
 
-    function renderStats(total, healthy, issues, expiringDomains, expiringCerts, totalSlaves) {
+    function renderStats(total, healthy, issues, expiringDomains) {
       document.getElementById('view-stats').innerHTML = `
         <div class="stat-box ${currentFilter === 'all' ? 'active' : ''}" onclick="toggleFilter('all')">
           <span class="stat-label">Total</span>
@@ -810,11 +806,6 @@
           <span class="stat-value" style="${expiringDomains > 0 ? 'color: var(--warning);' : ''}">${expiringDomains}</span>
         </div>` : ''}
 
-        ${currentView === 'nshealth' ? `
-        <div class="stat-box ${currentFilter === 'slaves' ? 'active' : ''}" onclick="toggleFilter('slaves')">
-          <span class="stat-label">Replicas / Slaves</span>
-          <span class="stat-value" style="color: var(--primary); font-weight: 600;">${totalSlaves || 0}</span>
-        </div>` : ''}
       `;
     }
 
@@ -894,13 +885,10 @@
           if (data.last_updated !== appState.last_updated) {
             appState = data;
             updateRenewalPricing();
-            updateNavVisibility();
             if (currentView === 'domains') {
               renderDomains();
             } else if (currentView === 'dns') {
               renderDNS();
-            } else if (currentView === 'nshealth') {
-              renderNSHealth();
             }
           }
         }
@@ -913,12 +901,8 @@
       }
     }
 
-    function updateNavVisibility() {
-    }
-
     function initialize() {
       updateHeaderTimestamps();
-      updateNavVisibility();
       pollState();
 
       const hash = window.location.hash.replace('#', '');
@@ -931,15 +915,8 @@
           const card = document.querySelector(`details[data-search*="${CSS.escape(target)}"]`);
           if (card) card.open = true;
         }, 50);
-      } else if (hash.startsWith('nshealth:')) {
-        const target = hash.substring(9);
-        switchView('nshealth');
-        setTimeout(() => {
-          const card = document.querySelector(`details[data-search="${CSS.escape(target)}"]`);
-          if (card) card.open = true;
-        }, 50);
-      } else if (hash.startsWith('open:')) {
-        const target = hash.substring(5);
+      } else if (hash.startsWith('open:') || hash.startsWith('nshealth:')) {
+        const target = hash.substring(hash.startsWith('open:') ? 5 : 9);
         switchView('domains');
         setTimeout(() => {
           const card = document.querySelector(`details[data-search="${CSS.escape(target)}"]`);
@@ -960,15 +937,8 @@
             const card = document.querySelector(`details[data-search*="${CSS.escape(target)}"]`);
             if (card) card.open = true;
           }, 50);
-        } else if (view.startsWith('nshealth:')) {
-          const target = view.substring(9);
-          switchView('nshealth');
-          setTimeout(() => {
-            const card = document.querySelector(`details[data-search="${CSS.escape(target)}"]`);
-            if (card) card.open = true;
-          }, 50);
-        } else if (view.startsWith('open:')) {
-          const target = view.substring(5);
+        } else if (view.startsWith('open:') || view.startsWith('nshealth:')) {
+          const target = view.substring(view.startsWith('open:') ? 5 : 9);
           switchView('domains');
           setTimeout(() => {
             const card = document.querySelector(`details[data-search="${CSS.escape(target)}"]`);
@@ -1050,7 +1020,7 @@
             <p style="color: var(--text-muted); margin: 0; font-size: 0.9rem;">Initial domain and security checks are running.<br>Results will appear here automatically.</p>
           </div>
         `;
-        renderStats(0, 0, 0, 0, 0);
+        renderStats(0, 0, 0, 0);
         return;
       }
 
@@ -1425,7 +1395,7 @@
       }
 
       if (currentView === 'domains') {
-        renderStats(allDomains.size, healthyCount, issueCount, expiringCount, 0, 0);
+        renderStats(allDomains.size, healthyCount, issueCount, expiringCount);
       }
     }
 
@@ -1450,7 +1420,7 @@
             <p style="color: var(--text-muted); margin: 0; font-size: 0.9rem;">DNS record verification is running.<br>Records will appear here automatically.</p>
           </div>
         `;
-        renderStats(0, 0, 0, 0, 0);
+        renderStats(0, 0, 0, 0);
         return;
       }
 
@@ -1583,9 +1553,9 @@
           <summary class="domain-header domain-header-dns">
             <div class="domain-header-left">
               <div class="domain-title" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                <span style="text-transform: lowercase;">${hostname}</span>
+                <span style="text-transform: lowercase;">${name.toUpperCase()}</span>
                 <span class="badge" style="font-size: 0.72rem; padding: 2px 6px; background: var(--bg-hover); color: var(--text-muted); border: 1px solid var(--border);">${type}</span>
-                <span style="font-size: 0.85rem; color: var(--text-muted); font-weight: 500;">${name}</span>
+                <span style="font-size: 0.85rem; color: var(--text-muted); font-weight: 500;">${hostname}</span>
               </div>
             </div>
             <div class="domain-header-right">
@@ -1619,7 +1589,7 @@
       }
 
       if (currentView === 'dns') {
-        renderStats(dnsKeys.length, healthyCount, issueCount, 0, 0);
+        renderStats(dnsKeys.length, healthyCount, issueCount, 0);
       }
     }
 

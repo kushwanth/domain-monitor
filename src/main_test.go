@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -286,10 +288,17 @@ func TestReleaseDashboardCAAAndDNSPolling(t *testing.T) {
 	harness := `
  (async () => {
   try {
-   const fixture = {last_updated:'2026-09-27T00:00:00Z',rdap_checks:{'example.com':{status:'ok',nameservers:['ns.example.com']}},dns_checks:{web:{hostname:'example.com',name:'web',type:'A',status:'ok'}},caa_checks:{'example.com':{valid:false,issue:['unexpected.example']}}};
+   const previousTheme = document.documentElement.getAttribute('data-theme');
+   toggleTheme();
+   if (document.documentElement.getAttribute('data-theme') === previousTheme) throw new Error('Theme toggle failed without browser storage');
+   const fixture = {last_updated:'2026-09-27T00:00:00Z',rdap_checks:{'example.com':{status:'ok',nameservers:['ns.example.com'],renewal_price:12}},dns_checks:{web:{hostname:'example.com',name:'web',type:'A',status:'ok'}},caa_checks:{'example.com':{valid:false,issue:['unexpected.example']}},ns_health:{'example.com':{status:'ok',valid:true,primary:'ns.example.com',servers:[{}]}}};
    appState = fixture; renderDomains();
    currentFilter = 'issues'; renderDomains();
    if (!document.querySelector('#view-domains details')) throw new Error('Invalid CAA missing from issues');
+   switchView('nshealth');
+   if (currentView !== 'domains' || document.getElementById('view-domains').classList.contains('hidden')) throw new Error('Legacy nameserver view hides domain cards');
+   if (!document.getElementById('view-domains').textContent.includes('$12.00/yr')) throw new Error('Renewal price missing');
+   if (!document.getElementById('view-domains').textContent.includes('Nameserver Health')) throw new Error('Nameserver health missing');
    switchView('dns'); appState = {};
    window.fetch = async () => ({ok:true,json:async()=>fixture});
    window.setTimeout = () => 0;
@@ -301,6 +310,7 @@ func TestReleaseDashboardCAAAndDNSPolling(t *testing.T) {
   } catch(error) { document.body.setAttribute('data-audit-result',String(error)); }
  })();`
 	html := strings.Replace(string(indexHTML), "    initialize();", harness, 1)
+	html = strings.Replace(html, "<script>", `<script>Object.defineProperty(window, 'localStorage', {get() {throw new Error('Storage unavailable');}});</script><script>`, 1)
 	page := filepath.Join(t.TempDir(), "dashboard.html")
 	require.NoError(t, os.WriteFile(page, []byte(html), 0600))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -346,5 +356,186 @@ func TestReleaseCAACyclePublishesCondition(t *testing.T) {
 		var published CheckState
 		require.NoError(t, jsonv2.Unmarshal(encoded, &published))
 		assert.Equal(t, want, published.CAA["sub.example.com"].Status)
+	}
+}
+
+func TestSerialRDAPPanicPreservesCompletedChecks(t *testing.T) {
+	domains := []DomainConfig{{Domain: "first.com"}, {Domain: "delegated.first.com", IsDelegatedZone: true}, {Domain: "last.com"}}
+	app := NewAppState(AppConfig{Domains: domains})
+	app.Bootstrap = &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()}
+	app.RDAPLimiter = nil
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { panic("RDAP transport panic") })}
+	state := prepareCycleState(domains)
+	state.RDAP[domains[1].Domain] = RDAPState{Status: StatusOK, IsDelegatedZone: true}
+	state.Email[domains[0].Domain] = EmailState{Status: StatusOK, MX: []string{"mail.first.com"}}
+	executeRateLimitedChecks(context.Background(), app, domains, client, state)
+	for _, domain := range []string{"first.com", "last.com"} {
+		assert.Equal(t, StatusFailed, state.RDAP[domain].Status)
+		assert.Contains(t, state.RDAP[domain].Error, "RDAP transport panic")
+	}
+	assert.Equal(t, StatusOK, state.RDAP[domains[1].Domain].Status)
+	assert.Equal(t, []string{"mail.first.com"}, state.Email[domains[0].Domain].MX)
+}
+
+func TestCyclePublicationRemainsIsolated(t *testing.T) {
+	app := NewAppState(AppConfig{})
+	state := NewCheckState()
+	result := DNSResult{Name: "__caa__example.com", State: DNSState{Status: StatusMismatch, Condition: &StateCondition{Code: CodeDNSLookupFailed}, Found: []string{`0 issue "other.example"`}}}
+	assembleDNSResults(state, []DNSResult{result})
+	result.State.Condition.Target = "worker mutation"
+	assert.Empty(t, state.CAA["example.com"].Condition.Target)
+	publishCycleState(app, state, time.Hour)
+	before, ok := app.PrerenderedJSON.Load().([]byte)
+	require.True(t, ok)
+	original := string(before)
+	state.CAA["example.com"].Issue[0] = "cycle mutation"
+	state.CAA["example.com"].Condition.Target = "cycle mutation"
+	after, ok := app.PrerenderedJSON.Load().([]byte)
+	require.True(t, ok)
+	assert.Equal(t, original, string(after))
+	assert.NotContains(t, string(after), "mutation")
+}
+
+func TestSerialRDAPCancellationCompletesFailedResults(t *testing.T) {
+	domains := []DomainConfig{{Domain: "first.com"}, {Domain: "last.com"}}
+	app := NewAppState(AppConfig{Domains: domains})
+	app.Bootstrap = &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()}
+	app.RDAPLimiter = nil
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) { return nil, request.Context().Err() })}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	state := prepareCycleState(domains)
+	executeRateLimitedChecks(ctx, app, domains, client, state)
+	for _, domain := range domains {
+		assert.Equal(t, StatusFailed, state.RDAP[domain.Domain].Status)
+		assert.Contains(t, state.RDAP[domain.Domain].Error, context.Canceled.Error())
+	}
+}
+
+func TestFastDomainNameserverHealthPublished(t *testing.T) {
+	for _, mode := range []string{"matching", "different keys", "unreachable", "key lookup error"} {
+		t.Run(mode, func(t *testing.T) {
+			target := DomainConfig{Domain: "example.com", VerifyNSHealth: true, DNSSEC: true, ExpectedNS: []string{"192.0.2.1", "192.0.2.2"}}
+			app := NewAppState(AppConfig{Domains: []DomainConfig{target}})
+			app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+				secondary := strings.HasPrefix(address, "192.0.2.2:")
+				if secondary && (mode == "unreachable" || mode == "key lookup error" && q.Question[0].Qtype == dns.TypeDNSKEY) {
+					return nil, 0, errors.New("injected nameserver failure")
+				}
+				response := new(dns.Msg)
+				response.SetReply(q)
+				response.Authoritative = true
+				switch q.Question[0].Qtype {
+				case dns.TypeSOA:
+					response.Answer = []dns.RR{&dns.SOA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}, Serial: 42}}
+				case dns.TypeDNSKEY:
+					key := "AQID"
+					if secondary && mode == "different keys" {
+						key = "BAUG"
+					}
+					response.Answer = []dns.RR{&dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET}, Flags: 257, Protocol: 3, Algorithm: dns.ED25519, PublicKey: key}}
+				}
+				return response, 0, nil
+			}}
+			results := executeFastDomainChecks(context.Background(), app, []DomainConfig{target})
+			require.Len(t, results, 1)
+			health := results[0].NSHealth
+			require.Len(t, health.Servers, 2)
+			assert.Equal(t, target.ExpectedNS[0], health.Primary)
+			assert.True(t, health.Servers[0].IsPrimary)
+			assert.False(t, health.Servers[1].IsPrimary)
+			assert.Equal(t, uint32(42), health.Servers[0].SOASerial)
+			if mode == "matching" {
+				assert.Equal(t, StatusOK, health.Status)
+				assert.True(t, health.Valid)
+				assert.True(t, health.Servers[1].DNSKEYMatch)
+			} else {
+				assert.Equal(t, StatusFailed, health.Status)
+				assert.False(t, health.Valid)
+				if mode == "different keys" {
+					assert.False(t, health.Servers[1].DNSKEYMatch)
+				} else {
+					assert.Contains(t, health.Servers[1].Error, "injected nameserver failure")
+				}
+			}
+			state := NewCheckState()
+			state.ApplyDomainResult(results[0])
+			publishCycleState(app, state, time.Hour)
+			var published CheckState
+			require.NoError(t, jsonv2.Unmarshal(app.PrerenderedJSON.Load().([]byte), &published))
+			assert.Equal(t, health, published.NSHealth[target.Domain])
+		})
+	}
+}
+
+func TestPublicationFailureKeepsLastSnapshot(t *testing.T) {
+	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: "example.com"}}, DNSRecords: []DNSTask{{Name: "web", Hostname: "example.com", Type: RecordTypeA, Expected: []string{"192.0.2.1"}}}})
+	app.PublishInitialState()
+	original := app.PrerenderedJSON.Load().([]byte)
+	var initial CheckState
+	require.NoError(t, jsonv2.Unmarshal(original, &initial))
+	assert.Equal(t, StatusPending, initial.RDAP["example.com"].Status)
+	assert.Equal(t, StatusPending, initial.DNS["web"].Status)
+	assert.Equal(t, []string{"192.0.2.1"}, initial.DNS["web"].Expected)
+	state := NewCheckState()
+	state.RDAP["example.com"] = RDAPState{RenewalPrice: math.NaN()}
+	publishCycleState(app, state, time.Hour)
+	assert.Equal(t, original, app.PrerenderedJSON.Load().([]byte))
+	publishCycleState(nil, state, time.Hour)
+	assert.NotEmpty(t, state.NextRefresh)
+}
+
+func TestConditionSinceTracksCodeWithoutRetainingDiagnostic(t *testing.T) {
+	since := time.Now().Add(-time.Hour).UTC()
+	previous := map[string]StateCondition{"dns:example": {Code: CodeDNSLookupFailed, Since: since, Target: "old secret"}}
+	same := &StateCondition{Code: CodeDNSLookupFailed, Target: "new secret"}
+	applyConditionSince(same, "dns:example", previous)
+	assert.Equal(t, since, same.Since)
+	assert.Empty(t, previous["dns:example"].Target)
+	changed := &StateCondition{Code: CodeDNSMatchVerified}
+	applyConditionSince(changed, "dns:example", previous)
+	assert.True(t, changed.Since.After(since))
+	applyConditionSince(nil, "dns:example", previous)
+	assert.Equal(t, changed.Code, previous["dns:example"].Code)
+	assert.Equal(t, "1h0m0s", formatDurationSince(since))
+}
+
+func TestCAATaskMatchingScopes(t *testing.T) {
+	for _, tc := range []struct {
+		name, checks string
+		want         CheckStatus
+		domainPolicy bool
+	}{
+		{"explicit absence", `"dns_records":[{"hostname":"example.com","name":"CAA","type":"CAA","expected":[]}]`, StatusMismatch, false},
+		{"explicit exact set", `"dns_records":[{"hostname":"example.com","name":"CAA","type":"CAA","expected":["0 issue \"ca.example\""]}]`, StatusMismatch, false},
+		{"domain omitted tag", `"domains":[{"domain":"example.com","name":"Example","caa":{"issue":["ca.example"]}}]`, StatusOK, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(context.Background(), "memory", func(string) ([]byte, error) {
+				return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},` + tc.checks + `}`), nil
+			})
+			require.NoError(t, err)
+			app, err := InitializeApp(context.Background(), cfg)
+			require.NoError(t, err)
+			app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+				response := new(dns.Msg)
+				response.SetReply(q)
+				for _, text := range []string{`example.com. IN CAA 0 issue "ca.example"`, `example.com. IN CAA 0 issuewild "other.example"`} {
+					rr, err := dns.NewRR(text)
+					require.NoError(t, err)
+					response.Answer = append(response.Answer, rr)
+				}
+				return response, 0, nil
+			}}
+			state := NewCheckState()
+			assembleDNSResults(state, executeDNSChecks(context.Background(), app, app.configuration().DNSRecords))
+			if tc.domainPolicy {
+				require.NotNil(t, state.CAA["example.com"])
+				assert.Equal(t, tc.want, state.CAA["example.com"].Status)
+				assert.Empty(t, state.DNS)
+			} else {
+				assert.Equal(t, tc.want, state.DNS["CAA"].Status)
+			}
+		})
 	}
 }

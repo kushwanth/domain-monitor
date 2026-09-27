@@ -2,17 +2,19 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"html"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
 
-// NewNotificationManager ...
+// NewNotificationManager configures delivery providers; callers must inject its HTTP client.
 func NewNotificationManager(ntfyURL, ntfyAuth, teleToken, teleChatID string) *NotificationManager {
 	return &NotificationManager{
 		NtfyURL:        ntfyURL,
@@ -37,14 +39,9 @@ func truncateAlertBytes(message string, limit int) string {
 	return b.String() + AlertTruncationNotice
 }
 
-// Dispatch ...
+// Dispatch queues an alert for delivery.
 func (nm *NotificationManager) Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
-	nm.DispatchIdentified(domain+SymPipe+string(tag)+SymPipe+redacted, message, redacted, priority, tag, domain, name)
-}
-
-// DispatchIdentified queues an alert.
-func (nm *NotificationManager) DispatchIdentified(identity, message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
-	alert := Alert{Message: message, Redacted: redacted, Identity: identity, Priority: priority, Tag: tag, Domain: domain, Name: name}
+	alert := Alert{Message: message, Redacted: redacted, Priority: priority, Tag: tag, Domain: domain, Name: name}
 	logQueuedAlert(alert)
 	if nm == nil || (nm.NtfyURL == StrEmpty && nm.TelegramToken == StrEmpty) {
 		return
@@ -65,9 +62,6 @@ func logQueuedAlert(alert Alert) {
 	}
 }
 
-// RetainIdentities is a no-op as we removed cooldowns.
-func (nm *NotificationManager) RetainIdentities(active map[string]bool) {}
-
 // Flush delivers the queued batch.
 func (nm *NotificationManager) Flush() {
 	nm.FlushContext(context.Background())
@@ -78,26 +72,40 @@ func (nm *NotificationManager) FlushContext(parent context.Context) {
 	if nm == nil {
 		return
 	}
-	nm.mu.Lock()
-	batch := nm.alertBatch
-	nm.alertBatch = nil
-	nm.mu.Unlock()
+	batch := nm.takeAlertBatch()
 
 	if len(batch) == 0 {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout*2)
-	defer cancel()
+	slices.SortStableFunc(batch, func(a, b Alert) int {
+		return cmp.Compare(b.Priority, a.Priority)
+	})
 
 	for _, alert := range batch {
+		if parent.Err() != nil {
+			break
+		}
 		if nm.NtfyURL != StrEmpty {
+			ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout)
 			nm.sendNtfyBatchContext(ctx, alert)
+			cancel()
 		}
 		if nm.TelegramToken != StrEmpty {
+			ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout)
 			nm.sendTelegramBatchContext(ctx, alert)
+			cancel()
 		}
 	}
+}
+
+// takeAlertBatch detaches the queue before network I/O so dispatch can continue.
+func (nm *NotificationManager) takeAlertBatch() []Alert {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	batch := nm.alertBatch
+	nm.alertBatch = nil
+	return batch
 }
 
 func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, alert Alert) bool {
