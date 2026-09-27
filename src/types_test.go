@@ -7,7 +7,7 @@ import (
 )
 
 func TestAlertPriority_TextFormatting(t *testing.T) {
-	var p AlertPriority = PriorityHigh
+	p := PriorityHigh
 	b, err := p.MarshalText()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

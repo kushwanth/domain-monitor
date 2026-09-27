@@ -232,6 +232,7 @@ const (
 	StatusMismatch
 	StatusWarning
 	StatusHijacked
+	StatusSkipped
 )
 
 const (
@@ -241,7 +242,7 @@ const (
 	PriorityUrgent
 )
 
-var checkStatusNames = [...]string{"", "pending", "ok", "failed", "mismatch", "warning", "hijacked"}
+var checkStatusNames = [...]string{"", "pending", "ok", "failed", "mismatch", "warning", "hijacked", "skipped"}
 var alertPriorityNames = [...]string{"default", "warning", "high", "urgent"}
 
 const (

@@ -95,12 +95,11 @@ func TestRDAPValidation(t *testing.T) {
 			target := DomainConfig{
 				Domain:      "example.com",
 				Name:        "Example",
-				AllowExpiry: true,
 				ExpectedNS:  tt.targetNS,
 				SecondaryNS: tt.secondaryNS,
 			}
 
-			snapshot := RDAPSnapshot{
+			snapshot := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 				Nameservers:  tt.liveNS,
 				DomainStatus: []string{"clientTransferProhibited"},
 			}
@@ -441,10 +440,9 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 1. ExpectedRegistrarID Match
 	target1 := DomainConfig{
 		Domain:              "example.com",
-		AllowExpiry:         true,
 		ExpectedRegistrarID: "292",
 	}
-	snapshot1 := RDAPSnapshot{
+	snapshot1 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:       "MarkMonitor Inc.",
 		RegistrarIANAID: "292",
 		DomainStatus:    []string{"clientTransferProhibited"},
@@ -460,10 +458,9 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 2. ExpectedRegistrarID Mismatch
 	target2 := DomainConfig{
 		Domain:              "example.com",
-		AllowExpiry:         true,
 		ExpectedRegistrarID: "292",
 	}
-	snapshot2 := RDAPSnapshot{
+	snapshot2 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:       "Other Registrar LLC",
 		RegistrarIANAID: "146",
 		DomainStatus:    []string{"clientTransferProhibited"},
@@ -479,10 +476,9 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 3. ExpectedRegistrarName Match (case-insensitive substring)
 	target3 := DomainConfig{
 		Domain:                "example.com",
-		AllowExpiry:           true,
 		ExpectedRegistrarName: "markmonitor",
 	}
-	snapshot3 := RDAPSnapshot{
+	snapshot3 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:    "MarkMonitor, Inc.",
 		DomainStatus: []string{"clientTransferProhibited"},
 	}
@@ -497,10 +493,9 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 4. ExpectedRegistrarName Mismatch
 	target4 := DomainConfig{
 		Domain:                "example.com",
-		AllowExpiry:           true,
 		ExpectedRegistrarName: "markmonitor",
 	}
-	snapshot4 := RDAPSnapshot{
+	snapshot4 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:    "GoDaddy.com, LLC",
 		DomainStatus: []string{"clientTransferProhibited"},
 	}
@@ -515,11 +510,10 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 5. Both set: Priority 1 (ID) matches, while Priority 2 (Name) would mismatch -> Passes on prioritized ID
 	target5 := DomainConfig{
 		Domain:                "example.com",
-		AllowExpiry:           true,
 		ExpectedRegistrarID:   "292",
 		ExpectedRegistrarName: "godaddy", // Name would mismatch, but ID 292 matches!
 	}
-	snapshot5 := RDAPSnapshot{
+	snapshot5 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:       "MarkMonitor Inc.",
 		RegistrarIANAID: "292",
 		DomainStatus:    []string{"clientTransferProhibited"},
@@ -535,11 +529,10 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	// 6. Both set: Priority 1 (ID) mismatches, even though Priority 2 (Name) matches -> Fails on prioritized ID
 	target6 := DomainConfig{
 		Domain:                "example.com",
-		AllowExpiry:           true,
 		ExpectedRegistrarID:   "999",         // ID mismatches
 		ExpectedRegistrarName: "markmonitor", // Name matches
 	}
-	snapshot6 := RDAPSnapshot{
+	snapshot6 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:       "MarkMonitor Inc.",
 		RegistrarIANAID: "292",
 		DomainStatus:    []string{"clientTransferProhibited"},
@@ -558,10 +551,9 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 
 	target1 := DomainConfig{
 		Domain:               "example.com",
-		AllowExpiry:          true,
 		DomainTransferLocked: false,
 	}
-	snapshot1 := RDAPSnapshot{
+	snapshot1 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		DomainStatus: []string{"ok"},
 	}
 	status1, cond1 := EvaluateRDAP(target1, snapshot1)
@@ -574,10 +566,9 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 
 	target2 := DomainConfig{
 		Domain:               "example.com",
-		AllowExpiry:          true,
 		DomainTransferLocked: true,
 	}
-	snapshot2 := RDAPSnapshot{
+	snapshot2 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		DomainStatus: []string{"ok"},
 	}
 	status2, cond2 := EvaluateRDAP(target2, snapshot2)
@@ -590,10 +581,9 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 
 	target3 := DomainConfig{
 		Domain:               "example.com",
-		AllowExpiry:          true,
 		DomainTransferLocked: true,
 	}
-	snapshot3 := RDAPSnapshot{
+	snapshot3 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		DomainStatus: []string{"clientTransferProhibited"},
 	}
 	status3, cond3 := EvaluateRDAP(target3, snapshot3)
@@ -1764,17 +1754,15 @@ func TestEvaluateRDAP_ExpiryEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		expiry string
-		allow  bool
 		want   CheckStatus
 		code   ResultCode
 	}{
 		{name: "missing", want: StatusFailed, code: CodeRDAPExpiryUnavailable},
 		{name: "malformed", expiry: "not-a-date", want: StatusFailed, code: CodeRDAPExpiryUnavailable},
-		{name: "allowed missing", allow: true, want: StatusOK, code: CodeRDAPSuccess},
 		{name: "valid", expiry: time.Now().Add(365 * 24 * time.Hour).UTC().Format(time.RFC3339), want: StatusOK, code: CodeRDAPSuccess},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			status, cond := EvaluateRDAP(DomainConfig{Domain: "example.com", AllowExpiry: tc.allow}, RDAPSnapshot{Expiration: tc.expiry, DomainStatus: []string{"clientTransferProhibited"}})
+			status, cond := EvaluateRDAP(DomainConfig{Domain: "example.com"}, RDAPSnapshot{Expiration: tc.expiry, DomainStatus: []string{"clientTransferProhibited"}})
 			assert.Equal(t, tc.want, status)
 			require.NotNil(t, cond)
 			assert.Equal(t, tc.code, cond.Code)
@@ -2325,7 +2313,7 @@ func TestEPPStatusClassificationAndExtensions(t *testing.T) {
 	assert.True(t, isTransferLocked([]string{"clientTransferProhibited"}))
 	statuses := NormalizeDomainStatuses([]string{"providerCustomStatus", "serverHold"})
 	assert.Contains(t, statuses, "providerCustomStatus")
-	status, condition := EvaluateRDAP(DomainConfig{Domain: "example.com", AllowExpiry: true}, RDAPSnapshot{DomainStatus: statuses})
+	status, condition := EvaluateRDAP(DomainConfig{Domain: "example.com"}, RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339), DomainStatus: statuses})
 	assert.Equal(t, StatusFailed, status)
 	require.NotNil(t, condition)
 	assert.Equal(t, CodeEPPServerHold, condition.Code)
@@ -2405,7 +2393,7 @@ func TestLiveWHOISOrg(t *testing.T) {
 
 func TestEPPDocumentationLinkCannotHideHold(t *testing.T) {
 	statuses := NormalizeDomainStatuses([]string{"serverHold https://icann.org/epp#ok", "providerExtension https://icann.org/epp#clientTransferProhibited"})
-	status, condition := EvaluateRDAP(DomainConfig{Domain: "example.com", AllowExpiry: true}, RDAPSnapshot{DomainStatus: statuses})
+	status, condition := EvaluateRDAP(DomainConfig{Domain: "example.com"}, RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339), DomainStatus: statuses})
 	assert.Equal(t, StatusFailed, status)
 	require.NotNil(t, condition)
 	assert.Equal(t, CodeEPPServerHold, condition.Code)

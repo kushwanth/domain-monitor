@@ -152,7 +152,7 @@ func (p *AlertPriority) UnmarshalText(text []byte) error {
 	return fmt.Errorf(MsgErrUnknownAlertPriority, text)
 }
 
-// AlertTag defines the visual badge or emoji category for an alert
+// AlertTag defines the icon or emoji category for an alert.
 type AlertTag string
 
 // ProviderConfig represents dynamic provider data (MX and DKIM selectors)
@@ -204,7 +204,7 @@ type DomainConfig struct {
 	SecondaryNS           []string   `json:"secondary_ns,omitempty"`
 	ExpectedRegistrarID   string     `json:"expected_registrar_id,omitempty"`
 	ExpectedRegistrarName string     `json:"expected_registrar_name,omitempty"`
-	AllowExpiry           bool       `json:"allow_expiry,omitempty"`
+	Unused                bool       `json:"unused,omitempty"`
 	RenewalPrice          float64    `json:"renewal_price,omitempty"`
 	DomainTransferLocked  bool       `json:"domain_transfer_locked,omitempty"`
 	VerifyNSHealth        bool       `json:"verify_ns_health,omitempty"`
@@ -470,7 +470,7 @@ type RDAPState struct {
 	DomainStatus      []string        `json:"domain_status,omitempty"`
 	DNSSEC            bool            `json:"dnssec,omitempty"`
 	RenewalPrice      float64         `json:"renewal_price,omitempty"`
-	AllowExpiry       bool            `json:"allow_expiry,omitempty"`
+	Unused            bool            `json:"unused,omitempty"`
 	Error             string          `json:"error,omitempty"`
 	IsDelegatedZone   bool            `json:"is_delegated_zone,omitempty"`
 	Source            string          `json:"source,omitempty"`

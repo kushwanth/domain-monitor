@@ -1167,15 +1167,15 @@ func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimar
 	srv.Authoritative = soaMsg.Authoritative
 	if !srv.Authoritative {
 		if isPrimary {
-			srv.Err = errors.New(MsgErrPrimaryNSNotAuthoritative) //lint:ignore ST1005 preserve existing diagnostic text.
+			srv.Err = errors.New(MsgErrPrimaryNSNotAuthoritative) //nolint:staticcheck // ST1005: preserve existing diagnostic text.
 		} else {
-			srv.Err = errors.New(MsgErrSecondaryNSNotAuthoritative) //lint:ignore ST1005 preserve existing diagnostic text.
+			srv.Err = errors.New(MsgErrSecondaryNSNotAuthoritative) //nolint:staticcheck // ST1005: preserve existing diagnostic text.
 		}
 	}
 
 	srv.SOASerial, srv.HasSOA = findSOASerial(soaMsg, target.Domain)
 	if !srv.HasSOA {
-		soaMissingErr := errors.New(MsgErrNoSOARecordReturned) //lint:ignore ST1005 preserve existing diagnostic text.
+		soaMissingErr := errors.New(MsgErrNoSOARecordReturned) //nolint:staticcheck // ST1005: preserve existing diagnostic text.
 		if srv.Err == nil {
 			srv.Err = soaMissingErr
 		}
@@ -1284,14 +1284,14 @@ func FetchNSHealthSnapshots(ctx context.Context, app *AppState, target DomainCon
 
 	snapshots := make([]NSSnapshot, 0, len(target.ExpectedNS)+len(target.SecondaryNS))
 	seen := make(map[string]bool)
-	for _, name := range append(slices.Clone(target.ExpectedNS), target.SecondaryNS...) {
+	for index, name := range append(slices.Clone(target.ExpectedNS), target.SecondaryNS...) {
 		name = strings.TrimSpace(name)
 		key := strings.ToLower(strings.TrimSuffix(name, SymDot))
 		if key == StrEmpty || seen[key] {
 			continue
 		}
 		seen[key] = true
-		snapshots = append(snapshots, FetchNSSnapshot(ctx, app, name, len(snapshots) == 0, target))
+		snapshots = append(snapshots, FetchNSSnapshot(ctx, app, name, index < len(target.ExpectedNS), target))
 	}
 
 	return snapshots

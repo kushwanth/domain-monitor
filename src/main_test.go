@@ -87,6 +87,45 @@ func TestRunMonitoringCycle(t *testing.T) {
 	assert.Equal(t, StatusOK, published.DNSChecks["example A"].Status)
 }
 
+func TestUnusedDomainSkipsEveryCheckAndOwnedDNSRecord(t *testing.T) {
+	app := NewAppState(AppConfig{
+		Domains:    []DomainConfig{{Domain: "example.com", Unused: true}},
+		DNSRecords: []DNSTask{{Name: "unused A", Hostname: "www.example.com", Type: RecordTypeA}},
+	})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(context.Context, *dns.Msg, string) (*dns.Msg, time.Duration, error) {
+		t.Fatal("unused domain caused a DNS lookup")
+		return nil, 0, nil
+	}}
+	app.PublishInitialState()
+	initialJSON, ok := app.PrerenderedJSON.Load().([]byte)
+	require.True(t, ok)
+	var initial CheckState
+	require.NoError(t, jsonv2.Unmarshal(initialJSON, &initial))
+	assert.Equal(t, StatusSkipped, initial.RDAP["example.com"].Status)
+	assert.Empty(t, initial.DNS)
+
+	state := runMonitoringCycle(context.Background(), app, nil, nil, nil, nil, nil)
+	assert.Equal(t, StatusSkipped, state.RDAP["example.com"].Status)
+	assert.Empty(t, state.DNS)
+	assert.Empty(t, state.Email)
+	assert.Empty(t, state.CAA)
+	assert.Empty(t, state.DNSSEC)
+	assert.Empty(t, state.NSHealth)
+}
+
+func TestActiveDNSRecordsUsesMostSpecificDomain(t *testing.T) {
+	domains := []DomainConfig{{Domain: "example.com", Unused: true}, {Domain: "sub.example.com"}}
+	records := []DNSTask{
+		{Name: "parent", Hostname: "www.example.com"},
+		{Name: "child", Hostname: "www.sub.example.com"},
+		{Name: "unrelated", Hostname: "outside.test"},
+	}
+	active := activeDNSRecords(records, domains)
+	require.Len(t, active, 2)
+	assert.Equal(t, "child", active[0].Name)
+	assert.Equal(t, "unrelated", active[1].Name)
+}
+
 func TestMonitoringCycleDoesNotReportWrongClassDNSMatch(t *testing.T) {
 	app := NewAppState(AppConfig{DNSRecords: []DNSTask{{
 		Hostname: "example.com", Name: "example A", Type: RecordTypeA,
@@ -192,10 +231,11 @@ func TestProcessConditionsAndAlerts_AllChecksAndSuppression(t *testing.T) {
 }
 
 func TestFillPanicDomainResults(t *testing.T) {
-	cfg := DomainConfig{CheckEmailSecurity: true, IsDelegatedZone: true, DNSSEC: true, VerifyNSHealth: true}
+	cfg := DomainConfig{CheckEmailSecurity: true, MailProvider: "google", IsDelegatedZone: true, DNSSEC: true, VerifyNSHealth: true}
 	var res DomainResult
 	fillPanicDomainResults(cfg, &res, "some panic")
 	assert.Equal(t, StatusFailed, res.Email.Status)
+	assert.Equal(t, "google", res.Email.Provider)
 	assert.Equal(t, StatusFailed, res.RDAP.Status)
 	assert.Equal(t, StatusFailed, res.DNSSEC.Status)
 	assert.Equal(t, StatusFailed, res.NSHealth.Status)
@@ -415,11 +455,11 @@ func TestSerialRDAPCancellationCompletesFailedResults(t *testing.T) {
 func TestFastDomainNameserverHealthPublished(t *testing.T) {
 	for _, mode := range []string{"matching", "different keys", "unreachable", "key lookup error"} {
 		t.Run(mode, func(t *testing.T) {
-			target := DomainConfig{Domain: "example.com", VerifyNSHealth: true, DNSSEC: true, ExpectedNS: []string{"192.0.2.1", "192.0.2.2"}}
+			target := DomainConfig{Domain: "example.com", VerifyNSHealth: true, DNSSEC: true, ExpectedNS: []string{"192.0.2.1", "192.0.2.2"}, SecondaryNS: []string{"192.0.2.3"}}
 			app := NewAppState(AppConfig{Domains: []DomainConfig{target}})
 			app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
-				secondary := strings.HasPrefix(address, "192.0.2.2:")
-				if secondary && (mode == "unreachable" || mode == "key lookup error" && q.Question[0].Qtype == dns.TypeDNSKEY) {
+				redundantPrimary := strings.HasPrefix(address, "192.0.2.2:")
+				if redundantPrimary && (mode == "unreachable" || mode == "key lookup error" && q.Question[0].Qtype == dns.TypeDNSKEY) {
 					return nil, 0, errors.New("injected nameserver failure")
 				}
 				response := new(dns.Msg)
@@ -430,7 +470,7 @@ func TestFastDomainNameserverHealthPublished(t *testing.T) {
 					response.Answer = []dns.RR{&dns.SOA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}, Serial: 42}}
 				case dns.TypeDNSKEY:
 					key := "AQID"
-					if secondary && mode == "different keys" {
+					if redundantPrimary && mode == "different keys" {
 						key = "BAUG"
 					}
 					response.Answer = []dns.RR{&dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET}, Flags: 257, Protocol: 3, Algorithm: dns.ED25519, PublicKey: key}}
@@ -440,10 +480,11 @@ func TestFastDomainNameserverHealthPublished(t *testing.T) {
 			results := executeFastDomainChecks(context.Background(), app, []DomainConfig{target})
 			require.Len(t, results, 1)
 			health := results[0].NSHealth
-			require.Len(t, health.Servers, 2)
+			require.Len(t, health.Servers, 3)
 			assert.Equal(t, target.ExpectedNS[0], health.Primary)
 			assert.True(t, health.Servers[0].IsPrimary)
-			assert.False(t, health.Servers[1].IsPrimary)
+			assert.True(t, health.Servers[1].IsPrimary)
+			assert.False(t, health.Servers[2].IsPrimary)
 			assert.Equal(t, uint32(42), health.Servers[0].SOASerial)
 			if mode == "matching" {
 				assert.Equal(t, StatusOK, health.Status)
@@ -462,7 +503,9 @@ func TestFastDomainNameserverHealthPublished(t *testing.T) {
 			state.ApplyDomainResult(results[0])
 			publishCycleState(app, state, time.Hour)
 			var published CheckState
-			require.NoError(t, jsonv2.Unmarshal(app.PrerenderedJSON.Load().([]byte), &published))
+			publishedJSON, ok := app.PrerenderedJSON.Load().([]byte)
+			require.True(t, ok)
+			require.NoError(t, jsonv2.Unmarshal(publishedJSON, &published))
 			assert.Equal(t, health, published.NSHealth[target.Domain])
 		})
 	}
@@ -471,7 +514,8 @@ func TestFastDomainNameserverHealthPublished(t *testing.T) {
 func TestPublicationFailureKeepsLastSnapshot(t *testing.T) {
 	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: "example.com"}}, DNSRecords: []DNSTask{{Name: "web", Hostname: "example.com", Type: RecordTypeA, Expected: []string{"192.0.2.1"}}}})
 	app.PublishInitialState()
-	original := app.PrerenderedJSON.Load().([]byte)
+	original, ok := app.PrerenderedJSON.Load().([]byte)
+	require.True(t, ok)
 	var initial CheckState
 	require.NoError(t, jsonv2.Unmarshal(original, &initial))
 	assert.Equal(t, StatusPending, initial.RDAP["example.com"].Status)
@@ -480,7 +524,9 @@ func TestPublicationFailureKeepsLastSnapshot(t *testing.T) {
 	state := NewCheckState()
 	state.RDAP["example.com"] = RDAPState{RenewalPrice: math.NaN()}
 	publishCycleState(app, state, time.Hour)
-	assert.Equal(t, original, app.PrerenderedJSON.Load().([]byte))
+	current, ok := app.PrerenderedJSON.Load().([]byte)
+	require.True(t, ok)
+	assert.Equal(t, original, current)
 	publishCycleState(nil, state, time.Hour)
 	assert.NotEmpty(t, state.NextRefresh)
 }

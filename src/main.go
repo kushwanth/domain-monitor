@@ -191,7 +191,7 @@ func executeFastDomainChecks(ctx context.Context, app *AppState, domains []Domai
 					Condition:       cond,
 					IsDelegatedZone: true,
 					Source:          SourceDNSDelegation,
-					AllowExpiry:     domain.AllowExpiry,
+					Unused:          domain.Unused,
 					Nameservers:     snapshot.Nameservers,
 				}
 			}
@@ -251,10 +251,10 @@ func executeFastDomainChecks(ctx context.Context, app *AppState, domains []Domai
 func fillPanicDomainResults(domain DomainConfig, res *DomainResult, recovered any) {
 	message := fmt.Sprintf(MsgErrDomainCheckPanic, AnyToString(recovered))
 	if domain.CheckEmailSecurity && res.Email.Status == StatusUnknown {
-		res.Email = EmailState{Status: StatusFailed, Error: message, Condition: &StateCondition{Code: CodeDNSLookupFailed, Target: message}}
+		res.Email = EmailState{Provider: domain.MailProvider, Status: StatusFailed, Error: message, Condition: &StateCondition{Code: CodeDNSLookupFailed, Target: message}}
 	}
 	if domain.IsDelegatedZone && res.RDAP.Status == StatusUnknown {
-		res.RDAP = RDAPState{Status: StatusFailed, Error: message, IsDelegatedZone: true, Condition: &StateCondition{Code: CodeRDAPHTTPError, Target: message}}
+		res.RDAP = RDAPState{Status: StatusFailed, Error: message, IsDelegatedZone: true, Unused: domain.Unused, Condition: &StateCondition{Code: CodeRDAPHTTPError, Target: message}}
 	}
 	if domain.DNSSEC && res.DNSSEC.Status == StatusUnknown {
 		res.DNSSEC = DNSSECResult{Status: StatusFailed, Error: message, Condition: &StateCondition{Code: CodeDNSSECNetworkError, Target: message}}
@@ -276,11 +276,15 @@ func executeRateLimitedChecks(ctx context.Context, app *AppState, domains []Doma
 }
 
 func executeRDAPCheck(ctx context.Context, app *AppState, domainConfig DomainConfig, rdapHTTPClient *http.Client) (result RDAPState) {
+	if domainConfig.Unused {
+		return RDAPState{Status: StatusSkipped, Unused: true}
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			LogError(MsgLogPanicRDAP, FieldDomain, domainConfig.Domain, FieldPanic, r)
 			result = RDAPState{
 				Status:    StatusFailed,
+				Unused:    domainConfig.Unused,
 				Error:     fmt.Sprintf(MsgErrInternalRDAPCheckPanic, AnyToString(r)),
 				Condition: &StateCondition{Code: CodeRDAPHTTPError, Target: StrInternalRDAPCheckPanic},
 			}
@@ -299,7 +303,7 @@ func executeRDAPCheck(ctx context.Context, app *AppState, domainConfig DomainCon
 		DomainStatus:    snapshot.DomainStatus,
 		DNSSEC:          snapshot.DNSSEC,
 		RenewalPrice:    domainConfig.RenewalPrice,
-		AllowExpiry:     domainConfig.AllowExpiry,
+		Unused:          domainConfig.Unused,
 		Source:          snapshot.Source,
 		ProtocolUsed:    snapshot.ProtocolUsed,
 		QueryDurationMs: snapshot.QueryDurationMs,
@@ -387,16 +391,22 @@ func runMonitoringCycle(
 	}
 
 	var domains []DomainConfig
+	var activeDomains []DomainConfig
 	var dnsRecords []DNSTask
 	if app != nil {
 		cfg := app.configuration()
 		domains = cfg.Domains
-		dnsRecords = cfg.DNSRecords
+		for _, domain := range cfg.Domains {
+			if !domain.Unused {
+				activeDomains = append(activeDomains, domain)
+			}
+		}
+		dnsRecords = activeDNSRecords(cfg.DNSRecords, cfg.Domains)
 	}
 
 	// Bound cycle timeout safely: scale with domain and DNS record counts so large portfolios
 	// have sufficient time for rate-limited RDAP requests and retries without hanging indefinitely.
-	minRequiredTimeout := time.Duration(len(domains))*(10+5)*time.Second + time.Duration(len(dnsRecords))*5*time.Second + 5*time.Minute
+	minRequiredTimeout := time.Duration(len(activeDomains))*(10+5)*time.Second + time.Duration(len(dnsRecords))*5*time.Second + 5*time.Minute
 	cycleMaxTimeout := max(loopDur, minRequiredTimeout, 5*time.Minute)
 	cycleCtx, cycleCancel := context.WithTimeout(ctx, cycleMaxTimeout)
 	defer cycleCancel()
@@ -418,10 +428,10 @@ func runMonitoringCycle(
 
 	// Each phase is assembled before the next starts, releasing its temporary result storage.
 	assembleDNSResults(loopState, executeDNSChecks(cycleCtx, app, dnsRecords))
-	for _, res := range executeFastDomainChecks(cycleCtx, app, domains) {
+	for _, res := range executeFastDomainChecks(cycleCtx, app, activeDomains) {
 		loopState.ApplyDomainResult(res)
 	}
-	executeRateLimitedChecks(cycleCtx, app, domains, rdapHTTPClient, loopState)
+	executeRateLimitedChecks(cycleCtx, app, activeDomains, rdapHTTPClient, loopState)
 
 	if app != nil {
 		computePortfolioPricing(cycleCtx, app, loopState, app.Pricing)
@@ -433,7 +443,7 @@ func runMonitoringCycle(
 	logStateTransitions(CheckTypeEmail, TargetKeyDomain, loopState.Email, func(s EmailState) CheckStatus { return s.Status }, prevEmailStatus)
 
 	// 6. Track Since Timestamps and Dispatch Cycle Report
-	processConditionsAndAlerts(app, loopState, domains, dnsRecords, prevConditions)
+	processConditionsAndAlerts(app, loopState, activeDomains, dnsRecords, prevConditions)
 
 	// 7. Update timestamps and pre-render atomic JSON cache
 	loopState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
@@ -449,7 +459,7 @@ func runMonitoringCycle(
 	cycleDuration := time.Since(cycleStart)
 	LogInfo(MsgLogMonitoringCycleCompleted,
 		FieldDurationMS, cycleDuration.Milliseconds(),
-		FieldDomainsChecked, len(domains),
+		FieldDomainsChecked, len(activeDomains),
 		FieldDNSRecordsChecked, len(dnsRecords),
 	)
 
@@ -472,9 +482,35 @@ func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) 
 func prepareCycleState(domains []DomainConfig) *CheckState {
 	state := NewCheckState()
 	for _, domain := range domains {
-		state.RDAP[domain.Domain] = RDAPState{Status: StatusPending}
+		status := StatusPending
+		if domain.Unused {
+			status = StatusSkipped
+		}
+		state.RDAP[domain.Domain] = RDAPState{Status: status, Unused: domain.Unused}
 	}
 	return state
+}
+
+// activeDNSRecords excludes records owned by an unused domain. The most specific
+// configured domain owns a record, so an active delegated child remains monitored.
+func activeDNSRecords(records []DNSTask, domains []DomainConfig) []DNSTask {
+	active := make([]DNSTask, 0, len(records))
+	for _, record := range records {
+		host := strings.TrimSuffix(strings.ToLower(record.Hostname), ".")
+		ownerLength := -1
+		unused := false
+		for _, domain := range domains {
+			name := strings.TrimSuffix(strings.ToLower(domain.Domain), ".")
+			if (host == name || strings.HasSuffix(host, "."+name)) && len(name) > ownerLength {
+				ownerLength = len(name)
+				unused = domain.Unused
+			}
+		}
+		if !unused {
+			active = append(active, record)
+		}
+	}
+	return active
 }
 
 func applyConditionSince(cond *StateCondition, key string, prev map[string]StateCondition) {
@@ -669,11 +705,9 @@ func run(parent context.Context, configPath string) error {
 
 // PublishInitialState publishes pending checks before the first cycle completes.
 func (a *AppState) PublishInitialState() {
-	initialState := NewCheckState()
-	for _, domainCfg := range a.configuration().Domains {
-		initialState.RDAP[domainCfg.Domain] = RDAPState{Status: StatusPending}
-	}
-	for _, dnsRecord := range a.configuration().DNSRecords {
+	cfg := a.configuration()
+	initialState := prepareCycleState(cfg.Domains)
+	for _, dnsRecord := range activeDNSRecords(cfg.DNSRecords, cfg.Domains) {
 		initialState.DNS[dnsRecord.Name] = DNSState{
 			Hostname: dnsRecord.Hostname, Name: dnsRecord.Name,
 			Type: dnsRecord.Type, Expected: dnsRecord.Expected,

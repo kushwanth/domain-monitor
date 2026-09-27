@@ -173,7 +173,7 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 }
 
 func eligibleForRenewalPrice(domainCfg DomainConfig, states map[string]RDAPState) (RDAPState, bool) {
-	if domainCfg.AllowExpiry || domainCfg.IsDelegatedZone {
+	if domainCfg.Unused || domainCfg.IsDelegatedZone {
 		return RDAPState{}, false
 	}
 	state, exists := states[domainCfg.Domain]

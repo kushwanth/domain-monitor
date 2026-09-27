@@ -48,6 +48,24 @@ func TestLoadConfigInjectedReader(t *testing.T) {
 	}
 }
 
+func TestUnusedDomainConfigAndLegacyMigration(t *testing.T) {
+	configJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"unused-one.example","name":"Unused One","unused":true},{"domain":"unused-two.example","name":"Unused Two","unused":true,"allow_expiry":true},{"domain":"renewing.example","name":"Renewing","allow_expiry":true}]}`
+	cfg, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
+		return []byte(configJSON), nil
+	})
+	require.NoError(t, err)
+	require.Len(t, cfg.Domains, 3)
+	assert.True(t, cfg.Domains[0].Unused)
+	assert.True(t, cfg.Domains[1].Unused)
+	assert.True(t, cfg.Domains[2].Unused)
+
+	state := prepareCycleState(cfg.Domains)
+	assert.True(t, state.RDAP["unused-one.example"].Unused)
+	assert.True(t, state.RDAP["unused-two.example"].Unused)
+	assert.True(t, state.RDAP["renewing.example"].Unused)
+	assert.Equal(t, StatusSkipped, state.RDAP["renewing.example"].Status)
+}
+
 func FuzzNormalizeExpectedDNSValue(f *testing.F) {
 	for _, seed := range []struct{ recordType, value string }{
 		{RecordTypeA, "192.0.2.1"},

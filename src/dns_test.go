@@ -1346,6 +1346,8 @@ func TestNSHealthChecksAllExpectedServersAndSOAOwner(t *testing.T) {
 	target := DomainConfig{Domain: "example.com", ExpectedNS: []string{"93.184.216.34", "93.184.216.35"}, SecondaryNS: []string{"93.184.216.34"}, VerifyNSHealth: true}
 	snapshots := FetchNSHealthSnapshots(context.Background(), app, target)
 	require.Len(t, snapshots, 2)
+	assert.True(t, snapshots[0].IsPrimary)
+	assert.True(t, snapshots[1].IsPrimary)
 	assert.Equal(t, 1, queries["93.184.216.34:53"])
 	assert.Equal(t, 1, queries["93.184.216.35:53"])
 	assert.False(t, snapshots[1].HasSOA)
@@ -2165,7 +2167,8 @@ func TestLiveNullMX(t *testing.T) {
 func TestCanonicalCAARecordValue(t *testing.T) {
 	record, err := dns.NewRR(`example.com. 300 IN CAA 0 issue "letsencrypt.org"`)
 	require.NoError(t, err)
-	caa := record.(*dns.CAA)
+	caa, ok := record.(*dns.CAA)
+	require.True(t, ok)
 	val := canonicalCAARecordValue(caa)
 	assert.Equal(t, `0 issue "letsencrypt.org"`, val)
 	val2, ok := dnsAnswerText(caa, dns.TypeCAA)

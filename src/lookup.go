@@ -1014,6 +1014,9 @@ func firstNonEmptyStrings(primary, fallback []string) []string {
 // Pure CPU — no network calls, no alerting.
 // Returns (CheckStatus, *StateCondition).
 func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *StateCondition) {
+	if target.Unused {
+		return StatusSkipped, nil
+	}
 	if target.Domain == StrEmpty {
 		return StatusPending, nil
 	}
@@ -1034,21 +1037,19 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *Sta
 	ct := ConditionTracker{Status: StatusOK}
 
 	// 1. Checks expiration
-	if !target.AllowExpiry {
-		if t, _, err := parseFlexibleDate(snapshot.Expiration); err == nil {
-			days := time.Until(t).Hours() / 24
-			if days < 0 {
-				ct.Promote(StatusFailed, CodeRDAPExpired, StrEmpty)
-			} else if days <= DefaultRDAPExpiryWarningDays {
-				priority := StatusWarning
-				if days <= 7 {
-					priority = StatusFailed
-				}
-				ct.Promote(priority, CodeRDAPExpiringSoon, StrEmpty)
+	if t, _, err := parseFlexibleDate(snapshot.Expiration); err == nil {
+		days := time.Until(t).Hours() / 24
+		if days < 0 {
+			ct.Promote(StatusFailed, CodeRDAPExpired, StrEmpty)
+		} else if days <= DefaultRDAPExpiryWarningDays {
+			priority := StatusWarning
+			if days <= 7 {
+				priority = StatusFailed
 			}
-		} else {
-			ct.Promote(StatusFailed, CodeRDAPExpiryUnavailable, snapshot.Expiration)
+			ct.Promote(priority, CodeRDAPExpiringSoon, StrEmpty)
 		}
+	} else {
+		ct.Promote(StatusFailed, CodeRDAPExpiryUnavailable, snapshot.Expiration)
 	}
 
 	// 2. Checks NS delegation

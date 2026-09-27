@@ -22,7 +22,7 @@
       ],
       "expected_registrar_id": "292",
       "renewal_price": 0,
-      "allow_expiry": false,
+      "unused": false,
       "verify_ns_health": true,
       "domain_transfer_locked": true,
       "check_email_security": false,
