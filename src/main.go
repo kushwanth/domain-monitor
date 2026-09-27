@@ -360,7 +360,7 @@ func runMonitoringCycle(
 	}
 
 	// Bound cycle timeout safely: scale with domain and DNS record counts so large portfolios
-	// have sufficient time under the 10-second token bucket RDAP and 5-second CTLogs rate limiters, while never hanging indefinitely.
+	// have sufficient time for rate-limited RDAP requests and retries without hanging indefinitely.
 	minRequiredTimeout := time.Duration(len(domains))*(10+5)*time.Second + time.Duration(len(dnsRecords))*5*time.Second + 5*time.Minute
 	cycleMaxTimeout := max(loopDur, minRequiredTimeout, 5*time.Minute)
 	cycleCtx, cycleCancel := context.WithTimeout(ctx, cycleMaxTimeout)
@@ -384,10 +384,10 @@ func runMonitoringCycle(
 	// 1. Dispatch DNS Records
 	dnsResults := executeDNSChecks(cycleCtx, app, dnsRecords)
 
-	// 2. Dispatch Fast Domain Checks (Email, DNSSEC, CAA, NS Health, NS Delegation)
+	// 2. Dispatch Fast Domain Checks (Email, DNSSEC, NS Health, NS Delegation)
 	domainResults := executeFastDomainChecks(cycleCtx, app, domains)
 
-	// 3. Dispatch Slow, Rate-Limited External Checks Concurrently (RDAP and CT Logs)
+	// 3. Dispatch Slow, Rate-Limited External Checks (RDAP)
 	rdapResults := executeRateLimitedChecks(cycleCtx, app, domains, rdapHTTPClient)
 
 	for i := range domains {
@@ -398,6 +398,51 @@ func runMonitoringCycle(
 
 	// 4. Assemble CheckState using clean helper methods
 	for _, res := range dnsResults {
+		if strings.HasPrefix(res.Name, "__caa__") {
+			domainName := strings.TrimPrefix(res.Name, "__caa__")
+
+			caaRes := CAAResult{
+				Status:    res.State.Status,
+				Condition: res.State.Condition,
+				Valid:     res.State.Status == StatusOK,
+				Error:     res.State.Error,
+			}
+
+			expectedSet := make(map[string]bool)
+			for _, exp := range res.State.Expected {
+				expectedSet[exp] = true
+			}
+
+			for _, rec := range res.State.Found {
+				parts := strings.SplitN(rec, " ", 3)
+				if len(parts) == 3 {
+					tag := strings.ToLower(parts[1])
+					val := strings.Trim(parts[2], `"`)
+					switch tag {
+					case "issue":
+						caaRes.Issue = append(caaRes.Issue, val)
+					case "issuewild":
+						caaRes.IssueWild = append(caaRes.IssueWild, val)
+					case "issuemail":
+						caaRes.IssueMail = append(caaRes.IssueMail, val)
+					}
+				}
+
+				if !caaRes.Valid && !expectedSet[rec] {
+					if len(parts) == 3 {
+						caaRes.UnknownCAs = append(caaRes.UnknownCAs, strings.Trim(parts[2], `"`))
+					} else {
+						caaRes.UnknownCAs = append(caaRes.UnknownCAs, rec)
+					}
+				}
+			}
+
+			// We assign it here, but it doesn't get added to loopState.DNS!
+			// So it won't trigger DNS alerts. It will trigger CAA alerts since we add it to CAA.
+			InitMap(&loopState.CAA)[domainName] = &caaRes
+			continue
+		}
+
 		loopState.ApplyDNSResult(res)
 	}
 	for _, res := range domainResults {
@@ -417,6 +462,13 @@ func runMonitoringCycle(
 	// 7. Update timestamps and pre-render atomic JSON cache
 	loopState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 	publishCycleState(app, loopState, loopDur)
+	if app != nil && app.Notifier != nil {
+		if notifier, ok := app.Notifier.(interface{ FlushContext(context.Context) }); ok {
+			notifier.FlushContext(cycleCtx)
+		} else {
+			app.Notifier.Flush()
+		}
+	}
 
 	cycleDuration := time.Since(cycleStart)
 	LogInfo(MsgLogMonitoringCycleCompleted,
@@ -521,6 +573,9 @@ func collectDomainAlerts(app *AppState, state *CheckState, cfg DomainConfig, pre
 	}
 	if st, ok := state.Email[domain]; ok {
 		alerts = appendConditionAlert(alerts, name, domain, CheckTypeEmail, st.Condition, st.Status, suppress, prev, active)
+	}
+	if st, ok := state.CAA[domain]; ok && st != nil {
+		alerts = appendConditionAlert(alerts, name, domain, CheckTypeCAA, st.Condition, st.Status, suppress, prev, active)
 	}
 
 	if st, ok := state.DNSSEC[domain]; ok {

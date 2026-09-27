@@ -893,14 +893,43 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RD
 // FetchRDAPSnapshot Returns raw data only — no business logic, no alerting.
 
 func FetchRDAPSnapshot(ctx context.Context, httpClient HTTPDoer, app *AppState, domain string) RDAPSnapshot {
-	snapshot, err := fetchRDAP(ctx, httpClient, app, domain)
-	if err != nil {
-		return fallbackWHOISSnapshot(ctx, app, domain, err)
+	var snapshot RDAPSnapshot
+	var err error
+
+	for attempts := 1; attempts <= 3; attempts++ {
+		snapshot, err = fetchRDAP(ctx, httpClient, app, domain)
+		if err == nil {
+			return snapshot // Return immediately on success, no WHOIS fallback
+		}
+
+		errStr := err.Error()
+
+		// If TLD doesn't support RDAP (bootstrap error, no RDAP server), fallback to WHOIS immediately
+		if strings.Contains(errStr, "bootstrap is unavailable") || strings.Contains(errStr, "no RDAP server") {
+			return fallbackWHOISSnapshot(ctx, app, domain, err)
+		}
+
+		// Don't retry 404, and do not fallback to WHOIS since it is authoritative
+		if errors.Is(err, ErrRDAPNotFound) {
+			return RDAPSnapshot{Err: err, ProtocolUsed: ProtocolRDAP}
+		}
+
+		// Wait before retry if not the last attempt
+		if attempts < 3 {
+			backoff := time.Duration(attempts*2) * time.Second
+			LogWarn("RDAP failed, retrying", FieldDomain, domain, "attempt", attempts, "retry_in", backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return RDAPSnapshot{Err: ctx.Err()}
+			case <-timer.C:
+			}
+		}
 	}
-	if snapshot.Err == nil && snapshot.RegistrarTier == nil && (snapshot.Expiration == StrEmpty || snapshot.Registrar == StrEmpty) {
-		snapshot = supplementThinRDAP(ctx, app, domain, snapshot)
-	}
-	return snapshot
+
+	// 3 retries exhausted
+	return fallbackWHOISSnapshot(ctx, app, domain, err)
 }
 
 func fallbackWHOISSnapshot(ctx context.Context, app *AppState, domain string, rdapErr error) RDAPSnapshot {
@@ -922,62 +951,6 @@ func fallbackWHOISSnapshot(ctx context.Context, app *AppState, domain string, rd
 	}
 	LogErrorf(MsgLogWHOISFailed, domain, whoisErr)
 	return RDAPSnapshot{ProtocolUsed: ProtocolWHOISFailed, Err: fmt.Errorf(MsgErrRDAPAndWHOIS, rdapErr, whoisErr)}
-}
-
-func supplementThinRDAP(ctx context.Context, app *AppState, domain string, snapshot RDAPSnapshot) RDAPSnapshot {
-	whoisSnapshot, whoisErr := fetchWHOIS(ctx, app, domain)
-	if whoisErr != nil {
-		return snapshot
-	}
-	if whoisSnapshot.RegistrarTier != nil {
-		snapshot.RegistrarTier = whoisSnapshot.RegistrarTier
-	} else if whoisSnapshot.RegistryTier != nil && snapshot.RegistryTier == nil {
-		snapshot.RegistryTier = whoisSnapshot.RegistryTier
-	}
-	synthesized, discrepancies := synthesizeTierData(snapshot.RegistryTier, snapshot.RegistrarTier)
-	if snapshot.Expiration == StrEmpty {
-		snapshot.Expiration = firstNonEmptyString(synthesized.Expiration, whoisSnapshot.Expiration)
-	}
-	if snapshot.Registrar == StrEmpty {
-		snapshot.Registrar = firstNonEmptyString(synthesized.Registrar, whoisSnapshot.Registrar)
-	}
-	if snapshot.RegistrarIANAID == StrEmpty {
-		snapshot.RegistrarIANAID = firstNonEmptyString(synthesized.RegistrarIANAID, whoisSnapshot.RegistrarIANAID)
-	}
-	if len(snapshot.Nameservers) == 0 {
-		snapshot.Nameservers = firstNonEmptyStrings(synthesized.Nameservers, whoisSnapshot.Nameservers)
-	}
-	if len(snapshot.DomainStatus) == 0 {
-		snapshot.DomainStatus = firstNonEmptyStrings(synthesized.DomainStatus, whoisSnapshot.DomainStatus)
-	}
-	if !snapshot.DNSSEC {
-		snapshot.DNSSEC = synthesized.DNSSEC || whoisSnapshot.DNSSEC
-	}
-	snapshot.Discrepancies = discrepancies
-	snapshot.Source = supplementedRDAPSource(synthesized.Source, snapshot.RegistryTier, whoisSnapshot)
-	snapshot.ProtocolUsed = ProtocolHybrid
-	return snapshot
-}
-
-func supplementedRDAPSource(source string, registry *DomainTierData, whois RDAPSnapshot) string {
-	if whois.RegistrarTier == nil && whois.RegistryTier != nil && registry != whois.RegistryTier {
-		return source + SymPlus + whois.Source
-	}
-	return source
-}
-
-func firstNonEmptyString(primary, fallback string) string {
-	if primary != StrEmpty {
-		return primary
-	}
-	return fallback
-}
-
-func firstNonEmptyStrings(primary, fallback []string) []string {
-	if len(primary) > 0 {
-		return primary
-	}
-	return fallback
 }
 
 // EvaluateRDAP compares expected config against fetched RDAP snapshot.

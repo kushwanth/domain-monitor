@@ -565,8 +565,6 @@
     <div class="nav-items">
       <div class="nav-item active" onclick="switchView('domains')" id="nav-domains">Domains</div>
       <div class="nav-item" onclick="switchView('dns')" id="nav-dns">DNS Records</div>
-      <div class="nav-item" onclick="switchView('certs')" id="nav-certs">Certificates</div>
-      <div class="nav-item" onclick="switchView('nshealth')" id="nav-nshealth" style="display: none;">Nameservers</div>
     </div>
     <div id="renewal-pricing" style="display: none; margin-bottom: 12px; font-size: 0.85rem; font-weight: 600; text-align: center; color: var(--text-main);">
       Min. Renewal Cost: $<span id="total-renewal-cost">0.00</span>/yr
@@ -628,14 +626,9 @@
       <div id="view-dns" class="domain-list hidden"></div>
 
       <!-- Certs View -->
-      <div id="view-certs" class="domain-list hidden">
-        <div class="domain-card" style="padding: 24px;">
-          <div id="certs-table-container">Select a domain to view certificate history.</div>
-        </div>
+              </div>
       </div>
 
-      <!-- Nameservers View -->
-      <div id="view-nshealth" class="domain-list hidden"></div>
     </div>
   </main>
 
@@ -690,8 +683,6 @@
     function refreshCurrentView() {
       if (currentView === 'domains') renderDomains();
       else if (currentView === 'dns') renderDNS();
-      else if (currentView === 'nshealth') renderNSHealth();
-      else if (currentView === 'certs') fetchCerts();
     }
 
     function renderPagination(totalItems) {
@@ -775,29 +766,14 @@
         history.replaceState(null, '', '#' + view);
       }
       document.getElementById('nav-domains').classList.toggle('active', view === 'domains');
-      document.getElementById('nav-dns').classList.toggle('active', view === 'dns');
-      document.getElementById('nav-certs').classList.toggle('active', view === 'certs');
-      const navNS = document.getElementById('nav-nshealth');
-      if (navNS) navNS.classList.toggle('active', view === 'nshealth');
-
-      document.getElementById('view-domains').classList.toggle('hidden', view !== 'domains');
-      document.getElementById('view-dns').classList.toggle('hidden', view !== 'dns');
-      document.getElementById('view-certs').classList.toggle('hidden', view !== 'certs');
-      const viewNS = document.getElementById('view-nshealth');
-      if (viewNS) viewNS.classList.toggle('hidden', view !== 'nshealth');
-
-      const controlsBar = document.getElementById('controls-bar');
-      if (controlsBar) controlsBar.classList.toggle('hidden', view === 'certs');
+      document.getElementById('nav-dns').classList.toggle('active', view === 'dns');document.getElementById('view-domains').classList.toggle('hidden', view !== 'domains');
+      document.getElementById('view-dns').classList.toggle('hidden', view !== 'dns');const controlsBar = document.getElementById('controls-bar');
 
       // Update stats on view switch without requiring a full fetch
       if (view === 'domains') {
         renderDomains();
       } else if (view === 'dns') {
         renderDNS();
-      } else if (view === 'certs') {
-        renderCertsInit();
-      } else if (view === 'nshealth') {
-        renderNSHealth();
       }
     }
 
@@ -811,8 +787,6 @@
         renderDomains();
       } else if (currentView === 'dns') {
         renderDNS();
-      } else if (currentView === 'nshealth') {
-        renderNSHealth();
       }
     }
 
@@ -925,8 +899,6 @@
               renderDomains();
             } else if (currentView === 'dns') {
               renderDNS();
-            } else if (currentView === 'certs') {
-              renderCertsInit();
             } else if (currentView === 'nshealth') {
               renderNSHealth();
             }
@@ -942,15 +914,6 @@
     }
 
     function updateNavVisibility() {
-      const nsHealthChecks = appState.ns_health || appState.ns_health_checks || {};
-      const hasNSHealth = Object.keys(nsHealthChecks).length > 0;
-      const navNS = document.getElementById('nav-nshealth');
-      if (navNS) {
-        navNS.style.display = hasNSHealth ? 'block' : 'none';
-      }
-      if (!hasNSHealth && currentView === 'nshealth') {
-        switchView('domains');
-      }
     }
 
     function initialize() {
@@ -959,10 +922,8 @@
       pollState();
 
       const hash = window.location.hash.replace('#', '');
-      if (['domains', 'dns', 'certs', 'nshealth'].includes(hash)) {
+      if (['domains', 'dns'].includes(hash)) {
         switchView(hash);
-      } else if (hash.startsWith('certs:')) {
-        switchView('certs');
       } else if (hash.startsWith('dns:')) {
         const target = decodeURIComponent(hash.substring(4)).toLowerCase();
         switchView('dns');
@@ -990,10 +951,8 @@
 
       window.addEventListener('hashchange', () => {
         const view = window.location.hash.replace('#', '');
-        if (['domains', 'dns', 'certs', 'nshealth'].includes(view) && currentView !== view) {
+        if (['domains', 'dns'].includes(view) && currentView !== view) {
           switchView(view);
-        } else if (view.startsWith('certs:')) {
-          switchView('certs');
         } else if (view.startsWith('dns:')) {
           const target = decodeURIComponent(view.substring(4)).toLowerCase();
           switchView('dns');
@@ -1053,7 +1012,7 @@
     }
 
     function aggregateDomainStatus(states) {
-      const statuses = states.map(state => state && state.status).filter(Boolean);
+      const statuses = states.map(state => state && (state.status || (state.valid === false ? 'failed' : undefined))).filter(Boolean);
       if (statuses.some(status => ['failed', 'mismatch', 'hijacked'].includes(status))) return 'error';
       if (statuses.some(status => status === 'warning')) return 'warning';
       if (statuses.length === 0 || statuses.some(status => status === 'pending')) return 'unknown';
@@ -1073,7 +1032,6 @@
       const emailChecks = appState.email_checks || {};
       const caaChecks = appState.caa_checks || {};
       const dnssecChecks = appState.dnssec_checks || {};
-      const ctChecks = appState.ct_logs || {};
       const nsHealthChecks = appState.ns_health || appState.ns_health_checks || {};
 
       let allDomains = new Set(Object.keys(rdapChecks));
@@ -1112,7 +1070,6 @@
         const dnssecState = dnssecChecks[domain] || {};
         const caaState = caaChecks[domain] || {};
         const nsHealthState = nsHealthChecks[domain] || {};
-        const ctState = ctChecks[domain] || {};
 
         let statusClass = 'ok';
         let statusText = 'Healthy';
@@ -1179,13 +1136,11 @@
         if (caaState.valid === false) badges.push({ label: 'caa_invalid', cls: 'warning' });
         if (caaState.unknown_cas && caaState.unknown_cas.length > 0) badges.push({ label: 'caa_unauthorized_ca', cls: 'warning' });
 
-        const checkStates = [rdapState, emailState, dnssecState, caaState, nsHealthState, ctState];
+        const checkStates = [rdapState, emailState, dnssecState, caaState, nsHealthState];
         statusClass = aggregateDomainStatus(checkStates);
         statusText = statusClass === 'error' ? 'Issue Detected' : statusClass === 'warning' ? 'Warning' : statusClass === 'unknown' ? 'Pending' : 'Healthy';
         if (rdapState.allow_expiry) badges.push({ label: 'allow_expiry', cls: 'warning' });
         if (emailState.status === 'failed' || emailState.status === 'hijacked') badges.push({ label: 'email_security_issue', cls: 'error' });
-        if (ctState.status === 'failed') badges.push({ label: 'ct_lookup_failed', cls: 'error' });
-        if (ctState.status === 'warning') badges.push({ label: 'ct_coverage_warning', cls: 'warning' });
 
         let labelsHtml = '';
         if (badges.length > 0) {
@@ -1474,254 +1429,6 @@
       }
     }
 
-    function renderNSHealth() {
-      const container = document.getElementById('view-nshealth');
-      if (!container) return;
-      const previouslyOpen = new Set();
-      container.querySelectorAll('details.domain-card[open]').forEach(el => {
-        const id = el.getAttribute('data-search');
-        if (id) previouslyOpen.add(id);
-      });
-      container.innerHTML = '';
-
-      const nsHealthChecks = appState.ns_health || appState.ns_health_checks || {};
-      const domains = Object.keys(nsHealthChecks).sort((a, b) => a.localeCompare(b));
-
-      if (domains.length === 0) {
-        renderStats(0, 0, 0, 0, 0, 0);
-        container.innerHTML = `
-          <div class="domain-card" style="padding: 40px 24px; text-align: center;">
-            <div style="font-size: 1.15rem; font-weight: 600; margin-bottom: 8px;">No Nameserver Health Configured</div>
-            <p style="color: var(--text-muted); margin: 0; font-size: 0.9rem;">To monitor primary & secondary nameserver synchronization and health, enable <code>verify_ns_health: true</code> in your configuration.</p>
-          </div>
-        `;
-        return;
-      }
-
-      let healthyCount = 0;
-      let issueCount = 0;
-      let totalSlaves = 0;
-
-      domains.forEach(d => {
-        const h = nsHealthChecks[d] || {};
-        const servers = h.servers || [];
-        const isPending = !h.servers || h.servers.length === 0;
-        const hasIssue = !isPending && (h.valid === false || servers.some(s => s.error || !s.authoritative || (s.has_dnskey && !s.dnskey_match)));
-        if (hasIssue) {
-          issueCount++;
-        } else if (!isPending) {
-          healthyCount++;
-        }
-        totalSlaves += servers.filter(s => !s.is_primary).length;
-      });
-
-      renderStats(domains.length, healthyCount, issueCount, 0, 0, totalSlaves);
-
-      let filteredDomains = domains;
-      if (searchQuery) {
-        filteredDomains = filteredDomains.filter(d => d.toLowerCase().includes(searchQuery));
-      }
-      if (currentFilter === 'healthy') {
-        filteredDomains = filteredDomains.filter(domain => {
-          const h = nsHealthChecks[domain] || {};
-          const servers = h.servers || [];
-          const isPending = !h.servers || h.servers.length === 0;
-          const hasIssue = !isPending && (h.valid === false || servers.some(s => s.error || !s.authoritative || (s.has_dnskey && !s.dnskey_match)));
-          return !hasIssue && !isPending;
-        });
-      } else if (currentFilter === 'issues') {
-        filteredDomains = filteredDomains.filter(domain => {
-          const h = nsHealthChecks[domain] || {};
-          const servers = h.servers || [];
-          const isPending = !h.servers || h.servers.length === 0;
-          return !isPending && (h.valid === false || servers.some(s => s.error || !s.authoritative || (s.has_dnskey && !s.dnskey_match)));
-        });
-      } else if (currentFilter === 'slaves') {
-        filteredDomains = filteredDomains.filter(domain => {
-          const h = nsHealthChecks[domain] || {};
-          const servers = h.servers || [];
-          return servers.some(s => !s.is_primary);
-        });
-      }
-
-      const totalFiltered = filteredDomains.length;
-      renderPagination(totalFiltered);
-
-      if (totalFiltered === 0) {
-        container.innerHTML = `
-          <div class="domain-card" style="padding: 40px 24px; text-align: center;">
-            <div style="font-size: 1.15rem; font-weight: 600; margin-bottom: 8px;">No Nameserver Health Records Found</div>
-            <p style="color: var(--text-muted); margin: 0; font-size: 0.9rem;">No nameservers match the current search or filter criteria.</p>
-          </div>
-        `;
-        return;
-      }
-      const startIndex = (currentPage - 1) * itemsPerPage;
-      const paginatedDomains = filteredDomains.slice(startIndex, startIndex + itemsPerPage);
-
-      paginatedDomains.forEach(domain => {
-        const h = nsHealthChecks[domain] || {};
-        const servers = h.servers || [];
-        const isPending = !h.servers || h.servers.length === 0;
-        const hasIssue = !isPending && (h.valid === false || servers.some(s => s.error || !s.authoritative || (s.has_dnskey && !s.dnskey_match)));
-        const slaveServers = servers.filter(s => !s.is_primary);
-        const primaryServer = servers.find(s => s.is_primary);
-
-        let primaryHtml = '';
-        if (primaryServer) {
-          const aaBadge = primaryServer.authoritative
-            ? '<span style="color: var(--success); font-weight: 600;">Pass (Authoritative Answer)</span>'
-            : '<span style="color: var(--error); font-weight: 600;">Fail (AA Missing)</span>';
-          let dnskeyBadge = '<span style="color: var(--text-muted)">Unsigned</span>';
-          if (primaryServer.has_dnskey) {
-            dnskeyBadge = '<span style="color: var(--success); font-weight: 600;">Active (Signed Zone)</span>';
-          }
-          primaryHtml = `
-            <div class="detail-panel">
-              <h3>Primary Nameserver (Master)</h3>
-              <div class="detail-row"><div class="detail-label">Server:</div><div class="detail-value" style="font-weight: 600;">${escapeHTML(primaryServer.nameserver)}</div></div>
-              <div class="detail-row"><div class="detail-label">Role:</div><div class="detail-value">Primary Master (expected_ns[0])</div></div>
-              <div class="detail-row"><div class="detail-label">Authoritative (AA):</div><div class="detail-value">${aaBadge}</div></div>
-              <div class="detail-row"><div class="detail-label">SOA Serial:</div><div class="detail-value" style="font-family: monospace; font-size: 1.05em; font-weight: 600;">${primaryServer.soa_serial || 'Unavailable'}</div></div>
-              <div class="detail-row"><div class="detail-label">DNSKEY / DNSSEC:</div><div class="detail-value">${dnskeyBadge}</div></div>
-              ${primaryServer.error ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value" style="color: var(--error);">${escapeHTML(primaryServer.error)}</div></div>` : ''}
-            </div>
-          `;
-        } else {
-          primaryHtml = `
-            <div class="detail-panel">
-              <h3>Primary Nameserver</h3>
-              <div class="detail-row"><div class="detail-label">Server:</div><div class="detail-value">${escapeHTML(h.primary || 'expected_ns[0]')}</div></div>
-              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value" style="color: var(--warning);">Query Pending</div></div>
-            </div>
-          `;
-        }
-
-        let secondaryHtml = '';
-        if (slaveServers.length > 0) {
-          const slaveCards = slaveServers.map(s => {
-            const aaBadge = s.authoritative
-              ? '<span style="color: var(--success); font-weight: 600;">Pass (AA)</span>'
-              : '<span style="color: var(--error); font-weight: 600;">Fail (No AA)</span>';
-
-            let serialDisplay = s.soa_serial ? `${s.soa_serial}` : 'Unavailable';
-            let syncBadge = '';
-            if (primaryServer && primaryServer.soa_serial && s.soa_serial) {
-              if (s.soa_serial === primaryServer.soa_serial) {
-                syncBadge = ' <span class="badge success" style="margin-left: 6px; font-size: 0.72rem;">Synchronized</span>';
-              } else if (s.soa_serial < primaryServer.soa_serial) {
-                const diff = primaryServer.soa_serial - s.soa_serial;
-                syncBadge = ` <span class="badge error" style="margin-left: 6px; font-size: 0.72rem;">Lagging (-${diff})</span>`;
-              } else {
-                syncBadge = ' <span class="badge warning" style="margin-left: 6px; font-size: 0.72rem;">Ahead</span>';
-              }
-            }
-
-            let dnskeyDisplay = '<span style="color: var(--text-muted)">Unsigned</span>';
-            if (s.has_dnskey) {
-              dnskeyDisplay = s.dnskey_match
-                ? '<span style="color: var(--success); font-weight: 600;">Replicated (Matching Keys)</span>'
-                : '<span style="color: var(--error); font-weight: 600;">Mismatch (Keys Differ)</span>';
-            } else if (!s.dnskey_match) {
-              dnskeyDisplay = '<span style="color: var(--error); font-weight: 600;">DNSKEY Missing on Secondary</span>';
-            }
-
-            return `
-              <div style="margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border);">
-                <div class="detail-row"><div class="detail-label">Server:</div><div class="detail-value" style="font-weight: 600;">${escapeHTML(s.nameserver)}</div></div>
-                <div class="detail-row"><div class="detail-label">Authoritative (AA):</div><div class="detail-value">${aaBadge}</div></div>
-                <div class="detail-row"><div class="detail-label">SOA Serial:</div><div class="detail-value" style="font-family: monospace;">${serialDisplay}${syncBadge}</div></div>
-                <div class="detail-row"><div class="detail-label">DNSKEY Sync:</div><div class="detail-value">${dnskeyDisplay}</div></div>
-                ${s.error ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value" style="color: var(--error);">${escapeHTML(s.error)}</div></div>` : ''}
-              </div>
-            `;
-          }).join('');
-
-          secondaryHtml = `
-            <div class="detail-panel">
-              <h3>Secondary / Slave Nameservers</h3>
-              ${slaveCards}
-            </div>
-          `;
-        } else {
-          secondaryHtml = `
-            <div class="detail-panel">
-              <h3>Secondary / Slave Nameservers</h3>
-              <div class="detail-row"><div class="detail-label">Secondary NS:</div><div class="detail-value" style="color: var(--text-muted);">None configured (single master model)</div></div>
-              <div class="detail-row"><div class="detail-label">Replication:</div><div class="detail-value">Primary-only validation</div></div>
-            </div>
-          `;
-        }
-
-        let overallStatusHtml = h.valid
-          ? '<span style="color: var(--success); font-weight: 600;">Fully Synchronized & Authoritative</span>'
-          : '<span style="color: var(--error); font-weight: 600;">Replication or Authority Issues Detected</span>';
-        if (isPending) {
-          overallStatusHtml = '<span style="color: var(--text-muted);">Initial Check Pending</span>';
-        }
-
-        const overviewHtml = `
-          <div class="detail-panel">
-            <h3>Zone Replication Overview</h3>
-            <div class="detail-row"><div class="detail-label">Overall Health:</div><div class="detail-value">${overallStatusHtml}</div></div>
-            <div class="detail-row"><div class="detail-label">Total Servers:</div><div class="detail-value">${servers.length} (${1 + slaveServers.length} expected)</div></div>
-            <div class="detail-row"><div class="detail-label">DNSKEY Consistency:</div><div class="detail-value">${h.valid && servers.every(s => s.dnskey_match) ? 'Compliant (Identical Keys)' : (slaveServers.length === 0 ? 'Single Master' : 'Check servers')}</div></div>
-            ${h.error ? `<div class="detail-row"><div class="detail-label">Alert:</div><div class="detail-value" style="color: var(--error); font-weight: 600;">${escapeHTML(h.error)}</div></div>` : ''}
-          </div>
-        `;
-
-        let statusBadgeHtml = '';
-        if (isPending) {
-          statusBadgeHtml = `<span class="badge" style="color: var(--text-muted); background: var(--border);">pending</span>`;
-        } else if (hasIssue) {
-          statusBadgeHtml = `<span class="badge error">issues</span>`;
-        } else {
-          statusBadgeHtml = `<span class="badge success">healthy</span>`;
-        }
-
-        let replicaInfoHtml = '';
-        if (slaveServers.length > 0) {
-          replicaInfoHtml = `<span class="badge" style="background: var(--bg-hover); color: var(--text-muted); font-size: 0.75rem;">${slaveServers.length} replica${slaveServers.length > 1 ? 's' : ''}</span>`;
-        } else {
-          replicaInfoHtml = `<span style="opacity: 0.6; font-size: 0.85rem;">primary only</span>`;
-        }
-
-        const card = document.createElement('details');
-        card.className = 'domain-card';
-        card.setAttribute('data-search', domain.toLowerCase());
-        const hash = window.location.hash.replace('#', '');
-        if (hash === 'nshealth:' + domain.toLowerCase() || hash === 'open:' + domain.toLowerCase() || previouslyOpen.has(domain.toLowerCase())) {
-          card.open = true;
-        }
-
-        const chevronHtml = `<svg class="domain-chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
-
-        card.innerHTML = `
-          <summary class="domain-header domain-header-domains">
-            <div class="domain-header-left">
-              <div class="domain-title" style="text-transform: lowercase;">${escapeHTML(domain)}</div>
-              <div class="domain-expiry">
-                ${replicaInfoHtml}
-              </div>
-            </div>
-            <div class="domain-header-right">
-              <div class="domain-status">
-                <span class="status-label">
-                  ${statusBadgeHtml}
-                </span>
-              </div>
-              ${chevronHtml}
-            </div>
-          </summary>
-          <div class="domain-details">
-            ${primaryHtml}
-            ${secondaryHtml}
-            ${overviewHtml}
-          </div>
-        `;
-        container.appendChild(card);
-      });
-    }
 
 
     function renderDNS() {
@@ -1913,188 +1620,6 @@
 
       if (currentView === 'dns') {
         renderStats(dnsKeys.length, healthyCount, issueCount, 0, 0);
-      }
-    }
-
-    let cachedCerts = [];
-    let certRequestID = 0;
-    let certCurrentPage = 1;
-    const certsPerPage = 50;
-
-    function renderCertPage(page) {
-      certCurrentPage = page;
-      const container = document.getElementById('certs-table-container');
-      if (!container || !cachedCerts || cachedCerts.length === 0) return;
-
-      const totalItems = cachedCerts.length;
-      const totalPages = Math.ceil(totalItems / certsPerPage) || 1;
-      const startIdx = (certCurrentPage - 1) * certsPerPage;
-      const pageCerts = cachedCerts.slice(startIdx, startIdx + certsPerPage);
-
-      let html = `
-        <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem;">
-          <thead>
-            <tr style="border-bottom: 1px solid var(--border); color: var(--text-muted);">
-              <th style="padding: 12px 8px;">Issue Date</th>
-              <th style="padding: 12px 8px;">Expiry Date</th>
-              <th style="padding: 12px 8px;">Days Left</th>
-              <th style="padding: 12px 8px;">Issuer</th>
-              <th style="padding: 12px 8px;">Match</th>
-              <th style="padding: 12px 8px;">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-      `;
-
-      pageCerts.forEach(c => {
-        const notAfterDate = c.not_after ? new Date(c.not_after) : null;
-        const notBeforeDate = c.not_before ? new Date(c.not_before) : null;
-        const notAfterValid = notAfterDate && !isNaN(notAfterDate.getTime());
-        const notBeforeValid = notBeforeDate && !isNaN(notBeforeDate.getTime());
-
-        const daysLeft = notAfterValid ? Math.ceil((notAfterDate - new Date()) / (1000 * 60 * 60 * 24)) : null;
-        const isExpired = daysLeft !== null && daysLeft < 0;
-        let status = '<span class="badge warning">Unknown</span>';
-        if (daysLeft !== null) {
-          status = isExpired ? '<span class="badge error">Expired</span>' : '<span class="badge success">Active</span>';
-        }
-
-        let daysHtml = '-';
-        if (daysLeft !== null) {
-          if (daysLeft < 0) {
-            daysHtml = `<span style="color: var(--error); font-weight: 600;">${Math.abs(daysLeft)}d ago</span>`;
-          } else if (daysLeft <= 30) {
-            daysHtml = `<span style="color: var(--warning); font-weight: 600;">${daysLeft}d left</span>`;
-          } else {
-            daysHtml = `${daysLeft}d left`;
-          }
-        }
-
-        html += `
-          <tr style="border-bottom: 1px solid var(--border);">
-            <td style="padding: 12px 8px;">${notBeforeValid ? notBeforeDate.toLocaleDateString() : '-'}</td>
-            <td style="padding: 12px 8px;">${notAfterValid ? notAfterDate.toLocaleDateString() : '-'}</td>
-            <td style="padding: 12px 8px;">${daysHtml}</td>
-            <td style="padding: 12px 8px;">${escapeHTML(c.issuer || 'Unknown')}</td>
-            <td style="padding: 12px 8px; word-break: break-all;">${escapeHTML(c.match || '')}</td>
-            <td style="padding: 12px 8px;">${status}</td>
-          </tr>
-        `;
-      });
-
-      html += '</tbody></table>';
-
-      if (totalPages > 1) {
-        html += `
-          <div style="display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 16px;">
-            <span style="color: var(--text-muted); font-size: 0.85rem; margin-right: 8px;">Page ${certCurrentPage} of ${totalPages} (${totalItems} certs)</span>
-            <button onclick="renderCertPage(${certCurrentPage > 1 ? certCurrentPage - 1 : 1})" ${certCurrentPage === 1 ? 'disabled' : ''} style="padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-main); cursor: ${certCurrentPage === 1 ? 'not-allowed' : 'pointer'}; opacity: ${certCurrentPage === 1 ? '0.5' : '1'};">Prev</button>
-            <button onclick="renderCertPage(${certCurrentPage < totalPages ? certCurrentPage + 1 : totalPages})" ${certCurrentPage === totalPages ? 'disabled' : ''} style="padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-main); cursor: ${certCurrentPage === totalPages ? 'not-allowed' : 'pointer'}; opacity: ${certCurrentPage === totalPages ? '0.5' : '1'};">Next</button>
-          </div>
-        `;
-      }
-      container.innerHTML = html;
-    }
-
-    function renderCertsInit() {
-      const rdapChecks = appState.rdap_checks || appState.rdap || {};
-      let allDomains = Object.keys(rdapChecks);
-      if (allDomains.length === 0) {
-        allDomains = Array.from(new Set([
-          ...Object.keys(appState.email_checks || appState.email || {}),
-          ...Object.keys(appState.caa_checks || appState.caa || {}),
-          ...Object.keys(appState.dnssec_checks || appState.dnssec || {}),
-          ...Object.keys(appState.ns_health || appState.ns_health_checks || {})
-        ]));
-      }
-      allDomains.sort((a, b) => a.localeCompare(b));
-
-      let optionsHtml = '<option value="" style="background-color: var(--bg-card); color: var(--text-main);">Select a domain...</option>';
-      allDomains.forEach(d => {
-        const escapedD = escapeHTML(d);
-        optionsHtml += `<option value="${escapedD}" style="background-color: var(--bg-card); color: var(--text-main);">${escapedD}</option>`;
-      });
-
-      document.getElementById('view-stats').innerHTML = `
-        <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
-          <div class="stat-box active" style="position: relative; padding: 0; border-radius: 6px;">
-            <select id="cert-domain-select" onchange="fetchCerts()" style="appearance: none; -webkit-appearance: none; -moz-appearance: none; background: transparent; border: none; border-radius: 6px; font-size: 0.95rem; font-weight: 600; font-family: inherit; color: var(--text-main); cursor: pointer; outline: none; margin: 0; min-width: 240px; padding: 10px 44px 10px 16px; width: 100%;">
-               ${optionsHtml}
-            </select>
-            <svg style="position: absolute; right: 14px; top: 50%; transform: translateY(-50%); pointer-events: none; color: var(--text-main);" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-               <polyline points="6 9 12 15 18 9"></polyline>
-            </svg>
-          </div>
-          <div id="selected-domain-display" style="font-weight: 600; font-size: 1.05rem; color: var(--text-main);"></div>
-        </div>
-      `;
-
-      let targetDomain = '';
-      const hash = window.location.hash.replace('#', '');
-      if (hash.startsWith('certs:')) {
-        const hDomain = hash.substring(6);
-        if (allDomains.includes(hDomain)) {
-          targetDomain = hDomain;
-        }
-      }
-      if (!targetDomain && allDomains.length > 0) {
-        targetDomain = allDomains[0];
-      }
-
-      if (targetDomain) {
-        setTimeout(() => {
-          const sel = document.getElementById('cert-domain-select');
-          if (sel) {
-            sel.value = targetDomain;
-            fetchCerts();
-          }
-        }, 0);
-      }
-    }
-
-    async function fetchCerts() {
-      const requestID = ++certRequestID;
-      const select = document.getElementById('cert-domain-select');
-      if (!select) return;
-      const domain = select.value;
-      const container = document.getElementById('certs-table-container');
-      const display = document.getElementById('selected-domain-display');
-      if (!domain) {
-        container.innerHTML = '<div style="color: var(--text-muted); padding: 24px 0; text-align: center;">Select a domain to view certificate history.</div>';
-        if (display) display.textContent = '';
-        return;
-      }
-
-      if (display) display.textContent = domain;
-
-      container.innerHTML = '<div style="padding: 24px 0; text-align: center; color: var(--text-muted);">Loading certificate history...</div>';
-      try {
-        const res = await fetch('/api/certs?domain=' + encodeURIComponent(domain));
-        if (requestID !== certRequestID) return;
-        if (!res.ok) throw new Error(`Certificate request failed: ${res.status}`);
-        let certs = await res.json();
-        if (requestID !== certRequestID) return;
-
-        if (!certs || certs.length === 0) {
-          container.innerHTML = '<div style="color: var(--text-muted); padding: 24px 0; text-align: center;">No certificates found for this domain yet.</div>';
-          return;
-        }
-
-        if (searchQuery) {
-          certs = certs.filter(c =>
-            (c.issuer && c.issuer.toLowerCase().includes(searchQuery)) ||
-            (c.match && c.match.toLowerCase().includes(searchQuery))
-          );
-          if (certs.length === 0) {
-            container.innerHTML = '<div style="color: var(--text-muted); padding: 24px 0; text-align: center;">No certificates matching "' + escapeHTML(searchQuery) + '" found.</div>';
-            return;
-          }
-        }
-
-        cachedCerts = certs;
-        renderCertPage(1);
-      } catch (err) {
-        if (requestID === certRequestID) container.innerHTML = '<span style="color: var(--error)">Failed to load certificates.</span>';
       }
     }
 

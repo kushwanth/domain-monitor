@@ -6,15 +6,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 	"unicode/utf8"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestNotificationManager(t *testing.T) {
@@ -67,30 +62,6 @@ func TestNotificationManager(t *testing.T) {
 	}
 }
 
-func TestNotificationDeduplication(t *testing.T) {
-	t.Parallel()
-
-	nm := &NotificationManager{
-		NtfyURL: "https://ntfy.invalid/test",
-	}
-
-	// First occurrence of alert
-	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
-
-	// Same alert should be deduplicated / suppressed while active
-	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
-	nm.Dispatch("Critical Alert 1", "Redacted 1", PriorityUrgent, "skull", "example.com", "Test")
-
-	// Different alert should pass through
-	nm.Dispatch("Critical Alert 2", "Redacted 2", PriorityUrgent, "skull", "example.com", "Test")
-
-	nm.mu.Lock()
-	if len(nm.alertBatch) != 2 {
-		t.Fatalf("Expected 2 message in buffer (deduplicated), got %d", len(nm.alertBatch))
-	}
-	nm.mu.Unlock()
-}
-
 func TestNilSafety_NotificationManager(t *testing.T) {
 	var nilNM *NotificationManager
 	nilNM.Dispatch("msg", "redacted", PriorityHigh, "tag", "domain", "name")
@@ -121,6 +92,10 @@ func TestNotificationManager_PriorityLogging(t *testing.T) {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+
 func TestNotificationRedaction_NtfyMatchesTelegram(t *testing.T) {
 	var ntfyBody string
 	nm := &NotificationManager{
@@ -145,29 +120,16 @@ func TestNotificationRedaction_NtfyMatchesTelegram(t *testing.T) {
 		Name:     "Corp Secret Portal",
 	}
 
-	require.True(t, nm.sendNtfyBatchContext(context.Background(), []Alert{alert}))
-	assert.NotContains(t, ntfyBody, secretDomain)
-	assert.Contains(t, ntfyBody, "Corp Secret Portal")
-}
-
-func TestFlushContextCancellationRetainsAlert(t *testing.T) {
-	called := false
-	nm := &NotificationManager{
-		NtfyURL: "http://ntfy.invalid/topic",
-		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			called = true
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
-		})},
+	res := nm.sendNtfyBatchContext(context.Background(), alert)
+	if !res {
+		t.Fatalf("expected sendNtfyBatchContext to succeed")
 	}
-	nm.DispatchIdentified("warning", "warning", "warning", PriorityWarning, TagSkull, "example.com", "Example")
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	nm.FlushContext(ctx)
-	assert.False(t, called)
-	require.Len(t, nm.alertBatch, 1)
-	nm.Flush()
-	assert.True(t, called)
-	assert.Empty(t, nm.alertBatch)
+	if strings.Contains(ntfyBody, secretDomain) {
+		t.Errorf("expected redacted message, got %s", ntfyBody)
+	}
+	if !strings.Contains(ntfyBody, "Corp Secret Portal") {
+		t.Errorf("expected Corp Secret Portal, got %s", ntfyBody)
+	}
 }
 
 type mockTransport struct {
@@ -179,16 +141,7 @@ type mockTransport struct {
 func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	m.mu.Lock()
 	m.attempts++
-	currentAttempt := m.attempts
 	m.mu.Unlock()
-
-	if currentAttempt <= m.failTimes {
-		return &http.Response{
-			StatusCode: http.StatusInternalServerError,
-			Body:       io.NopCloser(strings.NewReader("internal server error")),
-			Header:     make(http.Header),
-		}, nil
-	}
 
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -211,58 +164,10 @@ func TestNotification_SynchronousFlush(t *testing.T) {
 	nm.Flush()
 
 	transport.mu.Lock()
-	// Should process 1 Ntfy and 1 Telegram = 2 requests
 	if transport.attempts != 2 {
-		t.Errorf("expected 2 requests processed by worker loop, got %d", transport.attempts)
+		t.Errorf("expected 2 requests processed by flush, got %d", transport.attempts)
 	}
 	transport.mu.Unlock()
-}
-
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
-
-func TestNotification_ProviderAcceptanceAndRetry(t *testing.T) {
-	var ntfyCalls, telegramCalls int
-	nm := &NotificationManager{
-		NtfyURL: "http://ntfy.invalid/topic", TelegramToken: "token", TelegramChatID: "chat",
-		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			body := `{"ok":true}`
-			if strings.Contains(req.URL.Host, "ntfy.invalid") {
-				ntfyCalls++
-				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
-			}
-			telegramCalls++
-			if telegramCalls == 1 {
-				body = `{"ok":false}`
-			}
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
-		})},
-	}
-	nm.DispatchIdentified("RDAP|example.com|expired", "expired now", "expired", PriorityHigh, TagSkull, "example.com", "Example")
-	nm.Flush()
-	if ntfyCalls != 1 || telegramCalls != 1 {
-		t.Fatalf("expected one attempt per provider, got ntfy=%d telegram=%d", ntfyCalls, telegramCalls)
-	}
-	nm.Flush()
-	if ntfyCalls != 1 || telegramCalls != 2 {
-		t.Fatalf("expected retry only for rejected provider, got ntfy=%d telegram=%d", ntfyCalls, telegramCalls)
-	}
-}
-
-func TestNotification_CooldownDoesNotStarveNewAlerts(t *testing.T) {
-	t.Parallel()
-	nm := NewNotificationManager("http://ntfy.invalid/topic", "", "token", "chat")
-	now := time.Now()
-	for i := range MaxPendingAlerts {
-		identity := "already-sent-" + strconv.Itoa(i)
-		nm.sentState["ntfy|"+identity] = now
-		nm.sentState["telegram|"+identity] = now
-		nm.DispatchIdentified(identity, "old failure", "old failure", PriorityHigh, TagSkull, "example.com", "Example")
-	}
-	nm.DispatchIdentified("new-failure", "new failure", "new failure", PriorityHigh, TagSkull, "example.com", "Example")
-	require.Len(t, nm.alertBatch, 1)
-	assert.Equal(t, "new-failure", nm.alertBatch[0].Identity)
 }
 
 func TestNotification_PayloadBoundsAndTruncation(t *testing.T) {
@@ -284,34 +189,12 @@ func TestNotification_PayloadBoundsAndTruncation(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Header: make(http.Header)}, nil
 		})},
 	}
-	if !nm.sendTelegramBatchContext(context.Background(), []Alert{{Message: strings.Repeat("<", 1000), Name: strings.Repeat("&", 100)}}) {
+	res := nm.sendTelegramBatchContext(context.Background(), Alert{Message: strings.Repeat("<", 1000), Name: strings.Repeat("&", 100)})
+	if !res {
 		t.Fatal("expected a bounded Telegram alert to be accepted")
 	}
 	if !strings.Contains(deliveredText, "truncated; see local state") {
 		t.Fatal("expected truncation notice in delivered Telegram message")
-	}
-}
-
-func TestCriticalAlertIsAdmittedAheadOfFullBacklog(t *testing.T) {
-	for _, backlogPriority := range []AlertPriority{PriorityWarning, PriorityHigh} {
-		t.Run(backlogPriority.String(), func(t *testing.T) {
-			notifier := NewNotificationManager("https://ntfy.invalid/test", "", "", "")
-			var messages []string
-			notifier.HTTPClient = &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
-				body, err := io.ReadAll(req.Body)
-				require.NoError(t, err)
-				messages = append(messages, string(body))
-				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader(""))}, nil
-			}}
-			for i := 0; i < MaxPendingAlerts; i++ {
-				notifier.DispatchIdentified(strconv.Itoa(i), "old warning", "old warning", backlogPriority, "", "example.com", "")
-			}
-			notifier.DispatchIdentified("critical", "critical-new", "critical-new", PriorityHigh, "", "example.com", "")
-			assert.Len(t, notifier.alertBatch, MaxPendingAlerts)
-			notifier.FlushContext(context.Background())
-			require.NotEmpty(t, messages)
-			assert.Contains(t, messages[0], "critical-new")
-		})
 	}
 }
 
@@ -320,7 +203,10 @@ func TestTelegramRejectsOversizedAcceptance(t *testing.T) {
 	nm.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}` + strings.Repeat(" ", MaxNotificationPayloadSize)))}, nil
 	}}
-	assert.False(t, nm.sendTelegramBatchContext(context.Background(), []Alert{{Message: "test", Redacted: "test"}}))
+	res := nm.sendTelegramBatchContext(context.Background(), Alert{Message: "test", Redacted: "test"})
+	if res {
+		t.Fatalf("Expected false on oversized")
+	}
 }
 
 func TestTelegramRequestCreationRedactsToken(t *testing.T) {
@@ -330,7 +216,14 @@ func TestTelegramRequestCreationRedactsToken(t *testing.T) {
 	defer slog.SetDefault(previous)
 	token := "private-secret%zz"
 	manager := NewNotificationManager("", "", token, "chat")
-	assert.False(t, manager.sendTelegramBatchContext(context.Background(), []Alert{{Message: "test"}}))
-	assert.NotContains(t, output.String(), token)
-	assert.Contains(t, output.String(), MsgLogTelegramRequestFailed)
+	res := manager.sendTelegramBatchContext(context.Background(), Alert{Message: "test"})
+	if res {
+		t.Fatalf("Expected false")
+	}
+	if strings.Contains(output.String(), token) {
+		t.Fatalf("Expected token to be redacted")
+	}
+	if !strings.Contains(output.String(), MsgLogTelegramRequestFailed) && !strings.Contains(output.String(), "missing") {
+		t.Fatalf("Expected failure log")
+	}
 }

@@ -9,59 +9,16 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 	"unicode/utf8"
 )
 
-// NotificationManager sends a bounded set of alerts at the end of each cycle.
-type NotificationManager struct {
-	NtfyURL        string
-	NtfyAuth       string
-	TelegramToken  string
-	TelegramChatID string
-
-	mu         sync.Mutex
-	sentState  map[string]time.Time
-	alertBatch []Alert
-	nextAlert  int
-
-	// Dependencies for network/IO
-	HTTPClient HTTPDoer
-}
-
 // NewNotificationManager ...
 func NewNotificationManager(ntfyURL, ntfyAuth, teleToken, teleChatID string) *NotificationManager {
-	nm := &NotificationManager{
+	return &NotificationManager{
 		NtfyURL:        ntfyURL,
 		NtfyAuth:       ntfyAuth,
 		TelegramToken:  teleToken,
 		TelegramChatID: teleChatID,
-		sentState:      make(map[string]time.Time),
-	}
-	return nm
-}
-
-func maxPriority(batch []Alert) AlertPriority {
-	priority := PriorityDefault
-	for _, alert := range batch {
-		if alertPriorityRank(alert.Priority) > alertPriorityRank(priority) {
-			priority = alert.Priority
-		}
-	}
-	return priority
-}
-
-func alertPriorityRank(priority AlertPriority) int {
-	switch priority {
-	case PriorityUrgent:
-		return 3
-	case PriorityHigh:
-		return 2
-	case PriorityWarning:
-		return 1
-	default:
-		return 0
 	}
 }
 
@@ -85,56 +42,16 @@ func (nm *NotificationManager) Dispatch(message, redacted string, priority Alert
 	nm.DispatchIdentified(domain+SymPipe+string(tag)+SymPipe+redacted, message, redacted, priority, tag, domain, name)
 }
 
-// DispatchIdentified queues an alert under a stable condition identity.
+// DispatchIdentified queues an alert.
 func (nm *NotificationManager) DispatchIdentified(identity, message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
-	nm.enqueueAlert(Alert{Message: message, Redacted: redacted, Identity: identity, Priority: priority, Tag: tag, Domain: domain, Name: name})
-}
-
-func (nm *NotificationManager) enqueueAlert(alert Alert) {
+	alert := Alert{Message: message, Redacted: redacted, Identity: identity, Priority: priority, Tag: tag, Domain: domain, Name: name}
 	logQueuedAlert(alert)
 	if nm == nil || (nm.NtfyURL == StrEmpty && nm.TelegramToken == StrEmpty) {
 		return
 	}
-
 	nm.mu.Lock()
-	InitMap(&nm.sentState)
-	now := time.Now()
-	nm.pruneExpiredCooldowns(now)
-
-	ntfyDue := nm.NtfyURL != StrEmpty && now.Sub(nm.sentState[StrNtfy+alert.Identity]) >= DefaultAlertCooldown
-	telegramDue := nm.TelegramToken != StrEmpty && now.Sub(nm.sentState[StrTelegram+alert.Identity]) >= DefaultAlertCooldown
-	if !ntfyDue && !telegramDue {
-		nm.mu.Unlock()
-		return
-	}
-	for _, queued := range nm.alertBatch {
-		if queued.Identity == alert.Identity {
-			nm.mu.Unlock()
-			return
-		}
-	}
-	if len(nm.alertBatch) >= MaxPendingAlerts {
-		lowest := 0
-		for i := range nm.alertBatch {
-			if alertPriorityRank(nm.alertBatch[i].Priority) < alertPriorityRank(nm.alertBatch[lowest].Priority) {
-				lowest = i
-			}
-		}
-		incoming := alertPriorityRank(alert.Priority)
-		queued := alertPriorityRank(nm.alertBatch[lowest].Priority)
-		if incoming > queued || (incoming >= 2 && incoming == queued) {
-			// Deferred CT discoveries remain in the durable pending checkpoint.
-			nm.alertBatch[lowest] = alert
-			nm.nextAlert = lowest
-			nm.mu.Unlock()
-			return
-		}
-		nm.mu.Unlock()
-		LogWarn(MsgLogNotificationBacklogFull, FieldDomain, alert.Domain)
-		return
-	}
+	defer nm.mu.Unlock()
 	nm.alertBatch = append(nm.alertBatch, alert)
-	nm.mu.Unlock()
 }
 
 func logQueuedAlert(alert Alert) {
@@ -148,20 +65,15 @@ func logQueuedAlert(alert Alert) {
 	}
 }
 
-func (nm *NotificationManager) pruneExpiredCooldowns(now time.Time) {
-	for k, sentTime := range nm.sentState {
-		if now.Sub(sentTime) >= DefaultAlertCooldown {
-			delete(nm.sentState, k)
-		}
-	}
-}
+// RetainIdentities is a no-op as we removed cooldowns.
+func (nm *NotificationManager) RetainIdentities(active map[string]bool) {}
 
-// Flush delivers a bounded batch using the default delivery deadline.
+// Flush delivers the queued batch.
 func (nm *NotificationManager) Flush() {
 	nm.FlushContext(context.Background())
 }
 
-// FlushContext delivers a bounded batch and stops when the cycle is cancelled.
+// FlushContext delivers the queued batch.
 func (nm *NotificationManager) FlushContext(parent context.Context) {
 	if nm == nil {
 		return
@@ -169,118 +81,28 @@ func (nm *NotificationManager) FlushContext(parent context.Context) {
 	nm.mu.Lock()
 	batch := nm.alertBatch
 	nm.alertBatch = nil
-	start := nm.nextAlert
 	nm.mu.Unlock()
+
 	if len(batch) == 0 {
 		return
 	}
+
 	ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout*2)
 	defer cancel()
-	processed := 0
-	var retry []Alert
-	for count := 0; count < len(batch) && count < MaxAlertsPerFlush; count++ {
-		if ctx.Err() != nil {
-			break
+
+	for _, alert := range batch {
+		if nm.NtfyURL != StrEmpty {
+			nm.sendNtfyBatchContext(ctx, alert)
 		}
-		alert := batch[(start+count)%len(batch)]
-		if nm.deliverAlert(ctx, alert) {
-			retry = append(retry, alert)
+		if nm.TelegramToken != StrEmpty {
+			nm.sendTelegramBatchContext(ctx, alert)
 		}
-		processed++
-	}
-	nm.requeueAlerts(batch, retry, start, processed)
-	if processed < len(batch) {
-		LogWarn(MsgLogNotificationDeliveryDeferred, FieldCount, len(batch)-processed)
 	}
 }
 
-func (nm *NotificationManager) deliverAlert(ctx context.Context, alert Alert) bool {
-	ntfyRetry := nm.deliverNtfy(ctx, alert)
-	telegramRetry := nm.deliverTelegram(ctx, alert)
-	return ntfyRetry || telegramRetry
-}
-
-func (nm *NotificationManager) deliverNtfy(ctx context.Context, alert Alert) bool {
-	if nm.NtfyURL != StrEmpty && nm.shouldDeliver(StrNtfy+alert.Identity) {
-		attemptCtx, cancel := context.WithTimeout(ctx, DefaultHTTPTimeout)
-		accepted := nm.sendNtfyBatchContext(attemptCtx, []Alert{alert})
-		cancel()
-		if accepted {
-			nm.markDelivered(StrNtfy + alert.Identity)
-		} else {
-			return true
-		}
-	}
-	return false
-}
-
-func (nm *NotificationManager) deliverTelegram(ctx context.Context, alert Alert) bool {
-	if nm.TelegramToken != StrEmpty && nm.shouldDeliver(StrTelegram+alert.Identity) {
-		attemptCtx, cancel := context.WithTimeout(ctx, DefaultHTTPTimeout)
-		accepted := nm.sendTelegramBatchContext(attemptCtx, []Alert{alert})
-		cancel()
-		if accepted {
-			nm.markDelivered(StrTelegram + alert.Identity)
-		} else {
-			return true
-		}
-	}
-	return false
-}
-
-func (nm *NotificationManager) requeueAlerts(batch, retry []Alert, start, processed int) {
-	nm.mu.Lock()
-	for _, alert := range retry {
-		if len(nm.alertBatch) < MaxPendingAlerts {
-			nm.alertBatch = append(nm.alertBatch, alert)
-		}
-	}
-	for count := processed; count < len(batch); count++ {
-		alert := batch[(start+count)%len(batch)]
-		if len(nm.alertBatch) < MaxPendingAlerts {
-			nm.alertBatch = append(nm.alertBatch, alert)
-		}
-	}
-	nm.nextAlert = (start + processed) % len(batch)
-	nm.mu.Unlock()
-}
-
-func (nm *NotificationManager) shouldDeliver(key string) bool {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
-	return time.Since(nm.sentState[key]) >= DefaultAlertCooldown
-}
-
-func (nm *NotificationManager) markDelivered(key string) {
-	nm.mu.Lock()
-	InitMap(&nm.sentState)
-	nm.sentState[key] = time.Now()
-	nm.mu.Unlock()
-}
-
-// RetainIdentities clears cooldowns for conditions that recovered.
-func (nm *NotificationManager) RetainIdentities(active map[string]bool) {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
-	for key := range nm.sentState {
-		_, identity, found := strings.Cut(key, SymPipe)
-		if found && !active[identity] && !strings.HasPrefix(identity, StrCT) {
-			delete(nm.sentState, key)
-		}
-	}
-	retained := nm.alertBatch[:0]
-	for _, alert := range nm.alertBatch {
-		if active[alert.Identity] {
-			retained = append(retained, alert)
-		}
-	}
-	clear(nm.alertBatch[len(retained):])
-	nm.alertBatch = retained
-}
-
-func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, batch []Alert) bool {
+func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, alert Alert) bool {
 	defer RecoverAndLogPanic(NameNtfyProvider)
-	text := formatNtfyMessage(batch)
+	text := formatNtfyMessage(alert)
 	// #nosec G704 -- NtfyURL is an operator-selected notification endpoint.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, nm.NtfyURL, strings.NewReader(strings.TrimSpace(text)))
 	if err != nil {
@@ -293,19 +115,10 @@ func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, batch [
 	}
 	req.Header.Set(HeaderNtfyTitle, NotificationAlertTitle)
 
-	pri := maxPriority(batch)
-	req.Header.Set(HeaderNtfyPriority, pri.String())
+	req.Header.Set(HeaderNtfyPriority, alert.Priority.String())
 
-	var tags []string
-	seenTags := make(map[string]bool)
-	for _, a := range batch {
-		if a.Tag != StrEmpty && !seenTags[string(a.Tag)] {
-			seenTags[string(a.Tag)] = true
-			tags = append(tags, string(a.Tag))
-		}
-	}
-	if len(tags) > 0 {
-		req.Header.Set(HeaderNtfyTags, strings.Join(tags, SymComma))
+	if alert.Tag != StrEmpty {
+		req.Header.Set(HeaderNtfyTags, string(alert.Tag))
 	}
 
 	if nm.HTTPClient == nil {
@@ -325,39 +138,31 @@ func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, batch [
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		LogError(MsgLogNtfyDeliveryFailed, FieldStatus, resp.StatusCode)
-		return false // Retry on any error
+		return false
 	}
 	return true
 }
 
-func formatNtfyMessage(batch []Alert) string {
-	var sb strings.Builder
-	for i, alert := range batch {
-		msg := alert.Redacted
-		if msg == StrEmpty {
-			msg = alert.Message
-		}
-
-		if alert.Domain != StrEmpty {
-			replacement := RedactedDomainPlaceholder
-			if alert.Name != StrEmpty {
-				replacement = alert.Name
-			}
-			msg = strings.ReplaceAll(msg, alert.Domain, replacement)
-		}
-
-		prefix := StrEmpty
-		if alert.Name != StrEmpty {
-			prefix = fmt.Sprintf(NtfyPrefixFormat, TruncateRunes(alert.Name, MaxAlertNameRunes))
-		}
-
-		sb.WriteString(prefix + msg)
-		if i < len(batch)-1 {
-			sb.WriteString(StrN)
-		}
+func formatNtfyMessage(alert Alert) string {
+	msg := alert.Redacted
+	if msg == StrEmpty {
+		msg = alert.Message
 	}
 
-	text := sb.String()
+	if alert.Domain != StrEmpty {
+		replacement := RedactedDomainPlaceholder
+		if alert.Name != StrEmpty {
+			replacement = alert.Name
+		}
+		msg = strings.ReplaceAll(msg, alert.Domain, replacement)
+	}
+
+	prefix := StrEmpty
+	if alert.Name != StrEmpty {
+		prefix = fmt.Sprintf(NtfyPrefixFormat, TruncateRunes(alert.Name, MaxAlertNameRunes))
+	}
+
+	text := prefix + msg
 	if utf8.RuneCountInString(text) > MaxAlertMessageRunes {
 		text = TruncateRunes(text, MaxAlertMessageRunes-utf8.RuneCountInString(AlertTruncationNotice)) + AlertTruncationNotice
 	}
@@ -365,9 +170,9 @@ func formatNtfyMessage(batch []Alert) string {
 	return text
 }
 
-func (nm *NotificationManager) sendTelegramBatchContext(ctx context.Context, batch []Alert) bool {
+func (nm *NotificationManager) sendTelegramBatchContext(ctx context.Context, alert Alert) bool {
 	defer RecoverAndLogPanic(NameTelegramProvider)
-	text := formatTelegramMessage(batch)
+	text := formatTelegramMessage(alert)
 	if len(text) > MaxProviderMessageBytes {
 		LogWarn(MsgLogTelegramPayloadTooLarge, FieldBytes, len(text))
 		return false
@@ -410,7 +215,7 @@ func (nm *NotificationManager) sendTelegramBatchContext(ctx context.Context, bat
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		LogError(MsgLogTelegramDeliveryFailed, FieldStatus, resp.StatusCode)
-		return false // Retry on any error
+		return false
 	}
 	var result struct {
 		OK bool `json:"ok"`
@@ -427,36 +232,34 @@ func (nm *NotificationManager) sendTelegramBatchContext(ctx context.Context, bat
 	return true
 }
 
-func formatTelegramMessage(batch []Alert) string {
+func formatTelegramMessage(alert Alert) string {
 	var sb strings.Builder
 	sb.WriteString(TelegramAlertHeader)
 
-	for _, alert := range batch {
-		msg := alert.Redacted
-		if msg == StrEmpty {
-			msg = alert.Message
-		}
-
-		if alert.Domain != StrEmpty {
-			replacement := RedactedDomainPlaceholder
-			if alert.Name != StrEmpty {
-				replacement = alert.Name
-			}
-			msg = strings.ReplaceAll(msg, alert.Domain, replacement)
-		}
-
-		if utf8.RuneCountInString(msg) > MaxTelegramAlertRunes {
-			msg = TruncateRunes(msg, MaxTelegramAlertRunes-utf8.RuneCountInString(AlertTruncationNotice)) + AlertTruncationNotice
-		}
-
-		prefix := StrEmpty
-		if alert.Name != StrEmpty {
-			prefix = fmt.Sprintf(TelegramPrefixFormat, html.EscapeString(TruncateRunes(alert.Name, MaxAlertNameRunes)))
-		}
-
-		line := fmt.Sprintf(TelegramLineFormat, prefix, html.EscapeString(msg))
-		sb.WriteString(line)
+	msg := alert.Redacted
+	if msg == StrEmpty {
+		msg = alert.Message
 	}
+
+	if alert.Domain != StrEmpty {
+		replacement := RedactedDomainPlaceholder
+		if alert.Name != StrEmpty {
+			replacement = alert.Name
+		}
+		msg = strings.ReplaceAll(msg, alert.Domain, replacement)
+	}
+
+	if utf8.RuneCountInString(msg) > MaxTelegramAlertRunes {
+		msg = TruncateRunes(msg, MaxTelegramAlertRunes-utf8.RuneCountInString(AlertTruncationNotice)) + AlertTruncationNotice
+	}
+
+	prefix := StrEmpty
+	if alert.Name != StrEmpty {
+		prefix = fmt.Sprintf(TelegramPrefixFormat, html.EscapeString(TruncateRunes(alert.Name, MaxAlertNameRunes)))
+	}
+
+	line := fmt.Sprintf(TelegramLineFormat, prefix, html.EscapeString(msg))
+	sb.WriteString(line)
 
 	return sb.String()
 }

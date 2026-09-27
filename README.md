@@ -3,7 +3,7 @@
 > **Disclaimer: LLM Contribution**
 > This project was developed and refactored with the assistance of a Large Language Model (LLM).
 
-A self-hosted Go daemon that monitors domain registrations, DNS records, TLS certificates, and published email security records.
+A self-hosted Go daemon that monitors domain registrations, DNS records, CAA policies, and published email security records.
 
 It runs as one process with bounded concurrency, resource limits, an embedded dashboard, and alerts. Upstream failures and incomplete evidence remain visible.
 
@@ -13,10 +13,9 @@ It runs as one process with bounded concurrency, resource limits, an embedded da
 
 *   **RDAP & WHOIS Monitoring:** IANA RDAP bootstrap discovery with registry exceptions and fallback to port-43 WHOIS. Monitors registration, expiry and nameserver evidence.
 *   **DNS Record Integrity:** Validates `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `IP`, and `ALIAS` records. Supports `exact`, `prefix`, `contains`, and `any_of` matching strategies, CNAME flattening, and per-record custom resolver overrides.
-*   **SSL/TLS Expiration Tracking:** Automatically performs TLS handshakes on web-facing records to track certificate validity, warning on approaching expirations (<= 14 days).
-*   **Email Security Suite:** Checks MX records against configured providers, discovers SPF and DMARC records, and checks configured DKIM selectors. It does not evaluate complete mail authentication policy. Mail providers can be extended via JSON configs in `./data/email_providers/`.
+*   **Email Security Suite:** Checks MX records against configured providers, discovers SPF and DMARC records, and checks configured DKIM selectors. It does not evaluate complete mail authentication policy. Bundled provider presets can be extended or overridden at startup using JSON files in `./data/email_providers/` or `email_providers_dir`. Both MX suffixes and DKIM selectors come from those files.
 *   **2-Tier DNSSEC Verification:** Checks local DS/DNSKEY and RRSIG evidence and requires an authenticated DNS-over-HTTPS (DoH) response for a verified result.
-*   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Alerts are deduplicated and throttled, with domain-name redaction supported.
+*   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Each cycle delivers its alerts, with domain-name redaction supported. Persistent problems alert again on subsequent cycles; failed deliveries are logged.
 *   **Embedded Web Dashboard:** A single-page dashboard with Dark and Light modes, periodic state polling, and a `/health` liveness endpoint. Provider quotas can still defer checks despite local rate limiting.
 
 ---
@@ -44,8 +43,7 @@ and initializes an owned configuration snapshot. Changes require a restart.
       "expected_registrar_id": "292",
       "domain_transfer_locked": true,
       "check_email_security": true,
-      "dnssec": true,
-
+      "dnssec": true
     }
   ],
   "dns_records": [
@@ -69,7 +67,7 @@ and initializes an owned configuration snapshot. Changes require a restart.
 | :--- | :--- | :--- | :--- |
 | `port` | string | `"8080"` | HTTP server listening port. |
 | `loop_interval_days` | number | `0.25` | Days between monitoring cycles; values outside `0.125`–`365` are clamped to those bounds. |
-| `data_dir` | string | Container: `/app/data`; local: `./data` | Path to persist CT histories and state. `DATA_DIR` overrides it at startup. |
+| `email_providers_dir` | string | `./data/email_providers` | Optional startup directory of provider JSON files, overriding bundled presets by filename. A missing default directory uses bundled presets; an explicitly configured missing directory, malformed definition, or unknown configured provider fails startup. |
 | `resolvers` | array | `["1.1.1.1"...]` | List of up to 9 custom global DNS resolver IPs, retained for runtime failover. |
 | `doh_url` | string | `"https://dns.google/resolve"` | Trusted upstream JSON DoH validator used to corroborate local DNSSEC evidence; this daemon is not an independent root-to-zone validator. |
 | `notifications` | object | Required | Must contain `ntfy.url`, a valid HTTP(S) URL. Optional `ntfy.auth`. Telegram is enabled only when both `token` and `chat_id` are nonempty after config/environment overrides. Missing or incomplete credentials disable Telegram with a warning; Ntfy remains active. Reachability is checked during delivery. |
@@ -81,18 +79,29 @@ RDAP requests honor `HTTP_PROXY` and `HTTPS_PROXY`. With a proxy configured, the
 Configuration and resolver lists are owned at startup and shared read-only inside
 the daemon; explicit snapshot access returns independent copies. Internal status
 and priority values are byte enums, and condition codes are 16-bit enums. API and
-checkpoint status names retain their string representation. Condition history
+result status names retain their string representation. Condition history
 keeps only codes and start times, avoiding retention of old error messages.
 
 Domain names, DNS values and diagnostics still need strings; variable-sized
-results and durable CT discoveries need bounded slices/maps. Optional condition
-pointers avoid embedding large unused diagnostics in healthy results. Go's escape
-analysis determines stack versus heap placement; the daemon does not promise that
-all state lives on the stack. Completed cycles publish one cached JSON snapshot.
-CT exports and committed checkpoints own their nested slices and conditions;
-changing a returned cycle result cannot alter the restart checkpoint. Worker
-results transfer ownership to the cycle collector; mutable cycle maps have one
-owner. Bootstrap cache access returns a copy and pricing access returns values.
+results need bounded slices/maps. Optional condition pointers avoid embedding
+large unused diagnostics in healthy results. Configuration snapshots own their
+CAA policy slices. Worker results transfer ownership to the cycle collector;
+mutable cycle maps have one owner. Completed cycles publish one cached JSON
+snapshot. Bootstrap and pricing cache access return independent copies.
+
+Provider files use the filename as the provider name, for example `custom.json`:
+
+```json
+{
+  "mx_records": ["mail.example.com"],
+  "dkim_selectors": ["selector1", "selector2"]
+}
+```
+
+MX entries are normalized hostname suffixes, matched at label boundaries. At
+least one MX suffix is required. DKIM selectors may be omitted when no default
+selector is known. Set `mail_provider` to `custom` to use this definition. Provider
+files are read once; changes require a restart.
 
 ### Domain Options (`domains[]`)
 
@@ -109,7 +118,6 @@ owner. Bootstrap cache access returns a copy and pricing access returns values.
 | `mx_records` | array | No | Explicit expected MX records. |
 | `dkim_selectors` | array | No | Custom DKIM selector prefixes to query. |
 | `dnssec` | bool | No | Enables 2-tier local cryptographic and upstream DoH DNSSEC validation. |
-| `monitor_ct_logs` | bool | No | Enables Certificate Transparency log polling. |
 | `caa` | object | No | CAA validation policy (`issue`, `issuewild`, `issuemail`). |
 | `expected_registrar_id` | string | No | Expected IANA Registrar ID (e.g. `"292"`). |
 | `expected_registrar_name` | string | No | Expected registrar name when name matching is needed. |
@@ -139,12 +147,10 @@ Tokens and runtime paths can be configured via environment variables for easy co
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `CONFIG_PATH` | `"config.json"` | Path to the `config.json` file |
-| `DATA_DIR` | Config value, otherwise `./data` | Directory for persistent state and CT logs; deployment examples set `/app/data` |
 | `PORT` | `"8080"` | HTTP server listening port |
 | `NTFY_AUTH` | Config value | Authorization header/token for Ntfy |
 | `TELEGRAM_TOKEN` | Config value | Telegram Bot API token |
 | `TELEGRAM_CHAT_ID` | Config value | Telegram chat or channel ID |
-| `CTLOGS_API_KEY` | Config value | API token for `api.ctlogs.dev` |
 | `DOH_URL` | `"https://dns.google/resolve"` | Upstream DNS-over-HTTPS endpoint |
 
 ---
@@ -153,10 +159,9 @@ Tokens and runtime paths can be configured via environment variables for easy co
 
 The daemon provides an embedded Web UI and JSON API:
 
-*   **`GET /`:** Interactive Web Dashboard displaying the latest completed check and connection state. Domain cards show annual renewal prices when collapsed and expanded; CT issues appear as status badges, with certificate history on the Certificates page.
+*   **`GET /`:** Interactive Web Dashboard displaying the latest completed check and connection state. Domain cards show annual renewal prices when collapsed and expanded.
 *   **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
 *   **`GET /api/state`:** Real-time JSON snapshot of the full monitoring evaluation state.
-*   **`GET /api/certs?domain=example.com`:** Certificate Transparency history for a domain.
 
 ---
 
@@ -165,7 +170,7 @@ The daemon provides an embedded Web UI and JSON API:
 The daemon tracks estimated annual domain renewal costs for your portfolio:
 
 * **Automatic Standard TLD Pricing**: Standard domain extensions (e.g., `.com`, `.org`, `.co.uk`) are automatically priced using the open [DotSweep](https://dotsweep.com/tlds) TLD catalog.
-* **Pricing catalog privacy**: The daemon queries `https://dotsweep.com/tlds` to download a public TLD catalog without sending portfolio domain names, TLD lists, or registrar identities in that request. Domain, DNS, and CT checks contact their configured upstream services separately.
+* **Pricing catalog privacy**: The daemon queries `https://dotsweep.com/tlds` to download a public TLD catalog without sending portfolio domain names, TLD lists, or registrar identities in that request. Domain and DNS checks contact their configured upstream services separately.
 * **Catalog caching**: Upstream catalog responses are cached in memory for 24 hours (`PricingCacheTTL`). Temporary upstream failures or unusable catalogs retain existing cached data for up to 7 days.
 * **Premium Domains & Custom Overrides**: Because premium domains have custom renewal prices that cannot be inferred from standard TLD rates, you can specify `renewal_price` in `config.json` (e.g., `"renewal_price": 250.00`). A manual amount takes precedence. Domain cards show the annual price or `Unknown` in both states; domains being let go show `Not renewing`, and delegated zones show `Not applicable`. The portfolio total is partial when some prices are unknown.
 
@@ -184,13 +189,11 @@ docker run -d \
   --restart always \
   -p 8080:8080 \
   -v /path/to/your/config.json:/app/config.json:ro \
-  -v /path/to/your/data:/app/data:U \
   -e CONFIG_PATH=/app/config.json \
-  -e DATA_DIR=/app/data \
   ghcr.io/your-github-username/your-repo-name:latest
 ```
 
-*Note: Ensure your host data directory (`/path/to/your/data`) has write permissions for UID 65532.*
+To add custom email providers, mount their directory read-only at `/app/data/email_providers`. Bundled presets are used when this directory is absent.
 
 ### Local Execution
 
@@ -218,12 +221,11 @@ Deploy using the included `domain-monitor.container` Quadlet file:
 *   [**lissy93/who-dat**](https://github.com/lissy93/who-dat): Reference implementation for unified WHOIS/RDAP JSON lookups.
 *   [**likexian/whois-parser**](https://github.com/likexian/whois-parser): WHOIS schema parser. Port-43 transport is implemented locally with context cancellation and response bounds.
 *   [**miekg/dns**](https://github.com/miekg/dns): DNS wire protocol and cryptographic DNSSEC verification library for Go.
-*   [**api.ctlogs.dev**](https://api.ctlogs.dev): Certificate Transparency search API.
 ---
 
 ## Development & Testing
 
-The single [protocol reference](docs/protocols.md) links the RFCs and states which parts the monitor uses.
+The single [protocol reference](src/docs/protocols.md) links the RFCs and states which parts the monitor uses.
 
 The test suite uses injected clients, local HTTP/DNS fixtures, and a committed synthetic WHOIS corpus.
 
@@ -236,10 +238,10 @@ A dashboard regression runs in headless Chromium when it is installed; it skips 
 
 Live tests are colocated with their protocol tests and skip unless explicitly
 enabled: `DOMAIN_MONITOR_LIVE=1 go test ./src -run '^TestLive' -count=1`.
-The compact [assurance checklist](docs/protocols.md#assurance-checklist) defines
+The compact [assurance checklist](src/docs/protocols.md#assurance-checklist) defines
 the supported-scope release gate; passing tests alone is not a bug-free guarantee.
 
 For parser fuzzing, run `go test -fuzz=FuzzFlexibleDateParsing -fuzztime=30s ./src/`.
 
 ### CI/CD Pipeline
-The GitHub Actions pipeline runs race tests, `go vet`, `golangci-lint`, a formatting check, and an 83% coverage gate on pull requests, pushes to `main`, and release tags. Container publication remains tag-only.
+The GitHub Actions workflow builds and publishes containers for release tags on `main`. Run race tests, `go vet`, the configured `golangci-lint`, formatting checks, and the 83% coverage gate locally before release; the current workflow does not enforce these checks.

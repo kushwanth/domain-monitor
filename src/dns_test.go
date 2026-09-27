@@ -2192,4 +2192,3 @@ func TestCanonicalCAARecordValue(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, `0 issue "letsencrypt.org"`, val2)
 }
-

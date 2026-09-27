@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -16,49 +17,9 @@ import (
 // NewPricingManager initializes a PricingManager targeting DotSweep with the provided HTTP client.
 func NewPricingManager(httpClient HTTPDoer) *PricingManager {
 	return &PricingManager{
-		http:   ResolveHTTPClient(httpClient),
-		url:    DotSweepAPIEndpoint,
-		prices: make(map[string]float64),
+		http: ResolveHTTPClient(httpClient),
+		url:  DotSweepAPIEndpoint,
 	}
-}
-
-func (p *PricingManager) isFresh() bool {
-	if p == nil {
-		return false
-	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.prices) > 0 && time.Since(p.fetchedAt) < PricingCacheTTL
-}
-
-func (p *PricingManager) ensure(ctx context.Context) error {
-	if p == nil {
-		return ErrPricingManagerNil
-	}
-	if p.isFresh() {
-		return nil
-	}
-
-	p.fetchMu.Lock()
-	defer p.fetchMu.Unlock()
-
-	if p.isFresh() {
-		return nil
-	}
-
-	if err := p.fetch(ctx); err != nil {
-		p.mu.RLock()
-		hasData := len(p.prices) > 0
-		cacheAge := time.Since(p.fetchedAt)
-		p.mu.RUnlock()
-
-		if hasData && cacheAge <= PricingMaxStaleAge {
-			LogWarn(MsgLogDotSweepFetchFailed, FieldError, err, FieldCacheAge, cacheAge.Round(time.Minute))
-			return nil
-		}
-		return err
-	}
-	return nil
 }
 
 // normalizeTLD strips whitespace, lowercases, and removes a leading dot from a TLD string.
@@ -66,45 +27,67 @@ func normalizeTLD(tld string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(tld)), SymDot)
 }
 
-func (p *PricingManager) fetch(ctx context.Context) error {
+func (p *PricingManager) cachedPrices(ctx context.Context) (map[string]float64, error) {
 	if p == nil {
-		return ErrPricingManagerNil
+		return nil, ErrPricingManagerNil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.prices) > 0 && time.Since(p.fetchedAt) < PricingCacheTTL {
+		return maps.Clone(p.prices), nil
+	}
+	prices, err := p.fetch(ctx)
+	if err != nil {
+		if len(p.prices) > 0 && time.Since(p.fetchedAt) <= PricingMaxStaleAge {
+			LogWarn(MsgLogPricingFetchFailed, FieldError, err)
+			return maps.Clone(p.prices), nil
+		}
+		return nil, err
+	}
+	p.prices = prices
+	p.fetchedAt = time.Now()
+	return maps.Clone(p.prices), nil
+}
+
+func (p *PricingManager) fetch(ctx context.Context) (map[string]float64, error) {
+	if p == nil {
+		return nil, ErrPricingManagerNil
 	}
 	client := ResolveHTTPClient(p.http)
 	if client == nil {
-		return errors.New(MsgErrPricingHTTPClientNotConfigured)
+		return nil, errors.New(MsgErrPricingHTTPClientNotConfigured)
 	}
 	// #nosec G704 -- p.url is the fixed DotSweep endpoint or a test-injected URL.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
 	if err != nil {
-		return WrapError(MsgErrDotSweepFetchFailed, err)
+		return nil, WrapError(MsgErrDotSweepFetchFailed, err)
 	}
 	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return WrapError(MsgErrDotSweepFetchFailed, err)
+		return nil, WrapError(MsgErrDotSweepFetchFailed, err)
 	}
 	defer DrainAndClose(resp.Body, MaxBodyDrainSize)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf(MsgErr2, MsgErrDotSweepFetchFailed, resp.Status)
+		return nil, fmt.Errorf(MsgErr2, MsgErrDotSweepFetchFailed, resp.Status)
 	}
 
 	var pResp DotSweepResponse
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxPricingResponseSize+1))
 	if err != nil {
-		return fmt.Errorf(MsgErrReadPricingResponse, err)
+		return nil, fmt.Errorf(MsgErrReadPricingResponse, err)
 	}
 	if len(body) > MaxPricingResponseSize {
-		return fmt.Errorf(MsgErrPricingResponseExceedsBytes, MaxPricingResponseSize)
+		return nil, fmt.Errorf(MsgErrPricingResponseExceedsBytes, MaxPricingResponseSize)
 	}
 	if err := jsonv2.Unmarshal(body, &pResp); err != nil {
-		return WrapError(MsgErrDotSweepParseError, err)
+		return nil, WrapError(MsgErrDotSweepParseError, err)
 	}
 
 	if len(pResp.TLDs) == 0 {
-		return errors.New(MsgErrDotSweepNoData)
+		return nil, errors.New(MsgErrDotSweepNoData)
 	}
 
 	newPrices := make(map[string]float64, len(pResp.TLDs))
@@ -119,25 +102,10 @@ func (p *PricingManager) fetch(ctx context.Context) error {
 	}
 
 	if len(newPrices) == 0 {
-		return errors.New(MsgErrDotSweepNoData)
+		return nil, errors.New(MsgErrDotSweepNoData)
 	}
-	p.mu.Lock()
-	p.prices = newPrices
-	p.fetchedAt = time.Now()
-	p.mu.Unlock()
 
-	return nil
-}
-
-// GetPrice retrieves the cached renewal price for a normalized TLD.
-func (p *PricingManager) GetPrice(tld string) (float64, bool) {
-	if p == nil {
-		return 0, false
-	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	price, ok := p.prices[normalizeTLD(tld)]
-	return price, ok
+	return newPrices, nil
 }
 
 // extractTLD resolves the public suffix/TLD of a domain name using the public suffix list.
@@ -184,7 +152,8 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 		return
 	}
 
-	if err := pm.ensure(ctx); err != nil {
+	prices, err := pm.cachedPrices(ctx)
+	if err != nil {
 		LogWarn(MsgLogPricingFetchFailed, FieldError, err)
 		return
 	}
@@ -198,7 +167,7 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 			continue
 		}
 		tld := extractTLD(domainCfg.Domain)
-		if price, ok := pm.GetPrice(tld); ok && price > 0 {
+		if price, ok := prices[tld]; ok && price > 0 {
 			state.RenewalPrice = price
 			loopState.RDAP[domainCfg.Domain] = state
 		}

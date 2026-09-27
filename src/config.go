@@ -4,12 +4,14 @@ import (
 	"context"
 	"embed"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -135,6 +137,48 @@ func normalizeConfiguredChecks(rawCfg *AppConfig) error {
 		if err := normalizeDomainConfig(&rawCfg.Domains[i], i, seenDomains, seenDomainNames); err != nil {
 			return err
 		}
+
+		d := &rawCfg.Domains[i]
+		if d.CAA != nil {
+			var expected []string
+			if d.CAA.Issue != nil {
+				if len(d.CAA.Issue) == 0 {
+					expected = append(expected, `0 issue ";"`)
+				} else {
+					for _, val := range d.CAA.Issue {
+						expected = append(expected, fmt.Sprintf(`0 issue "%s"`, val))
+					}
+				}
+			}
+			if d.CAA.IssueWild != nil {
+				if len(d.CAA.IssueWild) == 0 {
+					expected = append(expected, `0 issuewild ";"`)
+				} else {
+					for _, val := range d.CAA.IssueWild {
+						expected = append(expected, fmt.Sprintf(`0 issuewild "%s"`, val))
+					}
+				}
+			}
+			if d.CAA.IssueMail != nil {
+				if len(d.CAA.IssueMail) == 0 {
+					expected = append(expected, `0 issuemail ";"`)
+				} else {
+					for _, val := range d.CAA.IssueMail {
+						expected = append(expected, fmt.Sprintf(`0 issuemail "%s"`, val))
+					}
+				}
+			}
+
+			if len(expected) > 0 {
+				task := DNSTask{
+					Hostname: d.Domain,
+					Name:     fmt.Sprintf("__caa__%s", d.Domain),
+					Type:     RecordTypeCAA,
+					Expected: expected,
+				}
+				rawCfg.DNSRecords = append(rawCfg.DNSRecords, task)
+			}
+		}
 	}
 
 	seenDNSNames := make(map[string]bool, len(rawCfg.DNSRecords))
@@ -197,7 +241,7 @@ func validateResolverEndpoint(endpoint string) error {
 func validateHTTPURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u == nil || (u.Scheme != StrHTTP && u.Scheme != StrHTTPS) || u.Hostname() == StrEmpty || u.User != nil {
-		return fmt.Errorf(MsgErrExpectedAnHTTPSURLWith)
+		return errors.New(MsgErrExpectedAnHTTPSURLWith)
 	}
 	if port := u.Port(); port != StrEmpty {
 		return validateTCPPort(port)
@@ -215,7 +259,42 @@ func normalizeDomainConfig(domainCfg *DomainConfig, i int, seenDomains map[strin
 	if err := normalizeDomainMetadata(domainCfg, seenDomainNames); err != nil {
 		return err
 	}
-	return normalizeDomainEmail(domainCfg)
+	if err := normalizeDomainEmail(domainCfg); err != nil {
+		return err
+	}
+	return normalizeDomainCAA(domainCfg)
+}
+
+func normalizeDomainCAA(domainCfg *DomainConfig) error {
+	if domainCfg.CAA != nil {
+		normalizeCAAList := func(list []string) []string {
+			if list == nil {
+				return nil
+			}
+			var res []string
+			for _, item := range list {
+				val := strings.ToLower(strings.TrimSpace(item))
+				if val != "" && val != ";" && val != "none" {
+					res = append(res, val)
+				}
+			}
+			if len(res) == 0 {
+				return []string{} // non-nil empty slice represents explicit deny-all
+			}
+			return res
+		}
+
+		if domainCfg.CAA.Issue != nil {
+			domainCfg.CAA.Issue = normalizeCAAList(domainCfg.CAA.Issue)
+		}
+		if domainCfg.CAA.IssueWild != nil {
+			domainCfg.CAA.IssueWild = normalizeCAAList(domainCfg.CAA.IssueWild)
+		}
+		if domainCfg.CAA.IssueMail != nil {
+			domainCfg.CAA.IssueMail = normalizeCAAList(domainCfg.CAA.IssueMail)
+		}
+	}
+	return nil
 }
 
 func normalizeDomainName(domainCfg *DomainConfig, i int, seenDomains map[string]bool) error {
@@ -486,7 +565,18 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 		app.Notifier = notifier
 	}
 
-	app.EmailProviders = loadEmailProviders()
+	providers, err := loadEmailProviders(cfg.EmailProvidersDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, domain := range app.configuration().Domains {
+		if domain.CheckEmailSecurity && domain.MailProvider != StrEmpty {
+			if _, known := providers[domain.MailProvider]; !known {
+				return nil, fmt.Errorf(MsgErrUnknownMailProviderFor, domain.MailProvider, domain.Domain)
+			}
+		}
+	}
+	app.EmailProviders = providers
 
 	return app, nil
 }
@@ -494,27 +584,87 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 //go:embed data/email_providers/*.json
 var emailProvidersFS embed.FS
 
-func loadEmailProviders() map[string]ProviderConfig {
-	providers := make(map[string]ProviderConfig)
-	entries, err := emailProvidersFS.ReadDir("data/email_providers")
+func loadEmailProviders(directory string) (map[string]ProviderConfig, error) {
+	builtin, err := fs.Sub(emailProvidersFS, "data/email_providers")
 	if err != nil {
-		return providers
+		return nil, fmt.Errorf("open embedded email providers: %w", err)
+	}
+	providers := make(map[string]ProviderConfig)
+	if err := readEmailProviders(builtin, providers); err != nil {
+		return nil, err
+	}
+	explicit := strings.TrimSpace(directory) != StrEmpty
+	if !explicit {
+		directory = "data/email_providers"
+	}
+	if _, err := os.Stat(directory); err != nil {
+		if !explicit && errors.Is(err, os.ErrNotExist) {
+			return providers, nil
+		}
+		return nil, fmt.Errorf("open email provider directory %s: %w", directory, err)
+	}
+	if err := readEmailProviders(os.DirFS(directory), providers); err != nil {
+		return nil, fmt.Errorf("load email providers from %s: %w", directory, err)
+	}
+	return providers, nil
+}
+
+func readEmailProviders(source fs.FS, providers map[string]ProviderConfig) error {
+	entries, err := fs.ReadDir(source, ".")
+	if err != nil {
+		return fmt.Errorf("list email providers: %w", err)
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		p := path.Join("data", "email_providers", entry.Name())
-		b, err := emailProvidersFS.ReadFile(p)
+		cfg, err := readEmailProvider(source, entry.Name())
 		if err != nil {
-			continue
+			return err
 		}
-		var cfg ProviderConfig
-		if err := jsonv2.Unmarshal(b, &cfg); err != nil {
-			continue
+		name := strings.ToLower(strings.TrimSuffix(entry.Name(), ".json"))
+		if !ReValidDomain.MatchString(name + ".example") {
+			return fmt.Errorf("invalid email provider name %q", name)
 		}
-		name := strings.TrimSuffix(entry.Name(), ".json")
 		providers[name] = cfg
 	}
-	return providers
+	return nil
+}
+
+func readEmailProvider(source fs.FS, name string) (ProviderConfig, error) {
+	file, err := source.Open(name)
+	if err != nil {
+		return ProviderConfig{}, fmt.Errorf("open email provider %s: %w", name, err)
+	}
+	defer func() { _ = file.Close() }() // read-only close
+	const maxProviderBytes = 64 << 10
+	body, err := io.ReadAll(io.LimitReader(file, maxProviderBytes+1))
+	if err != nil {
+		return ProviderConfig{}, fmt.Errorf("read email provider %s: %w", name, err)
+	}
+	if len(body) > maxProviderBytes {
+		return ProviderConfig{}, fmt.Errorf("email provider %s exceeds %d bytes", name, maxProviderBytes)
+	}
+	var cfg ProviderConfig
+	if err := jsonv2.Unmarshal(body, &cfg); err != nil {
+		return cfg, fmt.Errorf("decode email provider %s: %w", name, err)
+	}
+	if len(cfg.MXRecords) == 0 {
+		return cfg, fmt.Errorf("email provider %s has no MX records", name)
+	}
+	for i, mx := range cfg.MXRecords {
+		mx = NormalizeDomainToASCIIText(mx)
+		if !ReValidDomain.MatchString(mx) || len(mx) > 253 {
+			return cfg, fmt.Errorf("email provider %s has invalid MX suffix %q", name, mx)
+		}
+		cfg.MXRecords[i] = mx
+	}
+	for i, selector := range cfg.DKIMSelectors {
+		selector = strings.ToLower(strings.TrimSpace(selector))
+		if !ReValidDomain.MatchString(selector+".example") || len(selector) > 200 {
+			return cfg, fmt.Errorf("email provider %s has invalid DKIM selector %q", name, selector)
+		}
+		cfg.DKIMSelectors[i] = selector
+	}
+	return cfg, nil
 }

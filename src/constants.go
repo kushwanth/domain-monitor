@@ -11,26 +11,26 @@ import (
 
 // System & Default Paths and Files
 const (
-	MaxPendingAlerts           = 256
-	MaxAlertsPerFlush          = 32
-	CTStateVersion             = 1
-	MaxCTSeenIDs               = 1000
-	MaxCTScanPages             = 10
-	MaxCTPendingItems          = 256
-	MaxCTPendingBytes          = 1 << 20
-	DefaultConfigFile          = "config.json"
-	DefaultServerPort          = "8080"
-	DefaultDNSPort             = "53"
-	DefaultDataDir             = "/app/data"
-	DefaultLocalDataDir        = "./data"
-	DefaultDoHURL              = "https://dns.google/resolve"
-	DefaultCTLogsSubdir        = "ct_logs"
-	DefaultUserAgent           = "DomainMonitor/1.0 (+https://github.com/domain-monitor)"
-	MaxBootstrapResponseSize   = 8 << 20  // 8 MB
-	MaxCTLogsResponseSize      = 16 << 20 // 16 MB
-	MaxCTHistoryFileSize       = 8 << 20  // 8 MB
-	MaxNotificationPayloadSize = 1 << 20  // 1 MB
-	MaxPricingResponseSize     = 5 << 20  // 5 MB
+	MaxPendingAlerts    = 256
+	MaxAlertsPerFlush   = 32
+	CTStateVersion      = 1
+	MaxCTSeenIDs        = 1000
+	MaxCTScanPages      = 10
+	MaxCTPendingItems   = 256
+	MaxCTPendingBytes   = 1 << 20
+	DefaultConfigFile   = "config.json"
+	DefaultServerPort   = "8080"
+	DefaultDNSPort      = "53"
+	DefaultDataDir      = "/app/data"
+	DefaultLocalDataDir = "./data"
+	DefaultDoHURL       = "https://dns.google/resolve"
+
+	DefaultUserAgent         = "DomainMonitor/1.0 (+https://github.com/domain-monitor)"
+	MaxBootstrapResponseSize = 8 << 20 // 8 MB
+
+	MaxCTHistoryFileSize       = 8 << 20 // 8 MB
+	MaxNotificationPayloadSize = 1 << 20 // 1 MB
+	MaxPricingResponseSize     = 5 << 20 // 5 MB
 )
 
 // Standard Timeouts & Intervals
@@ -47,9 +47,9 @@ const (
 	ShutdownTimeout             = 5 * time.Second
 	DefaultLoopDurationFallback = 6 * time.Hour
 	RDAPRateLimitInterval       = 10 * time.Second
-	CTLogsRateLimitInterval     = 5 * time.Second
-	DefaultReferralRDAPTimeout  = 6 * time.Second
-	DefaultAlertCooldown        = 24 * time.Hour
+
+	DefaultReferralRDAPTimeout = 6 * time.Second
+	DefaultAlertCooldown       = 24 * time.Hour
 )
 
 // WHOIS transport protocol and known server aliases.
@@ -99,7 +99,6 @@ const (
 	EnvNtfyAuth       = "NTFY_AUTH"
 	EnvTelegramToken  = "TELEGRAM_TOKEN"
 	EnvTelegramChatID = "TELEGRAM_CHAT_ID"
-	EnvCTLogsAPIKey   = "CTLOGS_API_KEY" // #nosec G101 -- environment variable name, not a credential.
 )
 
 // HTTP Constants
@@ -150,10 +149,10 @@ const (
 
 // External API Endpoints
 const (
-	BootstrapURL                 = "https://data.iana.org/rdap/dns.json"
-	BootstrapTTL                 = 24 * time.Hour
-	BootstrapMaxAge              = 72 * time.Hour
-	CTLogsAPIEndpoint            = "https://api.ctlogs.dev/v1/subdomains/"
+	BootstrapURL    = "https://data.iana.org/rdap/dns.json"
+	BootstrapTTL    = 24 * time.Hour
+	BootstrapMaxAge = 72 * time.Hour
+
 	TelegramAPIEndpoint          = "https://api.telegram.org/bot%s/sendMessage"
 	TelegramAPIBase              = "https://api.telegram.org/bot"
 	TelegramAPISendMessageSuffix = "/sendMessage"
@@ -370,7 +369,6 @@ const (
 	CodeCAAUnexpectedIssuer
 	CodeCAAMissingIssuer
 
-	// CT Logs
 	CodeCTLogsVerified
 	CodeCTLogsRateLimited
 	CodeCTLogsHTTPError
@@ -458,10 +456,6 @@ var resultCodeNames = [...]string{
 	CodeCAAUnexpectedIssuer: "caaUnexpectedIssuer",
 	CodeCAAMissingIssuer:    "caaMissingIssuer",
 
-	// CT Logs
-	CodeCTLogsVerified:       "ctLogsVerified",
-	CodeCTLogsRateLimited:    "ctLogsRateLimited",
-	CodeCTLogsHTTPError:      "ctLogsHttpError",
 	CodeCTPersistenceFailed:  "ctPersistenceFailed",
 	CodeCTCoverageIncomplete: "ctCoverageIncomplete",
 
@@ -480,24 +474,24 @@ func (r ResultCode) String() string {
 
 // System Errors
 var (
-	ErrDNSResolution          = errors.New("dns resolution failed")
-	ErrNXDOMAIN               = errors.New("no such host (NXDOMAIN)")
-	ErrSERVFAIL               = errors.New("server failure (SERVFAIL)")
-	ErrRDAPNotFound           = errors.New("RDAP domain not found (404)")
-	ErrRDAPRateLimited        = errors.New("RDAP rate limited (429)")
-	ErrWHOISRateLimited       = errors.New("whois rate limited (429)")
-	ErrDomainNotFound         = errors.New("domain not found in whois (404)")
-	ErrNoResolvers            = errors.New("no resolvers configured")
-	ErrEmptyDNSResponse       = errors.New("empty dns response")
-	ErrInvalidNullMX          = errors.New("invalid null MX record")
-	ErrNoPeerCertificates     = errors.New("no peer certificates returned")
+	ErrDNSResolution    = errors.New("dns resolution failed")
+	ErrNXDOMAIN         = errors.New("no such host (NXDOMAIN)")
+	ErrSERVFAIL         = errors.New("server failure (SERVFAIL)")
+	ErrRDAPNotFound     = errors.New("RDAP domain not found (404)")
+	ErrRDAPRateLimited  = errors.New("RDAP rate limited (429)")
+	ErrWHOISRateLimited = errors.New("whois rate limited (429)")
+	ErrDomainNotFound   = errors.New("domain not found in whois (404)")
+	ErrNoResolvers      = errors.New("no resolvers configured")
+	ErrEmptyDNSResponse = errors.New("empty dns response")
+	ErrInvalidNullMX    = errors.New("invalid null MX record")
+
 	ErrRestrictedIP           = errors.New("connection to restricted IP blocked (SSRF)")
 	ErrBootstrapClientNil     = errors.New("bootstrap client is nil")
 	ErrNoRDAPServer           = errors.New("no rdap server found")
 	ErrEmptyDate              = errors.New("empty date string")
 	ErrEmptyBootstrapRegistry = errors.New("empty bootstrap registry")
-	ErrCTLogsRateLimited      = errors.New("api.ctlogs.dev rate limit exceeded")
-	ErrPricingManagerNil      = errors.New(MsgErrPricingManagerNil)
+
+	ErrPricingManagerNil = errors.New(MsgErrPricingManagerNil)
 )
 
 // DNSTypeMap maps record type string names to miekg/dns uint16 type constants.
@@ -845,9 +839,6 @@ const (
 	MsgAlertCAAUnauthorized = "CAA: Unauthorized CA '%s' in %s record for %s"
 	MsgAlertCAAExpectedNA   = "CAA: Expected CA '%s' missing from %s record for %s"
 
-	// CT Logs Alerts
-	MsgAlertNewSSLCert = "New SSL Certificate issued for %s by %s. Match: %s"
-
 	// Email Security Alerts
 	MsgAlertEmailNoMX           = "Email Security: No MX records found for %s"
 	MsgAlertEmailMXMissing      = "Email Security: Missing expected MX %s on %s. Found: [%s]"
@@ -925,8 +916,6 @@ const (
 	MsgRedactedRDAPUnauthorizedNS = "Unauthorized nameserver detected."
 	MsgRedactedRDAPMissingNS      = "Expected nameserver is missing."
 
-	MsgRedactedNewSSLCert = "New SSL Certificate issued by %s for %s."
-
 	MsgRedactedNSUnreachablePrimary   = "Primary nameserver unreachable."
 	MsgRedactedNSUnreachableSecondary = "Secondary nameserver unreachable."
 	MsgRedactedNSNonAuthoritative     = "Nameserver missing AA flag."
@@ -965,41 +954,41 @@ const (
 	MsgErrDomainNegativeRenewalPrice = "domain %s: renewal_price cannot be negative"
 	MsgErrNoTierData                 = "no registry or registrar tier data available"
 
-	MsgLogTelegramMarshalFailed           = "Telegram payload marshal failed"
-	MsgLogTelegramRequestFailed           = "Telegram request creation failed"
-	MsgLogTelegramDeliveryFailed          = "Telegram delivery failed"
-	MsgLogTelegramRequestError            = "Telegram request error"
-	MsgLogTelegramPayloadTooLarge         = "Telegram alert exceeds provider message budget"
-	MsgLogTelegramRejected                = "Telegram rejected notification"
-	MsgLogRDAPRefreshFailed               = "Failed to refresh RDAP bootstrap from IANA; falling back to cached registry"
-	MsgLogWHOISPanicked                   = "WHOIS query panicked"
-	MsgLogRDAPReturned404                 = "RDAP returned 404, attempting WHOIS fallback"
-	MsgLogRDAPRateLimited                 = "RDAP rate limited, falling back to WHOIS"
-	MsgLogWHOISRateLimitedRetry           = "WHOIS query rate limited, retrying"
-	MsgLogWHOISUnregistered               = "WHOIS reports domain is unregistered (404)"
-	MsgLogSkippingUnsafeRDAP              = "Skipping unsafe RDAP referral URL"
-	MsgLogQueryingRegistrarRDAP           = "Querying registrar RDAP link"
-	MsgLogRegistrarReferralInvalid        = "Registrar RDAP referral could not be read"
-	MsgLogRateLimitedRegistrarRDAP        = "Rate limited by registrar RDAP"
-	MsgLogFollowingWHOISReferral          = "Following WHOIS referral"
-	MsgLogLoopIntervalBelowMin            = "loop_interval_days is below minimum (0.125 days / 3 hours); defaulting to 0.125"
-	MsgLogLoopIntervalAboveMax            = "loop_interval_days exceeds maximum (365 days); defaulting to 365"
-	MsgLogResolverUnreachable             = "Configured resolver unreachable during health check"
-	MsgLogReadCTLogFailed                 = "Failed to read CT log history file"
-	MsgLogHTTPServerFailed                = "HTTP server failed"
-	MsgLogStateTransition                 = "State transition"
-	MsgLogPanicDNSWorker                  = "Recovered from unexpected panic in DNS check worker"
-	MsgLogPanicDomainWorker               = "Recovered from unexpected panic in Domain check worker"
-	MsgLogPanicRDAP                       = "Recovered from unexpected panic in RDAP evaluation"
-	MsgLogPanicCTLogs                     = "Recovered from unexpected panic in CT logs evaluation"
-	MsgLogWriteCTStateFailed              = "Failed to write ct_state.json"
-	MsgLogStateMarshalFailed              = "Failed to encode monitoring state"
-	MsgLogCTAcknowledgementPending        = "CT notification acknowledgement remains pending"
-	MsgLogMonitoringCycleCompleted        = "Monitoring cycle completed"
-	MsgLogConfigError                     = "Configuration error"
-	MsgLogInitError                       = "Initialization error"
-	MsgLogDataDirEnsureFailed             = "Failed to ensure data directory exists (ensure directory is writable by UID 65532 or use :U volume mount)"
-	MsgLogCTLogsDirEnsureFailed           = "Failed to ensure ct_logs directory exists (ensure directory is writable by UID 65532 or use :U volume mount)"
+	MsgLogTelegramMarshalFailed    = "Telegram payload marshal failed"
+	MsgLogTelegramRequestFailed    = "Telegram request creation failed"
+	MsgLogTelegramDeliveryFailed   = "Telegram delivery failed"
+	MsgLogTelegramRequestError     = "Telegram request error"
+	MsgLogTelegramPayloadTooLarge  = "Telegram alert exceeds provider message budget"
+	MsgLogTelegramRejected         = "Telegram rejected notification"
+	MsgLogRDAPRefreshFailed        = "Failed to refresh RDAP bootstrap from IANA; falling back to cached registry"
+	MsgLogWHOISPanicked            = "WHOIS query panicked"
+	MsgLogRDAPReturned404          = "RDAP returned 404, attempting WHOIS fallback"
+	MsgLogRDAPRateLimited          = "RDAP rate limited, falling back to WHOIS"
+	MsgLogWHOISRateLimitedRetry    = "WHOIS query rate limited, retrying"
+	MsgLogWHOISUnregistered        = "WHOIS reports domain is unregistered (404)"
+	MsgLogSkippingUnsafeRDAP       = "Skipping unsafe RDAP referral URL"
+	MsgLogQueryingRegistrarRDAP    = "Querying registrar RDAP link"
+	MsgLogRegistrarReferralInvalid = "Registrar RDAP referral could not be read"
+	MsgLogRateLimitedRegistrarRDAP = "Rate limited by registrar RDAP"
+	MsgLogFollowingWHOISReferral   = "Following WHOIS referral"
+	MsgLogLoopIntervalBelowMin     = "loop_interval_days is below minimum (0.125 days / 3 hours); defaulting to 0.125"
+	MsgLogLoopIntervalAboveMax     = "loop_interval_days exceeds maximum (365 days); defaulting to 365"
+	MsgLogResolverUnreachable      = "Configured resolver unreachable during health check"
+
+	MsgLogHTTPServerFailed  = "HTTP server failed"
+	MsgLogStateTransition   = "State transition"
+	MsgLogPanicDNSWorker    = "Recovered from unexpected panic in DNS check worker"
+	MsgLogPanicDomainWorker = "Recovered from unexpected panic in Domain check worker"
+	MsgLogPanicRDAP         = "Recovered from unexpected panic in RDAP evaluation"
+
+	MsgLogWriteCTStateFailed       = "Failed to write ct_state.json"
+	MsgLogStateMarshalFailed       = "Failed to encode monitoring state"
+	MsgLogCTAcknowledgementPending = "CT notification acknowledgement remains pending"
+	MsgLogMonitoringCycleCompleted = "Monitoring cycle completed"
+	MsgLogConfigError              = "Configuration error"
+	MsgLogInitError                = "Initialization error"
+	MsgLogDataDirEnsureFailed      = "Failed to ensure data directory exists (ensure directory is writable by UID 65532 or use :U volume mount)"
+
 	MsgLogParseCTStateFailed              = "Failed to parse ct_state.json"
 	MsgLogHTTPServerStopped               = "HTTP server stopped unexpectedly"
 	MsgLogMonitoringEngineStopped         = "Monitoring engine stopped unexpectedly"
@@ -1007,12 +996,6 @@ const (
 	MsgLogMonitoringEngineTimeout         = "Monitoring engine shutdown timed out"
 	MsgErrMonitoringEngineExited          = "stopped before shutdown"
 	MsgErrMonitoringEngineShutdownTimeout = "did not finish within shutdown budget"
-	MsgLogCTLogsPollingFailed             = "CT logs polling failed"
-	MsgLogDiscoveredNewCerts              = "Discovered new SSL certificates via CT logs"
-	MsgLogSaveCTLogsFailed                = "Failed to save CT logs history"
-	MsgLogCTLogsBackfillFailed            = "CT logs backfill failed"
-	MsgLogSaveBackfilledCTLogsFailed      = "Failed to save backfilled CT logs"
-	MsgLogUnmarshalCTLogFailed            = "Failed to unmarshal existing CT log history; continuing with empty list"
 )
 
 // Extracted Constants
@@ -1027,10 +1010,10 @@ const (
 
 // HTTP Routes & Query Params
 const (
-	RouteHealth            = "GET /health"
-	RouteAPIState          = "GET /api/state"
-	RouteAPICerts          = "GET /api/certs"
-	RouteAPICTLogs         = "GET /api/ctlogs/{domain}"
+	RouteHealth   = "GET /health"
+	RouteAPIState = "GET /api/state"
+	RouteAPICerts = "GET /api/certs"
+
 	ParamDomain            = "domain"
 	RDAPObjectClassDomain  = "domain"
 	ParamName              = "name"
@@ -1113,11 +1096,11 @@ const (
 
 // Provider & Component Names
 const (
-	NameNtfyProvider       = "Ntfy provider"
-	NameTelegramProvider   = "Telegram provider"
-	NameOpMonitoringCycle  = "Monitoring cycle"
-	NameOpRDAPCheckWorker  = "RDAP check worker"
-	NameOpCTLogsWorker     = "CT logs worker"
+	NameNtfyProvider      = "Ntfy provider"
+	NameTelegramProvider  = "Telegram provider"
+	NameOpMonitoringCycle = "Monitoring cycle"
+	NameOpRDAPCheckWorker = "RDAP check worker"
+
 	NameOpMonitoringEngine = "Monitoring engine"
 	CheckTypeRDAP          = "RDAP"
 	CheckTypeDNS           = "DNS"
@@ -1125,30 +1108,28 @@ const (
 	CheckTypeCAA           = "CAA"
 	CheckTypeDNSSEC        = "DNSSEC"
 	CheckTypeNSHealth      = "NSHealth"
-	CheckTypeCTLogs        = "CTLogs"
-	TargetKeyDomain        = "domain"
-	TargetKeyRecord        = "record"
-	FlagConfig             = "config"
-	FlagConfigShort        = "c"
-	FlagConfigUsage        = "Path to the JSON config file"
-	FlagConfigShortUsage   = "Path to the JSON config file (shorthand)"
+
+	TargetKeyDomain      = "domain"
+	TargetKeyRecord      = "record"
+	FlagConfig           = "config"
+	FlagConfigShort      = "c"
+	FlagConfigUsage      = "Path to the JSON config file"
+	FlagConfigShortUsage = "Path to the JSON config file (shorthand)"
 )
 
 // Notification Formatting & Delimiters
 const (
 	AlertConditionFormat         = "%s %s: %s %s (Since: %s)"
 	AlertConditionRedactedFormat = "%s %s: %s (Since: %s)"
-	AlertCTIdentityPrefix        = "CT:"
-	AlertNewCertificatePrefix    = "New Cert Issued: "
-	AlertNewCertificateRedacted  = "New Cert Issued"
-	TelegramAlertHeader          = "⚠️ <b>Domain Monitor Alerts</b>\n\n"
-	TelegramAlertHeaderCont      = "⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n"
-	TelegramBullet               = "• "
-	TelegramPrefixFormat         = "<b>[%s]</b> "
-	TelegramLineFormat           = "• %s%s\n"
-	NtfyPrefixFormat             = "[%s] "
-	TagSeparator                 = ","
-	AlertChunkSeparator          = "\n\n"
+
+	TelegramAlertHeader     = "⚠️ <b>Domain Monitor Alerts</b>\n\n"
+	TelegramAlertHeaderCont = "⚠️ <b>Domain Monitor Alerts (Cont.)</b>\n\n"
+	TelegramBullet          = "• "
+	TelegramPrefixFormat    = "<b>[%s]</b> "
+	TelegramLineFormat      = "• %s%s\n"
+	NtfyPrefixFormat        = "[%s] "
+	TagSeparator            = ","
+	AlertChunkSeparator     = "\n\n"
 )
 
 // Logging Formats
@@ -1179,11 +1160,11 @@ const (
 	MsgErrInternalDNSCheckPanic  = "internal check panic: %s"
 	MsgErrDomainCheckPanic       = "domain check panicked: %s"
 	MsgErrInternalRDAPCheckPanic = "internal rdap check panic: %s"
-	MsgErrInternalCTLogsPanic    = "internal ct logs panic: %s"
+
 	MsgErrCheckTimeoutOrCanceled = "check timed out or canceled"
 	MsgErrNilConnection          = "nil connection returned for %s"
 	MsgErrNonTLSConnection       = "unexpected non-TLS connection for %s"
-	MsgErrNoPeerCertsFound       = "no peer certificates found for %s"
+
 	MsgErrLookupEmptyResponse    = "lookup %s on %s: empty response"
 	MsgErrLookupQuestionMismatch = "lookup %s on %s: response question mismatch or missing"
 	MsgErrLookupServerError      = "lookup %s on %s: server error (%s)"
@@ -1305,28 +1286,26 @@ var RegistryDateLayouts = [...]string{
 
 // Auto-generated error and log constants
 const (
-	MsgErrTLS                                 = "tls: %w"
-	MsgErrIPv6ResolverTimeout                 = "IPv6 resolver timeout"
-	MsgErrResolverTimeout                     = "resolver timeout"
-	MsgErrCNAMELookupTimedOut                 = "CNAME lookup timed out"
-	MsgErrUntrustedChain                      = "untrusted chain"
-	MsgErrMockDohError                        = "mock doh error"
-	MsgErrMockDNSSECError                     = "mock DNSSEC error"
-	MsgErrResolutionFailed                    = "resolution failed"
-	MsgErrMockError                           = "mock error"
-	MsgErrResolverErrorCNAMELoopDetected      = "resolver error: CNAME loop detected"
-	MsgErrTemporaryDNSFailure                 = "temporary DNS failure"
-	MsgErrDNSTimeout                          = "DNS timeout"
-	MsgErrQuotaExceeded                       = "quota exceeded"
-	MsgErrCommitFailed                        = "commit failed"
-	MsgErrDiskFull                            = "disk full"
-	MsgErrDiskUnavailable                     = "disk unavailable"
-	MsgErrTLSDial                             = "TLS dial %s: %w"
-	MsgErrTLSCertificateAt                    = "TLS certificate at %s: %w"
-	MsgErrHostname                            = "hostname %s: %w: %w"
-	MsgErrLeafCertificateIsOutsideIts         = "leaf certificate is outside its validity period: %w: %w"
-	MsgErrSelfsignedServerCertificate         = "self-signed server certificate: %w: %w"
-	MsgErrCertificateChain                    = "certificate chain: %w: %w"
+	MsgErrTLS                            = "tls: %w"
+	MsgErrIPv6ResolverTimeout            = "IPv6 resolver timeout"
+	MsgErrResolverTimeout                = "resolver timeout"
+	MsgErrCNAMELookupTimedOut            = "CNAME lookup timed out"
+	MsgErrUntrustedChain                 = "untrusted chain"
+	MsgErrMockDohError                   = "mock doh error"
+	MsgErrMockDNSSECError                = "mock DNSSEC error"
+	MsgErrResolutionFailed               = "resolution failed"
+	MsgErrMockError                      = "mock error"
+	MsgErrResolverErrorCNAMELoopDetected = "resolver error: CNAME loop detected"
+	MsgErrTemporaryDNSFailure            = "temporary DNS failure"
+	MsgErrDNSTimeout                     = "DNS timeout"
+	MsgErrQuotaExceeded                  = "quota exceeded"
+	MsgErrCommitFailed                   = "commit failed"
+	MsgErrDiskFull                       = "disk full"
+	MsgErrDiskUnavailable                = "disk unavailable"
+	MsgErrTLSDial                        = "TLS dial %s: %w"
+
+	MsgErrHostname = "hostname %s: %w: %w"
+
 	MsgErrQueryDNSForOnTruncated              = "query DNS for %s on %s: truncated UDP answer and TCP resolver is not configured"
 	MsgErrQueryDNSForOnTCP                    = "query DNS for %s on %s: TCP answer is truncated"
 	MsgErrExpectedOneMXRecordWith             = "%w: expected one MX record with preference 0 and the root exchange"
@@ -1364,46 +1343,45 @@ const (
 	MsgErrCTHTTPClientIsNot                   = "CT HTTP client is not configured for %s"
 	MsgErrCTAPIResponseExceedsBytes           = "CT API response exceeds %d bytes"
 	MsgErrReadCTAPIErrorResponse              = "read CT API error response: %w"
-	MsgErrCTPageClaimsANext                   = "CT page claims a next page without a cursor"
-	MsgErrCTPageHasAMissing                   = "CT page has a missing or duplicate certificate ID"
-	MsgErrParseCTHistoryFor                   = "parse CT history for %s: %w"
-	MsgErrReadCTHistoryFor                    = "read CT history for %s: %w"
-	MsgErrEncodeCTHistoryFor                  = "encode CT history for %s: %w"
-	MsgErrCTHistoryForExceedsBytes            = "CT history for %s exceeds %d bytes"
-	MsgErrOpenCTFile                          = "open CT file %s: %w"
-	MsgErrReadCTFile                          = "read CT file %s: %w"
-	MsgErrCTFileExceedsBytes                  = "CT file %s exceeds %d bytes"
-	MsgErrCommitCTState                       = "commit CT state %s: %w"
-	MsgErrLoadConfiguration                   = "load configuration: %w"
-	MsgErrInitializeApplication               = "initialize application: %w"
-	MsgErrHTTPServerStopped                   = "HTTP server stopped: %w"
-	MsgErr2                                   = "%s: %s"
-	MsgErrShutDownHTTPServer                  = "shut down HTTP server: %w"
-	MsgErrCreateDataDirectory                 = "create data directory %s: %w"
-	MsgErrCreateCTLogsDirectory               = "create CT logs directory %s: %w"
-	MsgErrLoadCTState                         = "load CT state %s: %w"
-	MsgErrRootCause                           = "root cause"
-	MsgErrCustomError                         = "custom error"
-	MsgLogTestErrorMessage                    = "Test error message"
-	MsgLogTestWarnMessage                     = "Test warn message"
-	MsgLogTestInfoMessage                     = "Test info message"
-	MsgLogSampleLocalizedMessage              = "Sample localized message"
-	MsgLogTestInfof                           = "Test infof %s"
-	MsgLogTestErrorf                          = "Test errorf %s"
-	MsgLogTestWarnf                           = "Test warnf %d"
-	MsgLogTestDebugMessage                    = "Test debug message"
-	MsgLogTestDebugf                          = "Test debugf %s"
-	MsgErrInvalidServerPort                   = "invalid server port: %w"
-	MsgErrValidateConfiguredResolvers         = "validate configured resolvers (%d): %s"
-	MsgErrInvalidResolver                     = "invalid resolver %q: %w"
-	MsgErrInvalidDohURL                       = "invalid DoH URL: %w"
-	MsgErrValidateNotificationsntfy           = "validate notifications.ntfy: %s"
-	MsgErrInvalidNtfyURL                      = "invalid ntfy URL: %w"
-	MsgErrPortMustBeBetween1                  = "port %q must be between 1 and 65535"
-	MsgErrResolverEndpointIsEmpty             = "resolver endpoint %q is empty"
-	MsgErrExpectedAnIPAddressOr               = "expected an IP address or host:port: %w"
-	MsgErrResolverEndpointHasAnInvalid        = "resolver endpoint %q has an invalid host"
-	MsgErrExpectedAnHTTPSURLWith              = "expected an http(s) URL with a host"
+
+	MsgErrParseCTHistoryFor        = "parse CT history for %s: %w"
+	MsgErrReadCTHistoryFor         = "read CT history for %s: %w"
+	MsgErrEncodeCTHistoryFor       = "encode CT history for %s: %w"
+	MsgErrCTHistoryForExceedsBytes = "CT history for %s exceeds %d bytes"
+	MsgErrOpenCTFile               = "open CT file %s: %w"
+	MsgErrReadCTFile               = "read CT file %s: %w"
+	MsgErrCTFileExceedsBytes       = "CT file %s exceeds %d bytes"
+	MsgErrCommitCTState            = "commit CT state %s: %w"
+	MsgErrLoadConfiguration        = "load configuration: %w"
+	MsgErrInitializeApplication    = "initialize application: %w"
+	MsgErrHTTPServerStopped        = "HTTP server stopped: %w"
+	MsgErr2                        = "%s: %s"
+	MsgErrShutDownHTTPServer       = "shut down HTTP server: %w"
+	MsgErrCreateDataDirectory      = "create data directory %s: %w"
+
+	MsgErrLoadCTState                  = "load CT state %s: %w"
+	MsgErrRootCause                    = "root cause"
+	MsgErrCustomError                  = "custom error"
+	MsgLogTestErrorMessage             = "Test error message"
+	MsgLogTestWarnMessage              = "Test warn message"
+	MsgLogTestInfoMessage              = "Test info message"
+	MsgLogSampleLocalizedMessage       = "Sample localized message"
+	MsgLogTestInfof                    = "Test infof %s"
+	MsgLogTestErrorf                   = "Test errorf %s"
+	MsgLogTestWarnf                    = "Test warnf %d"
+	MsgLogTestDebugMessage             = "Test debug message"
+	MsgLogTestDebugf                   = "Test debugf %s"
+	MsgErrInvalidServerPort            = "invalid server port: %w"
+	MsgErrValidateConfiguredResolvers  = "validate configured resolvers (%d): %s"
+	MsgErrInvalidResolver              = "invalid resolver %q: %w"
+	MsgErrInvalidDohURL                = "invalid DoH URL: %w"
+	MsgErrValidateNotificationsntfy    = "validate notifications.ntfy: %s"
+	MsgErrInvalidNtfyURL               = "invalid ntfy URL: %w"
+	MsgErrPortMustBeBetween1           = "port %q must be between 1 and 65535"
+	MsgErrResolverEndpointIsEmpty      = "resolver endpoint %q is empty"
+	MsgErrExpectedAnIPAddressOr        = "expected an IP address or host:port: %w"
+	MsgErrResolverEndpointHasAnInvalid = "resolver endpoint %q has an invalid host"
+	MsgErrExpectedAnHTTPSURLWith       = "expected an http(s) URL with a host"
 
 	MsgErrInvalidMonitoredDomain               = "invalid monitored domain %q"
 	MsgErrRootZoneIsNotA                       = "root zone %q is not a parent of delegated zone %q"
@@ -1465,22 +1443,19 @@ const (
 
 // Auto-generated String Literals
 const (
-	Str20060102                           = "2006-01-02"
-	StrAppStateIsNil                      = "app state is nil"
-	StrAutoRenewGracePeriod               = "Auto-Renew Grace Period discrepancy: Registry expiration ("
-	StrCAAAliasTraversalLimit             = "CAA alias traversal limit reached at %s"
-	StrCacheAge                           = "cache_age"
-	StrClientdeleteprohibited             = "clientdeleteprohibited"
-	StrClienthold                         = "clienthold"
-	StrClientrenewprohibited              = "clientrenewprohibited"
-	StrClienttransferprohibited           = "clienttransferprohibited"
-	StrClientupdateprohibited             = "clientupdateprohibited"
-	StrConnectionRefused                  = "connection refused"
-	StrCreated                            = "created"
-	StrCT                                 = "CT:"
-	StrCTBaselineBackfillIs               = "CT baseline backfill is still in progress"
-	StrCTQuotaExhaustedDeferred           = "CT quota exhausted; deferred until next cycle"
-	StrCTScanCoverageIs                   = "CT scan coverage is incomplete; scan, seen ID or pending budget reached"
+	Str20060102                 = "2006-01-02"
+	StrAppStateIsNil            = "app state is nil"
+	StrAutoRenewGracePeriod     = "Auto-Renew Grace Period discrepancy: Registry expiration ("
+	StrCAAAliasTraversalLimit   = "CAA alias traversal limit reached at %s"
+	StrCacheAge                 = "cache_age"
+	StrClientdeleteprohibited   = "clientdeleteprohibited"
+	StrClienthold               = "clienthold"
+	StrClientrenewprohibited    = "clientrenewprohibited"
+	StrClienttransferprohibited = "clienttransferprohibited"
+	StrClientupdateprohibited   = "clientupdateprohibited"
+	StrConnectionRefused        = "connection refused"
+	StrCreated                  = "created"
+
 	StrDSQ                                = "%d %s %q"
 	StrDate                               = "date"
 	StrDelegationReturnedNoNameservers    = "delegation returned no nameservers"

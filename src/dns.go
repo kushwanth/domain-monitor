@@ -690,6 +690,23 @@ func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, str
 		var unauthorized []string
 		for _, found := range foundRecords {
 			if !slices.Contains(target.Expected, found) {
+				if target.Type == "CAA" {
+					parts := strings.SplitN(found, " ", 3)
+					if len(parts) == 3 {
+						tag := strings.ToLower(parts[1])
+						hasTagInExpected := false
+						for _, exp := range target.Expected {
+							expParts := strings.SplitN(exp, " ", 3)
+							if len(expParts) == 3 && strings.ToLower(expParts[1]) == tag {
+								hasTagInExpected = true
+								break
+							}
+						}
+						if !hasTagInExpected {
+							continue
+						}
+					}
+				}
 				unauthorized = append(unauthorized, found)
 				allMatch = false
 			}
@@ -886,10 +903,8 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 	// Note: if last query failed with non-NXDOMAIN, snap.DMARCErr retains it
 
 	var selectorsToCheck []string
-	if target.MailProvider != StrEmpty {
-		if defaults, ok := ProviderDKIMMap[target.MailProvider]; ok {
-			selectorsToCheck = append(selectorsToCheck, defaults...)
-		}
+	if target.MailProvider != StrEmpty && app != nil {
+		selectorsToCheck = append(selectorsToCheck, app.EmailProviders[target.MailProvider].DKIMSelectors...)
 	}
 	selectorsToCheck = append(selectorsToCheck, target.DKIMSelectors...)
 
@@ -1052,7 +1067,10 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, app *AppStat
 		}
 	}
 
-	hasDKIMExpected := (target.MailProvider != StrEmpty && len(ProviderDKIMMap[target.MailProvider]) > 0) || len(target.DKIMSelectors) > 0
+	hasDKIMExpected := len(target.DKIMSelectors) > 0
+	if app != nil && len(app.EmailProviders[target.MailProvider].DKIMSelectors) > 0 {
+		hasDKIMExpected = true
+	}
 	slices.Sort(validDkims)
 	slices.Sort(missingDkims)
 	if hasDKIMExpected && (len(validDkims) == 0 || dkimNetworkErr != nil) {
@@ -1148,15 +1166,15 @@ func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimar
 	srv.Authoritative = soaMsg.Authoritative
 	if !srv.Authoritative {
 		if isPrimary {
-			srv.Err = errors.New(MsgErrPrimaryNSNotAuthoritative) //nolint:staticcheck // preserve existing diagnostic text.
+			srv.Err = errors.New(MsgErrPrimaryNSNotAuthoritative) //lint:ignore ST1005 preserve existing diagnostic text.
 		} else {
-			srv.Err = errors.New(MsgErrSecondaryNSNotAuthoritative) //nolint:staticcheck // preserve existing diagnostic text.
+			srv.Err = errors.New(MsgErrSecondaryNSNotAuthoritative) //lint:ignore ST1005 preserve existing diagnostic text.
 		}
 	}
 
 	srv.SOASerial, srv.HasSOA = findSOASerial(soaMsg, target.Domain)
 	if !srv.HasSOA {
-		soaMissingErr := errors.New(MsgErrNoSOARecordReturned) //nolint:staticcheck // preserve existing diagnostic text.
+		soaMissingErr := errors.New(MsgErrNoSOARecordReturned) //lint:ignore ST1005 preserve existing diagnostic text.
 		if srv.Err == nil {
 			srv.Err = soaMissingErr
 		}

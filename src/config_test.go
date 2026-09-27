@@ -1076,3 +1076,33 @@ func TestLoadConfigRejectsUnpersistableCTDomain(t *testing.T) {
 		})
 	}
 }
+
+func TestExternalEmailProviderValidation(t *testing.T) {
+	for _, body := range []string{
+		`{`, `{"mx_records":[]}`, `{"mx_records":["bad/path"]}`,
+		`{"mx_records":["mail.example"],"dkim_selectors":[""]}`,
+		strings.Repeat(" ", (64<<10)+1),
+	} {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "custom.json"), []byte(body), 0600))
+		_, err := InitializeApp(context.Background(), AppConfig{EmailProvidersDir: dir})
+		require.Error(t, err)
+	}
+	_, err := InitializeApp(context.Background(), AppConfig{EmailProvidersDir: filepath.Join(t.TempDir(), "missing")})
+	require.Error(t, err)
+	_, err = InitializeApp(context.Background(), AppConfig{Domains: []DomainConfig{{Domain: "example.com", CheckEmailSecurity: true, MailProvider: "unknown"}}})
+	require.ErrorContains(t, err, "unknown mail provider")
+}
+
+func TestExternalEmailProvidersOverrideAndStayOwned(t *testing.T) {
+	dir := t.TempDir()
+	providerPath := filepath.Join(dir, "google.json")
+	require.NoError(t, os.WriteFile(providerPath, []byte(`{"mx_records":[" MAIL.EXAMPLE.COM. "],"dkim_selectors":["Custom"]}`), 0600))
+	app, err := InitializeApp(context.Background(), AppConfig{EmailProvidersDir: dir})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"mail.example.com"}, app.EmailProviders["google"].MXRecords)
+	assert.Equal(t, []string{"custom"}, app.EmailProviders["google"].DKIMSelectors)
+	assert.Contains(t, app.EmailProviders, "fastmail")
+	require.NoError(t, os.WriteFile(providerPath, []byte(`{}`), 0600))
+	assert.Equal(t, []string{"custom"}, app.EmailProviders["google"].DKIMSelectors, "provider files are read only at startup")
+}

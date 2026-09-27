@@ -773,28 +773,6 @@ DNSSEC: unsigned
 	}
 }
 
-func TestSupplementThinRDAPPreservesRDAPAndFillsMissingExpiry(t *testing.T) {
-	whois := `Domain Name: EXAMPLE.COM
-Registry Expiry Date: 2028-05-10T12:00:00Z
-Registrar: WHOIS Registrar
-Name Server: ns-whois.example.com
-DNSSEC: unsigned`
-	app := getMockWHOISApp(func(_ string) (string, error) { return whois, nil })
-	rdap := RDAPSnapshot{
-		RegistryTier: &DomainTierData{Source: SourceRegistryRDAP, Registrar: "RDAP Registrar", Nameservers: []string{"ns-rdap.example.com"}},
-		Registrar:    "RDAP Registrar",
-		Nameservers:  []string{"ns-rdap.example.com"},
-		Source:       SourceRegistryRDAP,
-		ProtocolUsed: ProtocolRDAP,
-	}
-	got := supplementThinRDAP(context.Background(), app, "example.com", rdap)
-	assert.Equal(t, "2028-05-10T12:00:00Z", got.Expiration)
-	assert.Equal(t, "RDAP Registrar", got.Registrar)
-	assert.Equal(t, []string{"ns-rdap.example.com"}, got.Nameservers)
-	assert.Equal(t, ProtocolHybrid, got.ProtocolUsed)
-	assert.Contains(t, got.Source, SourceRegistryWHOIS)
-}
-
 func TestFetchWHOIS_AlternativeTemplates(t *testing.T) {
 	// Test ccTLD style with paid-till and nserver (e.g. RU/SU/ccTLDs)
 	whoisRu := `
@@ -1900,45 +1878,22 @@ func TestFetchRDAPSnapshotKeepsCompleteRDAPWithoutWHOIS(t *testing.T) {
 	assert.Zero(t, whoisCalls)
 }
 
-func TestFetchRDAPSnapshotSupplementsThinRDAP(t *testing.T) {
-	const rdapBody = `{"objectClassName":"domain","ldhName":"example.com"}`
-	const whoisBody = "Domain Name: EXAMPLE.COM\nRegistry Expiry Date: 2030-01-01T00:00:00Z\nRegistrar: WHOIS Registrar\n"
+func TestFetchRDAPSnapshotDoesNotFallbackToWHOISOn404(t *testing.T) {
 	app := &AppState{
 		Bootstrap:      &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()},
 		RDAPURLAllowed: func(string) bool { return true },
 		WHOISClient: &MockWHOISClient{MockQuery: func(_ context.Context, domain, _ string) (string, error) {
-			assert.Equal(t, "example.com", domain)
-			return whoisBody, nil
-		}},
-	}
-	client := &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(rdapBody))}, nil
-	}}
-	snapshot := FetchRDAPSnapshot(context.Background(), client, app, "example.com")
-	require.NoError(t, snapshot.Err)
-	assert.Equal(t, ProtocolHybrid, snapshot.ProtocolUsed)
-	assert.Equal(t, "2030-01-01T00:00:00Z", snapshot.Expiration)
-	assert.Equal(t, "WHOIS Registrar", snapshot.Registrar)
-}
-
-func TestFetchRDAPSnapshotFallsBackToWHOISOn404(t *testing.T) {
-	const whoisBody = "Domain Name: EXAMPLE.COM\nRegistry Expiry Date: 2030-01-01T00:00:00Z\nRegistrar: WHOIS Registrar\n"
-	app := &AppState{
-		Bootstrap:      &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()},
-		RDAPURLAllowed: func(string) bool { return true },
-		WHOISClient: &MockWHOISClient{MockQuery: func(_ context.Context, domain, _ string) (string, error) {
-			assert.Equal(t, "example.com", domain)
-			return whoisBody, nil
+			t.Fatal("WHOIS should not be called on 404")
+			return "", nil
 		}},
 	}
 	client := &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(""))}, nil
 	}}
 	snapshot := FetchRDAPSnapshot(context.Background(), client, app, "example.com")
-	require.NoError(t, snapshot.Err)
-	assert.Equal(t, ProtocolWHOIS, snapshot.ProtocolUsed)
-	assert.Equal(t, "2030-01-01T00:00:00Z", snapshot.Expiration)
-	assert.Equal(t, "WHOIS Registrar", snapshot.Registrar)
+	require.Error(t, snapshot.Err)
+	assert.ErrorIs(t, snapshot.Err, ErrRDAPNotFound)
+	assert.Equal(t, ProtocolRDAP, snapshot.ProtocolUsed)
 }
 
 func TestFetchRDAPRejectsWrongDomainResponse(t *testing.T) {
@@ -2456,4 +2411,21 @@ func TestEPPDocumentationLinkCannotHideHold(t *testing.T) {
 	assert.Equal(t, CodeEPPServerHold, condition.Code)
 	assert.Contains(t, statuses, "providerExtension")
 	assert.False(t, isTransferLocked(statuses), "documentation fragments must not invent a lock")
+}
+
+func TestDialPublicWHOIS_MockLookup(t *testing.T) {
+	ctx := context.Background()
+	_, err := dialPublicWHOISWith(ctx, "whois.example.com", func(context.Context, string) ([]net.IPAddr, error) {
+		return nil, errors.New("mock dns failure")
+	}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mock dns failure")
+
+	_, err = dialPublicWHOISWith(ctx, "whois.example.com", func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("192.0.2.1")}}, nil
+	}, func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("mock dial failure")
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mock dial failure")
 }

@@ -173,11 +173,12 @@ type Notifications struct {
 
 // AppConfig ...
 type AppConfig struct {
-	Port             string        `json:"port"`
-	LoopIntervalDays float64       `json:"loop_interval_days"`
-	Notifications    Notifications `json:"notifications"`
-	Resolvers        []string      `json:"resolvers"`
-	DoHURL           string        `json:"doh_url,omitempty"`
+	Port              string        `json:"port"`
+	LoopIntervalDays  float64       `json:"loop_interval_days"`
+	Notifications     Notifications `json:"notifications"`
+	Resolvers         []string      `json:"resolvers"`
+	DoHURL            string        `json:"doh_url,omitempty"`
+	EmailProvidersDir string        `json:"email_providers_dir,omitempty"`
 
 	Domains    []DomainConfig `json:"domains"`
 	DNSRecords []DNSTask      `json:"dns_records"`
@@ -185,25 +186,45 @@ type AppConfig struct {
 
 // DomainConfig ...
 type DomainConfig struct {
-	Domain                string   `json:"domain"`
-	Name                  string   `json:"name"`
-	IsDelegatedZone       bool     `json:"is_delegated_zone"`
-	RootZone              string   `json:"root_zone"`
-	ExpectedNS            []string `json:"expected_ns"`
-	SecondaryNS           []string `json:"secondary_ns,omitempty"`
-	ExpectedRegistrarID   string   `json:"expected_registrar_id,omitempty"`
-	ExpectedRegistrarName string   `json:"expected_registrar_name,omitempty"`
-	AllowExpiry           bool     `json:"allow_expiry,omitempty"`
-	RenewalPrice          float64  `json:"renewal_price,omitempty"`
-	DomainTransferLocked  bool     `json:"domain_transfer_locked,omitempty"`
-	VerifyNSHealth        bool     `json:"verify_ns_health,omitempty"`
-	CheckEmailSecurity    bool     `json:"check_email_security"`
-	MailProvider          string   `json:"mail_provider"`
-	MXRecords             []string `json:"mx_records"`
-	DKIMSelectors         []string `json:"dkim_selectors"`
-	DNSSEC                bool     `json:"dnssec"`
+	Domain                string     `json:"domain"`
+	Name                  string     `json:"name"`
+	IsDelegatedZone       bool       `json:"is_delegated_zone"`
+	RootZone              string     `json:"root_zone"`
+	ExpectedNS            []string   `json:"expected_ns"`
+	SecondaryNS           []string   `json:"secondary_ns,omitempty"`
+	ExpectedRegistrarID   string     `json:"expected_registrar_id,omitempty"`
+	ExpectedRegistrarName string     `json:"expected_registrar_name,omitempty"`
+	AllowExpiry           bool       `json:"allow_expiry,omitempty"`
+	RenewalPrice          float64    `json:"renewal_price,omitempty"`
+	DomainTransferLocked  bool       `json:"domain_transfer_locked,omitempty"`
+	VerifyNSHealth        bool       `json:"verify_ns_health,omitempty"`
+	CheckEmailSecurity    bool       `json:"check_email_security"`
+	MailProvider          string     `json:"mail_provider"`
+	MXRecords             []string   `json:"mx_records"`
+	DKIMSelectors         []string   `json:"dkim_selectors"`
+	DNSSEC                bool       `json:"dnssec"`
+	CAA                   *CAAConfig `json:"caa,omitempty"`
 
 	SuppressAlerts bool `json:"suppress_alerts"`
+}
+
+// CAAConfig specifies expected certificate-authority records.
+type CAAConfig struct {
+	Issue     []string `json:"issue,omitempty"`
+	IssueWild []string `json:"issuewild,omitempty"`
+	IssueMail []string `json:"issuemail,omitempty"`
+}
+
+// CAAResult contains the evaluated CAA records and their condition.
+type CAAResult struct {
+	Status     CheckStatus     `json:"status"`
+	Condition  *StateCondition `json:"condition,omitempty"`
+	Valid      bool            `json:"valid"`
+	Issue      []string        `json:"issue,omitempty"`
+	IssueWild  []string        `json:"issuewild,omitempty"`
+	IssueMail  []string        `json:"issuemail,omitempty"`
+	UnknownCAs []string        `json:"unknown_cas,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 // DNSTask ...
@@ -322,7 +343,13 @@ func cloneConfig(cfg AppConfig) AppConfig {
 		domain.SecondaryNS = slices.Clone(domain.SecondaryNS)
 		domain.MXRecords = slices.Clone(domain.MXRecords)
 		domain.DKIMSelectors = slices.Clone(domain.DKIMSelectors)
-
+		if domain.CAA != nil {
+			caa := *domain.CAA
+			caa.Issue = slices.Clone(caa.Issue)
+			caa.IssueWild = slices.Clone(caa.IssueWild)
+			caa.IssueMail = slices.Clone(caa.IssueMail)
+			domain.CAA = &caa
+		}
 	}
 	for i := range cfg.DNSRecords {
 		cfg.DNSRecords[i].Expected = slices.Clone(cfg.DNSRecords[i].Expected)
@@ -346,12 +373,6 @@ func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority
 		return
 	}
 	a.Notifier.Dispatch(message, redacted, priority, tag, domain, name)
-}
-
-// SafeDispatchf formats the full alert message and safely dispatches it via Notifier.
-func (a *AppState) SafeDispatchf(priority AlertPriority, tag AlertTag, domain, name, redacted, format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	a.SafeDispatch(msg, redacted, priority, tag, domain, name)
 }
 
 // 3. Domain & Check Result Models
@@ -523,6 +544,7 @@ type CheckState struct {
 	Email       map[string]EmailState     `json:"email_checks"`
 	DNSSEC      map[string]DNSSECResult   `json:"dnssec_checks,omitempty"`
 	NSHealth    map[string]NSHealthResult `json:"ns_health,omitempty"`
+	CAA         map[string]*CAAResult     `json:"caa_checks,omitempty"`
 	LastUpdated string                    `json:"last_updated"`
 	NextRefresh string                    `json:"next_refresh"`
 }
@@ -534,6 +556,7 @@ type DomainResult struct {
 	Email    EmailState
 	DNSSEC   DNSSECResult
 	NSHealth NSHealthResult
+	CAA      *CAAResult
 }
 
 // DNSResult holds the evaluation result for a single DNS task.
@@ -577,6 +600,9 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 	}
 	if res.NSHealth.Status != StatusUnknown {
 		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
+	}
+	if res.CAA != nil {
+		InitMap(&c.CAA)[res.Domain] = res.CAA
 	}
 }
 
@@ -647,12 +673,6 @@ type DNSSECSnapshot struct {
 	Result DNSSECResult
 }
 
-// SSLSnapshot holds the certificate expiry data.
-type SSLSnapshot struct {
-	ExpiryDays int
-	Err        error
-}
-
 // 4. Notification Models & Interfaces
 
 // Alert represents a single notification event
@@ -718,14 +738,27 @@ type DotSweepResponse struct {
 	TLDs []DotSweepTLD `json:"tlds"`
 }
 
-// PricingManager manages TLD renewal pricing cache and scheduled upstream fetching.
+// PricingManager caches TLD renewal prices and bounds stale-data retention.
 type PricingManager struct {
 	http      HTTPDoer
 	url       string
-	mu        sync.RWMutex
-	fetchMu   sync.Mutex
+	mu        sync.Mutex
 	prices    map[string]float64
 	fetchedAt time.Time
+}
+
+// NotificationManager sends alerts directly.
+type NotificationManager struct {
+	NtfyURL        string
+	NtfyAuth       string
+	TelegramToken  string
+	TelegramChatID string
+
+	// Dependencies for network/IO
+	HTTPClient HTTPDoer
+
+	mu         sync.Mutex
+	alertBatch []Alert
 }
 
 // ConsoleHandler formats log records into human-readable lines without key=value syntax or source annotations.
