@@ -74,17 +74,18 @@ func TestDashboardBrowserRegressions(t *testing.T) {
         const bodyOverflow = getComputedStyle(document.body).overflowY;
         const mainOverflow = getComputedStyle(document.querySelector('.main')).overflowY;
         expect(mobile ? bodyOverflow === 'visible' && mainOverflow === 'visible' : bodyOverflow === 'hidden' && mainOverflow === 'auto', 'Responsive scrolling layout changed');
-        domainCard.querySelector('summary').click();
-        expect(domainCard.open && domainCard.querySelector('.domain-details').getClientRects().length, 'Domain details do not open in one click');
-        expect(domainCard.textContent.includes('Nameservers'), 'Domain evidence missing');
+        const visibleDomainCard = document.querySelector('#view-domains details[data-search="example.com"]');
+        visibleDomainCard.querySelector('summary').click();
+        expect(visibleDomainCard.open && visibleDomainCard.querySelector('.domain-details').getClientRects().length, 'Domain details do not open in one click');
+        expect(visibleDomainCard.textContent.includes('Nameservers'), 'Domain evidence missing');
         const panel = (card, heading) => Array.from(card.querySelectorAll('.detail-panel')).find(p => p.querySelector('h3')?.textContent === heading);
-        const providerPanel = panel(domainCard, 'Email Security');
+        const providerPanel = panel(visibleDomainCard, 'Email Security');
         expect(providerPanel.textContent.includes('Provider:') && providerPanel.textContent.includes('Google') && !providerPanel.textContent.includes('MX Records:'), 'Configured provider still shows MX hosts');
         const customCard = document.querySelector('#view-domains details[data-search="custom.example.com"]');
         const customEmail = panel(customCard, 'Email Security');
         expect(customEmail.textContent.includes('MX Records:') && customEmail.textContent.includes('mail.custom.example.com') && !customEmail.textContent.includes('Provider:'), 'Custom mail setup does not show MX hosts');
-        expect(!panel(domainCard, 'DNSSEC Validation').textContent.includes('Algorithms:'), 'DNSSEC algorithms are still shown');
-        expect(panel(domainCard, 'Nameserver Health').textContent.includes('Configured NS checked:') && panel(domainCard, 'Nameserver Health').textContent.includes('3'), 'Nameserver count does not cover all configured servers');
+        expect(!panel(visibleDomainCard, 'DNSSEC Validation').textContent.includes('Algorithms:'), 'DNSSEC algorithms are still shown');
+        expect(panel(visibleDomainCard, 'Nameserver Health').textContent.includes('Configured NS checked:') && panel(visibleDomainCard, 'Nameserver Health').textContent.includes('3'), 'Nameserver count does not cover all configured servers');
         const previousTheme = document.documentElement.getAttribute('data-theme');
         toggleTheme();
         expect(document.documentElement.getAttribute('data-theme') !== previousTheme, 'Theme toggle fails without storage');
@@ -107,8 +108,15 @@ func TestDashboardBrowserRegressions(t *testing.T) {
         expect(document.querySelector('#view-dns details.domain-card'), 'Clear search does not restore DNS records');
 
         const previousState = appState;
-        window.fetch = async () => { throw new Error('Offline'); };
+        stateETag = '"unchanged"';
+        window.fetch = async (_url, options) => {
+          expect(options.headers['If-None-Match'] === stateETag, 'Conditional poll omitted the ETag');
+          return {status:304, ok:false, json:async()=>{throw new Error('304 body parsed');}};
+        };
         window.setTimeout = () => 0;
+        await pollState();
+        expect(!connectionError && appState === previousState, 'Unchanged poll replaced state');
+        window.fetch = async () => { throw new Error('Offline'); };
         await pollState();
         expect(connectionError && appState === previousState && document.getElementById('last-updated').textContent.includes('Connection lost'), 'Offline polling loses the last state');
         document.body.setAttribute('data-audit-result', failures.length ? failures.join(' | ') : 'passed');

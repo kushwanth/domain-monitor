@@ -86,12 +86,16 @@ keeps only codes and start times, avoiding retention of old error messages.
 Domain names, DNS values and diagnostics still need strings; variable-sized
 results need bounded slices/maps. Optional condition pointers avoid embedding
 large unused diagnostics in healthy results. Configuration snapshots own their
-CAA policy slices. Worker results are deeply copied into cycle state, whose
-mutable maps have one owner. DNS and fast-domain results are assembled after
-each phase, so their temporary buffers can be collected before the slow RDAP
-phase. Serial RDAP checks write directly into cycle state without a second
-portfolio-sized result buffer. Completed cycles publish one immutable cached
-JSON snapshot; in-progress changes do not affect HTTP readers.
+CAA policy slices. Public result-application methods deeply copy caller-owned
+data. Active check lists store indices into the daemon's owned configuration,
+without copying wide structs or retaining pointers into their backing arrays.
+A fixed pool of at most 32 workers writes
+completed DNS and domain results directly into cycle maps under a short lock;
+there are no portfolio-sized result buffers or goroutines created per check.
+Expected DNS values are copied once so returned cycle state remains independent
+of configuration. Serial RDAP checks also write directly into cycle state.
+Completed cycles publish one immutable cached JSON snapshot; in-progress
+changes do not affect HTTP readers.
 
 Between cycles, the engine retains status/condition history and the latest JSON
 snapshot rather than prior result trees. Bootstrap access returns independent
@@ -189,7 +193,7 @@ The daemon provides an embedded Web UI and JSON API:
 
 *   **`GET /`:** Interactive Web Dashboard grouping checked domains into Healthy, Issues, and Unused sections and DNS records into Matched and Not Matched sections. Empty sections are hidden; pending results appear after checks finish. Domain cards show days to expiry, and the sidebar shows annual and upcoming renewal costs.
 *   **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
-*   **`GET /api/state`:** Latest completed-cycle JSON snapshot; pending checks are published at startup.
+*   **`GET /api/state`:** Latest completed-cycle JSON snapshot; pending checks are published at startup. Responses include an ETag, and matching `If-None-Match` requests return 304 without a body.
 
 ---
 

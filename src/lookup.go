@@ -627,7 +627,6 @@ func extractWHOISTier(raw string, source string, server string) *DomainTierData 
 	tier := &DomainTierData{
 		Source: source,
 		Server: server,
-		Raw:    raw,
 	}
 
 	parsed, parseErr := whoisparser.Parse(raw)
@@ -754,6 +753,21 @@ func extractWHOISTier(raw string, source string, server string) *DomainTierData 
 		}
 	}
 
+	// A small extracted substring can otherwise keep an unusually large WHOIS
+	// response alive for the entire monitoring cycle.
+	if len(raw) > 64<<10 {
+		tier.Registrar = strings.Clone(tier.Registrar)
+		tier.IANAID = strings.Clone(tier.IANAID)
+		tier.Expiration = strings.Clone(tier.Expiration)
+		tier.Created = strings.Clone(tier.Created)
+		tier.Updated = strings.Clone(tier.Updated)
+		for i := range tier.Nameservers {
+			tier.Nameservers[i] = strings.Clone(tier.Nameservers[i])
+		}
+		for i := range tier.DomainStatus {
+			tier.DomainStatus[i] = strings.Clone(tier.DomainStatus[i])
+		}
+	}
 	return tier
 }
 

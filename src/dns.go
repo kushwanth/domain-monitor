@@ -621,10 +621,29 @@ func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, str
 	case MatchPrefix:
 		allMatch := true
 		var mismatchReasons []string
+		var inlineFound [8]string
+		var lowerFound []string
+		if len(target.Expected) > 1 {
+			if len(foundRecords) <= len(inlineFound) {
+				lowerFound = inlineFound[:len(foundRecords)]
+			} else {
+				lowerFound = make([]string, len(foundRecords))
+			}
+			for i, found := range foundRecords {
+				lowerFound[i] = strings.ToLower(strings.TrimSpace(found))
+			}
+		}
 		for _, expected := range target.Expected {
 			matched := false
-			for _, found := range foundRecords {
-				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(found)), strings.ToLower(strings.TrimSpace(expected))) {
+			normalizedExpected := strings.ToLower(strings.TrimSpace(expected))
+			for i, found := range foundRecords {
+				var value string
+				if lowerFound != nil {
+					value = lowerFound[i]
+				} else {
+					value = strings.ToLower(strings.TrimSpace(found))
+				}
+				if strings.HasPrefix(value, normalizedExpected) {
 					matched = true
 					break
 				}
@@ -642,10 +661,29 @@ func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, str
 	case MatchContains:
 		allMatch := true
 		var mismatchReasons []string
+		var inlineFound [8]string
+		var lowerFound []string
+		if len(target.Expected) > 1 {
+			if len(foundRecords) <= len(inlineFound) {
+				lowerFound = inlineFound[:len(foundRecords)]
+			} else {
+				lowerFound = make([]string, len(foundRecords))
+			}
+			for i, found := range foundRecords {
+				lowerFound[i] = strings.ToLower(found)
+			}
+		}
 		for _, expected := range target.Expected {
 			matched := false
-			for _, found := range foundRecords {
-				if strings.Contains(strings.ToLower(found), strings.ToLower(expected)) {
+			normalizedExpected := strings.ToLower(expected)
+			for i, found := range foundRecords {
+				var value string
+				if lowerFound != nil {
+					value = lowerFound[i]
+				} else {
+					value = strings.ToLower(found)
+				}
+				if strings.Contains(value, normalizedExpected) {
 					matched = true
 					break
 				}
@@ -828,10 +866,7 @@ func hasValidDMARCPolicy(record string) bool {
 
 // FetchEmailSnapshot queries MX, SPF, DMARC, and configured DKIM selectors.
 func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig) EmailSnapshot {
-	snap := EmailSnapshot{
-		DKIMResults: make(map[string]bool),
-		DKIMErrs:    make(map[string]error),
-	}
+	var snap EmailSnapshot
 	if !target.CheckEmailSecurity {
 		return snap
 	}
@@ -914,8 +949,14 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 		dkimTxts, err := queryDNS(ctx, app, dkimHost, dns.TypeTXT, app.resolvers())
 		if err != nil {
 			if !errors.Is(err, ErrNXDOMAIN) {
+				if snap.DKIMErrs == nil {
+					snap.DKIMErrs = make(map[string]error)
+				}
 				snap.DKIMErrs[selector] = err
 			} else {
+				if snap.DKIMResults == nil {
+					snap.DKIMResults = make(map[string]bool)
+				}
 				snap.DKIMResults[selector] = false
 			}
 		} else {
@@ -925,6 +966,9 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 					dkimFound = true
 					break
 				}
+			}
+			if snap.DKIMResults == nil {
+				snap.DKIMResults = make(map[string]bool)
 			}
 			snap.DKIMResults[selector] = dkimFound
 		}
@@ -1238,21 +1282,31 @@ func selectNSSOA(ctx context.Context, app *AppState, domain string, addresses []
 }
 
 func hasSOAForDomain(message *dns.Msg, domain string) bool {
-	for _, rr := range append(slices.Clone(message.Answer), message.Ns...) {
-		if soa, ok := rr.(*dns.SOA); ok && soa.Hdr.Class == dns.ClassINET && strings.EqualFold(soa.Hdr.Name, dns.Fqdn(domain)) {
-			return true
-		}
-	}
-	return false
+	_, found := findSOAForDomain(message, domain)
+	return found
 }
 
 func findSOASerial(message *dns.Msg, domain string) (uint32, bool) {
-	for _, rr := range append(slices.Clone(message.Answer), message.Ns...) {
-		if soa, ok := rr.(*dns.SOA); ok && soa.Hdr.Class == dns.ClassINET && strings.EqualFold(soa.Hdr.Name, dns.Fqdn(domain)) {
-			return soa.Serial, true
-		}
+	soa, found := findSOAForDomain(message, domain)
+	if found {
+		return soa.Serial, true
 	}
 	return 0, false
+}
+
+func findSOAForDomain(message *dns.Msg, domain string) (*dns.SOA, bool) {
+	owner := dns.Fqdn(domain)
+	for _, rr := range message.Answer {
+		if soa, ok := rr.(*dns.SOA); ok && soa.Hdr.Class == dns.ClassINET && strings.EqualFold(soa.Hdr.Name, owner) {
+			return soa, true
+		}
+	}
+	for _, rr := range message.Ns {
+		if soa, ok := rr.(*dns.SOA); ok && soa.Hdr.Class == dns.ClassINET && strings.EqualFold(soa.Hdr.Name, owner) {
+			return soa, true
+		}
+	}
+	return nil, false
 }
 
 func fetchNSDNSKEY(ctx context.Context, app *AppState, domain, address string, srv *NSSnapshot) {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -97,6 +98,14 @@ func (s CheckStatus) String() string {
 		return checkStatusNames[s]
 	}
 	return StrEmpty
+}
+
+// MarshalJSONTo writes the status name without allocating a temporary []byte.
+func (s CheckStatus) MarshalJSONTo(enc *jsontext.Encoder) error {
+	if int(s) >= len(checkStatusNames) {
+		return fmt.Errorf(MsgErrInvalidCheckStatus, uint8(s))
+	}
+	return enc.WriteToken(jsontext.String(s.String()))
 }
 
 // MarshalText preserves readable status names at JSON boundaries.
@@ -198,24 +207,23 @@ type AppConfig struct {
 type DomainConfig struct {
 	Domain                string     `json:"domain"`
 	Name                  string     `json:"name"`
-	IsDelegatedZone       bool       `json:"is_delegated_zone"`
 	RootZone              string     `json:"root_zone"`
-	ExpectedNS            []string   `json:"expected_ns"`
-	SecondaryNS           []string   `json:"secondary_ns,omitempty"`
 	ExpectedRegistrarID   string     `json:"expected_registrar_id,omitempty"`
 	ExpectedRegistrarName string     `json:"expected_registrar_name,omitempty"`
-	Unused                bool       `json:"unused,omitempty"`
+	MailProvider          string     `json:"mail_provider"`
+	ExpectedNS            []string   `json:"expected_ns"`
+	SecondaryNS           []string   `json:"secondary_ns,omitempty"`
+	MXRecords             []string   `json:"mx_records"`
+	DKIMSelectors         []string   `json:"dkim_selectors"`
+	CAA                   *CAAConfig `json:"caa,omitempty"`
 	RenewalPrice          float64    `json:"renewal_price,omitempty"`
+	IsDelegatedZone       bool       `json:"is_delegated_zone"`
+	Unused                bool       `json:"unused,omitempty"`
 	DomainTransferLocked  bool       `json:"domain_transfer_locked,omitempty"`
 	VerifyNSHealth        bool       `json:"verify_ns_health,omitempty"`
 	CheckEmailSecurity    bool       `json:"check_email_security"`
-	MailProvider          string     `json:"mail_provider"`
-	MXRecords             []string   `json:"mx_records"`
-	DKIMSelectors         []string   `json:"dkim_selectors"`
 	DNSSEC                bool       `json:"dnssec"`
-	CAA                   *CAAConfig `json:"caa,omitempty"`
-
-	SuppressAlerts bool `json:"suppress_alerts"`
+	SuppressAlerts        bool       `json:"suppress_alerts"`
 }
 
 // CAAConfig specifies expected certificate-authority records.
@@ -267,10 +275,11 @@ type WHOISQuerier interface {
 type AppState struct {
 	config              AppConfig
 	activeResolvers     []string
+	active              activeChecks
 	Notifier            Notifier
 	Pricing             *PricingManager
 	LoopDuration        time.Duration
-	PrerenderedJSON     atomic.Value
+	publishedState      atomic.Pointer[publishedState]
 	GlobalResolverIndex atomic.Uint32
 
 	Bootstrap      *Bootstrap
@@ -283,6 +292,25 @@ type AppState struct {
 	RDAPLimiter    *rate.Limiter
 
 	EmailProviders map[string]ProviderConfig
+}
+
+// PublishedJSON returns a copy of the last complete API snapshot.
+func (a *AppState) PublishedJSON() ([]byte, bool) {
+	if a == nil {
+		return nil, false
+	}
+	state := a.publishedState.Load()
+	if state == nil {
+		return nil, false
+	}
+	return bytes.Clone(state.body), true
+}
+
+// activeChecks references positions in AppState's owned, immutable config.
+// Indices avoid retaining pointers into the config's backing arrays.
+type activeChecks struct {
+	domains    []int
+	dnsRecords []int
 }
 
 // Config returns an independent copy of the startup configuration.
@@ -321,18 +349,27 @@ func NewAppState(cfg AppConfig) *AppState {
 	if len(resolvers) == 0 {
 		resolvers = DefaultResolvers()
 	}
+	activeDomains := make([]int, 0, len(cfg.Domains))
+	for i := range cfg.Domains {
+		if !cfg.Domains[i].Unused {
+			activeDomains = append(activeDomains, i)
+		}
+	}
 	return &AppState{
 		config:          cfg,
 		activeResolvers: resolvers,
-		Notifier:        nil,
-		Pricing:         NewPricingManager(nil),
-		Bootstrap:       NewBootstrap(nil),
-		LoopDuration:    time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
-		RDAPLimiter:     rate.NewLimiter(rate.Every(RDAPRateLimitInterval), 1),
-		WHOISDial:       dialPublicWHOIS,
-		DNSClient:       &dns.Client{Timeout: DefaultDNSTimeout},
-		DNSTCPClient:    &dns.Client{Net: ProtocolTCP, Timeout: DefaultDNSTimeout},
-		RDAPURLAllowed:  IsSafeRDAPURL,
+		active: activeChecks{
+			domains: activeDomains, dnsRecords: activeDNSRecords(cfg.DNSRecords, cfg.Domains),
+		},
+		Notifier:       nil,
+		Pricing:        NewPricingManager(nil),
+		Bootstrap:      NewBootstrap(nil),
+		LoopDuration:   time.Duration(cfg.LoopIntervalDays * HoursPerDay * float64(time.Hour)),
+		RDAPLimiter:    rate.NewLimiter(rate.Every(RDAPRateLimitInterval), 1),
+		WHOISDial:      dialPublicWHOIS,
+		DNSClient:      &dns.Client{Timeout: DefaultDNSTimeout},
+		DNSTCPClient:   &dns.Client{Net: ProtocolTCP, Timeout: DefaultDNSTimeout},
+		RDAPURLAllowed: IsSafeRDAPURL,
 	}
 }
 
@@ -454,7 +491,6 @@ type DomainTierData struct {
 	Nameservers  []string `json:"nameservers,omitempty"`
 	DomainStatus []string `json:"domain_status,omitempty"`
 	DNSSEC       bool     `json:"dnssec,omitempty"`
-	Raw          string   `json:"-"`
 }
 
 // RDAPState stores evaluated registration evidence and renewal pricing.
@@ -594,6 +630,14 @@ func (c *CheckState) ApplyDNSResult(res DNSResult) {
 	res.State.Expected = slices.Clone(res.State.Expected)
 	res.State.Found = slices.Clone(res.State.Found)
 	res.State.Condition = clonePointer(res.State.Condition)
+	c.takeDNSResult(res)
+}
+
+// takeDNSResult transfers an exclusively owned result after its worker has finished.
+func (c *CheckState) takeDNSResult(res DNSResult) {
+	if c == nil || res.State.Status == StatusUnknown || res.Name == StrEmpty {
+		return
+	}
 	InitMap(&c.DNS)[res.Name] = res.State
 }
 
@@ -603,23 +647,20 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 		return
 	}
 	if res.RDAP.Status != StatusUnknown {
-		InitMap(&c.RDAP)[res.Domain] = cloneRDAPState(res.RDAP)
+		res.RDAP = cloneRDAPState(res.RDAP)
 	}
 	if res.Email.Status != StatusUnknown {
 		res.Email.Condition = clonePointer(res.Email.Condition)
 		res.Email.MX = slices.Clone(res.Email.MX)
 		res.Email.DKIMValid = slices.Clone(res.Email.DKIMValid)
-		InitMap(&c.Email)[res.Domain] = res.Email
 	}
 	if res.DNSSEC.Source != StrEmpty || res.DNSSEC.Error != StrEmpty || res.DNSSEC.Valid {
 		res.DNSSEC.Condition = clonePointer(res.DNSSEC.Condition)
 		res.DNSSEC.Algorithms = slices.Clone(res.DNSSEC.Algorithms)
-		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
 	}
 	if res.NSHealth.Status != StatusUnknown {
 		res.NSHealth.Condition = clonePointer(res.NSHealth.Condition)
 		res.NSHealth.Servers = slices.Clone(res.NSHealth.Servers)
-		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
 	}
 	if res.CAA != nil {
 		caa := *res.CAA
@@ -628,7 +669,30 @@ func (c *CheckState) ApplyDomainResult(res DomainResult) {
 		caa.IssueWild = slices.Clone(caa.IssueWild)
 		caa.IssueMail = slices.Clone(caa.IssueMail)
 		caa.UnknownCAs = slices.Clone(caa.UnknownCAs)
-		InitMap(&c.CAA)[res.Domain] = &caa
+		res.CAA = &caa
+	}
+	c.takeDomainResult(res)
+}
+
+// takeDomainResult transfers exclusively owned evidence into cycle state.
+func (c *CheckState) takeDomainResult(res DomainResult) {
+	if c == nil || res.Domain == StrEmpty {
+		return
+	}
+	if res.RDAP.Status != StatusUnknown {
+		InitMap(&c.RDAP)[res.Domain] = res.RDAP
+	}
+	if res.Email.Status != StatusUnknown {
+		InitMap(&c.Email)[res.Domain] = res.Email
+	}
+	if res.DNSSEC.Source != StrEmpty || res.DNSSEC.Error != StrEmpty || res.DNSSEC.Valid {
+		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
+	}
+	if res.NSHealth.Status != StatusUnknown {
+		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
+	}
+	if res.CAA != nil {
+		InitMap(&c.CAA)[res.Domain] = res.CAA
 	}
 }
 

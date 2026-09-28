@@ -14,6 +14,5 @@ require (
 	github.com/miekg/dns v1.1.73
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/net v0.59.0
-	golang.org/x/sync v0.23.0
 	golang.org/x/time v0.16.0
 )

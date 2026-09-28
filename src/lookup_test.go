@@ -1784,6 +1784,14 @@ func TestExtractWHOISTier_DNSSECTokens(t *testing.T) {
 	}
 }
 
+func TestExtractWHOISTierLargeResponse(t *testing.T) {
+	raw := "Domain Name: EXAMPLE.COM\nRegistry Expiry Date: 2030-08-13T04:00:00Z\nRegistrar: Example Registrar\nName Server: ns1.example.com\n" + strings.Repeat("padding\n", 12_000)
+	tier := extractWHOISTier(raw, SourceWHOIS, "whois.example")
+	assert.Equal(t, "Example Registrar", tier.Registrar)
+	assert.Equal(t, "2030-08-13T04:00:00Z", tier.Expiration)
+	assert.Contains(t, tier.Nameservers, "ns1.example.com")
+}
+
 func TestEvaluateRDAP(t *testing.T) {
 	app := &AppState{
 		Notifier: &NotificationManager{},

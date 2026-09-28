@@ -94,7 +94,7 @@ func BenchmarkCycleAlertCollection(b *testing.B) {
 			name = "shared_cycle_slice"
 		}
 		b.Run(name, func(b *testing.B) {
-			prev := make(map[string]StateCondition)
+			prev := make(map[conditionKey]StateCondition)
 			b.ReportAllocs()
 			for b.Loop() {
 				var alerts []Alert

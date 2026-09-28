@@ -462,7 +462,8 @@ func TestStateEnumWireCompatibility(t *testing.T) {
 		require.NoError(t, jsonv2.Unmarshal(encoded, &wire))
 		assert.IsType(t, "", wire["status"], "API statuses must remain strings")
 	}
-
+	_, err := jsonv2.Marshal(DNSState{Status: CheckStatus(255)})
+	require.Error(t, err, "invalid statuses must still fail encoding")
 }
 
 func TestRuntimeViewsAvoidAllocations(t *testing.T) {

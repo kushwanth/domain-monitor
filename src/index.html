@@ -823,6 +823,7 @@
     let currentFilter = 'all';
     let pollInterval = null;
     let appState = {};
+    let stateETag = '';
     let connectionError = false;
     let searchQuery = '';
     let currentPage = 1;
@@ -1058,9 +1059,15 @@
 
     async function pollState() {
       try {
-        const res = await fetch('/api/state');
+        const res = await fetch('/api/state', { headers: stateETag ? { 'If-None-Match': stateETag } : {} });
+        if (res.status === 304) {
+          connectionError = false;
+          updateHeaderTimestamps();
+          return;
+        }
         if (!res.ok) throw new Error(`State request failed: ${res.status}`);
         const data = await res.json();
+        stateETag = res.headers?.get?.('ETag') || '';
         connectionError = false;
         if (data && data.status !== 'initializing' && data.last_updated) {
           if (data.last_updated !== appState.last_updated) {
