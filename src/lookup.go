@@ -20,15 +20,12 @@ import (
 
 // queryWHOISWithContext owns IANA discovery and the one TCP query it selects.
 // fetchWHOIS owns the optional registrar referral.
-func queryWHOISWithContext(ctx context.Context, app *AppState, domain string, host ...string) (string, error) {
+func queryWHOISWithContext(ctx context.Context, app *AppState, domain, server string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return StrEmpty, err
 	}
 	asciiDomain := NormalizeDomainToASCIIText(domain)
-	server := StrEmpty
-	if len(host) > 0 {
-		server = strings.TrimSpace(host[0])
-	}
+	server = strings.TrimSpace(server)
 	if app != nil && app.WHOISClient != nil {
 		response, err := app.WHOISClient.Query(ctx, asciiDomain, server)
 		if err != nil {
@@ -1004,15 +1001,15 @@ func firstNonEmptyStrings(primary, fallback []string) []string {
 // Pure CPU — no network calls, no alerting.
 // Returns the status and its condition. A zero condition means no check ran.
 func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, StateCondition) {
-	if target.Unused {
-		return StatusSkipped, StateCondition{}
-	}
 	if target.Domain == StrEmpty {
 		return StatusPending, StateCondition{}
 	}
 
 	if snapshot.Err != nil {
-		if errors.Is(snapshot.Err, ErrDomainNotFound) {
+		if errors.Is(snapshot.Err, ErrDomainNotFound) || errors.Is(snapshot.Err, ErrRDAPNotFound) {
+			if target.allowsExpiry() {
+				return StatusSkipped, StateCondition{}
+			}
 			return StatusFailed, StateCondition{Code: CodeDomainNotFound}
 		}
 
@@ -1030,8 +1027,11 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 	if t, _, err := parseFlexibleDate(snapshot.Expiration); err == nil {
 		days := time.Until(t).Hours() / 24
 		if days < 0 {
+			if target.allowsExpiry() {
+				return StatusSkipped, StateCondition{}
+			}
 			ct.Promote(StatusFailed, CodeRDAPExpired, StrEmpty)
-		} else if days <= DefaultRDAPExpiryWarningDays {
+		} else if days <= DefaultRDAPExpiryWarningDays && !target.allowsExpiry() {
 			priority := StatusWarning
 			if days <= 7 {
 				priority = StatusFailed
@@ -1315,8 +1315,7 @@ func isSafeWHOISServer(server string) bool {
 	return ReValidDomain.MatchString(host)
 }
 
-func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client HTTPDoer, apps ...*AppState) *RDAPDomainResponse {
-	policyApp := firstApp(apps)
+func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client HTTPDoer, policyApp *AppState) *RDAPDomainResponse {
 	httpClient := resolveRDAPClient(client, policyApp)
 	if httpClient == nil {
 		return nil
@@ -1384,13 +1383,6 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 	return result
 }
 
-func firstApp(apps []*AppState) *AppState {
-	if len(apps) == 0 {
-		return nil
-	}
-	return apps[0]
-}
-
 func readRegistrarRDAPResponse(response *http.Response) (*RDAPDomainResponse, error) {
 	body, err := readBounded(response.Body, MaxBootstrapResponseSize)
 	DrainAndClose(response.Body, MaxBodyDrainSize)
@@ -1426,24 +1418,7 @@ func registrarRDAPURL(rawHref, domain string) string {
 
 func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPSnapshot, error) {
 	start := time.Now()
-	result, err := retryWithBackoff(ctx, NameOpWHOIS, WHOISRetryBaseDelay, func(_ int) (string, bool, time.Duration, error) {
-		qCtx, cancel := context.WithTimeout(ctx, DefaultWHOISQueryTimeout)
-		attemptResult, queryErr := queryWHOISWithContext(qCtx, app, domain)
-		cancel()
-
-		if queryErr != nil && attemptResult == StrEmpty {
-			wrapped := WrapError(MsgErrWHOISQueryFailed, queryErr)
-			return StrEmpty, transientNetworkError(queryErr), 0, wrapped
-		}
-
-		if !isWHOISRateLimited(attemptResult, queryErr) {
-			if queryErr != nil {
-				return StrEmpty, false, 0, WrapError(MsgErrWHOISQueryFailed, queryErr)
-			}
-			return attemptResult, false, 0, nil
-		}
-		return attemptResult, true, 0, ErrWHOISRateLimited
-	})
+	result, err := queryWHOISWithRetry(ctx, app, domain, StrEmpty, NameOpWHOIS)
 	if err != nil {
 		return RDAPSnapshot{}, err
 	}
@@ -1458,13 +1433,13 @@ func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPSnapshot
 		referralServer := strings.TrimSpace(m[1])
 		if referralServer != StrEmpty && !strings.Contains(referralServer, StrIana2) && !strings.Contains(referralServer, StrInternic) {
 			if !isSafeWHOISServer(referralServer) {
-				LogWarn(MsgLogSkippingUnsafeRDAP, FieldDomain, domain, FieldReferralServer, referralServer)
+				LogWarn(MsgLogSkippingUnsafeWHOIS, FieldDomain, domain, FieldReferralServer, referralServer)
 			} else {
 				LogInfo(MsgLogFollowingWHOISReferral, FieldDomain, domain, FieldReferralServer, referralServer)
-				refCtx, refCancel := context.WithTimeout(ctx, DefaultHTTPTimeout)
-				defer refCancel()
-
-				if refResult, err := queryWHOISWithContext(refCtx, app, domain, referralServer); err == nil && refResult != StrEmpty && !isDomainNotFoundInWHOIS(refResult) {
+				refResult, refErr := queryWHOISWithRetry(ctx, app, domain, referralServer, NameOpWHOISReferral)
+				if refErr != nil {
+					LogWarn(MsgLogWHOISReferralFailed, FieldDomain, domain, FieldReferralServer, referralServer, FieldError, refErr)
+				} else if refResult != StrEmpty && !isDomainNotFoundInWHOIS(refResult) {
 					registrarTier = extractWHOISTier(refResult, SourceRegistrarWHOIS, referralServer)
 				}
 			}
@@ -1485,6 +1460,27 @@ func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPSnapshot
 	}
 
 	return state, nil
+}
+
+func queryWHOISWithRetry(ctx context.Context, app *AppState, domain, server, operation string) (string, error) {
+	return retryWithBackoff(ctx, operation, WHOISRetryBaseDelay, func(_ int) (string, bool, time.Duration, error) {
+		qCtx, cancel := context.WithTimeout(ctx, DefaultWHOISQueryTimeout)
+		attemptResult, queryErr := queryWHOISWithContext(qCtx, app, domain, server)
+		cancel()
+
+		if queryErr != nil && attemptResult == StrEmpty {
+			wrapped := WrapError(MsgErrWHOISQueryFailed, queryErr)
+			return StrEmpty, transientNetworkError(queryErr), 0, wrapped
+		}
+
+		if !isWHOISRateLimited(attemptResult, queryErr) {
+			if queryErr != nil {
+				return StrEmpty, false, 0, WrapError(MsgErrWHOISQueryFailed, queryErr)
+			}
+			return attemptResult, false, 0, nil
+		}
+		return attemptResult, true, 0, ErrWHOISRateLimited
+	})
 }
 
 func resolveRootZoneResolvers(ctx context.Context, app *AppState, rootZone string, globalResolvers []string) []string {

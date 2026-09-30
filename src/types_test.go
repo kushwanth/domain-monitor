@@ -1,11 +1,106 @@
 package main
 
 import (
+	"context"
 	jsonv2 "encoding/json/v2"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/miekg/dns"
 )
+
+type dummyStringer struct{}
+
+func (dummyStringer) String() string { return "dummy-string" }
+
+// MockHTTPClient implements HTTPDoer for tests.
+type MockHTTPClient struct {
+	MockDo func(req *http.Request) (*http.Response, error)
+}
+
+func (m *MockHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	if m.MockDo != nil {
+		return m.MockDo(req)
+	}
+	return nil, nil
+}
+
+// MockDNSResolver implements Resolver for tests.
+type MockDNSResolver struct {
+	MockExchangeContext func(ctx context.Context, message *dns.Msg, address string) (*dns.Msg, time.Duration, error)
+}
+
+func (m *MockDNSResolver) ExchangeContext(ctx context.Context, message *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+	if m.MockExchangeContext != nil {
+		return m.MockExchangeContext(ctx, message, address)
+	}
+	return nil, 0, nil
+}
+
+// MockWHOISClient implements WHOISQuerier for tests.
+type MockWHOISClient struct {
+	MockQuery func(ctx context.Context, domain, server string) (string, error)
+}
+
+func (m *MockWHOISClient) Query(ctx context.Context, domain, server string) (string, error) {
+	if m.MockQuery != nil {
+		return m.MockQuery(ctx, domain, server)
+	}
+	return StrEmpty, nil
+}
+
+type recordingNotifier struct {
+	*NotificationManager
+	alerts []Alert
+}
+
+func newRecordingNotifier() *recordingNotifier {
+	notifier := NewNotificationManager("https://ntfy.invalid/test", StrEmpty, StrEmpty, StrEmpty)
+	notifier.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(StrEmpty))}, nil
+	}}
+	return &recordingNotifier{NotificationManager: notifier}
+}
+
+func (n *recordingNotifier) Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
+	n.NotificationManager.Dispatch(message, redacted, priority, tag, domain, name)
+	n.captureAndFlush()
+}
+
+func (n *recordingNotifier) captureAndFlush() {
+	n.alerts = append(n.alerts, n.alertBatch...)
+	n.Flush()
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return fn(request) }
+
+type mockTransport struct {
+	attempts int
+	mu       sync.Mutex
+}
+
+func (m *mockTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	m.mu.Lock()
+	m.attempts++
+	m.mu.Unlock()
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		Header:     make(http.Header),
+	}, nil
+}
+
+type failingProviderReader struct{}
+
+func (failingProviderReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
 func newTestCheckState() *CheckState {
 	return &CheckState{

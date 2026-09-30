@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"unicode/utf8"
 )
@@ -89,10 +88,6 @@ func TestNotificationManager_PriorityLogging(t *testing.T) {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
-
 func TestNotificationRedaction_NtfyMatchesTelegram(t *testing.T) {
 	var ntfyBody string
 	nm := &NotificationManager{
@@ -129,26 +124,8 @@ func TestNotificationRedaction_NtfyMatchesTelegram(t *testing.T) {
 	}
 }
 
-type mockTransport struct {
-	attempts  int
-	mu        sync.Mutex
-	failTimes int
-}
-
-func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	m.mu.Lock()
-	m.attempts++
-	m.mu.Unlock()
-
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-		Header:     make(http.Header),
-	}, nil
-}
-
 func TestNotification_SynchronousFlush(t *testing.T) {
-	transport := &mockTransport{failTimes: 0}
+	transport := &mockTransport{}
 
 	nm := &NotificationManager{
 		NtfyURL:        "http://dummy-ntfy",
@@ -304,10 +281,6 @@ func TestNotificationProviderFailures(t *testing.T) {
 		}
 	}
 }
-
-type failingProviderReader struct{}
-
-func (failingProviderReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
 func TestNotificationFormattingAndPayloadLimits(t *testing.T) {
 	text := formatNtfyMessage(Alert{Message: strings.Repeat("x", MaxAlertMessageRunes+100)})

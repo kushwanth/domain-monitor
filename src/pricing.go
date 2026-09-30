@@ -116,7 +116,7 @@ func extractTLD(domain string) string {
 
 func needsPricingCatalog(cfg AppConfig) bool {
 	for _, domainCfg := range cfg.Domains {
-		if !domainCfg.Unused && !domainCfg.IsDelegatedZone && domainCfg.RenewalPrice <= 0 {
+		if !domainCfg.IsDelegatedZone && domainCfg.RenewalPrice <= 0 {
 			return true
 		}
 	}
@@ -146,9 +146,9 @@ func applyPortfolioPricing(cfg AppConfig, loopState *CheckState, catalog *pricin
 }
 
 func eligibleForRenewalPrice(domainCfg DomainConfig, states map[string]RDAPState) (RDAPState, bool) {
-	if domainCfg.Unused || domainCfg.IsDelegatedZone {
+	if domainCfg.IsDelegatedZone {
 		return RDAPState{}, false
 	}
 	state, exists := states[domainCfg.Domain]
-	return state, exists && state.Status != StatusUnknown
+	return state, exists && state.Status != StatusUnknown && !state.Unused
 }

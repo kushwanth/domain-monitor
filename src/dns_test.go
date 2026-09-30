@@ -1549,53 +1549,15 @@ func TestAppStateDefaultResolvers(t *testing.T) {
 	}
 }
 
-func TestNilSafety_EvaluationsWithNilApp(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// 3. evaluateDNSSEC with nil app
-	dnssecCfg := DomainConfig{
+func TestFetchDNSSECEvidenceMissingApp(t *testing.T) {
+	result := FetchDNSSECEvidence(context.Background(), nil, DomainConfig{
 		Domain: "example.com",
 		DNSSEC: true,
-	}
-	dnssecRes := evaluateDNSSECForTest(ctx, nil, dnssecCfg)
-	if dnssecRes.Source == "" {
-		t.Errorf("expected non-nil DNSSECResult")
-	}
+	})
 
-	// 4. evaluateDNS with nil app
-	dnsTask := DNSTask{
-		Hostname: "example.com",
-		Name:     "example-a",
-		Type:     "A",
-		Expected: StringList{"93.184.216.34"},
-	}
-	dnsState := evaluateDNSForTest(ctx, nil, dnsTask)
-	if dnsState.Status == StatusUnknown {
-		t.Errorf("expected non-nil DNSState")
-	}
-
-	// 5. evaluateEmailSecurity with nil app
-	emailCfg := DomainConfig{
-		Domain:             "example.com",
-		CheckEmailSecurity: true,
-		MXRecords:          []string{"mail.example.com"},
-	}
-	emailState := evaluateEmailSecurityForTest(ctx, nil, emailCfg)
-	if emailState.Status == StatusUnknown {
-		t.Errorf("expected non-nil EmailState")
-	}
-
-	// 7. evaluateNSHealth with nil app
-	nsCfg := DomainConfig{
-		Domain:         "example.com",
-		VerifyNSHealth: true,
-		ExpectedNS:     []string{"ns1.example.com"},
-	}
-	nsRes := evaluateNSHealthForTest(ctx, nil, nsCfg)
-	if nsRes.Primary == "" {
-		t.Errorf("expected non-nil NSHealthResult")
-	}
+	assert.Equal(t, DNSSECSourceLocalOnly, result.Source)
+	assert.True(t, result.NetworkError)
+	assert.Equal(t, MsgErrDNSSECResolverNotConfigured, result.Error)
 }
 
 func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
@@ -1759,7 +1721,7 @@ func TestResolveTargetExtensive(t *testing.T) {
 	}
 }
 
-func TestValidateEmailSecurity(t *testing.T) {
+func TestValidateEmailSecurity(_ *testing.T) {
 	app := &AppState{
 		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
@@ -1790,7 +1752,7 @@ func TestEvaluateDNSSEC_MockedPaths(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			app.HTTPClient = &MockHTTPClient{
-				MockDo: func(req *http.Request) (*http.Response, error) {
+				MockDo: func(_ *http.Request) (*http.Response, error) {
 					if tt.expectedValid {
 						return &http.Response{
 							StatusCode: 200,
@@ -1801,7 +1763,7 @@ func TestEvaluateDNSSEC_MockedPaths(t *testing.T) {
 				},
 			}
 			app.DNSClient = &MockDNSResolver{
-				MockExchangeContext: func(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
+				MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 					resp := new(dns.Msg)
 					resp.SetReply(msg)
 					if tt.mockResult.Valid {
@@ -1843,7 +1805,7 @@ func TestEvaluateDNS_MockedPaths(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			app.DNSClient = &MockDNSResolver{
-				MockExchangeContext: func(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
+				MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 					if tt.mockErr != nil {
 						return nil, 0, tt.mockErr
 					}
@@ -1867,7 +1829,7 @@ func TestResolveTarget_MockedPaths(t *testing.T) {
 	ctx := context.Background()
 
 	app.DNSClient = &MockDNSResolver{
-		MockExchangeContext: func(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
+		MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 			if len(msg.Question) == 0 {
 				return nil, 0, errors.New(MsgErrMockError)
 			}
@@ -1913,7 +1875,7 @@ func TestEvaluateEmailSecurity_MockedPaths(t *testing.T) {
 	ctx := context.Background()
 
 	app.DNSClient = &MockDNSResolver{
-		MockExchangeContext: func(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
+		MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 			if len(msg.Question) == 0 {
 				return nil, 0, errors.New(MsgErrMockError)
 			}

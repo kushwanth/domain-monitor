@@ -789,6 +789,8 @@ const (
 	MsgLogRegistrarReferralInvalid = "Registrar RDAP referral could not be read"
 	MsgLogRateLimitedRegistrarRDAP = "Rate limited by registrar RDAP"
 	MsgLogFollowingWHOISReferral   = "Following WHOIS referral"
+	MsgLogSkippingUnsafeWHOIS      = "Skipping unsafe WHOIS referral"
+	MsgLogWHOISReferralFailed      = "WHOIS referral failed"
 	MsgLogLoopIntervalBelowMin     = "loop_interval_days is below minimum (0.125 days / 3 hours); defaulting to 0.125"
 	MsgLogLoopIntervalAboveMax     = "loop_interval_days exceeds maximum (365 days); defaulting to 365"
 
@@ -892,6 +894,7 @@ const (
 	NameOpRegistryRDAP     = "registry RDAP"
 	NameOpRegistrarRDAP    = "registrar RDAP"
 	NameOpWHOIS            = "WHOIS"
+	NameOpWHOISReferral    = "WHOIS referral"
 	NameOpPricingCatalog   = "pricing catalog"
 	CheckTypeRDAP          = "RDAP"
 	CheckTypeDNS           = "DNS"

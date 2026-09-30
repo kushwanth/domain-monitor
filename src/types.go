@@ -208,13 +208,13 @@ type AppConfig struct {
 	DNSRecords []DNSTask      `json:"dns_records"`
 }
 
-// legacyConfig reads the removed allow_expiry setting for migration.
-type legacyConfig struct {
-	Domains []legacyDomainConfig `json:"domains"`
+// configAliases reads supported compatibility keys that normalize into AppConfig.
+type configAliases struct {
+	Domains []domainConfigAliases `json:"domains"`
 }
 
-// legacyDomainConfig contains deprecated per-domain settings.
-type legacyDomainConfig struct {
+// domainConfigAliases contains alternative per-domain configuration keys.
+type domainConfigAliases struct {
 	AllowExpiry bool `json:"allow_expiry"`
 }
 
@@ -239,6 +239,10 @@ type DomainConfig struct {
 	CheckEmailSecurity    bool       `json:"check_email_security"`
 	DNSSEC                bool       `json:"dnssec"`
 	SuppressAlerts        bool       `json:"suppress_alerts"`
+}
+
+func (d DomainConfig) allowsExpiry() bool {
+	return d.Unused
 }
 
 // CAAConfig specifies expected certificate-authority records.
@@ -292,6 +296,7 @@ type AppState struct {
 	config              AppConfig
 	activeResolvers     []string
 	active              activeChecks
+	expiredDomains      map[string]bool // Owned by the monitoring loop; RDAP can reactivate entries.
 	Notifier            Notifier
 	Pricing             *PricingManager
 	LoopDuration        time.Duration
@@ -328,8 +333,9 @@ func (a *AppState) PublishedJSON() ([]byte, bool) {
 // activeChecks references positions in AppState's owned, immutable config.
 // Indices avoid retaining pointers into the config's backing arrays.
 type activeChecks struct {
-	domains    []int
-	dnsRecords []int
+	domains     []int
+	rdapDomains []int
+	dnsRecords  []int
 }
 
 // Config returns an independent copy of the startup configuration.
@@ -365,18 +371,21 @@ func NewAppState(cfg AppConfig) *AppState {
 	if len(resolvers) == 0 {
 		resolvers = DefaultResolvers()
 	}
-	activeDomains := make([]int, 0, len(cfg.Domains))
+	activeDomains := make([]int, len(cfg.Domains))
 	for i := range cfg.Domains {
-		if !cfg.Domains[i].Unused {
-			activeDomains = append(activeDomains, i)
-		}
+		activeDomains[i] = i
+	}
+	activeDNSRecords := make([]int, len(cfg.DNSRecords))
+	for i := range cfg.DNSRecords {
+		activeDNSRecords[i] = i
 	}
 	return &AppState{
 		config:          cfg,
 		activeResolvers: resolvers,
 		active: activeChecks{
-			domains: activeDomains, dnsRecords: activeDNSRecords(cfg.DNSRecords, cfg.Domains),
+			domains: activeDomains, rdapDomains: slices.Clone(activeDomains), dnsRecords: activeDNSRecords,
 		},
+		expiredDomains: make(map[string]bool),
 		Notifier:       nil,
 		Pricing:        NewPricingManager(nil),
 		Bootstrap:      NewBootstrap(nil),
@@ -521,6 +530,7 @@ type RDAPState struct {
 	DomainStatus      []string        `json:"domain_status,omitempty"`
 	DNSSEC            bool            `json:"dnssec,omitempty"`
 	RenewalPrice      float64         `json:"renewal_price,omitempty"`
+	AllowExpiry       bool            `json:"allow_expiry,omitempty"`
 	Unused            bool            `json:"unused,omitempty"`
 	Error             string          `json:"error,omitempty"`
 	IsDelegatedZone   bool            `json:"is_delegated_zone,omitempty"`

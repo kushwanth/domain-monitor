@@ -151,43 +151,105 @@ func TestEvaluateCycleEvidencePerformsNoNetworkRequests(t *testing.T) {
 	assert.Equal(t, StatusOK, state.NSHealth["example.com"].Status)
 }
 
-func TestUnusedDomainSkipsEveryCheckAndOwnedDNSRecord(t *testing.T) {
-	app := NewAppState(AppConfig{
-		Domains:    []DomainConfig{{Domain: "example.com", Unused: true}},
-		DNSRecords: []DNSTask{{Name: "unused A", Hostname: "www.example.com", Type: RecordTypeA}},
-	})
-	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(context.Context, *dns.Msg, string) (*dns.Msg, time.Duration, error) {
-		t.Fatal("unused domain caused a DNS lookup")
-		return nil, 0, nil
-	}}
-	app.PublishInitialState()
-	initialJSON, ok := app.PublishedJSON()
-	require.True(t, ok)
-	var initial CheckState
-	require.NoError(t, jsonv2.Unmarshal(initialJSON, &initial))
-	assert.Equal(t, StatusSkipped, initial.RDAP["example.com"].Status)
-	assert.Empty(t, initial.DNS)
+func TestAllowedExpiryDomainIsMonitoredUntilExpiration(t *testing.T) {
+	cfg := AppConfig{
+		Domains: []DomainConfig{{
+			Domain: "example.com", Unused: true, CheckEmailSecurity: true, DNSSEC: true,
+		}},
+		DNSRecords: []DNSTask{{Name: "allowed A", Hostname: "www.example.com", Type: RecordTypeA, Expected: []string{"192.0.2.1"}}},
+	}
+	app := NewAppState(cfg)
+	require.Equal(t, []int{0}, app.active.domains)
+	require.Equal(t, []int{0}, app.active.dnsRecords)
 
-	state := runMonitoringCycle(context.Background(), app, nil, nil, nil, nil, nil)
+	evidence := cycleEvidence{
+		dns: []DNSSnapshot{{Records: []string{"192.0.2.1"}}},
+		domains: []domainEvidence{{
+			email:  EmailSnapshot{MXRecords: []string{"mail.example.com"}, SPFRecords: []string{"v=spf1 -all"}, DMARCRecords: []string{"v=DMARC1; p=reject"}},
+			dnssec: DNSSECResult{Source: DNSSECSourceLocalDoH, Valid: true, HasDS: true, HasDNSKEY: true, DSMatchesDNSKEY: true, RRSIGValid: true, ChainIntact: true},
+		}},
+		rdap: []RDAPSnapshot{{Expiration: time.Now().Add(365 * 24 * time.Hour).UTC().Format(time.RFC3339)}},
+	}
+	state := evaluateCycleEvidence(nil, cfg, app.active, evidence)
+	assert.Equal(t, StatusOK, state.RDAP["example.com"].Status)
+	assert.True(t, state.RDAP["example.com"].AllowExpiry)
+	assert.False(t, state.RDAP["example.com"].Unused)
+	assert.Equal(t, StatusOK, state.DNS["allowed A"].Status)
+	assert.Equal(t, StatusOK, state.Email["example.com"].Status)
+	assert.Equal(t, StatusOK, state.DNSSEC["example.com"].Status)
+
+	evidence.rdap[0].Expiration = time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+	state = evaluateCycleEvidence(nil, cfg, app.active, evidence)
 	assert.Equal(t, StatusSkipped, state.RDAP["example.com"].Status)
+	assert.True(t, state.RDAP["example.com"].AllowExpiry)
+	assert.True(t, state.RDAP["example.com"].Unused)
+	assert.NotEmpty(t, state.RDAP["example.com"].Expiration)
 	assert.Empty(t, state.DNS)
 	assert.Empty(t, state.Email)
-	assert.Empty(t, state.CAA)
 	assert.Empty(t, state.DNSSEC)
-	assert.Empty(t, state.NSHealth)
+	updateExpiredDomains(app, cfg, state)
+	nextCycle := activeChecksForCycle(app, cfg)
+	assert.Empty(t, nextCycle.domains)
+	assert.Empty(t, nextCycle.dnsRecords)
+	assert.Equal(t, []int{0}, nextCycle.rdapDomains)
+
+	evidence.rdap[0].Expiration = time.Now().Add(365 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	state = evaluateCycleEvidence(nil, cfg, nextCycle, evidence)
+	updateExpiredDomains(app, cfg, state)
+	nextCycle = activeChecksForCycle(app, cfg)
+	assert.Equal(t, []int{0}, nextCycle.domains)
+	assert.Equal(t, []int{0}, nextCycle.dnsRecords)
 }
 
-func TestActiveDNSRecordsUsesMostSpecificDomain(t *testing.T) {
-	domains := []DomainConfig{{Domain: "example.com", Unused: true}, {Domain: "sub.example.com"}}
-	records := []DNSTask{
-		{Name: "parent", Hostname: "www.example.com"},
-		{Name: "child", Hostname: "www.sub.example.com"},
-		{Name: "unrelated", Hostname: "outside.test"},
+func TestAllowedExpiryDomainReactivatesDependentChecksInSameCycle(t *testing.T) {
+	expiration := time.Now().Add(365 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(HeaderContentType, AcceptRDAP)
+		_, _ = fmt.Fprintf(w, `{"objectClassName":"domain","ldhName":"example.com","events":[{"eventAction":"expiration","eventDate":%q}],"entities":[{"roles":["registrar"],"vcardArray":["vcard",[["fn",{},"text","Example Registrar"]]]}]}`, expiration)
+	}))
+	defer registry.Close()
+
+	cfg := AppConfig{
+		Domains:    []DomainConfig{{Domain: "example.com", Unused: true}},
+		DNSRecords: []DNSTask{{Name: "allowed A", Hostname: "www.example.com", Type: RecordTypeA, Expected: []string{"192.0.2.1"}}},
 	}
-	active := activeDNSRecords(records, domains)
-	require.Len(t, active, 2)
-	assert.Equal(t, "child", records[active[0]].Name)
-	assert.Equal(t, "unrelated", records[active[1]].Name)
+	app := NewAppState(cfg)
+	app.expiredDomains["example.com"] = true
+	app.Bootstrap = &Bootstrap{services: map[string][]string{"com": {registry.URL}}, fetchedAt: time.Now()}
+	app.RDAPURLAllowed = func(string) bool { return true }
+	app.RDAPLimiter = nil
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		record, err := dns.NewRR("www.example.com. IN A 192.0.2.1")
+		require.NoError(t, err)
+		response.Answer = []dns.RR{record}
+		return response, 0, nil
+	}}
+
+	state := runMonitoringCycle(context.Background(), app, registry.Client(), nil, nil, nil, nil)
+	assert.Equal(t, StatusOK, state.RDAP["example.com"].Status)
+	assert.Equal(t, StatusOK, state.DNS["allowed A"].Status)
+	assert.False(t, app.expiredDomains["example.com"])
+}
+
+func TestExpiredDomainRemainsSuppressedWhenRDAPIsUnavailable(t *testing.T) {
+	cfg := AppConfig{Domains: []DomainConfig{{Domain: "example.com", Unused: true}}}
+	app := NewAppState(cfg)
+	app.expiredDomains["example.com"] = true
+	state := newCycleState(cfg, app.active)
+	state.RDAP["example.com"] = RDAPState{Status: StatusWarning, Condition: StateCondition{Code: CodeRDAPHTTPError}}
+
+	updateExpiredDomains(app, cfg, state)
+
+	assert.True(t, app.expiredDomains["example.com"])
+}
+
+func TestConfiguredDomainOwnerUsesMostSpecificDomain(t *testing.T) {
+	domains := []DomainConfig{{Domain: "example.com", Unused: true}, {Domain: "sub.example.com"}}
+	assert.Equal(t, "example.com", configuredDomainOwner("www.example.com", domains))
+	assert.Equal(t, "sub.example.com", configuredDomainOwner("www.sub.example.com", domains))
+	assert.Empty(t, configuredDomainOwner("outside.test", domains))
 }
 
 func TestActiveViewsReferenceOwnedConfiguration(t *testing.T) {
@@ -196,9 +258,11 @@ func TestActiveViewsReferenceOwnedConfiguration(t *testing.T) {
 		DNSRecords: []DNSTask{{Name: "record", Hostname: "active.example"}},
 	}
 	app := NewAppState(cfg)
-	require.Len(t, app.active.domains, 1)
+	require.Len(t, app.active.domains, 2)
+	require.Len(t, app.active.rdapDomains, 2)
 	require.Len(t, app.active.dnsRecords, 1)
 	assert.Equal(t, 0, app.active.domains[0])
+	assert.Equal(t, 1, app.active.domains[1])
 	assert.Equal(t, 0, app.active.dnsRecords[0])
 	cfg.Domains[0].Domain = "caller mutation"
 	cfg.DNSRecords[0].Name = "caller mutation"
@@ -421,6 +485,48 @@ func TestProcessConditionsAndAlerts_AllChecksAndSuppression(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProcessConditionsDropsHistoryForSuppressedChecks(t *testing.T) {
+	domain := "example.com"
+	state := newTestCheckState()
+	state.RDAP[domain] = RDAPState{Status: StatusSkipped, Unused: true}
+	prev := map[conditionKey]StateCondition{
+		{check: CheckTypeEmail, domain: domain}:    {Code: CodeEmailMissingMX, Since: time.Now().Add(-time.Hour)},
+		{check: CheckTypeDNSSEC, domain: domain}:   {Code: CodeDNSSECNetworkError, Since: time.Now().Add(-time.Hour)},
+		{check: CheckTypeDNS, domain: "allowed A"}: {Code: CodeDNSLookupFailed, Since: time.Now().Add(-time.Hour)},
+	}
+	cfg := AppConfig{
+		Domains:    []DomainConfig{{Domain: domain, Name: "Example", Unused: true}},
+		DNSRecords: []DNSTask{{Name: "allowed A", Hostname: "www.example.com", Type: RecordTypeA}},
+	}
+
+	processConditionsAndAlerts(&AppState{}, state, cfg, activeChecks{}, prev)
+
+	assert.Empty(t, prev)
+}
+
+func TestNotificationWorkerDrainsQueueWhenWakeChannelCloses(t *testing.T) {
+	requests := 0
+	notifier := NewNotificationManager("https://ntfy.invalid/topic", "", "", "")
+	notifier.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}}
+	notifier.Dispatch("message", "redacted", PriorityHigh, TagSkull, "example.com", "Example")
+	wake := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go runNotificationWorker(context.Background(), notifier, wake, done)
+
+	close(wake)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("notification worker did not finish after draining")
+	}
+
+	assert.Equal(t, 1, requests)
+	assert.Empty(t, notifier.alertBatch)
 }
 
 func TestStorePanicDomainResults(t *testing.T) {

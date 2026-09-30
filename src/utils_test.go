@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -309,10 +308,6 @@ func TestWrapError(t *testing.T) {
 	}
 }
 
-type dummyStringer struct{}
-
-func (dummyStringer) String() string { return "dummy-string" }
-
 func TestAnyToString(t *testing.T) {
 	t.Parallel()
 
@@ -352,7 +347,7 @@ func TestCustomLoggerMethods(t *testing.T) {
 	assert.NotNil(t, h3)
 }
 
-func TestLogStateTransitions(t *testing.T) {
+func TestLogStateTransitions(_ *testing.T) {
 	prev := make(map[string]CheckStatus)
 	current := map[string]RDAPState{
 		"example.com": {Status: StatusFailed},
@@ -364,42 +359,6 @@ func TestLogStateTransitions(t *testing.T) {
 	tmp.Status = StatusOK
 	current["example.com"] = tmp
 	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, current, func(s RDAPState) CheckStatus { return s.Status }, prev)
-}
-
-// MockHTTPClient implements HTTPDoer for tests.
-type MockHTTPClient struct {
-	MockDo func(req *http.Request) (*http.Response, error)
-}
-
-func (m *MockHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	if m.MockDo != nil {
-		return m.MockDo(req)
-	}
-	return nil, nil
-}
-
-// MockDNSResolver implements DNSResolver for tests.
-type MockDNSResolver struct {
-	MockExchangeContext func(ctx context.Context, m *dns.Msg, a string) (*dns.Msg, time.Duration, error)
-}
-
-func (m *MockDNSResolver) ExchangeContext(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
-	if m.MockExchangeContext != nil {
-		return m.MockExchangeContext(ctx, msg, a)
-	}
-	return nil, 0, nil
-}
-
-// MockWHOISClient implements WHOISClient for tests.
-type MockWHOISClient struct {
-	MockQuery func(ctx context.Context, domain, server string) (string, error)
-}
-
-func (m *MockWHOISClient) Query(ctx context.Context, domain, server string) (string, error) {
-	if m.MockQuery != nil {
-		return m.MockQuery(ctx, domain, server)
-	}
-	return "", nil
 }
 
 func TestNewAppStateWiresWHOISTransport(t *testing.T) {
@@ -454,29 +413,6 @@ func TestDefaultResolversReturnsIndependentSlices(t *testing.T) {
 		first[0] = "192.0.2.1"
 		assert.NotEqual(t, first[0], second[0])
 	}
-}
-
-type recordingNotifier struct {
-	*NotificationManager
-	alerts []Alert
-}
-
-func newRecordingNotifier() *recordingNotifier {
-	notifier := NewNotificationManager("https://ntfy.invalid/test", "", "", "")
-	notifier.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
-	}}
-	return &recordingNotifier{NotificationManager: notifier}
-}
-
-func (n *recordingNotifier) Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
-	n.NotificationManager.Dispatch(message, redacted, priority, tag, domain, name)
-	n.captureAndFlush()
-}
-
-func (n *recordingNotifier) captureAndFlush() {
-	n.alerts = append(n.alerts, n.alertBatch...)
-	n.Flush()
 }
 
 func TestStateEnumWireCompatibility(t *testing.T) {

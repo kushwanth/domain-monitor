@@ -90,9 +90,10 @@ results need bounded slices/maps. Configuration snapshots own their CAA policy
 slices. Active check lists store indices into the daemon's owned configuration,
 without retaining pointers into backing arrays. A fixed pool of at most 32
 workers gathers network evidence into one cycle-owned snapshot. Serial RDAP and
-WHOIS gathering follows the same phase. Evaluation begins only after all
-gathering completes and performs no network requests. Expected DNS values are
-copied once so returned cycle state remains independent of configuration.
+WHOIS evidence is evaluated first so newly expired or re-registered domains
+select the correct dependent workload in the same cycle. Final evaluation
+performs no network requests. Expected DNS values are copied once so returned
+cycle state remains independent of configuration.
 Completed cycles publish one immutable cached JSON snapshot; in-progress
 changes do not affect HTTP readers.
 
@@ -145,7 +146,8 @@ files are read once; changes require a restart.
 | `expected_registrar_name` | string | No | Expected registrar name when name matching is needed. |
 | `domain_transfer_locked` | bool | No | Alert if the domain transfer lock is missing. |
 | `renewal_price` | float | No | Manual renewal price override (e.g. for premium domains or custom contracts). If omitted or `0`, the daemon looks for a renewal price in the DotSweep TLD catalog; unavailable prices remain unknown. |
-| `unused` | bool | No | If `true`, places the domain in the Unused section and skips all monitoring checks, alerts, and renewal pricing. Existing `allow_expiry: true` entries are treated as `unused: true` when loading older configs. |
+| `unused` | bool | No | Allows the domain to expire without expiry alerts and keeps it in the separate Allowed to Expire dashboard section. The daemon continues gathering, displaying, and validating it normally until RDAP confirms expiration or absence, then suppresses its dependent checks and alerts. RDAP continues so re-registration reactivates the other checks. |
+| `allow_expiry` | bool | No | Exact alias of `unused`; both keys have identical runtime behavior. |
 | `verify_ns_health` | bool | No | Queries primary/secondary NS for reachability and SOA consistency. |
 | `suppress_alerts` | bool | No | Mutes notification alerts for this domain. |
 
@@ -196,7 +198,7 @@ Tokens and runtime paths can be configured via environment variables for easy co
 
 The daemon provides an embedded Web UI and JSON API:
 
-*   **`GET /`:** Interactive Web Dashboard grouping checked domains into Healthy, Issues, and Unused sections and DNS records into Matched and Not Matched sections. Empty sections are hidden; pending results appear after checks finish. Domain cards show days to expiry, and the sidebar shows annual and upcoming renewal costs.
+*   **`GET /`:** Interactive Web Dashboard grouping checked domains into Healthy, Issues, and Allowed to Expire sections and DNS records into Matched and Not Matched sections. Empty sections are hidden; pending results appear after checks finish. Domain cards show days to expiry, and the sidebar shows annual and upcoming renewal costs.
 *   **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
 *   **`GET /api/state`:** Latest completed-cycle JSON snapshot; pending checks are published at startup. Responses include an ETag, and matching `If-None-Match` requests return 304 without a body.
 
@@ -209,7 +211,7 @@ The daemon tracks estimated annual domain renewal costs for your portfolio:
 * **Automatic Standard TLD Pricing**: Standard domain extensions (e.g., `.com`, `.org`, `.co.uk`) are automatically priced using the open [DotSweep](https://dotsweep.com/tlds) TLD catalog.
 * **Pricing catalog privacy**: The daemon queries `https://dotsweep.com/tlds` to download a public TLD catalog without sending portfolio domain names, TLD lists, or registrar identities in that request. Domain and DNS checks contact their configured upstream services separately.
 * **Catalog caching**: Upstream catalog responses are cached in memory for 24 hours (`PricingCacheTTL`). Temporary upstream failures or unusable catalogs retain existing cached data for up to 7 days.
-* **Premium Domains & Custom Overrides**: Because premium domains have custom renewal prices that cannot be inferred from standard TLD rates, you can specify `renewal_price` in `config.json` (e.g., `"renewal_price": 250.00`). A manual amount takes precedence. Monitored domain cards show the annual price or `Unknown`; delegated zones show `Not applicable`. Unused domains are excluded from the portfolio total, which is partial when some monitored prices are unknown.
+* **Premium Domains & Custom Overrides**: Because premium domains have custom renewal prices that cannot be inferred from standard TLD rates, you can specify `renewal_price` in `config.json` (e.g., `"renewal_price": 250.00`). A manual amount takes precedence. Monitored domain cards show the annual price or `Unknown`; delegated zones show `Not applicable`. Domains allowed to expire are excluded from the portfolio total, which is partial when some monitored prices are unknown.
 * **Sidebar totals**: Minimum annual renewal cost sums known prices for monitored domains. Renewals due in the next 12 months sum known prices for monitored domains whose reported expiration date falls within the next 365 days. Unknown prices are marked as partial; domains without a known expiration date are excluded from the upcoming total.
 
 

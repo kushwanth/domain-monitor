@@ -26,16 +26,36 @@ import (
 func getMockWHOISApp(fn func(string) (string, error)) *AppState {
 	return &AppState{
 		WHOISClient: &MockWHOISClient{
-			MockQuery: func(ctx context.Context, domain, server string) (string, error) {
+			MockQuery: func(_ context.Context, domain, _ string) (string, error) {
 				return fn(domain)
 			},
 		},
 		HTTPClient: &MockHTTPClient{
-			MockDo: func(req *http.Request) (*http.Response, error) {
+			MockDo: func(_ *http.Request) (*http.Response, error) {
 				return nil, errors.New(MsgErrMockHTTPError)
 			},
 		},
 	}
+}
+
+func TestQueryWHOISWithRetryRetriesTransientReferralFailure(t *testing.T) {
+	attempts := 0
+	app := &AppState{WHOISClient: &MockWHOISClient{MockQuery: func(_ context.Context, _, server string) (string, error) {
+		attempts++
+		assert.Equal(t, "whois.example", server)
+		if attempts == 1 {
+			return StrEmpty, &net.DNSError{Err: "temporary failure", IsTemporary: true}
+		}
+		return "Domain Name: EXAMPLE.COM", nil
+	}}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response, err := queryWHOISWithRetry(ctx, app, "example.com", "whois.example", NameOpWHOISReferral)
+
+	require.NoError(t, err)
+	assert.Equal(t, "Domain Name: EXAMPLE.COM", response)
+	assert.Equal(t, 2, attempts)
 }
 
 func TestRDAPValidation(t *testing.T) {
@@ -1078,7 +1098,7 @@ func TestWHOISContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	_, err := queryWHOISWithContext(ctx, nil, "example.com")
+	_, err := queryWHOISWithContext(ctx, nil, "example.com", StrEmpty)
 	if err == nil {
 		t.Errorf("Expected error from cancelled context, got nil")
 	}
@@ -1235,7 +1255,7 @@ func TestWHOISDiscoveryUsesInjectedTransport(t *testing.T) {
 				}()
 				return client, nil
 			}}
-			got, err := queryWHOISWithContext(context.Background(), app, "example.com")
+			got, err := queryWHOISWithContext(context.Background(), app, "example.com", StrEmpty)
 			require.NoError(t, err)
 			assert.Equal(t, "Domain Name: example.com", got)
 			assert.Equal(t, []string{WHOISIANAHost, "whois.example.com"}, hosts)
@@ -1514,7 +1534,7 @@ func TestFollowRegistrarRDAPLinks_SSRFProtection(t *testing.T) {
 		}
 	}
 
-	res := followRegistrarRDAPLinks(context.Background(), "example.com", unsafeLinks, nil)
+	res := followRegistrarRDAPLinks(context.Background(), "example.com", unsafeLinks, nil, nil)
 	if res != nil {
 		t.Errorf("Expected nil response when all referral links are unsafe SSRF targets")
 	}
@@ -1595,7 +1615,7 @@ func TestNewRDAPHTTPClient_BlocksInsecureRedirects(t *testing.T) {
 	}
 
 	// 3. Verify dial-time SSRF prevention blocks connection to restricted IPs
-	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer testServer.Close()
@@ -1770,6 +1790,29 @@ func TestEvaluateRDAP_ExpiryEvidence(t *testing.T) {
 	}
 }
 
+func TestEvaluateRDAP_AllowedExpiryPolicy(t *testing.T) {
+	target := DomainConfig{Domain: "example.com", Unused: true}
+
+	status, condition := EvaluateRDAP(target, RDAPSnapshot{
+		Expiration:   time.Now().Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		DomainStatus: []string{"clientTransferProhibited"},
+	})
+	assert.Equal(t, StatusOK, status)
+	assert.Equal(t, CodeRDAPSuccess, condition.Code)
+
+	status, condition = EvaluateRDAP(target, RDAPSnapshot{Expiration: time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339)})
+	assert.Equal(t, StatusSkipped, status)
+	assert.True(t, condition.IsZero())
+
+	status, condition = EvaluateRDAP(target, RDAPSnapshot{Err: ErrDomainNotFound})
+	assert.Equal(t, StatusSkipped, status)
+	assert.True(t, condition.IsZero())
+
+	status, condition = EvaluateRDAP(target, RDAPSnapshot{Err: ErrRDAPNotFound})
+	assert.Equal(t, StatusSkipped, status)
+	assert.True(t, condition.IsZero())
+}
+
 func TestExtractWHOISTier_DNSSECTokens(t *testing.T) {
 	for _, tc := range []struct {
 		token string
@@ -1806,7 +1849,7 @@ func TestEvaluateRDAP(t *testing.T) {
 	defer cancel()
 
 	// Create a mock server that returns 404 for RDAP to test the WHOIS fallback
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
@@ -1828,7 +1871,7 @@ func TestEvaluateRDAP(t *testing.T) {
 func TestFetchRDAP(t *testing.T) {
 	ctx := context.Background()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{ "rdapConformance": [ "rdap_level_0" ], "objectClassName": "domain", "ldhName": "example.com", "handle": "123" }`))
 	}))
@@ -1878,7 +1921,7 @@ func TestFetchRDAPSnapshotDoesNotFallbackToWHOISOn404(t *testing.T) {
 	app := &AppState{
 		Bootstrap:      &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()},
 		RDAPURLAllowed: func(string) bool { return true },
-		WHOISClient: &MockWHOISClient{MockQuery: func(_ context.Context, domain, _ string) (string, error) {
+		WHOISClient: &MockWHOISClient{MockQuery: func(_ context.Context, _, _ string) (string, error) {
 			t.Fatal("WHOIS should not be called on 404")
 			return "", nil
 		}},
@@ -1971,12 +2014,12 @@ func TestEvaluateRDAP_MockedPaths(t *testing.T) {
 	ctx := context.Background()
 
 	app.WHOISClient = &MockWHOISClient{
-		MockQuery: func(ctx context.Context, domain, server string) (string, error) {
+		MockQuery: func(_ context.Context, _, _ string) (string, error) {
 			return "mock whois", nil
 		},
 	}
 	app.HTTPClient = &MockHTTPClient{
-		MockDo: func(req *http.Request) (*http.Response, error) {
+		MockDo: func(_ *http.Request) (*http.Response, error) {
 			return nil, errors.New(MsgErrMockRDAPRateLimitError) // Simulates error in http
 		},
 	}
@@ -1992,7 +2035,7 @@ func TestResolveRootZoneResolvers_MockedPaths(t *testing.T) {
 	ctx := context.Background()
 
 	app.DNSClient = &MockDNSResolver{
-		MockExchangeContext: func(ctx context.Context, msg *dns.Msg, a string) (*dns.Msg, time.Duration, error) {
+		MockExchangeContext: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 			m := new(dns.Msg)
 			m.SetReply(msg)
 			if len(msg.Question) > 0 {

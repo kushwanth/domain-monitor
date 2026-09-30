@@ -30,8 +30,8 @@ func TestDashboardBrowserRegressions(t *testing.T) {
           rdap_checks: {
             'example.com': {status:'ok', nameservers:['ns.example.com'], renewal_price:12, expiration:new Date(Date.now() + 20*86400000).toISOString()},
             'custom.example.com': {status:'ok', nameservers:['ns.custom.example.com'], renewal_price:8, expiration:new Date(Date.now() + 400*86400000).toISOString()},
-            'unused.example': {status:'skipped', unused:true},
-            'letgo.example': {status:'ok', nameservers:['ns.letgo.example'], renewal_price:5, expiration:new Date(Date.now() + 10*86400000).toISOString()},
+            'unused.example': {status:'skipped', allow_expiry:true, unused:true},
+            'letgo.example': {status:'ok', allow_expiry:true, nameservers:['ns.letgo.example'], renewal_price:5, expiration:new Date(Date.now() + 10*86400000).toISOString()},
             'pending.example': {status:'pending'}
           },
           caa_checks: {'example.com': {status:'mismatch', valid:false, issue:['unexpected.example']}},
@@ -53,17 +53,17 @@ func TestDashboardBrowserRegressions(t *testing.T) {
         updateRenewalPricing();
         updateHeaderTimestamps();
         const domainCard = document.querySelector('#view-domains details[data-search="example.com"]');
-        expect(domainCard && document.getElementById('total-renewal-cost').textContent === '25.00', 'Annual minimum renewal cost is wrong');
-        expect(document.getElementById('next-year-renewal-cost').textContent === '17.00', 'Next-year renewal cost is wrong');
+        expect(domainCard && document.getElementById('total-renewal-cost').textContent === '20.00', 'Annual minimum renewal cost is wrong');
+        expect(document.getElementById('next-year-renewal-cost').textContent === '12.00', 'Next-year renewal cost is wrong');
         const groupName = card => card?.closest('.domain-group')?.querySelector('h2')?.textContent;
         expect(document.querySelectorAll('#view-domains .domain-group').length === 3, 'Dashboard does not show all three domain sections');
         expect(groupName(document.querySelector('#view-domains details[data-search="custom.example.com"]')) === 'Healthy Domains', 'Healthy domain is in the wrong section');
         expect(groupName(domainCard) === 'Domains with Issues', 'Issue domain is in the wrong section');
-        expect(groupName(document.querySelector('#view-domains [data-search="unused.example"]')) === 'Unused Domains', 'Unused domain is in the wrong section');
-        expect(!document.querySelector('#view-domains details[data-search="unused.example"]'), 'Unused domain should not show check details');
-        expect(groupName(document.querySelector('#view-domains details[data-search="letgo.example"]')) === 'Healthy Domains', 'Healthy domain is in the wrong section');
+        expect(groupName(document.querySelector('#view-domains [data-search="unused.example"]')) === 'Allowed to Expire', 'Allowed-expiry domain is in the wrong section');
+        expect(!document.querySelector('#view-domains details[data-search="unused.example"]'), 'Expired domain should not show check details');
+        expect(groupName(document.querySelector('#view-domains details[data-search="letgo.example"]')) === 'Allowed to Expire', 'Monitored allowed-expiry domain is in the wrong section');
         expect(!document.querySelector('#view-domains details[data-search="pending.example"]'), 'Pending domain is shown before checks finish');
-        expect(Array.from(document.querySelectorAll('#view-stats .stat-value')).map(el => el.textContent.trim()).join(',') === '4,2,1,1', 'Domain section counts do not exclude pending checks or keep unused separate');
+        expect(Array.from(document.querySelectorAll('#view-stats .stat-value')).map(el => el.textContent.trim()).join(',') === '4,1,1,2', 'Domain section counts do not exclude pending checks or keep allowed-expiry domains separate');
         expect(domainCard.querySelector('summary .domain-expiry')?.textContent === '20d left', 'Closed domain card does not show days to expiry');
         expect(!document.querySelector('.badge'), 'Badge markup remains visible');
         toggleFilter('healthy');

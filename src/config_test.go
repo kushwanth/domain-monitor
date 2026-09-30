@@ -60,7 +60,7 @@ func TestReadConfigFileRejectsOversizedInput(t *testing.T) {
 	assert.ErrorIs(t, err, ErrReadLimitExceeded)
 }
 
-func TestUnusedDomainConfigAndLegacyMigration(t *testing.T) {
+func TestExpiryPolicyConfigAliases(t *testing.T) {
 	configJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"unused-one.example","name":"Unused One","unused":true},{"domain":"unused-two.example","name":"Unused Two","unused":true,"allow_expiry":true},{"domain":"renewing.example","name":"Renewing","allow_expiry":true}]}`
 	cfg, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
 		return []byte(configJSON), nil
@@ -70,12 +70,22 @@ func TestUnusedDomainConfigAndLegacyMigration(t *testing.T) {
 	assert.True(t, cfg.Domains[0].Unused)
 	assert.True(t, cfg.Domains[1].Unused)
 	assert.True(t, cfg.Domains[2].Unused)
+	for _, domain := range cfg.Domains {
+		assert.True(t, domain.allowsExpiry())
+		futureStatus, _ := EvaluateRDAP(domain, RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).UTC().Format(time.RFC3339)})
+		expiredStatus, _ := EvaluateRDAP(domain, RDAPSnapshot{Expiration: time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339)})
+		assert.Equal(t, StatusOK, futureStatus)
+		assert.Equal(t, StatusSkipped, expiredStatus)
+	}
 
 	state := newCycleState(AppConfig{Domains: cfg.Domains}, activeChecks{})
-	assert.True(t, state.RDAP["unused-one.example"].Unused)
-	assert.True(t, state.RDAP["unused-two.example"].Unused)
-	assert.True(t, state.RDAP["renewing.example"].Unused)
-	assert.Equal(t, StatusSkipped, state.RDAP["renewing.example"].Status)
+	assert.False(t, state.RDAP["unused-one.example"].Unused)
+	assert.False(t, state.RDAP["unused-two.example"].Unused)
+	assert.False(t, state.RDAP["renewing.example"].Unused)
+	assert.True(t, state.RDAP["unused-one.example"].AllowExpiry)
+	assert.True(t, state.RDAP["unused-two.example"].AllowExpiry)
+	assert.True(t, state.RDAP["renewing.example"].AllowExpiry)
+	assert.Equal(t, StatusPending, state.RDAP["renewing.example"].Status)
 }
 
 func FuzzNormalizeExpectedDNSValue(f *testing.F) {
@@ -1010,9 +1020,6 @@ func TestConfigSnapshotOwnsNestedData(t *testing.T) {
 	resolvers := app.Resolvers()
 	resolvers[0] = "9.9.9.9"
 	assert.Equal(t, original.Resolvers, app.Resolvers())
-}
-
-func TestConfigAndEnvironmentAreReadOnlyAtStartup(t *testing.T) {
 }
 
 func TestOptionalTelegramDoesNotBlockNtfyStartup(t *testing.T) {

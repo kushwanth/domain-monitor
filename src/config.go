@@ -50,13 +50,13 @@ func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte,
 	if err := jsonv2.Unmarshal(jsonBytes, &rawCfg); err != nil {
 		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
-	// Preserve old allow_expiry:true configurations as unused domains.
-	var legacy legacyConfig
-	if err := jsonv2.Unmarshal(jsonBytes, &legacy); err != nil {
+	// unused and allow_expiry are equivalent configuration keys.
+	var aliases configAliases
+	if err := jsonv2.Unmarshal(jsonBytes, &aliases); err != nil {
 		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
 	for i := range rawCfg.Domains {
-		if i < len(legacy.Domains) && legacy.Domains[i].AllowExpiry {
+		if i < len(aliases.Domains) && aliases.Domains[i].AllowExpiry {
 			rawCfg.Domains[i].Unused = true
 		}
 	}

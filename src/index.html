@@ -976,7 +976,7 @@
         </div>
         ${currentView === 'domains' ? `
         <div class="stat-box ${currentFilter === 'unused' ? 'active' : ''}" onclick="toggleFilter('unused')">
-          <span class="stat-label">Unused</span>
+          <span class="stat-label">Allowed Expiry</span>
           <span class="stat-value">${unused}</span>
         </div>` : ''}
 
@@ -1036,7 +1036,7 @@
       const now = Date.now();
       const nextYear = now + 365 * 24 * 60 * 60 * 1000;
       Object.values(appState.rdap_checks).forEach(c => {
-        if (!c || c.unused || c.is_delegated_zone || !c.status || c.status === 'pending') return;
+        if (!c || c.allow_expiry || c.unused || c.is_delegated_zone || !c.status || c.status === 'pending') return;
         const hasPrice = Number.isFinite(c.renewal_price) && c.renewal_price > 0;
         if (hasPrice) annualTotal += c.renewal_price;
         else annualUnknown++;
@@ -1243,7 +1243,7 @@
         if (!rdapState.unused && (!rdapState.status || checkStates.some(state => state && state.status === 'pending') || statusClass === 'unknown')) {
           continue;
         }
-        const group = rdapState.unused ? 'unused' : (statusClass === 'error' || statusClass === 'warning' ? 'issues' : 'healthy');
+        const group = (rdapState.allow_expiry || rdapState.unused) ? 'unused' : (statusClass === 'error' || statusClass === 'warning' ? 'issues' : 'healthy');
 
         if (group === 'unused') unusedCount++;
         else if (group === 'issues') issueCount++;
@@ -1297,7 +1297,7 @@
         const caaState = item.caaState;
         const nsHealthState = item.nsHealthState;
 
-        if (item.group === 'unused') {
+        if (item.group === 'unused' && rdapState.unused) {
           const card = document.createElement('div');
           card.className = 'domain-card domain-header domain-header-domains unused-card';
           card.setAttribute('data-search', domain.toLowerCase());
@@ -1431,7 +1431,7 @@
         }
 
         const card = document.createElement('details');
-        card.className = 'domain-card';
+        card.className = item.group === 'unused' ? 'domain-card unused-card' : 'domain-card';
         card.setAttribute('data-search', domain.toLowerCase());
         if (window.location.hash === '#open:' + domain.toLowerCase() || previouslyOpen.has(domain.toLowerCase())) {
           card.open = true;
@@ -1463,7 +1463,7 @@
         groupedCards[item.group].push(card);
       } // end of for loop
 
-      for (const [group, heading] of [['healthy', 'Healthy Domains'], ['issues', 'Domains with Issues'], ['unused', 'Unused Domains']]) {
+      for (const [group, heading] of [['healthy', 'Healthy Domains'], ['issues', 'Domains with Issues'], ['unused', 'Allowed to Expire']]) {
         if (groupedCards[group].length === 0) continue;
         const section = document.createElement('section');
         section.className = 'domain-group';

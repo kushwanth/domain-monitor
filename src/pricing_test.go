@@ -72,7 +72,7 @@ func TestPricingManager_Fetch(t *testing.T) {
 		},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requestCount.Add(1)
 		w.Header().Set(HeaderContentType, "application/json")
 		out, _ := jsonv2.Marshal(mockResponse)
@@ -108,7 +108,7 @@ func TestComputePortfolioPricing(t *testing.T) {
 		},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(HeaderContentType, "application/json")
 		out, _ := jsonv2.Marshal(mockResponse)
 		_, _ = w.Write(out)
@@ -159,8 +159,8 @@ func TestComputePortfolioPricing(t *testing.T) {
 		t.Errorf("Expected premium.com renewal price 299.99, got %+v", state)
 	}
 
-	if state := loopState.RDAP["expiring.com"]; state.Status == StatusUnknown || state.RenewalPrice != 0 {
-		t.Errorf("Expected expiring.com renewal price to be 0, got %+v", state)
+	if state := loopState.RDAP["expiring.com"]; state.Status == StatusUnknown || state.RenewalPrice != 11.08 {
+		t.Errorf("Expected nonexpired allowed domain renewal price 11.08, got %+v", state)
 	}
 }
 
