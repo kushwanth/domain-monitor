@@ -100,10 +100,15 @@ func dialPublicWHOISWith(
 		return nil, fmt.Errorf(MsgErrResolveWHOISServer, host, err)
 	}
 	var lastErr error
+	attempts := 0
 	for _, address := range addresses {
 		if address.IP == nil || IsRestrictedIP(address.IP) {
 			continue
 		}
+		if attempts == MaxNetworkAttempts {
+			break
+		}
+		attempts++
 		conn, err := dial(ctx, StrTCP, net.JoinHostPort(address.IP.String(), WHOISPort))
 		if err == nil {
 			return conn, nil
@@ -172,15 +177,15 @@ func exchangeWHOIS(ctx context.Context, conn net.Conn, query, domain, server str
 	if _, err := io.WriteString(conn, query+StrRN); err != nil {
 		return StrEmpty, fmt.Errorf(MsgErrWriteWHOISQueryForTo, domain, server, err)
 	}
-	data, err := io.ReadAll(io.LimitReader(conn, MaxWHOISResponseBytes+1))
+	data, err := readBounded(conn, MaxWHOISResponseBytes)
 	if ctx.Err() != nil {
 		return StrEmpty, ctx.Err()
 	}
+	if errors.Is(err, ErrReadLimitExceeded) {
+		return StrEmpty, fmt.Errorf(MsgErrWHOISResponseForExceedsBytes, domain, MaxWHOISResponseBytes)
+	}
 	if err != nil {
 		return StrEmpty, fmt.Errorf(MsgErrReadWHOISResponseForFrom, domain, server, err)
-	}
-	if len(data) > MaxWHOISResponseBytes {
-		return StrEmpty, fmt.Errorf(MsgErrWHOISResponseForExceedsBytes, domain, MaxWHOISResponseBytes)
 	}
 	return strings.TrimSpace(string(data)), nil
 }
@@ -905,45 +910,16 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RD
 // FetchRDAPSnapshot fetches raw registry data via RDAP, falling back to WHOIS.
 // Returns raw data only — no business logic, no alerting.
 func FetchRDAPSnapshot(ctx context.Context, httpClient HTTPDoer, app *AppState, domain string) RDAPSnapshot {
-	var snapshot RDAPSnapshot
-	var err error
-
-	for attempts := 1; attempts <= 3; attempts++ {
-		snapshot, err = fetchRDAP(ctx, httpClient, app, domain)
-		if err == nil {
-			if snapshot.RegistrarTier == nil && (snapshot.Expiration == StrEmpty || snapshot.Registrar == StrEmpty) {
-				return supplementThinRDAP(ctx, app, domain, snapshot)
-			}
-			return snapshot
+	snapshot, err := fetchRDAP(ctx, httpClient, app, domain)
+	if err == nil {
+		if snapshot.RegistrarTier == nil && (snapshot.Expiration == StrEmpty || snapshot.Registrar == StrEmpty) {
+			return supplementThinRDAP(ctx, app, domain, snapshot)
 		}
-
-		errStr := err.Error()
-
-		// If TLD doesn't support RDAP (bootstrap error, no RDAP server), fallback to WHOIS immediately
-		if strings.Contains(errStr, "bootstrap is unavailable") || strings.Contains(errStr, "no RDAP server") {
-			return fallbackWHOISSnapshot(ctx, app, domain, err)
-		}
-
-		// Don't retry 404, and do not fallback to WHOIS since it is authoritative
-		if errors.Is(err, ErrRDAPNotFound) {
-			return RDAPSnapshot{Err: err, ProtocolUsed: ProtocolRDAP}
-		}
-
-		// Wait before retry if not the last attempt
-		if attempts < 3 {
-			backoff := time.Duration(attempts*2) * time.Second
-			LogWarn("RDAP failed, retrying", FieldDomain, domain, "attempt", attempts, "retry_in", backoff)
-			timer := time.NewTimer(backoff)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return RDAPSnapshot{Err: ctx.Err()}
-			case <-timer.C:
-			}
-		}
+		return snapshot
 	}
-
-	// 3 retries exhausted
+	if errors.Is(err, ErrRDAPNotFound) {
+		return RDAPSnapshot{Err: err, ProtocolUsed: ProtocolRDAP}
+	}
 	return fallbackWHOISSnapshot(ctx, app, domain, err)
 }
 
@@ -1026,26 +1002,26 @@ func firstNonEmptyStrings(primary, fallback []string) []string {
 
 // EvaluateRDAP compares expected config against fetched RDAP snapshot.
 // Pure CPU — no network calls, no alerting.
-// Returns (CheckStatus, *StateCondition).
-func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *StateCondition) {
+// Returns the status and its condition. A zero condition means no check ran.
+func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, StateCondition) {
 	if target.Unused {
-		return StatusSkipped, nil
+		return StatusSkipped, StateCondition{}
 	}
 	if target.Domain == StrEmpty {
-		return StatusPending, nil
+		return StatusPending, StateCondition{}
 	}
 
 	if snapshot.Err != nil {
 		if errors.Is(snapshot.Err, ErrDomainNotFound) {
-			return StatusFailed, &StateCondition{Code: CodeDomainNotFound}
+			return StatusFailed, StateCondition{Code: CodeDomainNotFound}
 		}
 
 		errStr := snapshot.Err.Error()
 		if strings.Contains(errStr, StrConnectionRefused) || strings.Contains(errStr, StrIOTimeout) || strings.Contains(errStr, StrNoSuchHost) || strings.Contains(errStr, StrTemporaryFailure) || isWHOISRateLimited(errStr, snapshot.Err) || errors.Is(snapshot.Err, ErrWHOISRateLimited) {
-			return StatusWarning, &StateCondition{Code: CodeRDAPHTTPError}
+			return StatusWarning, StateCondition{Code: CodeRDAPHTTPError}
 		}
 
-		return StatusFailed, &StateCondition{Code: CodeRDAPHTTPError}
+		return StatusFailed, StateCondition{Code: CodeRDAPHTTPError}
 	}
 
 	ct := ConditionTracker{Status: StatusOK}
@@ -1137,8 +1113,8 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, *Sta
 		}
 	}
 
-	if ct.Cond == nil {
-		ct.Cond = &StateCondition{Code: CodeRDAPSuccess}
+	if ct.Cond.IsZero() {
+		ct.Cond = StateCondition{Code: CodeRDAPSuccess}
 	}
 	return ct.Status, ct.Cond
 }
@@ -1156,45 +1132,58 @@ func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain s
 		return RDAPSnapshot{}, fmt.Errorf(MsgErrRDAPHTTPClientIsNot, asciiDomain)
 	}
 
-	var lastErr error
+	safeURLs := make([]string, 0, len(urls))
 	for _, rawBaseURL := range urls {
 		baseURL := strings.TrimRight(rawBaseURL, SymSlash)
 		reqURL := baseURL + PathRDAPDomain + asciiDomain
 		if !rdapURLAllowed(app, reqURL) {
-			lastErr = fmt.Errorf(MsgErrUnsafeRDAPURL, reqURL)
 			continue
 		}
+		safeURLs = append(safeURLs, baseURL)
+	}
+	if len(safeURLs) == 0 {
+		return RDAPSnapshot{}, fmt.Errorf(MsgErrRDAPLookupFor, asciiDomain, MsgErrRDAPLookupFailedAllCandidates)
+	}
+
+	return retryWithBackoff(ctx, NameOpRegistryRDAP, HTTPRetryBaseDelay, func(attempt int) (RDAPSnapshot, bool, time.Duration, error) {
+		baseURL := safeURLs[(attempt-1)%len(safeURLs)]
+		reqURL := baseURL + PathRDAPDomain + asciiDomain
 		// #nosec G704 -- rdapURLAllowed rejects unsafe hosts immediately above.
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
-			lastErr = err
-			continue
+			return RDAPSnapshot{}, false, 0, err
 		}
 		req.Header.Set(HeaderAccept, AcceptRDAP)
 		req.Header.Set(HeaderUserAgent, DefaultUserAgent)
 		if app.RDAPLimiter != nil {
 			if err := app.RDAPLimiter.Wait(ctx); err != nil {
-				return RDAPSnapshot{}, err
+				return RDAPSnapshot{}, false, 0, err
 			}
 		}
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			lastErr = err
-			continue
+			if resp != nil {
+				DrainAndClose(resp.Body, MaxBodyDrainSize)
+			}
+			return RDAPSnapshot{}, transientNetworkError(err), 0, err
+		}
+		if retryableHTTPStatus(resp.StatusCode) && attempt < MaxNetworkAttempts {
+			delay := responseRetryAfter(resp, time.Now())
+			statusErr := fmt.Errorf(MsgErrRDAPHTTPError, resp.StatusCode)
+			DrainAndClose(resp.Body, MaxBodyDrainSize)
+			return RDAPSnapshot{}, true, delay, statusErr
 		}
 
 		domainInfo, err := readRDAPDomainResponse(resp)
 		if errors.Is(err, ErrRDAPNotFound) || errors.Is(err, ErrRDAPRateLimited) {
-			return RDAPSnapshot{}, err
+			return RDAPSnapshot{}, false, 0, err
 		}
 		if err != nil {
-			lastErr = err
-			continue
+			return RDAPSnapshot{}, attempt < len(safeURLs), 0, err
 		}
 		if err := validateRDAPDomainIdentity(domainInfo, asciiDomain); err != nil {
-			lastErr = err
-			continue
+			return RDAPSnapshot{}, attempt < len(safeURLs), 0, err
 		}
 
 		registryTier := extractRDAPDomainTier(domainInfo, SourceRegistryRDAP, baseURL)
@@ -1211,13 +1200,8 @@ func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain s
 		state, _ := synthesizeTierData(registryTier, registrarTier)
 		state.ProtocolUsed = ProtocolRDAP
 		state.QueryDurationMs = time.Since(start).Milliseconds()
-		return state, nil
-	}
-
-	if lastErr != nil {
-		return RDAPSnapshot{}, lastErr
-	}
-	return RDAPSnapshot{}, fmt.Errorf(MsgErrRDAPLookupFor, asciiDomain, MsgErrRDAPLookupFailedAllCandidates)
+		return state, false, 0, nil
+	})
 }
 
 func rdapServersFor(ctx context.Context, app *AppState, domain string) ([]string, error) {
@@ -1252,12 +1236,12 @@ func readRDAPDomainResponse(response *http.Response) (*RDAPDomainResponse, error
 	default:
 		return nil, fmt.Errorf(MsgErrRDAPHTTPError, response.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, MaxBootstrapResponseSize+1))
+	body, err := readBounded(response.Body, MaxBootstrapResponseSize)
+	if errors.Is(err, ErrReadLimitExceeded) {
+		return nil, fmt.Errorf(MsgErrRDAPResponseExceedsBytes, MaxBootstrapResponseSize)
+	}
 	if err != nil {
 		return nil, fmt.Errorf(MsgErrReadRDAPResponse, err)
-	}
-	if len(body) > MaxBootstrapResponseSize {
-		return nil, fmt.Errorf(MsgErrRDAPResponseExceedsBytes, MaxBootstrapResponseSize)
 	}
 	var domain RDAPDomainResponse
 	if err := jsonv2.Unmarshal(body, &domain); err != nil {
@@ -1338,6 +1322,7 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 		return nil
 	}
 
+	var targets []string
 	for _, rawHref := range links {
 		targetURL := registrarRDAPURL(rawHref, domain)
 		if targetURL == StrEmpty {
@@ -1347,42 +1332,56 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 			LogWarn(MsgLogSkippingUnsafeRDAP, FieldDomain, domain, FieldURL, targetURL)
 			continue
 		}
+		targets = append(targets, targetURL)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	result, _ := retryWithBackoff(ctx, NameOpRegistrarRDAP, HTTPRetryBaseDelay, func(attempt int) (*RDAPDomainResponse, bool, time.Duration, error) {
+		targetURL := targets[(attempt-1)%len(targets)]
 		LogInfo(MsgLogQueryingRegistrarRDAP, FieldDomain, domain, FieldURL, targetURL)
 		relReq, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if err != nil {
-			continue
+			return nil, false, 0, err
 		}
 		relReq.Header.Set(HeaderAccept, AcceptRDAP)
 		relReq.Header.Set(HeaderUserAgent, DefaultUserAgent)
 		if policyApp != nil && policyApp.RDAPLimiter != nil {
 			if err := policyApp.RDAPLimiter.Wait(ctx); err != nil {
-				return nil
+				return nil, false, 0, err
 			}
 		}
 
 		relResp, err := httpClient.Do(relReq)
-		if err != nil || relResp.StatusCode != http.StatusOK {
+		if err != nil {
 			if relResp != nil {
-				if relResp.StatusCode == http.StatusTooManyRequests {
-					LogWarn(MsgLogRateLimitedRegistrarRDAP, FieldDomain, domain)
-				}
 				DrainAndClose(relResp.Body, MaxBodyDrainSize)
 			}
-			continue
+			return nil, transientNetworkError(err), 0, err
+		}
+		if relResp.StatusCode != http.StatusOK {
+			delay := responseRetryAfter(relResp, time.Now())
+			statusErr := fmt.Errorf(MsgErrRDAPHTTPError, relResp.StatusCode)
+			if relResp.StatusCode == http.StatusTooManyRequests {
+				LogWarn(MsgLogRateLimitedRegistrarRDAP, FieldDomain, domain)
+			}
+			DrainAndClose(relResp.Body, MaxBodyDrainSize)
+			return nil, retryableHTTPStatus(relResp.StatusCode) || len(targets) > 1, delay, statusErr
 		}
 
 		relDomain, err := readRegistrarRDAPResponse(relResp)
 		if err != nil {
 			LogWarn(MsgLogRegistrarReferralInvalid, FieldURL, targetURL, FieldError, err)
-			continue
+			return nil, attempt < len(targets), 0, err
 		}
 		if err := validateRDAPDomainIdentity(relDomain, NormalizeDomainToASCIIText(domain)); err != nil {
 			LogWarn(MsgLogRegistrarReferralInvalid, FieldURL, targetURL, FieldError, err)
-			continue
+			return nil, attempt < len(targets), 0, err
 		}
-		return relDomain
-	}
-	return nil
+		return relDomain, false, 0, nil
+	})
+	return result
 }
 
 func firstApp(apps []*AppState) *AppState {
@@ -1393,13 +1392,13 @@ func firstApp(apps []*AppState) *AppState {
 }
 
 func readRegistrarRDAPResponse(response *http.Response) (*RDAPDomainResponse, error) {
-	body, err := io.ReadAll(io.LimitReader(response.Body, MaxBootstrapResponseSize+1))
+	body, err := readBounded(response.Body, MaxBootstrapResponseSize)
 	DrainAndClose(response.Body, MaxBodyDrainSize)
+	if errors.Is(err, ErrReadLimitExceeded) {
+		return nil, fmt.Errorf(MsgErrRegistrarRDAPResponseExceedsBytes, MaxBootstrapResponseSize)
+	}
 	if err != nil {
 		return nil, fmt.Errorf(MsgErrReadRegistrarRDAPReferral, err)
-	}
-	if len(body) > MaxBootstrapResponseSize {
-		return nil, fmt.Errorf(MsgErrRegistrarRDAPResponseExceedsBytes, MaxBootstrapResponseSize)
 	}
 	var domain RDAPDomainResponse
 	if err := jsonv2.Unmarshal(body, &domain); err != nil {
@@ -1427,43 +1426,26 @@ func registrarRDAPURL(rawHref, domain string) string {
 
 func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPSnapshot, error) {
 	start := time.Now()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	var result string
-	var queryErr error
-	var attempts int
-
-	for attempts = 1; attempts <= 3; attempts++ {
+	result, err := retryWithBackoff(ctx, NameOpWHOIS, WHOISRetryBaseDelay, func(_ int) (string, bool, time.Duration, error) {
 		qCtx, cancel := context.WithTimeout(ctx, DefaultWHOISQueryTimeout)
-		result, queryErr = queryWHOISWithContext(qCtx, app, domain)
+		attemptResult, queryErr := queryWHOISWithContext(qCtx, app, domain)
 		cancel()
 
-		if queryErr != nil && result == StrEmpty {
-			return RDAPSnapshot{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
+		if queryErr != nil && attemptResult == StrEmpty {
+			wrapped := WrapError(MsgErrWHOISQueryFailed, queryErr)
+			return StrEmpty, transientNetworkError(queryErr), 0, wrapped
 		}
 
-		if !isWHOISRateLimited(result, queryErr) {
+		if !isWHOISRateLimited(attemptResult, queryErr) {
 			if queryErr != nil {
-				return RDAPSnapshot{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
+				return StrEmpty, false, 0, WrapError(MsgErrWHOISQueryFailed, queryErr)
 			}
-			break
+			return attemptResult, false, 0, nil
 		}
-
-		if attempts < 3 {
-			backoff := time.Duration(attempts*2) * time.Second
-			LogWarn(MsgLogWHOISRateLimitedRetry, FieldDomain, domain, FieldAttempt, attempts, FieldRetryIn, backoff)
-			timer := time.NewTimer(backoff)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return RDAPSnapshot{}, ctx.Err()
-			case <-timer.C:
-			}
-		} else {
-			return RDAPSnapshot{}, ErrWHOISRateLimited
-		}
+		return attemptResult, true, 0, ErrWHOISRateLimited
+	})
+	if err != nil {
+		return RDAPSnapshot{}, err
 	}
 
 	durationMs := time.Since(start).Milliseconds()
@@ -1499,9 +1481,6 @@ func fetchWHOIS(ctx context.Context, app *AppState, domain string) (RDAPSnapshot
 	}
 
 	if state.Expiration == StrEmpty && state.Registrar == StrEmpty && len(state.Nameservers) == 0 && len(state.DomainStatus) == 0 {
-		if queryErr != nil {
-			return RDAPSnapshot{}, WrapError(MsgErrWHOISQueryFailed, queryErr)
-		}
 		return RDAPSnapshot{}, errors.New(MsgErrWHOISParsingFailed)
 	}
 
@@ -1572,12 +1551,12 @@ func FetchNSDelegationSnapshot(ctx context.Context, app *AppState, target Domain
 }
 
 // EvaluateNSDelegation compares observed delegation with configured nameservers.
-func EvaluateNSDelegation(target DomainConfig, snapshot NSDelegationSnapshot) (CheckStatus, *StateCondition) {
+func EvaluateNSDelegation(target DomainConfig, snapshot NSDelegationSnapshot) (CheckStatus, StateCondition) {
 	if snapshot.Err != nil {
-		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: snapshot.Err.Error()}
+		return StatusFailed, StateCondition{Code: CodeDNSLookupFailed, Target: snapshot.Err.Error()}
 	}
 	if len(snapshot.Nameservers) == 0 {
-		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: StrDelegationReturnedNoNameservers}
+		return StatusFailed, StateCondition{Code: CodeDNSLookupFailed, Target: StrDelegationReturnedNoNameservers}
 	}
 
 	liveNS := make(map[string]bool)

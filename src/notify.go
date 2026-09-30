@@ -7,7 +7,6 @@ import (
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"html"
-	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -43,7 +42,7 @@ func truncateAlertBytes(message string, limit int) string {
 func (nm *NotificationManager) Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
 	alert := Alert{Message: message, Redacted: redacted, Priority: priority, Tag: tag, Domain: domain, Name: name}
 	logQueuedAlert(alert)
-	if nm == nil || (nm.NtfyURL == StrEmpty && nm.TelegramToken == StrEmpty) {
+	if nm.NtfyURL == StrEmpty && nm.TelegramToken == StrEmpty {
 		return
 	}
 	nm.mu.Lock()
@@ -69,9 +68,6 @@ func (nm *NotificationManager) Flush() {
 
 // FlushContext delivers the queued batch.
 func (nm *NotificationManager) FlushContext(parent context.Context) {
-	if nm == nil {
-		return
-	}
 	batch := nm.takeAlertBatch()
 
 	if len(batch) == 0 {
@@ -111,29 +107,27 @@ func (nm *NotificationManager) takeAlertBatch() []Alert {
 func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, alert Alert) bool {
 	defer RecoverAndLogPanic(NameNtfyProvider)
 	text := formatNtfyMessage(alert)
-	// #nosec G704 -- NtfyURL is an operator-selected notification endpoint.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, nm.NtfyURL, strings.NewReader(strings.TrimSpace(text)))
-	if err != nil {
-		LogError(MsgLogNtfyRequestFailed, FieldError, err)
-		return false
-	}
-	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
-	if nm.NtfyAuth != StrEmpty {
-		req.Header.Set(HeaderAuthorization, nm.NtfyAuth)
-	}
-	req.Header.Set(HeaderNtfyTitle, NotificationAlertTitle)
-
-	req.Header.Set(HeaderNtfyPriority, alert.Priority.String())
-
-	if alert.Tag != StrEmpty {
-		req.Header.Set(HeaderNtfyTags, string(alert.Tag))
-	}
-
 	if nm.HTTPClient == nil {
 		LogError(MsgLogNotificationClientMissing)
 		return false
 	}
-	resp, err := nm.HTTPClient.Do(req)
+	resp, err := doHTTPWithRetry(ctx, NameNtfyProvider, nm.HTTPClient, false, func() (*http.Request, error) {
+		// #nosec G704 -- NtfyURL is an operator-selected notification endpoint.
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, nm.NtfyURL, strings.NewReader(strings.TrimSpace(text)))
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		req.Header.Set(HeaderUserAgent, DefaultUserAgent)
+		if nm.NtfyAuth != StrEmpty {
+			req.Header.Set(HeaderAuthorization, nm.NtfyAuth)
+		}
+		req.Header.Set(HeaderNtfyTitle, NotificationAlertTitle)
+		req.Header.Set(HeaderNtfyPriority, alert.Priority.String())
+		if alert.Tag != StrEmpty {
+			req.Header.Set(HeaderNtfyTags, string(alert.Tag))
+		}
+		return req, nil
+	})
 	if err != nil {
 		errStr := err.Error()
 		if nm.NtfyAuth != StrEmpty {
@@ -197,20 +191,20 @@ func (nm *NotificationManager) sendTelegramBatchContext(ctx context.Context, ale
 		return false
 	}
 
-	// #nosec G704 -- TelegramAPIBase is fixed; the configured token only selects its path.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		LogError(MsgLogTelegramRequestFailed, FieldError, strings.ReplaceAll(err.Error(), nm.TelegramToken, RedactedTokenPlaceholder))
-		return false
-	}
-	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
-	req.Header.Set(HeaderContentType, MIMEApplicationJSON)
-
 	if nm.HTTPClient == nil {
 		LogError(MsgLogNotificationClientMissing)
 		return false
 	}
-	resp, err := nm.HTTPClient.Do(req)
+	resp, err := doHTTPWithRetry(ctx, NameTelegramProvider, nm.HTTPClient, false, func() (*http.Request, error) {
+		// #nosec G704 -- TelegramAPIBase is fixed; the configured token only selects its path.
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewBuffer(payloadBytes))
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		req.Header.Set(HeaderUserAgent, DefaultUserAgent)
+		req.Header.Set(HeaderContentType, MIMEApplicationJSON)
+		return req, nil
+	})
 	if err != nil {
 		errStr := err.Error()
 		if nm.TelegramToken != StrEmpty {
@@ -225,11 +219,9 @@ func (nm *NotificationManager) sendTelegramBatchContext(ctx context.Context, ale
 		LogError(MsgLogTelegramDeliveryFailed, FieldStatus, resp.StatusCode)
 		return false
 	}
-	var result struct {
-		OK bool `json:"ok"`
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize+1))
-	if err != nil || len(body) > MaxNotificationPayloadSize {
+	var result telegramResponse
+	body, err := readBounded(resp.Body, MaxNotificationPayloadSize)
+	if err != nil {
 		LogError(MsgLogTelegramRejected, FieldStatus, resp.StatusCode)
 		return false
 	}

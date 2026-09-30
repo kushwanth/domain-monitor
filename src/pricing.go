@@ -5,7 +5,6 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -27,9 +26,6 @@ func normalizeTLD(tld string) string {
 }
 
 func (p *PricingManager) cachedCatalog(ctx context.Context) (*pricingCatalog, error) {
-	if p == nil {
-		return nil, ErrPricingManagerNil
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.catalog != nil && time.Since(p.catalog.fetchedAt) < PricingCacheTTL {
@@ -48,21 +44,19 @@ func (p *PricingManager) cachedCatalog(ctx context.Context) (*pricingCatalog, er
 }
 
 func (p *PricingManager) fetch(ctx context.Context) (*pricingCatalog, error) {
-	if p == nil {
-		return nil, ErrPricingManagerNil
-	}
 	client := ResolveHTTPClient(p.http)
 	if client == nil {
 		return nil, errors.New(MsgErrPricingHTTPClientNotConfigured)
 	}
-	// #nosec G704 -- p.url is the fixed DotSweep endpoint or a test-injected URL.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
-	if err != nil {
-		return nil, WrapError(MsgErrDotSweepFetchFailed, err)
-	}
-	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
-
-	resp, err := client.Do(req)
+	resp, err := doHTTPWithRetry(ctx, NameOpPricingCatalog, client, true, func() (*http.Request, error) {
+		// #nosec G704 -- p.url is the fixed DotSweep endpoint or a test-injected URL.
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+		if requestErr != nil {
+			return nil, WrapError(MsgErrDotSweepFetchFailed, requestErr)
+		}
+		req.Header.Set(HeaderUserAgent, DefaultUserAgent)
+		return req, nil
+	})
 	if err != nil {
 		return nil, WrapError(MsgErrDotSweepFetchFailed, err)
 	}
@@ -73,12 +67,12 @@ func (p *PricingManager) fetch(ctx context.Context) (*pricingCatalog, error) {
 	}
 
 	var pResp DotSweepResponse
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxPricingResponseSize+1))
+	body, err := readBounded(resp.Body, MaxPricingResponseSize)
+	if errors.Is(err, ErrReadLimitExceeded) {
+		return nil, fmt.Errorf(MsgErrPricingResponseExceedsBytes, MaxPricingResponseSize)
+	}
 	if err != nil {
 		return nil, fmt.Errorf(MsgErrReadPricingResponse, err)
-	}
-	if len(body) > MaxPricingResponseSize {
-		return nil, fmt.Errorf(MsgErrPricingResponseExceedsBytes, MaxPricingResponseSize)
 	}
 	if err := jsonv2.Unmarshal(body, &pResp); err != nil {
 		return nil, WrapError(MsgErrDotSweepParseError, err)
@@ -120,15 +114,16 @@ func extractTLD(domain string) string {
 	return domain
 }
 
-// computePortfolioPricing updates RDAP state renewal prices from manual config or the DotSweep TLD catalog.
-func computePortfolioPricing(ctx context.Context, app *AppState, loopState *CheckState, pm *PricingManager) {
-	if app == nil || loopState == nil {
-		return
+func needsPricingCatalog(cfg AppConfig) bool {
+	for _, domainCfg := range cfg.Domains {
+		if !domainCfg.Unused && !domainCfg.IsDelegatedZone && domainCfg.RenewalPrice <= 0 {
+			return true
+		}
 	}
+	return false
+}
 
-	cfg := app.configuration()
-
-	var needsTLDPricing bool
+func applyPortfolioPricing(cfg AppConfig, loopState *CheckState, catalog *pricingCatalog) {
 	for _, domainCfg := range cfg.Domains {
 		state, eligible := eligibleForRenewalPrice(domainCfg, loopState.RDAP)
 		if !eligible {
@@ -137,31 +132,9 @@ func computePortfolioPricing(ctx context.Context, app *AppState, loopState *Chec
 		if domainCfg.RenewalPrice > 0 {
 			state.RenewalPrice = domainCfg.RenewalPrice
 			loopState.RDAP[domainCfg.Domain] = state
-		} else {
-			needsTLDPricing = true
-		}
-	}
-
-	if !needsTLDPricing {
-		return
-	}
-
-	if pm == nil {
-		return
-	}
-
-	catalog, err := pm.cachedCatalog(ctx)
-	if err != nil {
-		LogWarn(MsgLogPricingFetchFailed, FieldError, err)
-		return
-	}
-
-	for _, domainCfg := range cfg.Domains {
-		if domainCfg.RenewalPrice > 0 {
 			continue
 		}
-		state, eligible := eligibleForRenewalPrice(domainCfg, loopState.RDAP)
-		if !eligible {
+		if catalog == nil {
 			continue
 		}
 		tld := extractTLD(domainCfg.Domain)

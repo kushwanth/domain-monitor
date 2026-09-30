@@ -149,7 +149,7 @@ func TestComputePortfolioPricing(t *testing.T) {
 		},
 	}
 
-	computePortfolioPricing(context.Background(), app, loopState, pm)
+	computePortfolioPricingForTest(context.Background(), app, loopState, pm)
 
 	if state := loopState.RDAP["standard.com"]; state.Status == StatusUnknown || state.RenewalPrice != 11.08 {
 		t.Errorf("Expected standard.com renewal price 11.08, got %+v", state)
@@ -325,23 +325,18 @@ func TestPricingFetchFailuresDoNotPublishCatalog(t *testing.T) {
 			assert.Nil(t, pm.catalog)
 		})
 	}
-	var absent *PricingManager
-	_, err := absent.fetch(context.Background())
-	assert.ErrorIs(t, err, ErrPricingManagerNil)
-	_, err = absent.cachedCatalog(context.Background())
-	assert.ErrorIs(t, err, ErrPricingManagerNil)
 }
 
 func TestPortfolioPricingUnavailableKeepsManualPrice(t *testing.T) {
 	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: "manual.com", RenewalPrice: 42}, {Domain: "automatic.com"}}})
 	for _, pm := range []*PricingManager{nil, NewPricingManager(nil)} {
-		state := NewCheckState()
+		state := newTestCheckState()
 		state.RDAP["manual.com"] = RDAPState{Status: StatusOK}
 		state.RDAP["automatic.com"] = RDAPState{Status: StatusOK}
-		computePortfolioPricing(context.Background(), app, state, pm)
+		computePortfolioPricingForTest(context.Background(), app, state, pm)
 		assert.Equal(t, float64(42), state.RDAP["manual.com"].RenewalPrice)
 		assert.Zero(t, state.RDAP["automatic.com"].RenewalPrice)
 	}
-	computePortfolioPricing(context.Background(), nil, NewCheckState(), nil)
-	computePortfolioPricing(context.Background(), app, nil, nil)
+	computePortfolioPricingForTest(context.Background(), nil, newTestCheckState(), nil)
+	computePortfolioPricingForTest(context.Background(), app, nil, nil)
 }

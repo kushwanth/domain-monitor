@@ -10,6 +10,8 @@ linters:
     - govet
     - gocritic
     - ineffassign
+    - revive
+    - forbidigo
     - unused
   settings:
     gocyclo:
@@ -20,6 +22,14 @@ linters:
     errcheck:
       check-type-assertions: true
       check-blank: false
+    forbidigo:
+      forbid:
+        - pattern: ^fmt\.Print.*$
+          msg: use the project logging utilities
+        - pattern: ^log\..*$
+          msg: use the project logging utilities
+        - pattern: ^slog\.(Debug|Info|Warn|Error).*$
+          msg: use the project logging utilities
   exclusions:
     rules:
       # These existing protocol evaluators require focused refactors and regression tests.
@@ -27,11 +37,14 @@ linters:
       - path: src/(dns|lookup)\.go
         linters:
           - gocyclo
-        text: 'func `(validateDNSSEC|EvaluateEmailSecurity|extractWHOISTier|synthesizeTierData|EvaluateRDAP)`'
+        text: 'func `(validateDNSSEC|validateRecordsWithReason|EvaluateEmailSecurity|extractWHOISTier|synthesizeTierData|EvaluateRDAP)`'
       - path: _test\.go
         linters:
           - gocyclo
           - gosec
+      - path: src/utils\.go
+        linters:
+          - forbidigo
 
 run:
   timeout: 5m

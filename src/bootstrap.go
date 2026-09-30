@@ -7,7 +7,6 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"slices"
@@ -105,9 +104,6 @@ func NewBootstrap(httpClient HTTPDoer) *Bootstrap {
 
 // ServersFor returns an independent server list for the longest matching domain suffix.
 func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, error) {
-	if b == nil {
-		return nil, ErrBootstrapClientNil
-	}
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
 	}
@@ -130,18 +126,12 @@ func (b *Bootstrap) ServersFor(ctx context.Context, domain string) ([]string, er
 }
 
 func (b *Bootstrap) isFresh() bool {
-	if b == nil {
-		return false
-	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.services) > 0 && time.Since(b.fetchedAt) < BootstrapTTL
 }
 
 func (b *Bootstrap) ensure(ctx context.Context) error {
-	if b == nil {
-		return ErrBootstrapClientNil
-	}
 	if b.isFresh() {
 		return nil
 	}
@@ -172,21 +162,19 @@ func (b *Bootstrap) cachedRegistryAge() (bool, time.Duration) {
 }
 
 func (b *Bootstrap) fetch(ctx context.Context) error {
-	if b == nil {
-		return ErrBootstrapClientNil
-	}
 	client := ResolveHTTPClient(b.http)
 	if client == nil {
 		return fmt.Errorf(MsgErrFetchRDAPBootstrapRegistry, ErrBootstrapClientNil)
 	}
-	// #nosec G704 -- bootstrap URL is a configured endpoint; callers control its HTTP transport.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.url, nil)
-	if err != nil {
-		return WrapError(MsgErrBootstrapRequestError, err)
-	}
-	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
-
-	resp, err := client.Do(req)
+	resp, err := doHTTPWithRetry(ctx, NameOpRDAPBootstrap, client, true, func() (*http.Request, error) {
+		// #nosec G704 -- bootstrap URL is a configured endpoint; callers control its HTTP transport.
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, b.url, nil)
+		if requestErr != nil {
+			return nil, WrapError(MsgErrBootstrapRequestError, requestErr)
+		}
+		req.Header.Set(HeaderUserAgent, DefaultUserAgent)
+		return req, nil
+	})
 	if err != nil {
 		return WrapError(MsgErrBootstrapFetchError, err)
 	}
@@ -197,12 +185,12 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	}
 
 	var registry dnsRegistry
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxBootstrapResponseSize+1))
+	body, err := readBounded(resp.Body, MaxBootstrapResponseSize)
+	if errors.Is(err, ErrReadLimitExceeded) {
+		return fmt.Errorf(MsgErrRDAPBootstrapResponseExceedsBytes, MaxBootstrapResponseSize)
+	}
 	if err != nil {
 		return fmt.Errorf(MsgErrReadRDAPBootstrapResponse, err)
-	}
-	if len(body) > MaxBootstrapResponseSize {
-		return fmt.Errorf(MsgErrRDAPBootstrapResponseExceedsBytes, MaxBootstrapResponseSize)
 	}
 	if err := jsonv2.Unmarshal(body, &registry); err != nil {
 		return WrapError(MsgErrBootstrapDecodeError, err)

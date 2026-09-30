@@ -24,11 +24,6 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
-type publishedState struct {
-	body []byte
-	etag string
-}
-
 func storePublishedState(app *AppState, body []byte) {
 	digest := sha256.Sum256(body)
 	app.publishedState.Store(&publishedState{body: body, etag: `"` + hex.EncodeToString(digest[:]) + `"`})
@@ -56,16 +51,14 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 	mux.HandleFunc(RouteAPIState, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
 		w.Header().Set(HeaderCacheControl, CacheControlNoCache)
-		if app != nil {
-			if state := app.publishedState.Load(); state != nil {
-				w.Header().Set("ETag", state.etag)
-				if r.Header.Get("If-None-Match") == state.etag {
-					w.WriteHeader(http.StatusNotModified)
-					return
-				}
-				_, _ = w.Write(state.body)
+		if state := app.publishedState.Load(); state != nil {
+			w.Header().Set(HeaderETag, state.etag)
+			if r.Header.Get(HeaderIfNoneMatch) == state.etag {
+				w.WriteHeader(http.StatusNotModified)
 				return
 			}
+			_, _ = w.Write(state.body)
+			return
 		}
 		_, _ = w.Write([]byte(JSONResponseStatusInit))
 	})
@@ -126,11 +119,6 @@ func logStateTransitions[T any](checkName, targetKey string, current map[string]
 	}
 }
 
-type conditionKey struct {
-	check  string
-	domain string
-}
-
 // runBoundedChecks starts at most DefaultMaxConcurrency workers. Each worker
 // claims the next item without allocating a goroutine or channel entry per task.
 func runBoundedChecks(count int, check func(int)) {
@@ -155,7 +143,17 @@ func runBoundedChecks(count int, check func(int)) {
 	workers.Wait()
 }
 
-func evaluateDNSCheck(ctx context.Context, app *AppState, record DNSTask) (result DNSResult) {
+func gatherDNSEvidence(ctx context.Context, app *AppState, record DNSTask) (snapshot DNSSnapshot) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			LogError(MsgLogPanicDNSWorker, FieldRecord, record.Name, FieldPanic, recovered)
+			snapshot = DNSSnapshot{Err: fmt.Errorf(MsgErrInternalDNSCheckPanic, AnyToString(recovered))}
+		}
+	}()
+	return FetchDNSSnapshot(ctx, app, record)
+}
+
+func evaluateDNSCheck(record DNSTask, snapshot DNSSnapshot) (result DNSResult) {
 	result.Name = record.Name
 	defer func() {
 		if r := recover(); r != nil {
@@ -164,119 +162,136 @@ func evaluateDNSCheck(ctx context.Context, app *AppState, record DNSTask) (resul
 				Hostname: record.Hostname, Name: record.Name, Type: record.Type,
 				Expected: slices.Clone(record.Expected), Status: StatusFailed,
 				Error:     fmt.Sprintf(MsgErrInternalDNSCheckPanic, AnyToString(r)),
-				Condition: &StateCondition{Code: CodeDNSLookupFailed, Target: StrInternalDNSCheckPanic},
+				Condition: StateCondition{Code: CodeDNSLookupFailed, Target: StrInternalDNSCheckPanic},
 			}
 		}
 	}()
-	dnsSnap := FetchDNSSnapshot(ctx, app, record)
-	status, cond := EvaluateDNS(record, dnsSnap)
+	status, cond := EvaluateDNS(record, snapshot)
 	errStr := StrEmpty
-	if cond != nil && cond.Code != CodeDNSMatchVerified {
+	if !cond.IsZero() && cond.Code != CodeDNSMatchVerified {
 		errStr = cond.Target
 	}
 	result.State = DNSState{
 		Hostname: record.Hostname, Name: record.Name, Type: record.Type,
 		Expected: slices.Clone(record.Expected), Status: status, Condition: cond,
-		Found: dnsSnap.Records, Error: errStr,
+		Found: snapshot.Records, Error: errStr,
 	}
 	return result
 }
 
-func evaluateFastDomainChecks(ctx context.Context, app *AppState, domain DomainConfig) (result DomainResult) {
-	result.Domain = domain.Domain
+func gatherDomainEvidence(ctx context.Context, app *AppState, domain DomainConfig) (evidence domainEvidence) {
 	defer func() {
-		if r := recover(); r != nil {
-			LogError(MsgLogPanicDomainWorker, FieldDomain, domain.Domain, FieldPanic, r)
-			fillPanicDomainResults(domain, &result, r)
+		if recovered := recover(); recovered != nil {
+			LogError(MsgLogPanicDomainWorker, FieldDomain, domain.Domain, FieldPanic, recovered)
+			evidence.panicText = AnyToString(recovered)
 		}
 	}()
-	res := &result
+	evidence.email = FetchEmailSnapshot(ctx, app, domain)
+	if domain.IsDelegatedZone {
+		evidence.delegation = FetchNSDelegationSnapshot(ctx, app, domain)
+	}
+	evidence.dnssec = FetchDNSSECEvidence(ctx, app, domain)
+	if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
+		evidence.nsHealth = FetchNSHealthSnapshots(ctx, app, domain)
+	}
+	return evidence
+}
 
-	emailSnap := FetchEmailSnapshot(ctx, app, domain)
-	_, cond, emailState := EvaluateEmailSecurity(domain, emailSnap, app)
+func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain DomainConfig, evidence domainEvidence, state *CheckState) {
+	if evidence.panicText != StrEmpty {
+		storePanicDomainResults(domain, state, evidence.panicText)
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			LogError(MsgLogPanicDomainWorker, FieldDomain, domain.Domain, FieldPanic, recovered)
+			storePanicDomainResults(domain, state, recovered)
+		}
+	}()
+
+	_, cond, emailState := EvaluateEmailSecurity(domain, evidence.email, providers)
 	emailState.Condition = cond
-	res.Email = emailState
+	if emailState.Status != StatusUnknown {
+		state.Email[domain.Domain] = emailState
+	}
 
 	if domain.IsDelegatedZone {
-		snapshot := FetchNSDelegationSnapshot(ctx, app, domain)
-		status, cond := EvaluateNSDelegation(domain, snapshot)
-		res.RDAP = RDAPState{
+		status, cond := EvaluateNSDelegation(domain, evidence.delegation)
+		state.RDAP[domain.Domain] = RDAPState{
 			Status:          status,
 			Condition:       cond,
 			IsDelegatedZone: true,
 			Source:          SourceDNSDelegation,
 			Unused:          domain.Unused,
-			Nameservers:     snapshot.Nameservers,
+			Nameservers:     evidence.delegation.Nameservers,
 		}
 	}
 
-	{
-		dnssecSnap := FetchDNSSECSnapshot(ctx, app, domain)
-		dnssecStatus, dnssecCond, dnssecRes := EvaluateDNSSEC(domain, dnssecSnap)
-		dnssecRes.Status = dnssecStatus
-		dnssecRes.Condition = dnssecCond
-		res.DNSSEC = dnssecRes
-
-		if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
-			snapshots := FetchNSHealthSnapshots(ctx, app, domain)
-			status, nsCond := EvaluateNSHealth(domain, snapshots)
-
-			servers := make([]NSHealthServerResult, 0, len(snapshots))
-			for idx, srvSnap := range snapshots {
-				errStr := StrEmpty
-				if combined := errors.Join(srvSnap.Err, srvSnap.PartialError, srvSnap.DNSKEYErr); combined != nil {
-					errStr = combined.Error()
-				}
-				dnskeyMatch := true
-				if idx > 0 {
-					if len(snapshots[0].DNSKEYs) > 0 || len(srvSnap.DNSKEYs) > 0 {
-						dnskeyMatch = slices.Equal(snapshots[0].DNSKEYs, srvSnap.DNSKEYs)
-					}
-				}
-				servers = append(servers, NSHealthServerResult{
-					Nameserver:    srvSnap.Nameserver,
-					IsPrimary:     srvSnap.IsPrimary,
-					Authoritative: srvSnap.Authoritative,
-					HasSOA:        srvSnap.HasSOA,
-					SOASerial:     srvSnap.SOASerial,
-					HasDNSKEY:     srvSnap.HasDNSKEY,
-					DNSKEYMatch:   dnskeyMatch,
-					Error:         errStr,
-				})
-			}
-
-			res.NSHealth = NSHealthResult{
-				Valid:     status != StatusFailed,
-				Primary:   domain.ExpectedNS[0],
-				Status:    status,
-				Condition: nsCond,
-				Servers:   servers,
-			}
-		}
+	dnssecStatus, dnssecCondition, dnssecResult := EvaluateDNSSEC(domain, evidence.dnssec)
+	dnssecResult.Status = dnssecStatus
+	dnssecResult.Condition = dnssecCondition
+	if dnssecResult.Source != StrEmpty || dnssecResult.Error != StrEmpty || dnssecResult.Valid {
+		state.DNSSEC[domain.Domain] = dnssecResult
 	}
 
-	return result
+	if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
+		status, nsCondition := EvaluateNSHealth(domain, evidence.nsHealth)
+
+		servers := make([]NSHealthServerResult, 0, len(evidence.nsHealth))
+		for index, serverSnapshot := range evidence.nsHealth {
+			errStr := StrEmpty
+			if combined := errors.Join(serverSnapshot.Err, serverSnapshot.PartialError, serverSnapshot.DNSKEYErr); combined != nil {
+				errStr = combined.Error()
+			}
+			dnskeyMatch := true
+			if index > 0 && (len(evidence.nsHealth[0].DNSKEYs) > 0 || len(serverSnapshot.DNSKEYs) > 0) {
+				dnskeyMatch = slices.Equal(evidence.nsHealth[0].DNSKEYs, serverSnapshot.DNSKEYs)
+			}
+			servers = append(servers, NSHealthServerResult{
+				Nameserver:    serverSnapshot.Nameserver,
+				IsPrimary:     serverSnapshot.IsPrimary,
+				Authoritative: serverSnapshot.Authoritative,
+				HasSOA:        serverSnapshot.HasSOA,
+				SOASerial:     serverSnapshot.SOASerial,
+				HasDNSKEY:     serverSnapshot.HasDNSKEY,
+				DNSKEYMatch:   dnskeyMatch,
+				Unreachable:   serverSnapshot.Unreachable,
+				Error:         errStr,
+			})
+		}
+
+		state.NSHealth[domain.Domain] = NSHealthResult{
+			Valid:     status != StatusFailed,
+			Primary:   domain.ExpectedNS[0],
+			Status:    status,
+			Condition: nsCondition,
+			Servers:   servers,
+		}
+	}
 }
 
-// executeFastChecks shares one bounded worker group across DNS and domain work.
-// Each completed result is transferred into the cycle's keyed API state.
-func executeFastChecks(ctx context.Context, app *AppState, cfg AppConfig, active activeChecks, state *CheckState) {
-	var mu sync.Mutex
+// gatherFastEvidence shares one bounded worker group across DNS and domain requests.
+func gatherFastEvidence(ctx context.Context, app *AppState, cfg AppConfig, active activeChecks, evidence *cycleEvidence) {
 	dnsCount := len(active.dnsRecords)
 	runBoundedChecks(dnsCount+len(active.domains), func(index int) {
 		isDNS, checkIndex := fastCheckSlot(index, dnsCount, len(active.domains))
 		if isDNS {
-			result := evaluateDNSCheck(ctx, app, cfg.DNSRecords[active.dnsRecords[checkIndex]])
-			mu.Lock()
-			storeDNSResult(state, result)
-			mu.Unlock()
+			record := cfg.DNSRecords[active.dnsRecords[checkIndex]]
+			evidence.dns[checkIndex] = gatherDNSEvidence(ctx, app, record)
 			return
 		}
-		result := evaluateFastDomainChecks(ctx, app, cfg.Domains[active.domains[checkIndex]])
-		mu.Lock()
-		state.takeDomainResult(result)
-		mu.Unlock()
+		domain := cfg.Domains[active.domains[checkIndex]]
+		evidence.domains[checkIndex] = gatherDomainEvidence(ctx, app, domain)
 	})
+}
+
+func evaluateFastEvidence(providers map[string]ProviderConfig, cfg AppConfig, active activeChecks, evidence cycleEvidence, state *CheckState) {
+	for index, configIndex := range active.dnsRecords {
+		storeDNSResult(state, evaluateDNSCheck(cfg.DNSRecords[configIndex], evidence.dns[index]))
+	}
+	for index, configIndex := range active.domains {
+		evaluateFastDomainChecks(providers, cfg.Domains[configIndex], evidence.domains[index], state)
+	}
 }
 
 // fastCheckSlot alternates check types while both have work, then drains the
@@ -292,35 +307,45 @@ func fastCheckSlot(position, dnsCount, domainCount int) (isDNS bool, checkIndex 
 	return false, position - dnsCount
 }
 
-func fillPanicDomainResults(domain DomainConfig, res *DomainResult, recovered any) {
+func storePanicDomainResults(domain DomainConfig, state *CheckState, recovered any) {
 	message := fmt.Sprintf(MsgErrDomainCheckPanic, AnyToString(recovered))
-	if domain.CheckEmailSecurity && res.Email.Status == StatusUnknown {
-		res.Email = EmailState{Provider: domain.MailProvider, Status: StatusFailed, Error: message, Condition: &StateCondition{Code: CodeDNSLookupFailed, Target: message}}
+	if current := state.Email[domain.Domain]; domain.CheckEmailSecurity && current.Status == StatusUnknown {
+		state.Email[domain.Domain] = EmailState{Provider: domain.MailProvider, Status: StatusFailed, Error: message, Condition: StateCondition{Code: CodeDNSLookupFailed, Target: message}}
 	}
-	if domain.IsDelegatedZone && res.RDAP.Status == StatusUnknown {
-		res.RDAP = RDAPState{Status: StatusFailed, Error: message, IsDelegatedZone: true, Unused: domain.Unused, Condition: &StateCondition{Code: CodeRDAPHTTPError, Target: message}}
+	if current := state.RDAP[domain.Domain]; domain.IsDelegatedZone && current.Status == StatusUnknown {
+		state.RDAP[domain.Domain] = RDAPState{Status: StatusFailed, Error: message, IsDelegatedZone: true, Unused: domain.Unused, Condition: StateCondition{Code: CodeRDAPHTTPError, Target: message}}
 	}
-	if domain.DNSSEC && res.DNSSEC.Status == StatusUnknown {
-		res.DNSSEC = DNSSECResult{Status: StatusFailed, Error: message, Condition: &StateCondition{Code: CodeDNSSECNetworkError, Target: message}}
+	if current := state.DNSSEC[domain.Domain]; domain.DNSSEC && current.Status == StatusUnknown {
+		state.DNSSEC[domain.Domain] = DNSSECResult{Status: StatusFailed, Error: message, Condition: StateCondition{Code: CodeDNSSECNetworkError, Target: message}}
 	}
 
-	if domain.VerifyNSHealth && res.NSHealth.Status == StatusUnknown {
-		res.NSHealth = NSHealthResult{Status: StatusFailed, Condition: &StateCondition{Code: CodeNSUnreachable, Target: message}}
+	if current := state.NSHealth[domain.Domain]; domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 && current.Status == StatusUnknown {
+		state.NSHealth[domain.Domain] = NSHealthResult{Status: StatusFailed, Condition: StateCondition{Code: CodeNSUnreachable, Target: message}}
 	}
 }
 
-// executeRateLimitedChecks writes serial RDAP results directly into the cycle-owned state.
-func executeRateLimitedChecks(ctx context.Context, app *AppState, domains []DomainConfig, active []int, rdapHTTPClient *http.Client, state *CheckState) {
-	for _, index := range active {
+func gatherRDAPEvidence(ctx context.Context, app *AppState, domain DomainConfig, rdapHTTPClient *http.Client) (snapshot RDAPSnapshot) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			LogError(MsgLogPanicRDAP, FieldDomain, domain.Domain, FieldPanic, recovered)
+			snapshot = RDAPSnapshot{Err: fmt.Errorf(MsgErrInternalRDAPCheckPanic, AnyToString(recovered))}
+		}
+	}()
+	return FetchRDAPSnapshot(ctx, rdapHTTPClient, app, domain.Domain)
+}
+
+// gatherRateLimitedEvidence performs serial RDAP requests to respect registry limits.
+func gatherRateLimitedEvidence(ctx context.Context, app *AppState, domains []DomainConfig, active []int, rdapHTTPClient *http.Client, evidence *cycleEvidence) {
+	for position, index := range active {
 		domain := domains[index]
 		if domain.IsDelegatedZone {
 			continue
 		}
-		state.takeDomainResult(DomainResult{Domain: domain.Domain, RDAP: executeRDAPCheck(ctx, app, domain, rdapHTTPClient)})
+		evidence.rdap[position] = gatherRDAPEvidence(ctx, app, domain, rdapHTTPClient)
 	}
 }
 
-func executeRDAPCheck(ctx context.Context, app *AppState, domainConfig DomainConfig, rdapHTTPClient *http.Client) (result RDAPState) {
+func evaluateRDAPCheck(domainConfig DomainConfig, snapshot RDAPSnapshot) (result RDAPState) {
 	if domainConfig.Unused {
 		return RDAPState{Status: StatusSkipped, Unused: true}
 	}
@@ -331,11 +356,10 @@ func executeRDAPCheck(ctx context.Context, app *AppState, domainConfig DomainCon
 				Status:    StatusFailed,
 				Unused:    domainConfig.Unused,
 				Error:     fmt.Sprintf(MsgErrInternalRDAPCheckPanic, AnyToString(r)),
-				Condition: &StateCondition{Code: CodeRDAPHTTPError, Target: StrInternalRDAPCheckPanic},
+				Condition: StateCondition{Code: CodeRDAPHTTPError, Target: StrInternalRDAPCheckPanic},
 			}
 		}
 	}()
-	snapshot := FetchRDAPSnapshot(ctx, rdapHTTPClient, app, domainConfig.Domain)
 	status, cond := EvaluateRDAP(domainConfig, snapshot)
 
 	rdapState := RDAPState{
@@ -361,11 +385,21 @@ func executeRDAPCheck(ctx context.Context, app *AppState, domainConfig DomainCon
 		rdapState.Error = snapshot.Err.Error()
 	}
 
-	if cond != nil && cond.Code == CodeRDAPRegistrarMismatch {
+	if !cond.IsZero() && cond.Code == CodeRDAPRegistrarMismatch {
 		rdapState.RegistrarMismatch = true
 		rdapState.ExpectedRegistrar = cond.Target
 	}
 	return rdapState
+}
+
+func evaluateRateLimitedEvidence(domains []DomainConfig, active []int, evidence cycleEvidence, state *CheckState) {
+	for position, index := range active {
+		domain := domains[index]
+		if domain.IsDelegatedZone {
+			continue
+		}
+		state.RDAP[domain.Domain] = evaluateRDAPCheck(domain, evidence.rdap[position])
+	}
 }
 
 func storeDNSResult(state *CheckState, res DNSResult) {
@@ -390,11 +424,11 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 				tag := strings.ToLower(parts[1])
 				val := strings.Trim(parts[2], `"`)
 				switch tag {
-				case "issue":
+				case CAATagIssue:
 					caaRes.Issue = append(caaRes.Issue, val)
-				case "issuewild":
+				case CAATagIssueWild:
 					caaRes.IssueWild = append(caaRes.IssueWild, val)
-				case "issuemail":
+				case CAATagIssueMail:
 					caaRes.IssueMail = append(caaRes.IssueMail, val)
 				}
 			}
@@ -410,11 +444,36 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 
 		// We assign it here, but it doesn't get added to state.DNS!
 		// So it won't trigger DNS alerts. It will trigger CAA alerts since we add it to CAA.
-		InitMap(&state.CAA)[domainName] = &caaRes
+		state.CAA[domainName] = caaRes
 		return
 	}
 
-	state.takeDNSResult(res)
+	state.storeDNSResultValue(res)
+}
+
+func gatherCycleEvidence(ctx context.Context, app *AppState, cfg AppConfig, active activeChecks, rdapHTTPClient *http.Client) cycleEvidence {
+	evidence := cycleEvidence{
+		dns:     make([]DNSSnapshot, len(active.dnsRecords)),
+		domains: make([]domainEvidence, len(active.domains)),
+		rdap:    make([]RDAPSnapshot, len(active.domains)),
+	}
+	gatherFastEvidence(ctx, app, cfg, active, &evidence)
+	gatherRateLimitedEvidence(ctx, app, cfg.Domains, active.domains, rdapHTTPClient, &evidence)
+	if app.Pricing != nil && needsPricingCatalog(cfg) {
+		evidence.pricing, evidence.pricingErr = app.Pricing.cachedCatalog(ctx)
+	}
+	return evidence
+}
+
+func evaluateCycleEvidence(providers map[string]ProviderConfig, cfg AppConfig, active activeChecks, evidence cycleEvidence) *CheckState {
+	state := newCycleState(cfg, active)
+	evaluateFastEvidence(providers, cfg, active, evidence, state)
+	evaluateRateLimitedEvidence(cfg.Domains, active.domains, evidence, state)
+	if evidence.pricingErr != nil {
+		LogWarn(MsgLogPricingFetchFailed, FieldError, evidence.pricingErr)
+	}
+	applyPortfolioPricing(cfg, state, evidence.pricing)
+	return state
 }
 
 func runMonitoringCycle(
@@ -428,17 +487,13 @@ func runMonitoringCycle(
 ) *CheckState {
 	cycleStart := time.Now()
 
-	loopDur := DefaultLoopDurationFallback
-	if app != nil && app.LoopDuration > 0 {
-		loopDur = app.LoopDuration
+	loopDur := app.LoopDuration
+	if loopDur <= 0 {
+		loopDur = DefaultLoopDurationFallback
 	}
 
-	var cfg AppConfig
-	var active activeChecks
-	if app != nil {
-		cfg = app.configuration()
-		active = app.active
-	}
+	cfg := app.configuration()
+	active := app.active
 
 	// Bound cycle timeout safely: scale with domain and DNS record counts so large portfolios
 	// have sufficient time for rate-limited RDAP requests and retries without hanging indefinitely.
@@ -460,15 +515,9 @@ func runMonitoringCycle(
 		prevConditions = make(map[conditionKey]StateCondition)
 	}
 
-	loopState := prepareCycleStateForWorkload(cfg, active)
-
-	// One bounded group writes DNS and domain results directly into cycle state.
-	executeFastChecks(cycleCtx, app, cfg, active, loopState)
-	executeRateLimitedChecks(cycleCtx, app, cfg.Domains, active.domains, rdapHTTPClient, loopState)
-
-	if app != nil {
-		computePortfolioPricing(cycleCtx, app, loopState, app.Pricing)
-	}
+	// Complete every network request before the pure evaluation phase starts.
+	evidence := gatherCycleEvidence(cycleCtx, app, cfg, active, rdapHTTPClient)
+	loopState := evaluateCycleEvidence(app.EmailProviders, cfg, active, evidence)
 
 	// 5. State transition logging
 	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, loopState.RDAP, func(s RDAPState) CheckStatus { return s.Status }, prevRDAPStatus)
@@ -481,13 +530,6 @@ func runMonitoringCycle(
 	// 7. Update timestamps and pre-render atomic JSON cache
 	loopState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
 	publishCycleState(app, loopState, loopDur)
-	if app != nil && app.Notifier != nil {
-		if notifier, ok := app.Notifier.(interface{ FlushContext(context.Context) }); ok {
-			notifier.FlushContext(cycleCtx)
-		} else {
-			app.Notifier.Flush()
-		}
-	}
 
 	cycleDuration := time.Since(cycleStart)
 	LogInfo(MsgLogMonitoringCycleCompleted,
@@ -499,11 +541,27 @@ func runMonitoringCycle(
 	return loopState
 }
 
-func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) {
-	state.NextRefresh = time.Now().Add(loopDur).UTC().Format(time.RFC3339)
-	if app == nil {
+func flushNotifier(ctx context.Context, notifier Notifier) {
+	if notifier == nil {
 		return
 	}
+	notifier.FlushContext(ctx)
+}
+
+func runNotificationWorker(ctx context.Context, notifier Notifier, wake <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-wake:
+			flushNotifier(ctx, notifier)
+		}
+	}
+}
+
+func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) {
+	state.NextRefresh = time.Now().Add(loopDur).UTC().Format(time.RFC3339)
 	encoded, err := jsonv2.Marshal(state)
 	if err != nil {
 		LogWarn(MsgLogStateMarshalFailed, FieldError, err)
@@ -512,12 +570,9 @@ func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) 
 	storePublishedState(app, encoded)
 }
 
-func prepareCycleState(domains []DomainConfig) *CheckState {
-	return prepareCycleStateForWorkload(AppConfig{Domains: domains}, activeChecks{})
-}
-
-// prepareCycleStateForWorkload sizes the maps that this cycle is likely to fill.
-func prepareCycleStateForWorkload(cfg AppConfig, active activeChecks) *CheckState {
+// newCycleState creates the maps owned by one monitoring cycle.
+// Optional maps stay nil when their check type is absent.
+func newCycleState(cfg AppConfig, active activeChecks) *CheckState {
 	emailCount, dnssecCount, nsHealthCount, caaCount := 0, 0, 0, 0
 	for _, index := range active.domains {
 		domain := cfg.Domains[index]
@@ -539,7 +594,7 @@ func prepareCycleStateForWorkload(cfg AppConfig, active activeChecks) *CheckStat
 	}
 	state := &CheckState{
 		RDAP:  make(map[string]RDAPState, len(cfg.Domains)),
-		DNS:   make(map[string]DNSState, len(active.dnsRecords)),
+		DNS:   make(map[string]DNSState, len(active.dnsRecords)-caaCount),
 		Email: make(map[string]EmailState, emailCount),
 	}
 	if dnssecCount > 0 {
@@ -549,7 +604,7 @@ func prepareCycleStateForWorkload(cfg AppConfig, active activeChecks) *CheckStat
 		state.NSHealth = make(map[string]NSHealthResult, nsHealthCount)
 	}
 	if caaCount > 0 {
-		state.CAA = make(map[string]*CAAResult, caaCount)
+		state.CAA = make(map[string]CAAResult, caaCount)
 	}
 	for _, domain := range cfg.Domains {
 		status := StatusPending
@@ -584,9 +639,9 @@ func activeDNSRecords(records []DNSTask, domains []DomainConfig) []int {
 	return active
 }
 
-func applyConditionSince(cond *StateCondition, key conditionKey, prev map[conditionKey]StateCondition) {
-	if cond == nil {
-		return
+func applyConditionSince(cond StateCondition, key conditionKey, prev map[conditionKey]StateCondition) StateCondition {
+	if cond.IsZero() {
+		return cond
 	}
 	prevCond, exists := prev[key]
 	if exists && prevCond.Code == cond.Code {
@@ -596,6 +651,7 @@ func applyConditionSince(cond *StateCondition, key conditionKey, prev map[condit
 	}
 	// History needs only the code and start time, not prior diagnostic text.
 	prev[key] = StateCondition{Code: cond.Code, Since: cond.Since}
+	return cond
 }
 
 func formatDurationSince(since time.Time) string {
@@ -607,9 +663,6 @@ func formatDurationSince(since time.Time) string {
 }
 
 func processConditionsAndAlerts(app *AppState, state *CheckState, cfg AppConfig, active activeChecks, prev map[conditionKey]StateCondition) {
-	if app == nil || state == nil {
-		return
-	}
 	var cycleAlerts []Alert
 	for _, index := range active.domains {
 		cycleAlerts = collectDomainAlerts(cycleAlerts, state, cfg.Domains[index], prev)
@@ -618,21 +671,22 @@ func processConditionsAndAlerts(app *AppState, state *CheckState, cfg AppConfig,
 		dnsCfg := cfg.DNSRecords[index]
 		name := dnsCfg.Name
 		if st, ok := state.DNS[name]; ok {
-			cycleAlerts = appendConditionAlert(cycleAlerts, name, name, CheckTypeDNS, st.Condition, st.Status, false, prev)
+			cycleAlerts, st.Condition = appendConditionAlert(cycleAlerts, name, name, CheckTypeDNS, st.Condition, st.Status, false, prev)
+			state.DNS[name] = st
 		}
 	}
 	dispatchCycleAlerts(app, cycleAlerts)
 }
 
-func appendConditionAlert(alerts []Alert, name, domain, check string, cond *StateCondition, status CheckStatus, suppress bool, prev map[conditionKey]StateCondition) []Alert {
+func appendConditionAlert(alerts []Alert, name, domain, check string, cond StateCondition, status CheckStatus, suppress bool, prev map[conditionKey]StateCondition) ([]Alert, StateCondition) {
 	key := conditionKey{check: check, domain: domain}
-	if cond == nil || (status != StatusFailed && status != StatusMismatch && status != StatusHijacked && status != StatusWarning) {
+	if cond.IsZero() || (status != StatusFailed && status != StatusMismatch && status != StatusHijacked && status != StatusWarning) {
 		delete(prev, key)
-		return alerts
+		return alerts, cond
 	}
-	applyConditionSince(cond, key, prev)
+	cond = applyConditionSince(cond, key, prev)
 	if suppress {
-		return alerts
+		return alerts, cond
 	}
 	priority := PriorityWarning
 	if status != StatusWarning {
@@ -642,11 +696,11 @@ func appendConditionAlert(alerts []Alert, name, domain, check string, cond *Stat
 	statusName, codeName := status.String(), cond.Code.String()
 	message := conditionAlertMessage(check, statusName, codeName, cond.Target, duration, false)
 	redacted := conditionAlertMessage(check, statusName, codeName, StrEmpty, duration, true)
-	return append(alerts, Alert{Message: message, Redacted: redacted, Priority: priority, Tag: TagSkull, Domain: domain, Name: name})
+	return append(alerts, Alert{Message: message, Redacted: redacted, Priority: priority, Tag: TagSkull, Domain: domain, Name: name}), cond
 }
 
 func conditionAlertMessage(check, status, code, target, duration string, redacted bool) string {
-	size := len(check) + len(status) + len(code) + len(duration) + len(" :  (Since: )")
+	size := len(check) + len(status) + len(code) + len(duration) + len(AlertConditionFixedText)
 	if !redacted {
 		size += len(target) + 1
 	}
@@ -655,13 +709,13 @@ func conditionAlertMessage(check, status, code, target, duration string, redacte
 	message.WriteString(check)
 	message.WriteByte(' ')
 	message.WriteString(status)
-	message.WriteString(": ")
+	message.WriteString(AlertStatusSeparator)
 	message.WriteString(code)
 	if !redacted {
 		message.WriteByte(' ')
 		message.WriteString(target)
 	}
-	message.WriteString(" (Since: ")
+	message.WriteString(AlertSincePrefix)
 	message.WriteString(duration)
 	message.WriteByte(')')
 	return message.String()
@@ -670,20 +724,25 @@ func conditionAlertMessage(check, status, code, target, duration string, redacte
 func collectDomainAlerts(alerts []Alert, state *CheckState, cfg DomainConfig, prev map[conditionKey]StateCondition) []Alert {
 	domain, name, suppress := cfg.Domain, cfg.Name, cfg.SuppressAlerts
 	if st, ok := state.RDAP[domain]; ok {
-		alerts = appendConditionAlert(alerts, name, domain, CheckTypeRDAP, st.Condition, st.Status, suppress, prev)
+		alerts, st.Condition = appendConditionAlert(alerts, name, domain, CheckTypeRDAP, st.Condition, st.Status, suppress, prev)
+		state.RDAP[domain] = st
 	}
 	if st, ok := state.Email[domain]; ok {
-		alerts = appendConditionAlert(alerts, name, domain, CheckTypeEmail, st.Condition, st.Status, suppress, prev)
+		alerts, st.Condition = appendConditionAlert(alerts, name, domain, CheckTypeEmail, st.Condition, st.Status, suppress, prev)
+		state.Email[domain] = st
 	}
-	if st, ok := state.CAA[domain]; ok && st != nil {
-		alerts = appendConditionAlert(alerts, name, domain, CheckTypeCAA, st.Condition, st.Status, suppress, prev)
+	if st, ok := state.CAA[domain]; ok {
+		alerts, st.Condition = appendConditionAlert(alerts, name, domain, CheckTypeCAA, st.Condition, st.Status, suppress, prev)
+		state.CAA[domain] = st
 	}
 
 	if st, ok := state.DNSSEC[domain]; ok {
-		alerts = appendConditionAlert(alerts, name, domain, CheckTypeDNSSEC, st.Condition, st.Status, suppress, prev)
+		alerts, st.Condition = appendConditionAlert(alerts, name, domain, CheckTypeDNSSEC, st.Condition, st.Status, suppress, prev)
+		state.DNSSEC[domain] = st
 	}
 	if st, ok := state.NSHealth[domain]; ok {
-		alerts = appendConditionAlert(alerts, name, domain, CheckTypeNSHealth, st.Condition, st.Status, suppress, prev)
+		alerts, st.Condition = appendConditionAlert(alerts, name, domain, CheckTypeNSHealth, st.Condition, st.Status, suppress, prev)
+		state.NSHealth[domain] = st
 	}
 	return alerts
 }
@@ -736,6 +795,9 @@ func run(parent context.Context, configPath string) error {
 	app.PublishInitialState()
 
 	server, serverErrChan := setupHTTPServer(app, app.configuration().Port)
+	notificationWake := make(chan struct{}, 1)
+	notificationDone := make(chan struct{})
+	go runNotificationWorker(ctx, app.Notifier, notificationWake, notificationDone)
 
 	engineDone := make(chan struct{})
 	// Execute concurrent engine
@@ -750,6 +812,10 @@ func run(parent context.Context, configPath string) error {
 
 		for {
 			_ = runMonitoringCycle(ctx, app, rdapHTTPClient, prevRDAPStatus, prevDNSStatus, prevEmailStatus, prevConditions)
+			select {
+			case notificationWake <- struct{}{}:
+			default:
+			}
 
 			timer := time.NewTimer(app.LoopDuration)
 			select {
@@ -794,6 +860,11 @@ func run(parent context.Context, configPath string) error {
 		LogWarn(MsgLogMonitoringEngineTimeout)
 		runErr = errors.Join(runErr, fmt.Errorf(MsgErr2, NameOpMonitoringEngine, MsgErrMonitoringEngineShutdownTimeout))
 	}
+	select {
+	case <-notificationDone:
+	case <-time.After(5 * time.Second):
+		LogWarn(MsgLogNotificationWorkerTimeout)
+	}
 
 	LogInfo(MsgLogShutdownComplete)
 	return runErr
@@ -802,7 +873,7 @@ func run(parent context.Context, configPath string) error {
 // PublishInitialState publishes pending checks before the first cycle completes.
 func (a *AppState) PublishInitialState() {
 	cfg := a.configuration()
-	initialState := prepareCycleStateForWorkload(cfg, activeChecks{dnsRecords: a.active.dnsRecords})
+	initialState := newCycleState(cfg, activeChecks{dnsRecords: a.active.dnsRecords})
 	for _, index := range a.active.dnsRecords {
 		dnsRecord := cfg.DNSRecords[index]
 		initialState.DNS[dnsRecord.Name] = DNSState{

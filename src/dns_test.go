@@ -187,7 +187,7 @@ func TestEvaluateEmailSecurity_DMARCFailurePromotesSPFWarning(t *testing.T) {
 	}, nil)
 	assert.Equal(t, StatusFailed, status)
 	assert.Equal(t, StatusFailed, state.Status)
-	require.NotNil(t, cond)
+	require.False(t, cond.IsZero())
 	assert.Equal(t, CodeDNSLookupFailed, cond.Code)
 	assert.Contains(t, cond.Target, "DMARC")
 }
@@ -967,6 +967,7 @@ func evaluateNSHealthForTest(ctx context.Context, app *AppState, target DomainCo
 			SOASerial:     srvSnap.SOASerial,
 			HasDNSKEY:     srvSnap.HasDNSKEY,
 			DNSKEYMatch:   true,
+			Unreachable:   srvSnap.Unreachable,
 			Error:         errStr,
 		})
 	}
@@ -1533,16 +1534,7 @@ func TestDNS_ValidateRecords_MultiIPConsolidatedAlert(t *testing.T) {
 	}
 }
 
-func TestNilSafety_AppState(t *testing.T) {
-	// 1. Nil AppState
-	var nilApp *AppState
-	resolvers := nilApp.Resolvers()
-	if len(resolvers) == 0 {
-		t.Errorf("expected fallback resolvers for nil AppState")
-	}
-	nilApp.SafeDispatch("test message", "redacted", PriorityHigh, "tag", "domain", "name")
-
-	// 2. AppState with nil Config
+func TestAppStateDefaultResolvers(t *testing.T) {
 	appNilCfg := &AppState{Notifier: nil}
 	res2 := appNilCfg.Resolvers()
 	if len(res2) == 0 {
@@ -1550,7 +1542,6 @@ func TestNilSafety_AppState(t *testing.T) {
 	}
 	appNilCfg.SafeDispatch("test message", "redacted", PriorityHigh, "tag", "domain", "name")
 
-	// 3. AppState with empty Config.Resolvers
 	appEmptyRes := &AppState{config: AppConfig{Resolvers: []string{}}}
 	res3 := appEmptyRes.Resolvers()
 	if len(res3) == 0 {
@@ -1689,16 +1680,16 @@ func TestDNS_ResolverIndexOverflow(t *testing.T) {
 }
 
 func TestEvaluateDNSSECExtensive(t *testing.T) {
-	status, condition, _ := EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, DNSSECSnapshot{})
+	status, condition, _ := EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, DNSSECResult{})
 	assert.Equal(t, StatusFailed, status)
-	require.NotNil(t, condition)
+	require.False(t, condition.IsZero())
 	assert.Equal(t, CodeDNSSECNetworkError, condition.Code)
 
-	snapshot := FetchDNSSECSnapshot(context.Background(), nil, DomainConfig{Domain: "example.com", DNSSEC: true})
-	assert.Equal(t, MsgErrDNSSECResolverNotConfigured, snapshot.Result.Error)
+	snapshot := FetchDNSSECEvidence(context.Background(), nil, DomainConfig{Domain: "example.com", DNSSEC: true})
+	assert.Equal(t, MsgErrDNSSECResolverNotConfigured, snapshot.Error)
 	status, condition, _ = EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, snapshot)
 	assert.Equal(t, StatusFailed, status)
-	require.NotNil(t, condition)
+	require.False(t, condition.IsZero())
 	assert.Equal(t, CodeDNSSECNetworkError, condition.Code)
 }
 
@@ -1724,9 +1715,9 @@ func TestEvaluateDNSSECConditions(t *testing.T) {
 			if tc.edit != nil {
 				tc.edit(&result)
 			}
-			status, condition, _ := EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, DNSSECSnapshot{Result: result})
+			status, condition, _ := EvaluateDNSSEC(DomainConfig{Domain: "example.com", DNSSEC: true}, result)
 			assert.Equal(t, tc.want, status)
-			require.NotNil(t, condition)
+			require.False(t, condition.IsZero())
 			assert.Equal(t, tc.code, condition.Code)
 		})
 	}
@@ -1966,7 +1957,7 @@ func evaluateDNSForTest(ctx context.Context, app *AppState, record DNSTask) DNSS
 	dnsSnap := FetchDNSSnapshot(ctx, app, record)
 	status, cond := EvaluateDNS(record, dnsSnap)
 	errStr := ""
-	if cond != nil && cond.Code != CodeDNSMatchVerified {
+	if !cond.IsZero() && cond.Code != CodeDNSMatchVerified {
 		errStr = cond.Target
 	}
 	return DNSState{
@@ -1990,7 +1981,7 @@ func evaluateEmailSecurityForTest(ctx context.Context, app *AppState, target Dom
 }
 
 func evaluateDNSSECForTest(ctx context.Context, app *AppState, target DomainConfig) DNSSECResult {
-	snap := FetchDNSSECSnapshot(ctx, app, target)
+	snap := FetchDNSSECEvidence(ctx, app, target)
 	status, cond, res := EvaluateDNSSEC(target, snap)
 	res.Status = status
 	res.Condition = cond
@@ -2108,7 +2099,7 @@ func TestEmailUnavailableSelectorCannotHideBehindValidKey(t *testing.T) {
 	target := DomainConfig{CheckEmailSecurity: true, DKIMSelectors: []string{"good", "other"}}
 	status, condition, state := EvaluateEmailSecurity(target, snapshot, nil)
 	assert.Equal(t, StatusWarning, status)
-	require.NotNil(t, condition)
+	require.False(t, condition.IsZero())
 	assert.Equal(t, CodeDNSLookupFailed, condition.Code)
 	assert.Equal(t, []string{"good"}, state.DKIMValid)
 }
@@ -2135,9 +2126,9 @@ func TestLiveDNSSECMatrix(t *testing.T) {
 			target := DomainConfig{Domain: test.domain, DNSSEC: true}
 			app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1", "8.8.8.8"}})
 			app.HTTPClient = &http.Client{Timeout: 10 * time.Second}
-			status, condition, result := EvaluateDNSSEC(target, FetchDNSSECSnapshot(ctx, app, target))
+			status, condition, result := EvaluateDNSSEC(target, FetchDNSSECEvidence(ctx, app, target))
 			t.Logf("status=%s condition=%v hasDS=%t hasDNSKEY=%t chainIntact=%t source=%s error=%q", status, condition, result.HasDS, result.HasDNSKEY, result.ChainIntact, result.Source, result.Error)
-			if status != test.status || condition == nil || condition.Code != test.code {
+			if status != test.status || condition.IsZero() || condition.Code != test.code {
 				t.Fatalf("expected status=%s code=%s; got status=%s condition=%v", test.status, test.code, status, condition)
 			}
 		})

@@ -106,8 +106,8 @@ func TestRDAPValidation(t *testing.T) {
 
 			status, cond := EvaluateRDAP(target, snapshot)
 
-			unauthAlert := cond != nil && cond.Code == CodeUnauthorizedNS
-			missingAlert := cond != nil && cond.Code == CodeExpectedNSMissing
+			unauthAlert := !cond.IsZero() && cond.Code == CodeUnauthorizedNS
+			missingAlert := !cond.IsZero() && cond.Code == CodeExpectedNSMissing
 
 			if unauthAlert != tt.expectUnauth {
 				t.Errorf("Expected Unauth alert=%v, got %v", tt.expectUnauth, unauthAlert)
@@ -451,7 +451,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	if status1 != StatusOK {
 		t.Errorf("Expected StatusOK, got %s", status1)
 	}
-	if cond1 != nil && cond1.Code == CodeRDAPRegistrarMismatch {
+	if !cond1.IsZero() && cond1.Code == CodeRDAPRegistrarMismatch {
 		t.Errorf("Expected no mismatch")
 	}
 
@@ -469,7 +469,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	if status2 != StatusFailed {
 		t.Errorf("Expected StatusFailed, got %s", status2)
 	}
-	if cond2 == nil || cond2.Code != CodeRDAPRegistrarMismatch {
+	if cond2.IsZero() || cond2.Code != CodeRDAPRegistrarMismatch {
 		t.Errorf("Expected mismatch condition")
 	}
 
@@ -486,7 +486,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	if status3 != StatusOK {
 		t.Errorf("Expected StatusOK, got %s", status3)
 	}
-	if cond3 != nil && cond3.Code == CodeRDAPRegistrarMismatch {
+	if !cond3.IsZero() && cond3.Code == CodeRDAPRegistrarMismatch {
 		t.Errorf("Expected no mismatch")
 	}
 
@@ -503,7 +503,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	if status4 != StatusFailed {
 		t.Errorf("Expected StatusFailed, got %s", status4)
 	}
-	if cond4 == nil || cond4.Code != CodeRDAPRegistrarMismatch {
+	if cond4.IsZero() || cond4.Code != CodeRDAPRegistrarMismatch {
 		t.Errorf("Expected mismatch condition")
 	}
 
@@ -522,7 +522,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	if status5 != StatusOK {
 		t.Errorf("Expected StatusOK, got %s", status5)
 	}
-	if cond5 != nil && cond5.Code == CodeRDAPRegistrarMismatch {
+	if !cond5.IsZero() && cond5.Code == CodeRDAPRegistrarMismatch {
 		t.Errorf("Expected no mismatch")
 	}
 
@@ -541,7 +541,7 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	if status6 != StatusFailed {
 		t.Errorf("Expected StatusFailed, got %s", status6)
 	}
-	if cond6 == nil || cond6.Code != CodeRDAPRegistrarMismatch {
+	if cond6.IsZero() || cond6.Code != CodeRDAPRegistrarMismatch {
 		t.Errorf("Expected mismatch condition")
 	}
 }
@@ -557,7 +557,7 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 		DomainStatus: []string{"ok"},
 	}
 	status1, cond1 := EvaluateRDAP(target1, snapshot1)
-	if cond1 != nil && cond1.Code == CodeRDAPTransferUnlocked {
+	if !cond1.IsZero() && cond1.Code == CodeRDAPTransferUnlocked {
 		t.Errorf("Expected no alert")
 	}
 	if status1 != StatusOK {
@@ -575,7 +575,7 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 	if status2 != StatusWarning {
 		t.Errorf("Expected StatusWarning, got %s", status2)
 	}
-	if cond2 == nil || cond2.Code != CodeRDAPTransferUnlocked {
+	if cond2.IsZero() || cond2.Code != CodeRDAPTransferUnlocked {
 		t.Errorf("Expected unlocked condition")
 	}
 
@@ -587,7 +587,7 @@ func TestValidateRDAPState_DomainTransferLockedGating(t *testing.T) {
 		DomainStatus: []string{"clientTransferProhibited"},
 	}
 	status3, cond3 := EvaluateRDAP(target3, snapshot3)
-	if cond3 != nil && cond3.Code == CodeRDAPTransferUnlocked {
+	if !cond3.IsZero() && cond3.Code == CodeRDAPTransferUnlocked {
 		t.Errorf("Expected no alert")
 	}
 	if status3 != StatusOK {
@@ -1673,7 +1673,7 @@ func TestValidateRDAPState_ExpiredDomain(t *testing.T) {
 		t.Errorf("expected StatusFailed for expired domain, got %s", status)
 	}
 
-	if cond == nil || cond.Code != CodeRDAPExpired {
+	if cond.IsZero() || cond.Code != CodeRDAPExpired {
 		t.Errorf("expected CodeRDAPExpired")
 	}
 }
@@ -1712,7 +1712,7 @@ func TestValidateRDAPState_ExpiryWarning(t *testing.T) {
 				t.Errorf("days=%.0f: expected status %s, got %s", tt.daysFromNow, tt.wantStatus, status)
 			}
 
-			if cond == nil || cond.Code != CodeRDAPExpiringSoon {
+			if cond.IsZero() || cond.Code != CodeRDAPExpiringSoon {
 				t.Errorf("days=%.0f: expected CodeRDAPExpiringSoon", tt.daysFromNow)
 			}
 		})
@@ -1764,7 +1764,7 @@ func TestEvaluateRDAP_ExpiryEvidence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			status, cond := EvaluateRDAP(DomainConfig{Domain: "example.com"}, RDAPSnapshot{Expiration: tc.expiry, DomainStatus: []string{"clientTransferProhibited"}})
 			assert.Equal(t, tc.want, status)
-			require.NotNil(t, cond)
+			require.False(t, cond.IsZero())
 			assert.Equal(t, tc.code, cond.Code)
 		})
 	}
@@ -2280,22 +2280,6 @@ func TestBootstrapConcurrentColdStart(t *testing.T) {
 	}
 }
 
-func TestNilSafety_Bootstrap(t *testing.T) {
-	var nilB *Bootstrap
-	if _, err := nilB.ServersFor(context.Background(), "example.com"); err == nil {
-		t.Errorf("expected error from ServersFor on nil Bootstrap")
-	}
-	if nilB.isFresh() {
-		t.Errorf("expected isFresh to be false for nil Bootstrap")
-	}
-	if err := nilB.ensure(context.Background()); err == nil {
-		t.Errorf("expected error from ensure on nil Bootstrap")
-	}
-	if err := nilB.fetch(context.Background()); err == nil {
-		t.Errorf("expected error from fetch on nil Bootstrap")
-	}
-}
-
 func TestNewRDAPHTTPClient_SSRFBlocked_SentinelError(t *testing.T) {
 	client := NewRDAPHTTPClient(2 * time.Second)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1:54321/domain/test", nil)
@@ -2323,7 +2307,7 @@ func TestEPPStatusClassificationAndExtensions(t *testing.T) {
 	assert.Contains(t, statuses, "providerCustomStatus")
 	status, condition := EvaluateRDAP(DomainConfig{Domain: "example.com"}, RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339), DomainStatus: statuses})
 	assert.Equal(t, StatusFailed, status)
-	require.NotNil(t, condition)
+	require.False(t, condition.IsZero())
 	assert.Equal(t, CodeEPPServerHold, condition.Code)
 }
 
@@ -2403,7 +2387,7 @@ func TestEPPDocumentationLinkCannotHideHold(t *testing.T) {
 	statuses := NormalizeDomainStatuses([]string{"serverHold https://icann.org/epp#ok", "providerExtension https://icann.org/epp#clientTransferProhibited"})
 	status, condition := EvaluateRDAP(DomainConfig{Domain: "example.com"}, RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339), DomainStatus: statuses})
 	assert.Equal(t, StatusFailed, status)
-	require.NotNil(t, condition)
+	require.False(t, condition.IsZero())
 	assert.Equal(t, CodeEPPServerHold, condition.Code)
 	assert.Contains(t, statuses, "providerExtension")
 	assert.False(t, isTransferLocked(statuses), "documentation fragments must not invent a lock")

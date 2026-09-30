@@ -70,20 +70,25 @@ type StateCondition struct {
 	Since  time.Time  `json:"since,omitempty"`
 }
 
+// IsZero reports whether no condition is present.
+func (c StateCondition) IsZero() bool {
+	return c.Code == CodeNone
+}
+
 // ConditionTracker tracks the worst status and its associated condition.
 type ConditionTracker struct {
 	Status CheckStatus
-	Cond   *StateCondition
+	Cond   StateCondition
 }
 
 // Promote escalates the tracked status/condition if the new status is worse.
 func (ct *ConditionTracker) Promote(status CheckStatus, code ResultCode, target string) {
 	if status == StatusFailed && ct.Status != StatusFailed {
 		ct.Status = StatusFailed
-		ct.Cond = &StateCondition{Code: code, Target: target}
+		ct.Cond = StateCondition{Code: code, Target: target}
 	} else if status == StatusWarning && ct.Status == StatusOK {
 		ct.Status = StatusWarning
-		ct.Cond = &StateCondition{Code: code, Target: target}
+		ct.Cond = StateCondition{Code: code, Target: target}
 	}
 }
 
@@ -203,6 +208,16 @@ type AppConfig struct {
 	DNSRecords []DNSTask      `json:"dns_records"`
 }
 
+// legacyConfig reads the removed allow_expiry setting for migration.
+type legacyConfig struct {
+	Domains []legacyDomainConfig `json:"domains"`
+}
+
+// legacyDomainConfig contains deprecated per-domain settings.
+type legacyDomainConfig struct {
+	AllowExpiry bool `json:"allow_expiry"`
+}
+
 // DomainConfig defines expected registration, DNS, and email evidence for a domain.
 type DomainConfig struct {
 	Domain                string     `json:"domain"`
@@ -227,6 +242,7 @@ type DomainConfig struct {
 }
 
 // CAAConfig specifies expected certificate-authority records.
+// A nil tag slice is unconstrained; a non-nil empty tag slice requires deny-all.
 type CAAConfig struct {
 	Issue     []string `json:"issue,omitempty"`
 	IssueWild []string `json:"issuewild,omitempty"`
@@ -235,14 +251,14 @@ type CAAConfig struct {
 
 // CAAResult contains the evaluated CAA records and their condition.
 type CAAResult struct {
-	Status     CheckStatus     `json:"status"`
-	Condition  *StateCondition `json:"condition,omitempty"`
-	Valid      bool            `json:"valid"`
-	Issue      []string        `json:"issue,omitempty"`
-	IssueWild  []string        `json:"issuewild,omitempty"`
-	IssueMail  []string        `json:"issuemail,omitempty"`
-	UnknownCAs []string        `json:"unknown_cas,omitempty"`
-	Error      string          `json:"error,omitempty"`
+	Status     CheckStatus    `json:"status"`
+	Condition  StateCondition `json:"condition,omitzero"`
+	Valid      bool           `json:"valid"`
+	Issue      []string       `json:"issue,omitempty"`
+	IssueWild  []string       `json:"issuewild,omitempty"`
+	IssueMail  []string       `json:"issuemail,omitempty"`
+	UnknownCAs []string       `json:"unknown_cas,omitempty"`
+	Error      string         `json:"error,omitempty"`
 }
 
 // DNSTask defines a DNS record query and its expected values.
@@ -294,11 +310,14 @@ type AppState struct {
 	EmailProviders map[string]ProviderConfig
 }
 
+// publishedState is an immutable HTTP representation installed atomically.
+type publishedState struct {
+	body []byte
+	etag string
+}
+
 // PublishedJSON returns a copy of the last complete API snapshot.
 func (a *AppState) PublishedJSON() ([]byte, bool) {
-	if a == nil {
-		return nil, false
-	}
 	state := a.publishedState.Load()
 	if state == nil {
 		return nil, false
@@ -320,9 +339,6 @@ func (a *AppState) Config() AppConfig {
 
 // configuration shares immutable startup data with internal read-only callers.
 func (a *AppState) configuration() AppConfig {
-	if a == nil {
-		return AppConfig{}
-	}
 	return a.config
 }
 
@@ -333,10 +349,10 @@ func (a *AppState) Resolvers() []string {
 
 // resolvers shares an immutable list with internal callers, avoiding per-query copies.
 func (a *AppState) resolvers() []string {
-	if a != nil && len(a.activeResolvers) > 0 {
+	if len(a.activeResolvers) > 0 {
 		return a.activeResolvers
 	}
-	if a != nil && len(a.config.Resolvers) > 0 {
+	if len(a.config.Resolvers) > 0 {
 		return a.config.Resolvers
 	}
 	return DefaultResolvers()
@@ -405,10 +421,9 @@ func cloneConfig(cfg AppConfig) AppConfig {
 	return cfg
 }
 
-// SafeDispatch safely dispatches an alert via Notifier if both app and Notifier are non-nil,
-// while always logging the alert message.
+// SafeDispatch dispatches an alert when a notifier is configured and otherwise logs it.
 func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
-	if a == nil || a.Notifier == nil {
+	if a.Notifier == nil {
 		switch priority {
 		case PriorityUrgent, PriorityHigh:
 			LogError(message, StrDomain2, domain, StrPriority, priority, StrTag, tag)
@@ -496,7 +511,7 @@ type DomainTierData struct {
 // RDAPState stores evaluated registration evidence and renewal pricing.
 type RDAPState struct {
 	Status            CheckStatus     `json:"status"`
-	Condition         *StateCondition `json:"condition,omitempty"`
+	Condition         StateCondition  `json:"condition,omitzero"`
 	Registrar         string          `json:"registrar,omitempty"`
 	RegistrarIANAID   string          `json:"registrar_iana_id,omitempty"`
 	RegistrarMismatch bool            `json:"registrar_mismatch,omitempty"`
@@ -511,7 +526,6 @@ type RDAPState struct {
 	IsDelegatedZone   bool            `json:"is_delegated_zone,omitempty"`
 	Source            string          `json:"source,omitempty"`
 	ProtocolUsed      string          `json:"protocol_used,omitempty"`
-	RawResponsePath   string          `json:"raw_response_path,omitempty"`
 	QueryDurationMs   int64           `json:"query_duration_ms,omitempty"`
 	RegistryTier      *DomainTierData `json:"registry_tier,omitempty"`
 	RegistrarTier     *DomainTierData `json:"registrar_tier,omitempty"`
@@ -520,45 +534,45 @@ type RDAPState struct {
 
 // DNSState stores expected and observed DNS records with their verdict.
 type DNSState struct {
-	Hostname  string          `json:"hostname"`
-	Name      string          `json:"name"`
-	Type      string          `json:"type"`
-	Expected  []string        `json:"expected"`
-	Status    CheckStatus     `json:"status"`
-	Condition *StateCondition `json:"condition,omitempty"`
-	Found     []string        `json:"found,omitempty"`
-	Error     string          `json:"error,omitempty"`
+	Hostname  string         `json:"hostname"`
+	Name      string         `json:"name"`
+	Type      string         `json:"type"`
+	Expected  []string       `json:"expected"`
+	Status    CheckStatus    `json:"status"`
+	Condition StateCondition `json:"condition,omitzero"`
+	Found     []string       `json:"found,omitempty"`
+	Error     string         `json:"error,omitempty"`
 }
 
 // EmailState stores evaluated MX, SPF, DMARC, and DKIM publication evidence.
 type EmailState struct {
-	Provider     string          `json:"provider,omitempty"`
-	Status       CheckStatus     `json:"status"`
-	Condition    *StateCondition `json:"condition,omitempty"`
-	SPF          bool            `json:"spf,omitempty"`
-	DMARC        bool            `json:"dmarc,omitempty"`
-	DKIMExpected bool            `json:"dkim_expected,omitempty"`
-	DKIMValid    []string        `json:"dkim_valid,omitempty"`
-	MX           []string        `json:"mx,omitempty"`
-	Error        string          `json:"error,omitempty"`
+	Provider     string         `json:"provider,omitempty"`
+	Status       CheckStatus    `json:"status"`
+	Condition    StateCondition `json:"condition,omitzero"`
+	SPF          bool           `json:"spf,omitempty"`
+	DMARC        bool           `json:"dmarc,omitempty"`
+	DKIMExpected bool           `json:"dkim_expected,omitempty"`
+	DKIMValid    []string       `json:"dkim_valid,omitempty"`
+	MX           []string       `json:"mx,omitempty"`
+	Error        string         `json:"error,omitempty"`
 }
 
 // DNSSECResult stores local cryptographic and upstream validation evidence.
 type DNSSECResult struct {
-	Status          CheckStatus     `json:"status"`
-	Condition       *StateCondition `json:"condition,omitempty"`
-	Valid           bool            `json:"valid"`
-	HasDS           bool            `json:"has_ds"`
-	HasDNSKEY       bool            `json:"has_dnskey"`
-	DSMatchesDNSKEY bool            `json:"ds_matches_dnskey"`
-	RRSIGValid      bool            `json:"rrsig_valid"`
-	RRSIGExpiry     string          `json:"rrsig_expiry,omitempty"`
-	ChainIntact     bool            `json:"chain_intact"`
-	Algorithms      []string        `json:"algorithms,omitempty"`
-	Source          string          `json:"source"`
-	NetworkError    bool            `json:"network_error,omitempty"`
-	Disabled        bool            `json:"disabled,omitempty"`
-	Error           string          `json:"error,omitempty"`
+	Status          CheckStatus    `json:"status"`
+	Condition       StateCondition `json:"condition,omitzero"`
+	Valid           bool           `json:"valid"`
+	HasDS           bool           `json:"has_ds"`
+	HasDNSKEY       bool           `json:"has_dnskey"`
+	DSMatchesDNSKEY bool           `json:"ds_matches_dnskey"`
+	RRSIGValid      bool           `json:"rrsig_valid"`
+	RRSIGExpiry     string         `json:"rrsig_expiry,omitempty"`
+	ChainIntact     bool           `json:"chain_intact"`
+	Algorithms      []string       `json:"algorithms,omitempty"`
+	Source          string         `json:"source"`
+	NetworkError    bool           `json:"network_error,omitempty"`
+	Disabled        bool           `json:"disabled,omitempty"`
+	Error           string         `json:"error,omitempty"`
 }
 
 // NSHealthServerResult stores the evaluation metrics for an individual authoritative nameserver.
@@ -579,30 +593,22 @@ type NSHealthResult struct {
 	Valid     bool                   `json:"valid"`
 	Primary   string                 `json:"primary"`
 	Status    CheckStatus            `json:"status"`
-	Condition *StateCondition        `json:"condition,omitempty"`
+	Condition StateCondition         `json:"condition,omitzero"`
 	Servers   []NSHealthServerResult `json:"servers"`
 }
 
 // CheckState coordinates the per-cycle aggregated state across all checks.
+// Required maps are allocated by newCycleState. A nil optional map means that
+// its check type is disabled for the cycle.
 type CheckState struct {
 	RDAP        map[string]RDAPState      `json:"rdap_checks"`
 	DNS         map[string]DNSState       `json:"dns_checks"`
 	Email       map[string]EmailState     `json:"email_checks"`
 	DNSSEC      map[string]DNSSECResult   `json:"dnssec_checks,omitempty"`
 	NSHealth    map[string]NSHealthResult `json:"ns_health,omitempty"`
-	CAA         map[string]*CAAResult     `json:"caa_checks,omitempty"`
+	CAA         map[string]CAAResult      `json:"caa_checks,omitempty"`
 	LastUpdated string                    `json:"last_updated"`
 	NextRefresh string                    `json:"next_refresh"`
-}
-
-// DomainResult holds the evaluation results for a single domain.
-type DomainResult struct {
-	Domain   string
-	RDAP     RDAPState
-	Email    EmailState
-	DNSSEC   DNSSECResult
-	NSHealth NSHealthResult
-	CAA      *CAAResult
 }
 
 // DNSResult holds the evaluation result for a single DNS task.
@@ -611,117 +617,12 @@ type DNSResult struct {
 	State DNSState
 }
 
-// NewCheckState returns a fresh CheckState with all maps initialized.
-func NewCheckState() *CheckState {
-	return &CheckState{
-		RDAP:     make(map[string]RDAPState),
-		DNS:      make(map[string]DNSState),
-		Email:    make(map[string]EmailState),
-		DNSSEC:   make(map[string]DNSSECResult),
-		NSHealth: make(map[string]NSHealthResult),
-	}
-}
-
-// ApplyDNSResult stores an independent copy of a worker result in cycle-owned state.
-func (c *CheckState) ApplyDNSResult(res DNSResult) {
-	if c == nil || res.State.Status == StatusUnknown || res.Name == StrEmpty {
+// storeDNSResultValue transfers an exclusively owned result into cycle state.
+func (c *CheckState) storeDNSResultValue(res DNSResult) {
+	if res.State.Status == StatusUnknown || res.Name == StrEmpty {
 		return
 	}
-	res.State.Expected = slices.Clone(res.State.Expected)
-	res.State.Found = slices.Clone(res.State.Found)
-	res.State.Condition = clonePointer(res.State.Condition)
-	c.takeDNSResult(res)
-}
-
-// takeDNSResult transfers an exclusively owned result after its worker has finished.
-func (c *CheckState) takeDNSResult(res DNSResult) {
-	if c == nil || res.State.Status == StatusUnknown || res.Name == StrEmpty {
-		return
-	}
-	InitMap(&c.DNS)[res.Name] = res.State
-}
-
-// ApplyDomainResult isolates all mutable worker data before storing it in cycle-owned state.
-func (c *CheckState) ApplyDomainResult(res DomainResult) {
-	if c == nil || res.Domain == StrEmpty {
-		return
-	}
-	if res.RDAP.Status != StatusUnknown {
-		res.RDAP = cloneRDAPState(res.RDAP)
-	}
-	if res.Email.Status != StatusUnknown {
-		res.Email.Condition = clonePointer(res.Email.Condition)
-		res.Email.MX = slices.Clone(res.Email.MX)
-		res.Email.DKIMValid = slices.Clone(res.Email.DKIMValid)
-	}
-	if res.DNSSEC.Source != StrEmpty || res.DNSSEC.Error != StrEmpty || res.DNSSEC.Valid {
-		res.DNSSEC.Condition = clonePointer(res.DNSSEC.Condition)
-		res.DNSSEC.Algorithms = slices.Clone(res.DNSSEC.Algorithms)
-	}
-	if res.NSHealth.Status != StatusUnknown {
-		res.NSHealth.Condition = clonePointer(res.NSHealth.Condition)
-		res.NSHealth.Servers = slices.Clone(res.NSHealth.Servers)
-	}
-	if res.CAA != nil {
-		caa := *res.CAA
-		caa.Condition = clonePointer(caa.Condition)
-		caa.Issue = slices.Clone(caa.Issue)
-		caa.IssueWild = slices.Clone(caa.IssueWild)
-		caa.IssueMail = slices.Clone(caa.IssueMail)
-		caa.UnknownCAs = slices.Clone(caa.UnknownCAs)
-		res.CAA = &caa
-	}
-	c.takeDomainResult(res)
-}
-
-// takeDomainResult transfers exclusively owned evidence into cycle state.
-func (c *CheckState) takeDomainResult(res DomainResult) {
-	if c == nil || res.Domain == StrEmpty {
-		return
-	}
-	if res.RDAP.Status != StatusUnknown {
-		InitMap(&c.RDAP)[res.Domain] = res.RDAP
-	}
-	if res.Email.Status != StatusUnknown {
-		InitMap(&c.Email)[res.Domain] = res.Email
-	}
-	if res.DNSSEC.Source != StrEmpty || res.DNSSEC.Error != StrEmpty || res.DNSSEC.Valid {
-		InitMap(&c.DNSSEC)[res.Domain] = res.DNSSEC
-	}
-	if res.NSHealth.Status != StatusUnknown {
-		InitMap(&c.NSHealth)[res.Domain] = res.NSHealth
-	}
-	if res.CAA != nil {
-		InitMap(&c.CAA)[res.Domain] = res.CAA
-	}
-}
-
-// clonePointer copies scalar-only pointed-to values; nested mutable fields need explicit cloning.
-func clonePointer[T any](value *T) *T {
-	if value == nil {
-		return nil
-	}
-	copyValue := *value
-	return &copyValue
-}
-
-func cloneDomainTier(tier *DomainTierData) *DomainTierData {
-	cloned := clonePointer(tier)
-	if cloned != nil {
-		cloned.Nameservers = slices.Clone(cloned.Nameservers)
-		cloned.DomainStatus = slices.Clone(cloned.DomainStatus)
-	}
-	return cloned
-}
-
-func cloneRDAPState(state RDAPState) RDAPState {
-	state.Condition = clonePointer(state.Condition)
-	state.Nameservers = slices.Clone(state.Nameservers)
-	state.DomainStatus = slices.Clone(state.DomainStatus)
-	state.Discrepancies = slices.Clone(state.Discrepancies)
-	state.RegistryTier = cloneDomainTier(state.RegistryTier)
-	state.RegistrarTier = cloneDomainTier(state.RegistrarTier)
-	return state
+	c.DNS[res.Name] = res.State
 }
 
 // 7. Pipeline Snapshot Structs (Phase 2 Fetcher Outputs)
@@ -741,7 +642,6 @@ type RDAPSnapshot struct {
 	RegistryTier    *DomainTierData
 	RegistrarTier   *DomainTierData
 	Discrepancies   []string
-	RawResponsePath string
 	Err             error
 }
 
@@ -785,9 +685,28 @@ type EmailSnapshot struct {
 	DKIMErrs     map[string]error
 }
 
-// DNSSECSnapshot holds raw DNSSEC chain data.
-type DNSSECSnapshot struct {
-	Result DNSSECResult
+// conditionKey identifies one check condition across monitoring cycles.
+type conditionKey struct {
+	check  string
+	domain string
+}
+
+// domainEvidence owns all network evidence gathered for one domain in a cycle.
+type domainEvidence struct {
+	email      EmailSnapshot
+	delegation NSDelegationSnapshot
+	dnssec     DNSSECResult
+	nsHealth   []NSSnapshot
+	panicText  string
+}
+
+// cycleEvidence owns every network result until pure evaluation begins.
+type cycleEvidence struct {
+	dns        []DNSSnapshot
+	domains    []domainEvidence
+	rdap       []RDAPSnapshot
+	pricing    *pricingCatalog
+	pricingErr error
 }
 
 // 4. Notification Models & Interfaces
@@ -803,10 +722,15 @@ type Alert struct {
 	Name     string
 }
 
+// telegramResponse is the minimal Telegram sendMessage response payload.
+type telegramResponse struct {
+	OK bool `json:"ok"`
+}
+
 // Notifier is the interface for dispatching alerts.
 type Notifier interface {
 	Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string)
-	Flush()
+	FlushContext(context.Context)
 }
 
 // 5. External API & Response Payloads

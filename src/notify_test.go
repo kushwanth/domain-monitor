@@ -64,11 +64,6 @@ func TestNotificationManager(t *testing.T) {
 	}
 }
 
-func TestNilSafety_NotificationManager(t *testing.T) {
-	var nilNM *NotificationManager
-	nilNM.Dispatch("msg", "redacted", PriorityHigh, "tag", "domain", "name")
-}
-
 func TestNotificationManager_PriorityLogging(t *testing.T) {
 	t.Parallel()
 
@@ -225,7 +220,7 @@ func TestTelegramRequestCreationRedactsToken(t *testing.T) {
 	if strings.Contains(output.String(), token) {
 		t.Fatalf("Expected token to be redacted")
 	}
-	if !strings.Contains(output.String(), MsgLogTelegramRequestFailed) && !strings.Contains(output.String(), "missing") {
+	if !strings.Contains(output.String(), MsgLogTelegramRequestFailed) && !strings.Contains(output.String(), MsgLogTelegramRequestError) && !strings.Contains(output.String(), MsgLogNotificationClientMissing) {
 		t.Fatalf("Expected failure log")
 	}
 }
@@ -289,8 +284,11 @@ func TestNotificationProviderFailures(t *testing.T) {
 					t.Fatal("failure must not be reported as delivered")
 				}
 				wantCalls := 1
-				if failure == "missing client" || failure == "invalid URL" {
+				switch failure {
+				case "missing client", "invalid URL":
 					wantCalls = 0
+				case "status":
+					wantCalls = MaxNetworkAttempts
 				}
 				if calls != wantCalls {
 					t.Errorf("transport calls = %d, want %d", calls, wantCalls)
@@ -320,8 +318,6 @@ func TestNotificationFormattingAndPayloadLimits(t *testing.T) {
 	if len(text) > MaxProviderMessageBytes || strings.Contains(text, "&&") {
 		t.Fatal("escaped Telegram message exceeds limits or contains unescaped HTML")
 	}
-	var absent *NotificationManager
-	absent.FlushContext(context.Background())
 }
 
 func TestNotificationFlushPriorityAndIndependentAttempts(t *testing.T) {

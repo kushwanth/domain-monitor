@@ -48,6 +48,18 @@ func TestLoadConfigInjectedReader(t *testing.T) {
 	}
 }
 
+func TestReadConfigFileRejectsOversizedInput(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "oversized.json")
+	content := strings.Repeat("x", MaxConfigFileSize+1)
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	body, err := readConfigFile(path)
+	assert.Nil(t, body)
+	assert.ErrorIs(t, err, ErrReadLimitExceeded)
+}
+
 func TestUnusedDomainConfigAndLegacyMigration(t *testing.T) {
 	configJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"unused-one.example","name":"Unused One","unused":true},{"domain":"unused-two.example","name":"Unused Two","unused":true,"allow_expiry":true},{"domain":"renewing.example","name":"Renewing","allow_expiry":true}]}`
 	cfg, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
@@ -59,7 +71,7 @@ func TestUnusedDomainConfigAndLegacyMigration(t *testing.T) {
 	assert.True(t, cfg.Domains[1].Unused)
 	assert.True(t, cfg.Domains[2].Unused)
 
-	state := prepareCycleState(cfg.Domains)
+	state := newCycleState(AppConfig{Domains: cfg.Domains}, activeChecks{})
 	assert.True(t, state.RDAP["unused-one.example"].Unused)
 	assert.True(t, state.RDAP["unused-two.example"].Unused)
 	assert.True(t, state.RDAP["renewing.example"].Unused)
@@ -778,38 +790,6 @@ func TestConfig_TypeSpecificIPValidation(t *testing.T) {
 			t.Errorf("expected elements to be sorted, got %v", expected)
 		}
 	})
-}
-
-func TestNilSafety_CheckState(t *testing.T) {
-	// 1. Nil receiver should not panic
-	var nilCS *CheckState
-	nilCS.ApplyDNSResult(DNSResult{Name: "test", State: DNSState{}})
-	nilCS.ApplyDomainResult(DomainResult{Domain: "example.com", RDAP: RDAPState{}})
-
-	// 2. Uninitialized inner maps should be lazily initialized without panicking
-	emptyCS := &CheckState{}
-	emptyCS.ApplyDNSResult(DNSResult{Name: "test.example.com", State: DNSState{Hostname: "test.example.com", Status: StatusOK}})
-	if dnsState, ok := emptyCS.DNS["test.example.com"]; !ok || dnsState.Hostname == "" {
-		t.Errorf("expected DNS result to be safely applied to empty CheckState")
-	}
-
-	emptyCS.ApplyDomainResult(DomainResult{
-		Domain:   "example.com",
-		RDAP:     RDAPState{Status: StatusOK},
-		Email:    EmailState{Status: StatusOK},
-		DNSSEC:   DNSSECResult{Valid: true, Status: StatusOK},
-		NSHealth: NSHealthResult{Valid: true, Status: StatusOK},
-	})
-	if rdap, ok := emptyCS.RDAP["example.com"]; !ok || rdap.Status == StatusUnknown {
-		t.Errorf("expected RDAP result applied")
-	}
-	if email, ok := emptyCS.Email["example.com"]; !ok || email.Status == StatusUnknown {
-		t.Errorf("expected Email result applied")
-	}
-
-	if dnssec, ok := emptyCS.DNSSEC["example.com"]; !ok || !dnssec.Valid {
-		t.Errorf("expected DNSSEC result applied")
-	}
 }
 
 func TestNilSafety_StringList(t *testing.T) {

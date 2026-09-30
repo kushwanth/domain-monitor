@@ -9,7 +9,6 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,7 +38,6 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 		startIdx = int(uint64(app.GlobalResolverIndex.Add(1)) % uint64(len(resolvers))) // #nosec G115 -- modulo bounds the result by slice length.
 	}
 
-	var lastErr error
 	dnsClient := &dns.Client{Timeout: DefaultDNSTimeout}
 	dnsMsg := new(dns.Msg)
 	fqdn := dns.Fqdn(hostname)
@@ -47,9 +45,11 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 	dnsMsg.SetEdns0(MaxBodyDrainSize, true)
 	dnsMsg.RecursionDesired = recursionDesired
 
-	for attempt := range resolvers {
-		idx := (startIdx + attempt) % len(resolvers)
+	maxAttempts := min(len(resolvers), MaxNetworkAttempts)
+	return retryWithBackoff(ctx, NameOpDNSLookup, DNSRetryBaseDelay, func(attempt int) (*dns.Msg, bool, time.Duration, error) {
+		idx := (startIdx + attempt - 1) % len(resolvers)
 		ip := DefaultPort(resolvers[idx], DefaultDNSPort)
+		canRetry := attempt < maxAttempts
 
 		dnsClient.Net = StrEmpty
 		dnsMsg.Id = dns.Id()
@@ -60,8 +60,8 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 			r, _, err = app.DNSClient.ExchangeContext(ctx, dnsMsg, ip)
 			if err == nil && r != nil && r.Truncated {
 				if app.DNSTCPClient == nil {
-					lastErr = fmt.Errorf(MsgErrQueryDNSForOnTruncated, hostname, ip)
-					continue
+					err = fmt.Errorf(MsgErrQueryDNSForOnTruncated, hostname, ip)
+					return nil, canRetry, 0, err
 				}
 				r, _, err = app.DNSTCPClient.ExchangeContext(ctx, dnsMsg, ip)
 			}
@@ -75,48 +75,46 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, false, 0, ctx.Err()
 			}
-			lastErr = WrapError(fmt.Sprintf(MsgPrefixLookupOn, hostname, ip), err)
-			continue
+			err = WrapError(fmt.Sprintf(MsgPrefixLookupOn, hostname, ip), err)
+			return nil, canRetry, 0, err
 		}
 
 		if r == nil {
-			lastErr = fmt.Errorf(MsgErrLookupEmptyResponse, hostname, ip)
-			continue
+			err = fmt.Errorf(MsgErrLookupEmptyResponse, hostname, ip)
+			return nil, canRetry, 0, err
 		}
 		if r.Truncated {
-			lastErr = fmt.Errorf(MsgErrQueryDNSForOnTCP, hostname, ip)
-			continue
+			err = fmt.Errorf(MsgErrQueryDNSForOnTCP, hostname, ip)
+			return nil, canRetry, 0, err
 		}
 
 		// Verify question section echoes request per RFC 5452 Section 4
 		if len(r.Question) != 1 || !strings.EqualFold(r.Question[0].Name, fqdn) || r.Question[0].Qtype != qtype || r.Question[0].Qclass != dns.ClassINET {
-			lastErr = fmt.Errorf(MsgErrLookupQuestionMismatch, hostname, ip)
-			continue
+			err = fmt.Errorf(MsgErrLookupQuestionMismatch, hostname, ip)
+			return nil, canRetry, 0, err
 		}
 
 		if r.Rcode != dns.RcodeSuccess {
 			if r.Rcode == dns.RcodeNameError {
 				// NXDOMAIN is authoritative — do not retry on other resolvers
-				return nil, WrapError(fmt.Sprintf(MsgPrefixLookupOn, hostname, ip), ErrNXDOMAIN)
+				return nil, false, 0, WrapError(fmt.Sprintf(MsgPrefixLookupOn, hostname, ip), ErrNXDOMAIN)
 			}
 			if r.Rcode == dns.RcodeServerFailure {
-				lastErr = WrapError(fmt.Sprintf(MsgPrefixLookupOnWithRcode, hostname, ip, dns.RcodeToString[r.Rcode]), ErrSERVFAIL)
-				continue
+				err = WrapError(fmt.Sprintf(MsgPrefixLookupOnWithRcode, hostname, ip, dns.RcodeToString[r.Rcode]), ErrSERVFAIL)
+				return nil, canRetry, 0, err
 			}
 			// REFUSED, NOTIMP, FORMERR are server-specific failures — retry next resolver
 			if r.Rcode == dns.RcodeRefused || r.Rcode == dns.RcodeNotImplemented || r.Rcode == dns.RcodeFormatError {
-				lastErr = fmt.Errorf(MsgErrLookupServerError, hostname, ip, dns.RcodeToString[r.Rcode])
-				continue
+				err = fmt.Errorf(MsgErrLookupServerError, hostname, ip, dns.RcodeToString[r.Rcode])
+				return nil, canRetry, 0, err
 			}
-			return nil, fmt.Errorf(MsgErrLookupServerErrorCode, hostname, ip, r.Rcode)
+			return nil, false, 0, fmt.Errorf(MsgErrLookupServerErrorCode, hostname, ip, r.Rcode)
 		}
 
-		return r, nil
-	}
-
-	return nil, lastErr
+		return r, false, 0, nil
+	})
 }
 
 // queryDNS queries the given resolvers and returns parsed string results.
@@ -400,13 +398,15 @@ func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn 
 	query.Set(ParamType, RecordTypeDNSKEY)
 	query.Set(ParamDO, ParamDOValue)
 	u.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set(HeaderAccept, MIMEDNSJSON)
-	req.Header.Set(HeaderUserAgent, DefaultUserAgent)
-	resp, err := app.HTTPClient.Do(req)
+	resp, err := doHTTPWithRetry(ctx, NameOpDNSSECDoH, app.HTTPClient, true, func() (*http.Request, error) {
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		req.Header.Set(HeaderAccept, MIMEDNSJSON)
+		req.Header.Set(HeaderUserAgent, DefaultUserAgent)
+		return req, nil
+	})
 	if err != nil {
 		if resp != nil {
 			DrainAndClose(resp.Body, MaxBodyDrainSize)
@@ -420,8 +420,8 @@ func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn 
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxNotificationPayloadSize+1))
-	if err != nil || len(body) > MaxNotificationPayloadSize {
+	body, err := readBounded(resp.Body, MaxNotificationPayloadSize)
+	if err != nil {
 		return false
 	}
 	var result dohJSONResponse
@@ -456,58 +456,57 @@ func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn 
 	return false
 }
 
-// FetchDNSSECSnapshot fetches DNSSEC evidence when the check is enabled.
-func FetchDNSSECSnapshot(ctx context.Context, app *AppState, target DomainConfig) DNSSECSnapshot {
+// FetchDNSSECEvidence fetches DNSSEC evidence when the check is enabled.
+func FetchDNSSECEvidence(ctx context.Context, app *AppState, target DomainConfig) DNSSECResult {
 	if !target.DNSSEC {
-		return DNSSECSnapshot{}
+		return DNSSECResult{}
 	}
 	if app == nil {
-		return DNSSECSnapshot{Result: DNSSECResult{Source: DNSSECSourceLocalOnly, NetworkError: true, Error: MsgErrDNSSECResolverNotConfigured}}
+		return DNSSECResult{Source: DNSSECSourceLocalOnly, NetworkError: true, Error: MsgErrDNSSECResolverNotConfigured}
 	}
 	dohURL := DefaultDoHURL
 	if app.configuration().DoHURL != StrEmpty {
 		dohURL = app.configuration().DoHURL
 	}
 	res := validateDNSSEC(ctx, app, target.Domain, app.resolvers(), dohURL)
-	return DNSSECSnapshot{Result: res}
+	return res
 }
 
 // EvaluateDNSSEC evaluates fetched local and upstream DNSSEC evidence.
-func EvaluateDNSSEC(target DomainConfig, snapshot DNSSECSnapshot) (CheckStatus, *StateCondition, DNSSECResult) {
+func EvaluateDNSSEC(target DomainConfig, res DNSSECResult) (CheckStatus, StateCondition, DNSSECResult) {
 	if !target.DNSSEC {
-		return StatusOK, nil, DNSSECResult{}
+		return StatusOK, StateCondition{}, DNSSECResult{}
 	}
-	res := snapshot.Result
 	if res.Source == StrEmpty {
 		res.Source = DNSSECSourceLocalOnly
 		res.Error = MsgErrValidateDNSSECNil
 		res.Valid = false
-		return StatusFailed, &StateCondition{Code: CodeDNSSECNetworkError, Target: res.Error}, res
+		return StatusFailed, StateCondition{Code: CodeDNSSECNetworkError, Target: res.Error}, res
 	}
 	status := StatusOK
-	var cond *StateCondition
+	var cond StateCondition
 	if !res.Valid {
 		status = StatusFailed
 		switch {
 		case res.NetworkError:
-			cond = &StateCondition{Code: CodeDNSSECNetworkError, Target: res.Error}
+			cond = StateCondition{Code: CodeDNSSECNetworkError, Target: res.Error}
 		case res.Error != StrEmpty && strings.Contains(res.Error, StrQueryFailed):
-			cond = &StateCondition{Code: CodeDNSLookupFailed, Target: res.Error}
+			cond = StateCondition{Code: CodeDNSLookupFailed, Target: res.Error}
 		case !res.HasDS && !res.HasDNSKEY:
-			cond = &StateCondition{Code: CodeDNSSECDisabled}
+			cond = StateCondition{Code: CodeDNSSECDisabled}
 		case !res.HasDS:
-			cond = &StateCondition{Code: CodeDNSSECNoDS}
+			cond = StateCondition{Code: CodeDNSSECNoDS}
 		case !res.HasDNSKEY:
-			cond = &StateCondition{Code: CodeDNSSECNoDNSKEY}
+			cond = StateCondition{Code: CodeDNSSECNoDNSKEY}
 		case !res.DSMatchesDNSKEY:
-			cond = &StateCondition{Code: CodeDNSSECDSMismatch}
+			cond = StateCondition{Code: CodeDNSSECDSMismatch}
 		case !res.RRSIGValid:
-			cond = &StateCondition{Code: CodeDNSSECRRSIGFailed}
+			cond = StateCondition{Code: CodeDNSSECRRSIGFailed}
 		case !res.ChainIntact:
-			cond = &StateCondition{Code: CodeDNSLookupFailed, Target: res.Error}
+			cond = StateCondition{Code: CodeDNSLookupFailed, Target: res.Error}
 		}
 	} else {
-		cond = &StateCondition{Code: CodeDNSSECVerified}
+		cond = StateCondition{Code: CodeDNSSECVerified}
 	}
 	return status, cond, res
 }
@@ -543,9 +542,9 @@ func FetchDNSSnapshot(ctx context.Context, app *AppState, target DNSTask) DNSSna
 }
 
 // EvaluateDNS evaluates the DNS records against the expected ones
-func EvaluateDNS(target DNSTask, snapshot DNSSnapshot) (CheckStatus, *StateCondition) {
+func EvaluateDNS(target DNSTask, snapshot DNSSnapshot) (CheckStatus, StateCondition) {
 	if snapshot.Err != nil {
-		return StatusFailed, &StateCondition{Code: CodeDNSLookupFailed, Target: snapshot.Err.Error()}
+		return StatusFailed, StateCondition{Code: CodeDNSLookupFailed, Target: snapshot.Err.Error()}
 	}
 
 	if snapshot.ExpectedRecords != nil {
@@ -553,10 +552,10 @@ func EvaluateDNS(target DNSTask, snapshot DNSSnapshot) (CheckStatus, *StateCondi
 	}
 	allMatch, mismatchReason, mismatchCode := validateRecordsWithReason(target, snapshot.Records)
 	if !allMatch {
-		return StatusMismatch, &StateCondition{Code: mismatchCode, Target: mismatchReason}
+		return StatusMismatch, StateCondition{Code: mismatchCode, Target: mismatchReason}
 	}
 
-	return StatusOK, &StateCondition{Code: CodeDNSMatchVerified}
+	return StatusOK, StateCondition{Code: CodeDNSMatchVerified}
 }
 
 func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string, error) {
@@ -978,9 +977,9 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 }
 
 // EvaluateEmailSecurity evaluates published email records without sending alerts.
-func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, app *AppState) (CheckStatus, *StateCondition, EmailState) {
+func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers map[string]ProviderConfig) (CheckStatus, StateCondition, EmailState) {
 	if !target.CheckEmailSecurity {
-		return StatusOK, nil, EmailState{}
+		return StatusOK, StateCondition{}, EmailState{}
 	}
 
 	var conditions []StateCondition
@@ -1019,8 +1018,8 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, app *AppStat
 			}
 		} else if target.MailProvider != StrEmpty {
 			var safe, known bool
-			if app != nil {
-				if provider, ok := app.EmailProviders[target.MailProvider]; ok {
+			if providers != nil {
+				if provider, ok := providers[target.MailProvider]; ok {
 					known = true
 					safe = isProviderMXSafeDynamic(liveMXs, provider)
 				}
@@ -1095,30 +1094,30 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, app *AppStat
 	}
 
 	// DKIM
-	var validDkims []string
-	var missingDkims []string
+	var validDKIMs []string
+	var missingDKIMs []string
 	var dkimNetworkErr error
 	for sel, err := range snap.DKIMErrs {
 		if err != nil {
 			dkimNetworkErr = err
-			missingDkims = append(missingDkims, sel)
+			missingDKIMs = append(missingDKIMs, sel)
 		}
 	}
 	for sel, found := range snap.DKIMResults {
 		if found {
-			validDkims = append(validDkims, sel)
+			validDKIMs = append(validDKIMs, sel)
 		} else {
-			missingDkims = append(missingDkims, sel)
+			missingDKIMs = append(missingDKIMs, sel)
 		}
 	}
 
 	hasDKIMExpected := len(target.DKIMSelectors) > 0
-	if app != nil && len(app.EmailProviders[target.MailProvider].DKIMSelectors) > 0 {
+	if len(providers[target.MailProvider].DKIMSelectors) > 0 {
 		hasDKIMExpected = true
 	}
-	slices.Sort(validDkims)
-	slices.Sort(missingDkims)
-	if hasDKIMExpected && (len(validDkims) == 0 || dkimNetworkErr != nil) {
+	slices.Sort(validDKIMs)
+	slices.Sort(missingDKIMs)
+	if hasDKIMExpected && (len(validDKIMs) == 0 || dkimNetworkErr != nil) {
 		if dkimNetworkErr != nil {
 			if emailStatus == StatusOK {
 				emailStatus = StatusWarning
@@ -1128,7 +1127,7 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, app *AppStat
 			if emailStatus == StatusOK {
 				emailStatus = StatusWarning
 			}
-			conditions = append(conditions, StateCondition{Code: CodeEmailMissingDKIM, Target: strings.Join(missingDkims, SymCommaSpace)})
+			conditions = append(conditions, StateCondition{Code: CodeEmailMissingDKIM, Target: strings.Join(missingDKIMs, SymCommaSpace)})
 		}
 	}
 
@@ -1149,21 +1148,21 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, app *AppStat
 		SPF:          spfFound,
 		DMARC:        dmarcFound,
 		DKIMExpected: hasDKIMExpected,
-		DKIMValid:    validDkims,
+		DKIMValid:    validDKIMs,
 		MX:           liveMXs,
 		Error:        strings.Join(errs, SymPipeSpaced),
 	}
 
 	// Return highest priority condition
-	var finalCond *StateCondition
+	var finalCond StateCondition
 	if len(conditions) > 0 {
 		c := conditions[0]
 		if emailStatus == StatusFailed && snap.DMARCErr != nil && !errors.Is(snap.DMARCErr, ErrNXDOMAIN) {
 			c = StateCondition{Code: CodeDNSLookupFailed, Target: StrDmarc2 + snap.DMARCErr.Error()}
 		}
-		finalCond = &c
+		finalCond = c
 	} else if emailStatus == StatusOK {
-		finalCond = &StateCondition{Code: CodeEmailVerified}
+		finalCond = StateCondition{Code: CodeEmailVerified}
 	}
 
 	return emailStatus, finalCond, state
@@ -1261,7 +1260,7 @@ func selectNSSOA(ctx context.Context, app *AppState, domain string, addresses []
 	var firstResponse *dns.Msg
 	var firstAddress string
 	var partial error
-	for _, address := range addresses {
+	for _, address := range addresses[:min(len(addresses), MaxNetworkAttempts)] {
 		response, err := queryDNSMsgWithRD(ctx, app, domain, dns.TypeSOA, []string{address}, false)
 		if err == nil && response != nil {
 			if firstResponse == nil {
@@ -1352,9 +1351,9 @@ func FetchNSHealthSnapshots(ctx context.Context, app *AppState, target DomainCon
 }
 
 // EvaluateNSHealth checks authority, SOA consistency, and optional DNSKEY agreement.
-func EvaluateNSHealth(target DomainConfig, snapshots []NSSnapshot) (CheckStatus, *StateCondition) {
+func EvaluateNSHealth(target DomainConfig, snapshots []NSSnapshot) (CheckStatus, StateCondition) {
 	if len(snapshots) == 0 {
-		return StatusOK, nil
+		return StatusOK, StateCondition{}
 	}
 
 	ct := ConditionTracker{Status: StatusOK}
@@ -1391,8 +1390,8 @@ func EvaluateNSHealth(target DomainConfig, snapshots []NSSnapshot) (CheckStatus,
 		}
 	}
 
-	if ct.Cond == nil {
-		ct.Cond = &StateCondition{Code: CodeNSSyncVerified, Target: target.Domain}
+	if ct.Cond.IsZero() {
+		ct.Cond = StateCondition{Code: CodeNSSyncVerified, Target: target.Domain}
 	}
 
 	return ct.Status, ct.Cond

@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +19,7 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// --- 1. Pointer & Map Safety Utilities ---
+// --- 1. Value Safety Utilities ---
 
 // WrapError wraps an underlying error with a descriptive prefix message while preserving the error chain for errors.Is and errors.As.
 func WrapError(prefix string, err error) error {
@@ -51,16 +54,16 @@ func DerefOrDefault[T any](ptr *T, fallback T) T {
 	return *ptr
 }
 
-// InitMap initializes *m with make(map[K]V) if *m is nil, and returns *m.
-// If m is nil, it returns a new empty map without mutating m.
-func InitMap[K comparable, V any](m *map[K]V) map[K]V {
-	if m == nil {
-		return make(map[K]V)
+// readBounded reads at most limit bytes and rejects input that exceeds it.
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
 	}
-	if *m == nil {
-		*m = make(map[K]V)
+	if int64(len(body)) > limit {
+		return nil, ErrReadLimitExceeded
 	}
-	return *m
+	return body, nil
 }
 
 // --- 2. Domain & String Normalization Utilities ---
@@ -139,6 +142,97 @@ func ResolveHTTPClient(client HTTPDoer) HTTPDoer {
 		return nil
 	}
 	return client
+}
+
+func retryBackoff(attempt int, base time.Duration) time.Duration {
+	delay := base << max(attempt-1, 0)
+	jitter := delay / 4
+	if jitter == 0 {
+		return delay
+	}
+	return delay + time.Duration(rand.Int64N(int64(jitter)+1)) // #nosec G404 -- timing jitter does not require cryptographic randomness.
+}
+
+func retryWithBackoff[T any](ctx context.Context, operation string, baseDelay time.Duration, attemptFn func(int) (T, bool, time.Duration, error)) (T, error) {
+	var zero T
+	for attempt := 1; attempt <= MaxNetworkAttempts; attempt++ {
+		value, retry, serverDelay, err := attemptFn(attempt)
+		if !retry || attempt == MaxNetworkAttempts {
+			return value, err
+		}
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+		delay := retryBackoff(attempt, baseDelay)
+		if serverDelay > delay {
+			delay = serverDelay
+		}
+		if delay > MaxRetryDelay {
+			return value, err
+		}
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
+			return value, err
+		}
+		LogWarn(MsgLogNetworkRetry, StrOperation, operation, FieldAttempt, attempt, FieldRetryIn, delay, FieldError, err)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return zero, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return zero, ctx.Err()
+}
+
+func retryableHTTPStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests ||
+		status == http.StatusInternalServerError || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+func responseRetryAfter(response *http.Response, now time.Time) time.Duration {
+	if response == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(response.Header.Get(HeaderRetryAfter))
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(raw); err == nil && when.After(now) {
+		return when.Sub(now)
+	}
+	return 0
+}
+
+func transientNetworkError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
+}
+
+func doHTTPWithRetry(ctx context.Context, operation string, client HTTPDoer, retryTransport bool, requestFn func() (*http.Request, error)) (*http.Response, error) {
+	return retryWithBackoff(ctx, operation, HTTPRetryBaseDelay, func(attempt int) (*http.Response, bool, time.Duration, error) {
+		request, err := requestFn()
+		if err != nil {
+			return nil, false, 0, err
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			if response != nil {
+				DrainAndClose(response.Body, MaxBodyDrainSize)
+			}
+			return nil, retryTransport && transientNetworkError(err), 0, err
+		}
+		if !retryableHTTPStatus(response.StatusCode) || attempt == MaxNetworkAttempts {
+			return response, false, 0, nil
+		}
+		delay := responseRetryAfter(response, time.Now())
+		statusErr := fmt.Errorf(MsgErrTemporaryHTTPStatus, response.StatusCode)
+		DrainAndClose(response.Body, MaxBodyDrainSize)
+		return nil, true, delay, statusErr
+	})
 }
 
 // DrainAndClose reads remaining bytes from rc up to maxBytes (defaulting to 4KB if <= 0)

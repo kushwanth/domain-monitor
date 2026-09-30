@@ -17,8 +17,11 @@ const (
 	DefaultServerPort        = "8080"
 	DefaultDNSPort           = "53"
 	DefaultDoHURL            = "https://dns.google/resolve"
+	JSONFileExtension        = ".json"
+	ValidationDomainSuffix   = ".example"
 
 	DefaultUserAgent         = "DomainMonitor/1.0 (+https://github.com/domain-monitor)"
+	MaxConfigFileSize        = 8 << 20 // 8 MB
 	MaxBootstrapResponseSize = 8 << 20 // 8 MB
 
 	MaxNotificationPayloadSize   = 1 << 20  // 1 MB
@@ -93,6 +96,9 @@ const (
 const (
 	HeaderContentType           = "Content-Type"
 	HeaderCacheControl          = "Cache-Control"
+	HeaderETag                  = "ETag"
+	HeaderIfNoneMatch           = "If-None-Match"
+	HeaderRetryAfter            = "Retry-After"
 	HeaderUserAgent             = "User-Agent"
 	HeaderAuthorization         = "Authorization"
 	HeaderAccept                = "Accept"
@@ -129,9 +135,14 @@ const (
 
 // External API Endpoints
 const (
-	BootstrapURL    = "https://data.iana.org/rdap/dns.json"
-	BootstrapTTL    = 24 * time.Hour
-	BootstrapMaxAge = 72 * time.Hour
+	BootstrapURL        = "https://data.iana.org/rdap/dns.json"
+	BootstrapTTL        = 24 * time.Hour
+	BootstrapMaxAge     = 72 * time.Hour
+	MaxNetworkAttempts  = 3
+	HTTPRetryBaseDelay  = 500 * time.Millisecond
+	DNSRetryBaseDelay   = 100 * time.Millisecond
+	WHOISRetryBaseDelay = 2 * time.Second
+	MaxRetryDelay       = 30 * time.Second
 
 	TelegramAPIBase              = "https://api.telegram.org/bot"
 	TelegramAPISendMessageSuffix = "/sendMessage"
@@ -144,15 +155,24 @@ const (
 
 // DNS Record Types
 const (
-	RecordTypeA     = "A"
-	RecordTypeAAAA  = "AAAA"
-	RecordTypeCNAME = "CNAME"
-	RecordTypeMX    = "MX"
-	RecordTypeTXT   = "TXT"
-	RecordTypeCAA   = "CAA"
-	RecordTypeNS    = "NS"
-	RecordTypeIP    = "IP"
-	RecordTypeALIAS = "ALIAS"
+	RecordTypeA               = "A"
+	RecordTypeAAAA            = "AAAA"
+	RecordTypeCNAME           = "CNAME"
+	RecordTypeMX              = "MX"
+	RecordTypeTXT             = "TXT"
+	RecordTypeCAA             = "CAA"
+	RecordTypeNS              = "NS"
+	RecordTypeIP              = "IP"
+	RecordTypeALIAS           = "ALIAS"
+	CAATagIssue               = "issue"
+	CAATagIssueWild           = "issuewild"
+	CAATagIssueMail           = "issuemail"
+	CAARecordIssueFormat      = `0 issue "%s"`
+	CAARecordIssueWildFormat  = `0 issuewild "%s"`
+	CAARecordIssueMailFormat  = `0 issuemail "%s"`
+	CAARecordIssueDenyAll     = `0 issue ";"`
+	CAARecordIssueWildDenyAll = `0 issuewild ";"`
+	CAARecordIssueMailDenyAll = `0 issuemail ";"`
 )
 
 // DNS Match Types
@@ -415,24 +435,23 @@ var resultCodeNames = [...]string{
 
 // System Errors
 var (
-	ErrDNSResolution    = errors.New("dns resolution failed")
-	ErrNXDOMAIN         = errors.New("no such host (NXDOMAIN)")
-	ErrSERVFAIL         = errors.New("server failure (SERVFAIL)")
-	ErrRDAPNotFound     = errors.New("RDAP domain not found (404)")
-	ErrRDAPRateLimited  = errors.New("RDAP rate limited (429)")
-	ErrWHOISRateLimited = errors.New("whois rate limited (429)")
-	ErrDomainNotFound   = errors.New("domain not found in whois (404)")
-	ErrNoResolvers      = errors.New("no resolvers configured")
-	ErrEmptyDNSResponse = errors.New("empty dns response")
-	ErrInvalidNullMX    = errors.New("invalid null MX record")
+	ErrDNSResolution     = errors.New("dns resolution failed")
+	ErrNXDOMAIN          = errors.New("no such host (NXDOMAIN)")
+	ErrSERVFAIL          = errors.New("server failure (SERVFAIL)")
+	ErrRDAPNotFound      = errors.New("RDAP domain not found (404)")
+	ErrRDAPRateLimited   = errors.New("RDAP rate limited (429)")
+	ErrWHOISRateLimited  = errors.New("whois rate limited (429)")
+	ErrDomainNotFound    = errors.New("domain not found in whois (404)")
+	ErrNoResolvers       = errors.New("no resolvers configured")
+	ErrEmptyDNSResponse  = errors.New("empty dns response")
+	ErrInvalidNullMX     = errors.New("invalid null MX record")
+	ErrReadLimitExceeded = errors.New("read limit exceeded")
 
 	ErrRestrictedIP           = errors.New("connection to restricted IP blocked (SSRF)")
 	ErrBootstrapClientNil     = errors.New("bootstrap client is nil")
 	ErrNoRDAPServer           = errors.New("no rdap server found")
 	ErrEmptyDate              = errors.New("empty date string")
 	ErrEmptyBootstrapRegistry = errors.New("empty bootstrap registry")
-
-	ErrPricingManagerNil = errors.New(MsgErrPricingManagerNil)
 )
 
 // DNSTypeMap maps record type string names to miekg/dns uint16 type constants.
@@ -751,7 +770,6 @@ const (
 	MsgErrDotSweepParseError         = "dotsweep json parse error"
 	MsgErrDotSweepNoData             = "no tld pricing data in dotsweep response"
 	MsgLogPricingFetchFailed         = "Failed to resolve portfolio renewal pricing"
-	MsgErrPricingManagerNil          = "pricing manager is nil"
 	MsgErrDomainNegativeRenewalPrice = "domain %s: renewal_price cannot be negative"
 	MsgErrNoTierData                 = "no registry or registrar tier data available"
 
@@ -787,6 +805,8 @@ const (
 	MsgLogMonitoringEngineStopped         = "Monitoring engine stopped unexpectedly"
 	MsgLogApplicationFailed               = "Application stopped with an error"
 	MsgLogMonitoringEngineTimeout         = "Monitoring engine shutdown timed out"
+	MsgLogNotificationWorkerTimeout       = "Notification worker shutdown timed out"
+	MsgLogNetworkRetry                    = "Network request failed, retrying"
 	MsgErrMonitoringEngineExited          = "stopped before shutdown"
 	MsgErrMonitoringEngineShutdownTimeout = "did not finish within shutdown budget"
 )
@@ -866,6 +886,13 @@ const (
 	NameTelegramProvider = "Telegram provider"
 
 	NameOpMonitoringEngine = "Monitoring engine"
+	NameOpDNSLookup        = "DNS lookup"
+	NameOpDNSSECDoH        = "DNSSEC DoH"
+	NameOpRDAPBootstrap    = "RDAP bootstrap"
+	NameOpRegistryRDAP     = "registry RDAP"
+	NameOpRegistrarRDAP    = "registrar RDAP"
+	NameOpWHOIS            = "WHOIS"
+	NameOpPricingCatalog   = "pricing catalog"
 	CheckTypeRDAP          = "RDAP"
 	CheckTypeDNS           = "DNS"
 	CheckTypeEmail         = "Email"
@@ -885,6 +912,9 @@ const (
 const (
 	AlertConditionFormat         = "%s %s: %s %s (Since: %s)"
 	AlertConditionRedactedFormat = "%s %s: %s (Since: %s)"
+	AlertStatusSeparator         = ": "
+	AlertSincePrefix             = " (Since: "
+	AlertConditionFixedText      = " :  (Since: )"
 
 	TelegramAlertHeader  = "⚠️ <b>Domain Monitor Alerts</b>\n\n"
 	TelegramPrefixFormat = "<b>[%s]</b> "
@@ -1202,6 +1232,7 @@ const (
 	SymPipeSpaced                         = " | "
 	SymInvalidURLChars                    = " /?#@\\"
 	SymSemicolonSpace                     = "; "
+	SymSemicolon                          = ";"
 	SymEquals                             = "="
 	SymQuoteSpace                         = `"' `
 	SymHash                               = "#"
@@ -1237,6 +1268,7 @@ const (
 	MsgErrOpenEmbeddedEmailProviders   = "open embedded email providers: %w"
 	MsgErrOpenEmailProviderDirectory   = "open email provider directory %s: %w"
 	MsgErrLoadEmailProviders           = "load email providers from %s: %w"
+	MsgErrTemporaryHTTPStatus          = "temporary HTTP status %d"
 	MsgErrListEmailProviders           = "list email providers: %w"
 	MsgErrInvalidEmailProviderName     = "invalid email provider name %q"
 	MsgErrOpenEmailProvider            = "open email provider %s: %w"

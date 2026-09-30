@@ -6,7 +6,6 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -21,7 +20,17 @@ import (
 
 // LoadConfig reads, unmarshals, normalizes, and validates the configuration file.
 func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
-	return loadConfig(ctx, path, os.ReadFile)
+	return loadConfig(ctx, path, readConfigFile)
+}
+
+func readConfigFile(path string) ([]byte, error) {
+	// #nosec G304,G703 -- path is the operator-selected configuration file.
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }() // read-only close
+	return readBounded(file, MaxConfigFileSize)
 }
 
 func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte, error)) (AppConfig, error) {
@@ -42,11 +51,7 @@ func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte,
 		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
 	// Preserve old allow_expiry:true configurations as unused domains.
-	var legacy struct {
-		Domains []struct {
-			AllowExpiry bool `json:"allow_expiry"`
-		} `json:"domains"`
-	}
+	var legacy legacyConfig
 	if err := jsonv2.Unmarshal(jsonBytes, &legacy); err != nil {
 		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
@@ -162,28 +167,28 @@ func normalizeConfiguredChecks(rawCfg *AppConfig) error {
 			var expected []string
 			if d.CAA.Issue != nil {
 				if len(d.CAA.Issue) == 0 {
-					expected = append(expected, `0 issue ";"`)
+					expected = append(expected, CAARecordIssueDenyAll)
 				} else {
 					for _, val := range d.CAA.Issue {
-						expected = append(expected, fmt.Sprintf(`0 issue "%s"`, val))
+						expected = append(expected, fmt.Sprintf(CAARecordIssueFormat, val))
 					}
 				}
 			}
 			if d.CAA.IssueWild != nil {
 				if len(d.CAA.IssueWild) == 0 {
-					expected = append(expected, `0 issuewild ";"`)
+					expected = append(expected, CAARecordIssueWildDenyAll)
 				} else {
 					for _, val := range d.CAA.IssueWild {
-						expected = append(expected, fmt.Sprintf(`0 issuewild "%s"`, val))
+						expected = append(expected, fmt.Sprintf(CAARecordIssueWildFormat, val))
 					}
 				}
 			}
 			if d.CAA.IssueMail != nil {
 				if len(d.CAA.IssueMail) == 0 {
-					expected = append(expected, `0 issuemail ";"`)
+					expected = append(expected, CAARecordIssueMailDenyAll)
 				} else {
 					for _, val := range d.CAA.IssueMail {
-						expected = append(expected, fmt.Sprintf(`0 issuemail "%s"`, val))
+						expected = append(expected, fmt.Sprintf(CAARecordIssueMailFormat, val))
 					}
 				}
 			}
@@ -294,7 +299,7 @@ func normalizeDomainCAA(domainCfg *DomainConfig) error {
 			var res []string
 			for _, item := range list {
 				val := strings.ToLower(strings.TrimSpace(item))
-				if val != "" && val != ";" && val != "none" {
+				if val != StrEmpty && val != SymSemicolon && val != StrNone {
 					res = append(res, val)
 				}
 			}
@@ -629,20 +634,20 @@ func loadEmailProviders(directory string) (map[string]ProviderConfig, error) {
 }
 
 func readEmailProviders(source fs.FS, providers map[string]ProviderConfig) error {
-	entries, err := fs.ReadDir(source, ".")
+	entries, err := fs.ReadDir(source, SymDot)
 	if err != nil {
 		return fmt.Errorf(MsgErrListEmailProviders, err)
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), JSONFileExtension) {
 			continue
 		}
 		cfg, err := readEmailProvider(source, entry.Name())
 		if err != nil {
 			return err
 		}
-		name := strings.ToLower(strings.TrimSuffix(entry.Name(), ".json"))
-		if !ReValidDomain.MatchString(name + ".example") {
+		name := strings.ToLower(strings.TrimSuffix(entry.Name(), JSONFileExtension))
+		if !ReValidDomain.MatchString(name + ValidationDomainSuffix) {
 			return fmt.Errorf(MsgErrInvalidEmailProviderName, name)
 		}
 		providers[name] = cfg
@@ -656,12 +661,12 @@ func readEmailProvider(source fs.FS, name string) (ProviderConfig, error) {
 		return ProviderConfig{}, fmt.Errorf(MsgErrOpenEmailProvider, name, err)
 	}
 	defer func() { _ = file.Close() }() // read-only close
-	body, err := io.ReadAll(io.LimitReader(file, MaxEmailProviderResponseSize+1))
+	body, err := readBounded(file, MaxEmailProviderResponseSize)
+	if errors.Is(err, ErrReadLimitExceeded) {
+		return ProviderConfig{}, fmt.Errorf(MsgErrEmailProviderExceedsBytes, name, MaxEmailProviderResponseSize)
+	}
 	if err != nil {
 		return ProviderConfig{}, fmt.Errorf(MsgErrReadEmailProvider, name, err)
-	}
-	if len(body) > MaxEmailProviderResponseSize {
-		return ProviderConfig{}, fmt.Errorf(MsgErrEmailProviderExceedsBytes, name, MaxEmailProviderResponseSize)
 	}
 	var cfg ProviderConfig
 	if err := jsonv2.Unmarshal(body, &cfg); err != nil {
@@ -679,7 +684,7 @@ func readEmailProvider(source fs.FS, name string) (ProviderConfig, error) {
 	}
 	for i, selector := range cfg.DKIMSelectors {
 		selector = strings.ToLower(strings.TrimSpace(selector))
-		if !ReValidDomain.MatchString(selector+".example") || len(selector) > 200 {
+		if !ReValidDomain.MatchString(selector+ValidationDomainSuffix) || len(selector) > 200 {
 			return cfg, fmt.Errorf(MsgErrEmailProviderInvalidSelector, name, selector)
 		}
 		cfg.DKIMSelectors[i] = selector

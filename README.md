@@ -16,7 +16,7 @@ It runs as one process with bounded concurrency, resource limits, an embedded da
 *   **CAA Publication Checks:** Compares configured issuer-tag values and supports explicit deny-all lists. This monitors DNS publication; it does not verify certificates or evaluate CA issuance policy.
 *   **Email Security Suite:** Checks MX records against configured providers, discovers SPF and DMARC records, and checks configured DKIM selectors. It does not evaluate complete mail authentication policy. Bundled provider presets can be extended or overridden at startup using JSON files in `./data/email_providers/` or `email_providers_dir`. Both MX suffixes and DKIM selectors come from those files.
 *   **2-Tier DNSSEC Verification:** Checks local DS/DNSKEY and RRSIG evidence and requires an authenticated DNS-over-HTTPS (DoH) response for a verified result.
-*   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Each cycle delivers its alerts, with domain-name redaction supported. Persistent problems alert again on subsequent cycles; failed deliveries are logged.
+*   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Alerts are published through one lifecycle-bound worker, with domain-name redaction supported. Transient HTTP failures receive up to three attempts; persistent problems alert again on subsequent cycles.
 *   **Embedded Web Dashboard:** A single-page dashboard with Dark and Light modes, periodic state polling, and a `/health` liveness endpoint. Provider quotas can still defer checks despite local rate limiting.
 
 ---
@@ -24,7 +24,8 @@ It runs as one process with bounded concurrency, resource limits, an embedded da
 ## Configuration
 
 The daemon reads `config.json` once, applies environment overrides, validates it,
-and initializes an owned configuration snapshot. Changes require a restart.
+and initializes an owned configuration snapshot. Files are limited to 8 MiB.
+Changes require a restart.
 
 ### Standard `config.json` Example
 
@@ -80,20 +81,18 @@ RDAP requests honor `HTTP_PROXY` and `HTTPS_PROXY`. With a proxy configured, the
 Configuration and resolver lists are owned at startup and shared read-only inside
 the daemon; explicit snapshot access returns independent copies. Internal status
 and priority values are byte enums, and condition codes are 16-bit enums. API and
-result status names retain their string representation. Condition history
-keeps only codes and start times, avoiding retention of old error messages.
+result status names retain their string representation. Conditions are embedded
+values with an explicit zero state. Condition history keeps only codes and start
+times, avoiding retention of old error messages.
 
 Domain names, DNS values and diagnostics still need strings; variable-sized
-results need bounded slices/maps. Optional condition pointers avoid embedding
-large unused diagnostics in healthy results. Configuration snapshots own their
-CAA policy slices. Public result-application methods deeply copy caller-owned
-data. Active check lists store indices into the daemon's owned configuration,
-without copying wide structs or retaining pointers into their backing arrays.
-A fixed pool of at most 32 workers writes
-completed DNS and domain results directly into cycle maps under a short lock;
-there are no portfolio-sized result buffers or goroutines created per check.
-Expected DNS values are copied once so returned cycle state remains independent
-of configuration. Serial RDAP checks also write directly into cycle state.
+results need bounded slices/maps. Configuration snapshots own their CAA policy
+slices. Active check lists store indices into the daemon's owned configuration,
+without retaining pointers into backing arrays. A fixed pool of at most 32
+workers gathers network evidence into one cycle-owned snapshot. Serial RDAP and
+WHOIS gathering follows the same phase. Evaluation begins only after all
+gathering completes and performs no network requests. Expected DNS values are
+copied once so returned cycle state remains independent of configuration.
 Completed cycles publish one immutable cached JSON snapshot; in-progress
 changes do not affect HTTP readers.
 
@@ -104,7 +103,13 @@ scalar prices without copying or exposing its map. Existing catalog readers
 remain stable across refreshes, with the same freshness and stale-data limits.
 State, condition ages, pricing/bootstrap caches, and notification queues are
 in memory only. Restarting rebuilds them; the daemon does not persist check
-history or retry failed notification deliveries. Alerts are delivered in descending priority order, with a separate timeout for each provider attempt, bounded by cycle cancellation.
+history or failed notification deliveries. HTTP gathering retries transient
+transport failures and retryable statuses up to three total attempts with
+context-aware exponential backoff and `Retry-After` support. DNS tries at most
+three distinct resolvers or nameserver addresses. WHOIS uses conservative
+rate-limited retries. Notifications are delivered after state publication in
+descending priority order by one bounded worker, with separate provider
+timeouts and retry budgets controlled by daemon cancellation.
 
 Provider files use the filename as the provider name, for example `custom.json`:
 

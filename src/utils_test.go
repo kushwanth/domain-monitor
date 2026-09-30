@@ -34,32 +34,60 @@ func TestDerefOrDefault(t *testing.T) {
 	}
 }
 
-func TestInitMap(t *testing.T) {
+func TestReadBounded(t *testing.T) {
 	t.Parallel()
 
-	// 1. Nil pointer
-	m1 := InitMap[string, int](nil)
-	if m1 == nil {
-		t.Fatalf("InitMap(nil) returned nil map")
+	body, err := readBounded(strings.NewReader("1234"), 4)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("1234"), body)
+
+	body, err = readBounded(strings.NewReader("12345"), 4)
+	assert.Nil(t, body)
+	assert.ErrorIs(t, err, ErrReadLimitExceeded)
+}
+
+func TestRetryWithBackoffAttemptLimitAndCancellation(t *testing.T) {
+	attempts := 0
+	_, err := retryWithBackoff(context.Background(), "test", 0, func(int) (string, bool, time.Duration, error) {
+		attempts++
+		return "", true, 0, errors.New("temporary")
+	})
+	require.Error(t, err)
+	assert.Equal(t, MaxNetworkAttempts, attempts)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts = 0
+	_, err = retryWithBackoff(ctx, "test", time.Second, func(int) (string, bool, time.Duration, error) {
+		attempts++
+		cancel()
+		return "", true, 0, errors.New("temporary")
+	})
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, attempts)
+
+	attempts = 0
+	_, err = retryWithBackoff(context.Background(), "test", 0, func(int) (string, bool, time.Duration, error) {
+		attempts++
+		return "", true, MaxRetryDelay + time.Second, errors.New("rate limited")
+	})
+	require.Error(t, err)
+	assert.Equal(t, 1, attempts, "a long Retry-After must defer work to a later cycle")
+}
+
+func TestHTTPRetryPolicy(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		assert.True(t, retryableHTTPStatus(status), "status %d", status)
+	}
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound, http.StatusNotImplemented, http.StatusHTTPVersionNotSupported} {
+		assert.False(t, retryableHTTPStatus(status), "status %d", status)
 	}
 
-	// 2. Pointer to nil map
-	var m2 map[string]int
-	InitMap(&m2)
-	if m2 == nil {
-		t.Fatalf("InitMap(&nilMap) did not initialize map")
-	}
-	m2["key"] = 100
-	if m2["key"] != 100 {
-		t.Errorf("failed to write to initialized map")
-	}
-
-	// 3. Pointer to existing map
-	m3 := map[string]int{"orig": 1}
-	res := InitMap(&m3)
-	if res["orig"] != 1 {
-		t.Errorf("InitMap mutated existing map contents")
-	}
+	now := time.Now().UTC().Truncate(time.Second)
+	response := &http.Response{Header: make(http.Header)}
+	response.Header.Set("Retry-After", "7")
+	assert.Equal(t, 7*time.Second, responseRetryAfter(response, now))
+	response.Header.Set("Retry-After", now.Add(5*time.Second).Format(http.TimeFormat))
+	assert.Equal(t, 5*time.Second, responseRetryAfter(response, now))
 }
 
 func TestNormalizeDomain(t *testing.T) {

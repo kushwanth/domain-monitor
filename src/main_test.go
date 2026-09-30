@@ -25,6 +25,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func executeFastChecksForTest(ctx context.Context, app *AppState, cfg AppConfig, active activeChecks, state *CheckState) {
+	evidence := cycleEvidence{dns: make([]DNSSnapshot, len(active.dnsRecords)), domains: make([]domainEvidence, len(active.domains))}
+	gatherFastEvidence(ctx, app, cfg, active, &evidence)
+	evaluateFastEvidence(app.EmailProviders, cfg, active, evidence, state)
+}
+
+func executeRateLimitedChecksForTest(ctx context.Context, app *AppState, domains []DomainConfig, active []int, client *http.Client, state *CheckState) {
+	evidence := cycleEvidence{rdap: make([]RDAPSnapshot, len(active))}
+	gatherRateLimitedEvidence(ctx, app, domains, active, client, &evidence)
+	evaluateRateLimitedEvidence(domains, active, evidence, state)
+}
+
+func computePortfolioPricingForTest(ctx context.Context, app *AppState, state *CheckState, manager *PricingManager) {
+	if app == nil || state == nil {
+		return
+	}
+	cfg := app.configuration()
+	var catalog *pricingCatalog
+	if needsPricingCatalog(cfg) && manager != nil {
+		catalog, _ = manager.cachedCatalog(ctx)
+	}
+	applyPortfolioPricing(cfg, state, catalog)
+}
+
 func TestFastDomainWorkerPanicPreservesCompletedEmail(t *testing.T) {
 	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
 	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
@@ -50,8 +74,8 @@ func TestFastDomainWorkerPanicPreservesCompletedEmail(t *testing.T) {
 		return response, 0, nil
 	}}
 	target := DomainConfig{Domain: "example.com", CheckEmailSecurity: true}
-	state := NewCheckState()
-	executeFastChecks(context.Background(), app, AppConfig{Domains: []DomainConfig{target}}, activeChecks{domains: []int{0}}, state)
+	state := newTestCheckState()
+	executeFastChecksForTest(context.Background(), app, AppConfig{Domains: []DomainConfig{target}}, activeChecks{domains: []int{0}}, state)
 	assert.Equal(t, StatusOK, state.Email[target.Domain].Status)
 }
 
@@ -91,6 +115,40 @@ func TestRunMonitoringCycle(t *testing.T) {
 	stored := state.DNS["example A"]
 	stored.Expected[0] = "cycle mutation"
 	assert.Equal(t, "192.0.2.10", app.Config().DNSRecords[0].Expected[0], "cycle state must not alias startup expectations")
+}
+
+func TestEvaluateCycleEvidencePerformsNoNetworkRequests(t *testing.T) {
+	cfg := AppConfig{
+		Domains: []DomainConfig{{
+			Domain: "example.com", IsDelegatedZone: true, CheckEmailSecurity: true,
+			DNSSEC: true, VerifyNSHealth: true, ExpectedNS: []string{"ns1.example.com"},
+		}},
+		DNSRecords: []DNSTask{{Hostname: "www.example.com", Name: "web", Type: RecordTypeA, Expected: []string{"192.0.2.1"}}},
+	}
+	app := NewAppState(cfg)
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(context.Context, *dns.Msg, string) (*dns.Msg, time.Duration, error) {
+		panic("evaluation performed DNS")
+	}}
+	app.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		panic("evaluation performed HTTP")
+	}}
+	app.WHOISDial = func(context.Context, string) (net.Conn, error) {
+		panic("evaluation performed WHOIS")
+	}
+	evidence := cycleEvidence{
+		dns: []DNSSnapshot{{Records: []string{"192.0.2.1"}}},
+		domains: []domainEvidence{{
+			email:      EmailSnapshot{MXRecords: []string{"mail.example.com"}, SPFRecords: []string{"v=spf1 -all"}, DMARCRecords: []string{"v=DMARC1; p=reject"}},
+			delegation: NSDelegationSnapshot{Nameservers: []string{"ns1.example.com"}},
+			dnssec:     DNSSECResult{Source: DNSSECSourceLocalDoH, Valid: true, HasDS: true, HasDNSKEY: true, DSMatchesDNSKEY: true, RRSIGValid: true, ChainIntact: true},
+			nsHealth:   []NSSnapshot{{Nameserver: "ns1.example.com", IsPrimary: true, Authoritative: true, HasSOA: true}},
+		}},
+		rdap: make([]RDAPSnapshot, 1),
+	}
+	state := evaluateCycleEvidence(app.EmailProviders, cfg, activeChecks{domains: []int{0}, dnsRecords: []int{0}}, evidence)
+	assert.Equal(t, StatusOK, state.DNS["web"].Status)
+	assert.Equal(t, StatusOK, state.DNSSEC["example.com"].Status)
+	assert.Equal(t, StatusOK, state.NSHealth["example.com"].Status)
 }
 
 func TestUnusedDomainSkipsEveryCheckAndOwnedDNSRecord(t *testing.T) {
@@ -204,7 +262,7 @@ func TestFastChecksDoNotWaitForDNSPhase(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		executeFastChecks(context.Background(), app, app.configuration(), app.active, NewCheckState())
+		executeFastChecksForTest(context.Background(), app, app.configuration(), app.active, newTestCheckState())
 	}()
 	select {
 	case <-addressStarted:
@@ -298,7 +356,7 @@ func TestStateETagSkipsUnchangedBody(t *testing.T) {
 	assert.Equal(t, http.StatusNotModified, unchanged.Code)
 	assert.Empty(t, unchanged.Body.String())
 
-	state := prepareCycleState([]DomainConfig{{Domain: "example.com"}})
+	state := newCycleState(AppConfig{Domains: []DomainConfig{{Domain: "example.com"}}}, activeChecks{})
 	state.RDAP["example.com"] = RDAPState{Status: StatusOK}
 	publishCycleState(app, state, time.Hour)
 	changed := httptest.NewRecorder()
@@ -345,15 +403,19 @@ func TestProcessConditionsAndAlerts_AllChecksAndSuppression(t *testing.T) {
 			notifier := newRecordingNotifier()
 			app := &AppState{Notifier: notifier}
 			domain := "example.com"
-			state := NewCheckState()
-			state.RDAP[domain] = RDAPState{Status: StatusFailed, Condition: &StateCondition{Code: CodeRDAPHTTPError}}
-			state.Email[domain] = EmailState{Status: StatusHijacked, Condition: &StateCondition{Code: CodeEmailMissingMX}}
-			state.DNSSEC[domain] = DNSSECResult{Status: StatusFailed, Condition: &StateCondition{Code: CodeDNSSECNetworkError}}
-			state.NSHealth[domain] = NSHealthResult{Status: StatusWarning, Condition: &StateCondition{Code: CodeNSUnreachable}}
+			state := newTestCheckState()
+			state.RDAP[domain] = RDAPState{Status: StatusFailed, Condition: StateCondition{Code: CodeRDAPHTTPError}}
+			state.Email[domain] = EmailState{Status: StatusHijacked, Condition: StateCondition{Code: CodeEmailMissingMX}}
+			state.DNSSEC[domain] = DNSSECResult{Status: StatusFailed, Condition: StateCondition{Code: CodeDNSSECNetworkError}}
+			state.NSHealth[domain] = NSHealthResult{Status: StatusWarning, Condition: StateCondition{Code: CodeNSUnreachable}}
 			prev := make(map[conditionKey]StateCondition)
 			processConditionsAndAlerts(app, state, AppConfig{Domains: []DomainConfig{{Domain: domain, Name: "Example", SuppressAlerts: tc.suppress}}}, activeChecks{domains: []int{0}}, prev)
 			assert.Len(t, notifier.alerts, tc.wantAlerts)
 			assert.Len(t, prev, 4)
+			assert.False(t, state.RDAP[domain].Condition.Since.IsZero())
+			assert.False(t, state.Email[domain].Condition.Since.IsZero())
+			assert.False(t, state.DNSSEC[domain].Condition.Since.IsZero())
+			assert.False(t, state.NSHealth[domain].Condition.Since.IsZero())
 			if !tc.suppress {
 				assert.Equal(t, PriorityWarning, notifier.alerts[3].Priority)
 			}
@@ -361,16 +423,19 @@ func TestProcessConditionsAndAlerts_AllChecksAndSuppression(t *testing.T) {
 	}
 }
 
-func TestFillPanicDomainResults(t *testing.T) {
-	cfg := DomainConfig{CheckEmailSecurity: true, MailProvider: "google", IsDelegatedZone: true, DNSSEC: true, VerifyNSHealth: true}
-	var res DomainResult
-	fillPanicDomainResults(cfg, &res, "some panic")
-	assert.Equal(t, StatusFailed, res.Email.Status)
-	assert.Equal(t, "google", res.Email.Provider)
-	assert.Equal(t, StatusFailed, res.RDAP.Status)
-	assert.Equal(t, StatusFailed, res.DNSSEC.Status)
-	assert.Equal(t, StatusFailed, res.NSHealth.Status)
-	assert.Contains(t, res.RDAP.Error, "some panic")
+func TestStorePanicDomainResults(t *testing.T) {
+	cfg := DomainConfig{
+		Domain: "example.com", CheckEmailSecurity: true, MailProvider: "google",
+		IsDelegatedZone: true, DNSSEC: true, VerifyNSHealth: true, ExpectedNS: []string{"ns1.example.com"},
+	}
+	state := newTestCheckState()
+	storePanicDomainResults(cfg, state, "some panic")
+	assert.Equal(t, StatusFailed, state.Email[cfg.Domain].Status)
+	assert.Equal(t, "google", state.Email[cfg.Domain].Provider)
+	assert.Equal(t, StatusFailed, state.RDAP[cfg.Domain].Status)
+	assert.Equal(t, StatusFailed, state.DNSSEC[cfg.Domain].Status)
+	assert.Equal(t, StatusFailed, state.NSHealth[cfg.Domain].Status)
+	assert.Contains(t, state.RDAP[cfg.Domain].Error, "some panic")
 }
 
 func TestReleaseCycleDeliversAlerts(t *testing.T) {
@@ -389,6 +454,7 @@ func TestReleaseCycleDeliversAlerts(t *testing.T) {
 	for range 2 {
 		state := runMonitoringCycle(context.Background(), app, nil, nil, nil, nil, nil)
 		assert.Equal(t, StatusMismatch, state.DNS["web"].Status)
+		flushNotifier(context.Background(), notifier)
 	}
 	assert.Equal(t, 2, requests)
 	assert.Empty(t, notifier.alertBatch)
@@ -428,10 +494,10 @@ func TestReleaseProviderDKIMFromJSON(t *testing.T) {
 	snap.MXRecords = []string{"mail.example.com"}
 	snap.SPFRecords = []string{"v=spf1 -all"}
 	snap.DMARCRecords = []string{"v=DMARC1; p=reject"}
-	status, cond, state := EvaluateEmailSecurity(target, snap, app)
+	status, cond, state := EvaluateEmailSecurity(target, snap, app.EmailProviders)
 	assert.True(t, state.DKIMExpected)
 	assert.Equal(t, StatusWarning, status)
-	require.NotNil(t, cond)
+	require.False(t, cond.IsZero())
 	assert.Equal(t, CodeEmailMissingDKIM, cond.Code)
 }
 
@@ -443,9 +509,9 @@ func TestReleasePricingCachesAcrossCycles(t *testing.T) {
 	}})
 	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: "example.com"}}})
 	for range 2 {
-		state := NewCheckState()
+		state := newTestCheckState()
 		state.RDAP["example.com"] = RDAPState{Status: StatusOK}
-		computePortfolioPricing(context.Background(), app, state, pm)
+		computePortfolioPricingForTest(context.Background(), app, state, pm)
 		assert.Equal(t, float64(12), state.RDAP["example.com"].RenewalPrice)
 	}
 	assert.Equal(t, 1, requests)
@@ -513,14 +579,14 @@ func TestReleaseCAACyclePublishesCondition(t *testing.T) {
 			return response, 0, nil
 		}}
 		state := runMonitoringCycle(context.Background(), app, nil, nil, nil, nil, nil)
-		caa := state.CAA["sub.example.com"]
-		require.NotNil(t, caa)
+		caa, ok := state.CAA["sub.example.com"]
+		require.True(t, ok)
 		want := StatusMismatch
 		if lookupFails {
 			want = StatusFailed
 		}
 		assert.Equal(t, want, caa.Status)
-		require.NotNil(t, caa.Condition)
+		require.False(t, caa.Condition.IsZero())
 		assert.False(t, caa.Condition.Since.IsZero())
 		encoded, ok := app.PublishedJSON()
 		require.True(t, ok)
@@ -536,10 +602,10 @@ func TestSerialRDAPPanicPreservesCompletedChecks(t *testing.T) {
 	app.Bootstrap = &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()}
 	app.RDAPLimiter = nil
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { panic("RDAP transport panic") })}
-	state := prepareCycleState(domains)
+	state := newTestCheckState()
 	state.RDAP[domains[1].Domain] = RDAPState{Status: StatusOK, IsDelegatedZone: true}
 	state.Email[domains[0].Domain] = EmailState{Status: StatusOK, MX: []string{"mail.first.com"}}
-	executeRateLimitedChecks(context.Background(), app, domains, []int{0, 1, 2}, client, state)
+	executeRateLimitedChecksForTest(context.Background(), app, domains, []int{0, 1, 2}, client, state)
 	for _, domain := range []string{"first.com", "last.com"} {
 		assert.Equal(t, StatusFailed, state.RDAP[domain].Status)
 		assert.Contains(t, state.RDAP[domain].Error, "RDAP transport panic")
@@ -550,8 +616,8 @@ func TestSerialRDAPPanicPreservesCompletedChecks(t *testing.T) {
 
 func TestCyclePublicationRemainsIsolated(t *testing.T) {
 	app := NewAppState(AppConfig{})
-	state := NewCheckState()
-	result := DNSResult{Name: "__caa__example.com", State: DNSState{Status: StatusMismatch, Condition: &StateCondition{Code: CodeDNSLookupFailed}, Found: []string{`0 issue "other.example"`}}}
+	state := newTestCheckState()
+	result := DNSResult{Name: "__caa__example.com", State: DNSState{Status: StatusMismatch, Condition: StateCondition{Code: CodeDNSLookupFailed}, Found: []string{`0 issue "other.example"`}}}
 	storeDNSResult(state, result)
 	publishCycleState(app, state, time.Hour)
 	before, ok := app.PublishedJSON()
@@ -559,7 +625,9 @@ func TestCyclePublicationRemainsIsolated(t *testing.T) {
 	original := string(before)
 	before[0] = 'x'
 	state.CAA["example.com"].Issue[0] = "cycle mutation"
-	state.CAA["example.com"].Condition.Target = "cycle mutation"
+	caa := state.CAA["example.com"]
+	caa.Condition.Target = "cycle mutation"
+	state.CAA["example.com"] = caa
 	after, ok := app.PublishedJSON()
 	require.True(t, ok)
 	assert.Equal(t, original, string(after))
@@ -574,8 +642,8 @@ func TestSerialRDAPCancellationCompletesFailedResults(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) { return nil, request.Context().Err() })}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	state := prepareCycleState(domains)
-	executeRateLimitedChecks(ctx, app, domains, []int{0, 1}, client, state)
+	state := newTestCheckState()
+	executeRateLimitedChecksForTest(ctx, app, domains, []int{0, 1}, client, state)
 	for _, domain := range domains {
 		assert.Equal(t, StatusFailed, state.RDAP[domain.Domain].Status)
 		assert.Contains(t, state.RDAP[domain.Domain].Error, context.Canceled.Error())
@@ -607,8 +675,8 @@ func TestFastDomainNameserverHealthPublished(t *testing.T) {
 				}
 				return response, 0, nil
 			}}
-			state := NewCheckState()
-			executeFastChecks(context.Background(), app, AppConfig{Domains: []DomainConfig{target}}, activeChecks{domains: []int{0}}, state)
+			state := newTestCheckState()
+			executeFastChecksForTest(context.Background(), app, AppConfig{Domains: []DomainConfig{target}}, activeChecks{domains: []int{0}}, state)
 			health := state.NSHealth[target.Domain]
 			require.Len(t, health.Servers, 3)
 			assert.Equal(t, target.ExpectedNS[0], health.Primary)
@@ -628,6 +696,7 @@ func TestFastDomainNameserverHealthPublished(t *testing.T) {
 				} else {
 					assert.Contains(t, health.Servers[1].Error, "injected nameserver failure")
 				}
+				assert.Equal(t, mode == "unreachable", health.Servers[1].Unreachable)
 			}
 			publishCycleState(app, state, time.Hour)
 			var published CheckState
@@ -649,14 +718,12 @@ func TestPublicationFailureKeepsLastSnapshot(t *testing.T) {
 	assert.Equal(t, StatusPending, initial.RDAP["example.com"].Status)
 	assert.Equal(t, StatusPending, initial.DNS["web"].Status)
 	assert.Equal(t, []string{"192.0.2.1"}, initial.DNS["web"].Expected)
-	state := NewCheckState()
+	state := newTestCheckState()
 	state.RDAP["example.com"] = RDAPState{RenewalPrice: math.NaN()}
 	publishCycleState(app, state, time.Hour)
 	current, ok := app.PublishedJSON()
 	require.True(t, ok)
 	assert.Equal(t, original, current)
-	publishCycleState(nil, state, time.Hour)
-	assert.NotEmpty(t, state.NextRefresh)
 }
 
 func TestConditionAlertMessagePreservesText(t *testing.T) {
@@ -685,14 +752,12 @@ func TestConditionSinceTracksCodeWithoutRetainingDiagnostic(t *testing.T) {
 	since := time.Now().Add(-time.Hour).UTC()
 	key := conditionKey{check: "dns", domain: "example"}
 	previous := map[conditionKey]StateCondition{key: {Code: CodeDNSLookupFailed, Since: since, Target: "old secret"}}
-	same := &StateCondition{Code: CodeDNSLookupFailed, Target: "new secret"}
-	applyConditionSince(same, key, previous)
+	same := applyConditionSince(StateCondition{Code: CodeDNSLookupFailed, Target: "new secret"}, key, previous)
 	assert.Equal(t, since, same.Since)
 	assert.Empty(t, previous[key].Target)
-	changed := &StateCondition{Code: CodeDNSMatchVerified}
-	applyConditionSince(changed, key, previous)
+	changed := applyConditionSince(StateCondition{Code: CodeDNSMatchVerified}, key, previous)
 	assert.True(t, changed.Since.After(since))
-	applyConditionSince(nil, key, previous)
+	applyConditionSince(StateCondition{}, key, previous)
 	assert.Equal(t, changed.Code, previous[key].Code)
 	assert.Equal(t, "1h0m0s", formatDurationSince(since))
 }
@@ -724,10 +789,11 @@ func TestCAATaskMatchingScopes(t *testing.T) {
 				}
 				return response, 0, nil
 			}}
-			state := NewCheckState()
-			executeFastChecks(context.Background(), app, app.configuration(), activeChecks{dnsRecords: app.active.dnsRecords}, state)
+			state := newTestCheckState()
+			executeFastChecksForTest(context.Background(), app, app.configuration(), activeChecks{dnsRecords: app.active.dnsRecords}, state)
 			if tc.domainPolicy {
-				require.NotNil(t, state.CAA["example.com"])
+				_, ok := state.CAA["example.com"]
+				require.True(t, ok)
 				assert.Equal(t, tc.want, state.CAA["example.com"].Status)
 				assert.Empty(t, state.DNS)
 			} else {
