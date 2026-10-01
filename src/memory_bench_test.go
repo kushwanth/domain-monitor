@@ -52,7 +52,7 @@ func benchmarkCycleFixture(size int) ([]DomainConfig, []RDAPState, []EmailState,
 	for i := range size {
 		domain := fmt.Sprintf("domain-%04d.example", i)
 		name := fmt.Sprintf("record-%04d", i)
-		domains[i] = DomainConfig{Domain: domain, Name: domain, CheckEmailSecurity: true}
+		domains[i] = DomainConfig{Domain: domain, Name: domain, Email: &EmailConfig{}}
 		rdapResults[i] = RDAPState{
 			Status: StatusOK, Registrar: "Example Registrar", Expiration: "2027-09-28T00:00:00Z",
 			Nameservers: []string{"ns1.example", "ns2.example"},

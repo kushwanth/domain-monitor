@@ -73,7 +73,7 @@ func TestFastDomainWorkerPanicPreservesCompletedEmail(t *testing.T) {
 		}
 		return response, 0, nil
 	}}
-	target := DomainConfig{Domain: "example.com", CheckEmailSecurity: true}
+	target := DomainConfig{Domain: "example.com", Email: &EmailConfig{}}
 	state := newTestCheckState()
 	executeFastChecksForTest(context.Background(), app, AppConfig{Domains: []DomainConfig{target}}, activeChecks{domains: []int{0}}, state)
 	assert.Equal(t, StatusOK, state.Email[target.Domain].Status)
@@ -120,8 +120,8 @@ func TestRunMonitoringCycle(t *testing.T) {
 func TestEvaluateCycleEvidencePerformsNoNetworkRequests(t *testing.T) {
 	cfg := AppConfig{
 		Domains: []DomainConfig{{
-			Domain: "example.com", IsDelegatedZone: true, CheckEmailSecurity: true,
-			DNSSEC: true, VerifyNSHealth: true, ExpectedNS: []string{"ns1.example.com"},
+			Domain: "example.com", RootZone: "com", Email: &EmailConfig{},
+			DNSSEC: true, Nameservers: []NameserverConfig{{Hostname: "ns1.example.com"}},
 		}},
 		DNSRecords: []DNSTask{{Hostname: "www.example.com", Name: "web", Type: RecordTypeA, Expected: []string{"192.0.2.1"}}},
 	}
@@ -141,7 +141,7 @@ func TestEvaluateCycleEvidencePerformsNoNetworkRequests(t *testing.T) {
 			email:      EmailSnapshot{MXRecords: []string{"mail.example.com"}, SPFRecords: []string{"v=spf1 -all"}, DMARCRecords: []string{"v=DMARC1; p=reject"}},
 			delegation: NSDelegationSnapshot{Nameservers: []string{"ns1.example.com"}},
 			dnssec:     DNSSECResult{Source: DNSSECSourceLocalDoH, Valid: true, HasDS: true, HasDNSKEY: true, DSMatchesDNSKEY: true, RRSIGValid: true, ChainIntact: true},
-			nsHealth:   []NSSnapshot{{Nameserver: "ns1.example.com", IsPrimary: true, Authoritative: true, HasSOA: true}},
+			nsHealth:   []NSSnapshot{{Nameserver: "ns1.example.com", Authoritative: true, HasSOA: true}},
 		}},
 		rdap: make([]RDAPSnapshot, 1),
 	}
@@ -154,7 +154,7 @@ func TestEvaluateCycleEvidencePerformsNoNetworkRequests(t *testing.T) {
 func TestAllowedExpiryDomainIsMonitoredUntilExpiration(t *testing.T) {
 	cfg := AppConfig{
 		Domains: []DomainConfig{{
-			Domain: "example.com", Unused: true, CheckEmailSecurity: true, DNSSEC: true,
+			Domain: "example.com", AllowExpiry: true, Email: &EmailConfig{}, DNSSEC: true,
 		}},
 		DNSRecords: []DNSTask{{Name: "allowed A", Hostname: "www.example.com", Type: RecordTypeA, Expected: []string{"192.0.2.1"}}},
 	}
@@ -210,7 +210,7 @@ func TestAllowedExpiryDomainReactivatesDependentChecksInSameCycle(t *testing.T) 
 	defer registry.Close()
 
 	cfg := AppConfig{
-		Domains:    []DomainConfig{{Domain: "example.com", Unused: true}},
+		Domains:    []DomainConfig{{Domain: "example.com", AllowExpiry: true}},
 		DNSRecords: []DNSTask{{Name: "allowed A", Hostname: "www.example.com", Type: RecordTypeA, Expected: []string{"192.0.2.1"}}},
 	}
 	app := NewAppState(cfg)
@@ -234,7 +234,7 @@ func TestAllowedExpiryDomainReactivatesDependentChecksInSameCycle(t *testing.T) 
 }
 
 func TestExpiredDomainRemainsSuppressedWhenRDAPIsUnavailable(t *testing.T) {
-	cfg := AppConfig{Domains: []DomainConfig{{Domain: "example.com", Unused: true}}}
+	cfg := AppConfig{Domains: []DomainConfig{{Domain: "example.com", AllowExpiry: true}}}
 	app := NewAppState(cfg)
 	app.expiredDomains["example.com"] = true
 	state := newCycleState(cfg, app.active)
@@ -246,7 +246,7 @@ func TestExpiredDomainRemainsSuppressedWhenRDAPIsUnavailable(t *testing.T) {
 }
 
 func TestConfiguredDomainOwnerUsesMostSpecificDomain(t *testing.T) {
-	domains := []DomainConfig{{Domain: "example.com", Unused: true}, {Domain: "sub.example.com"}}
+	domains := []DomainConfig{{Domain: "example.com", AllowExpiry: true}, {Domain: "sub.example.com"}}
 	assert.Equal(t, "example.com", configuredDomainOwner("www.example.com", domains))
 	assert.Equal(t, "sub.example.com", configuredDomainOwner("www.sub.example.com", domains))
 	assert.Empty(t, configuredDomainOwner("outside.test", domains))
@@ -254,7 +254,7 @@ func TestConfiguredDomainOwnerUsesMostSpecificDomain(t *testing.T) {
 
 func TestActiveViewsReferenceOwnedConfiguration(t *testing.T) {
 	cfg := AppConfig{
-		Domains:    []DomainConfig{{Domain: "active.example"}, {Domain: "unused.example", Unused: true}},
+		Domains:    []DomainConfig{{Domain: "active.example"}, {Domain: "unused.example", AllowExpiry: true}},
 		DNSRecords: []DNSTask{{Name: "record", Hostname: "active.example"}},
 	}
 	app := NewAppState(cfg)
@@ -299,7 +299,7 @@ func TestFastChecksDoNotWaitForDNSPhase(t *testing.T) {
 		dnsRecords[i] = DNSTask{Name: fmt.Sprintf("address-%d", i), Hostname: "example.com", Type: RecordTypeA}
 	}
 	app := NewAppState(AppConfig{
-		Domains:    []DomainConfig{{Domain: "example.com", CheckEmailSecurity: true}},
+		Domains:    []DomainConfig{{Domain: "example.com", Email: &EmailConfig{}}},
 		DNSRecords: dnsRecords,
 	})
 	addressStarted := make(chan struct{}, 1)
@@ -497,7 +497,7 @@ func TestProcessConditionsDropsHistoryForSuppressedChecks(t *testing.T) {
 		{check: CheckTypeDNS, domain: "allowed A"}: {Code: CodeDNSLookupFailed, Since: time.Now().Add(-time.Hour)},
 	}
 	cfg := AppConfig{
-		Domains:    []DomainConfig{{Domain: domain, Name: "Example", Unused: true}},
+		Domains:    []DomainConfig{{Domain: domain, Name: "Example", AllowExpiry: true}},
 		DNSRecords: []DNSTask{{Name: "allowed A", Hostname: "www.example.com", Type: RecordTypeA}},
 	}
 
@@ -531,8 +531,8 @@ func TestNotificationWorkerDrainsQueueWhenWakeChannelCloses(t *testing.T) {
 
 func TestStorePanicDomainResults(t *testing.T) {
 	cfg := DomainConfig{
-		Domain: "example.com", CheckEmailSecurity: true, MailProvider: "google",
-		IsDelegatedZone: true, DNSSEC: true, VerifyNSHealth: true, ExpectedNS: []string{"ns1.example.com"},
+		Domain: "example.com", RootZone: "com", Email: &EmailConfig{Provider: "google"},
+		DNSSEC: true, Nameservers: []NameserverConfig{{Hostname: "ns1.example.com"}},
 	}
 	state := newTestCheckState()
 	storePanicDomainResults(cfg, state, "some panic")
@@ -581,7 +581,7 @@ func TestReleaseCAAConfigIsolation(t *testing.T) {
 func TestReleaseProviderDKIMFromJSON(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "custom.json"), []byte(`{"mx_records":["mail.example.com"],"dkim_selectors":["custom"]}`), 0600))
-	body, err := jsonv2.Marshal(map[string]any{"notifications": map[string]any{"ntfy": map[string]string{"url": "https://ntfy.invalid/topic"}}, "email_providers_dir": dir, "domains": []map[string]any{{"domain": "example.com", "name": "Example", "check_email_security": true, "mail_provider": "custom"}}})
+	body, err := jsonv2.Marshal(map[string]any{"notifications": map[string]any{"ntfy": map[string]string{"url": "https://ntfy.invalid/topic"}}, "email_providers_dir": dir, "domains": []map[string]any{{"domain": "example.com", "name": "Example", "email": map[string]any{"provider": "custom"}}}})
 	require.NoError(t, err)
 	cfg, err := loadConfig(context.Background(), "memory", func(string) ([]byte, error) { return body, nil })
 	require.NoError(t, err)
@@ -634,7 +634,7 @@ func TestReleaseDashboardCAAAndDNSPolling(t *testing.T) {
    const previousTheme = document.documentElement.getAttribute('data-theme');
    toggleTheme();
    if (document.documentElement.getAttribute('data-theme') === previousTheme) throw new Error('Theme toggle failed without browser storage');
-   const fixture = {last_updated:'2026-09-27T00:00:00Z',rdap_checks:{'example.com':{status:'ok',nameservers:['ns.example.com'],renewal_price:12}},dns_checks:{web:{hostname:'example.com',name:'web',type:'A',status:'ok'}},caa_checks:{'example.com':{valid:false,issue:['unexpected.example']}},ns_health:{'example.com':{status:'ok',valid:true,primary:'ns.example.com',servers:[{}]}}};
+   const fixture = {last_updated:'2026-09-27T00:00:00Z',rdap_checks:{'example.com':{status:'ok',nameservers:['ns.example.com'],renewal_price:12}},dns_checks:{web:{hostname:'example.com',name:'web',type:'A',status:'ok'}},caa_checks:{'example.com':{valid:false,issue:['unexpected.example']}},ns_health:{'example.com':{status:'ok',valid:true,servers:[{nameserver:'ns.example.com'}]}}};
    appState = fixture; renderDomains();
    currentFilter = 'issues'; renderDomains();
    if (!document.querySelector('#view-domains details')) throw new Error('Invalid CAA missing from issues');
@@ -668,7 +668,7 @@ func TestReleaseDashboardCAAAndDNSPolling(t *testing.T) {
 func TestReleaseCAACyclePublishesCondition(t *testing.T) {
 	for _, lookupFails := range []bool{false, true} {
 		cfg, err := loadConfig(context.Background(), "memory", func(string) ([]byte, error) {
-			return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"sub.example.com","name":"Subdomain","is_delegated_zone":true,"root_zone":"example.com","caa":{"issue":["ca.example"]}}]}`), nil
+			return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"sub.example.com","name":"Subdomain","root_zone":"example.com","caa":{"issue":["ca.example"]}}]}`), nil
 		})
 		require.NoError(t, err)
 		app := NewAppState(cfg)
@@ -703,7 +703,7 @@ func TestReleaseCAACyclePublishesCondition(t *testing.T) {
 }
 
 func TestSerialRDAPPanicPreservesCompletedChecks(t *testing.T) {
-	domains := []DomainConfig{{Domain: "first.com"}, {Domain: "delegated.first.com", IsDelegatedZone: true}, {Domain: "last.com"}}
+	domains := []DomainConfig{{Domain: "first.com"}, {Domain: "delegated.first.com", RootZone: "first.com"}, {Domain: "last.com"}}
 	app := NewAppState(AppConfig{Domains: domains})
 	app.Bootstrap = &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()}
 	app.RDAPLimiter = nil
@@ -759,7 +759,7 @@ func TestSerialRDAPCancellationCompletesFailedResults(t *testing.T) {
 func TestFastDomainNameserverHealthPublished(t *testing.T) {
 	for _, mode := range []string{"matching", "different keys", "unreachable", "key lookup error"} {
 		t.Run(mode, func(t *testing.T) {
-			target := DomainConfig{Domain: "example.com", VerifyNSHealth: true, DNSSEC: true, ExpectedNS: []string{"192.0.2.1", "192.0.2.2"}, SecondaryNS: []string{"192.0.2.3"}}
+			target := DomainConfig{Domain: "example.com", DNSSEC: true, Nameservers: []NameserverConfig{{Hostname: "192.0.2.1"}, {Hostname: "192.0.2.2"}, {Hostname: "192.0.2.3", Hidden: true}}}
 			app := NewAppState(AppConfig{Domains: []DomainConfig{target}})
 			app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
 				redundantPrimary := strings.HasPrefix(address, "192.0.2.2:")
@@ -785,10 +785,9 @@ func TestFastDomainNameserverHealthPublished(t *testing.T) {
 			executeFastChecksForTest(context.Background(), app, AppConfig{Domains: []DomainConfig{target}}, activeChecks{domains: []int{0}}, state)
 			health := state.NSHealth[target.Domain]
 			require.Len(t, health.Servers, 3)
-			assert.Equal(t, target.ExpectedNS[0], health.Primary)
-			assert.True(t, health.Servers[0].IsPrimary)
-			assert.True(t, health.Servers[1].IsPrimary)
-			assert.False(t, health.Servers[2].IsPrimary)
+			assert.False(t, health.Servers[0].Hidden)
+			assert.False(t, health.Servers[1].Hidden)
+			assert.True(t, health.Servers[2].Hidden)
 			assert.Equal(t, uint32(42), health.Servers[0].SOASerial)
 			if mode == "matching" {
 				assert.Equal(t, StatusOK, health.Status)

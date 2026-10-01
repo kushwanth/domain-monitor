@@ -29,3 +29,4 @@ domain_snapshots.json
 # Antigravity Customizations
 .agents/
 plan/
+.codex*

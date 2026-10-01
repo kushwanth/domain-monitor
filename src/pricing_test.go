@@ -134,7 +134,7 @@ func TestComputePortfolioPricing(t *testing.T) {
 				{
 					Domain:       "expiring.com",
 					Name:         "Expiring Domain",
-					Unused:       true,
+					AllowExpiry:  true,
 					RenewalPrice: 0,
 				},
 			},

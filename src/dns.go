@@ -89,6 +89,10 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 			err = fmt.Errorf(MsgErrQueryDNSForOnTCP, hostname, ip)
 			return nil, canRetry, 0, err
 		}
+		if r.Id != dnsMsg.Id {
+			err = fmt.Errorf(MsgErrLookupIDMismatch, hostname, ip)
+			return nil, canRetry, 0, err
+		}
 
 		// Verify question section echoes request per RFC 5452 Section 4
 		if len(r.Question) != 1 || !strings.EqualFold(r.Question[0].Name, fqdn) || r.Question[0].Qtype != qtype || r.Question[0].Qclass != dns.ClassINET {
@@ -765,8 +769,12 @@ func hasUsableDKIMKey(record string) bool {
 	if !valid {
 		return false
 	}
-	if version, exists := tags[DNSPolicyTagVersion]; exists && !strings.EqualFold(DNSPolicyTagVersion+SymEquals+version, DKIMPrefix) {
-		return false
+	if version, exists := tags[DNSPolicyTagVersion]; exists {
+		firstPart, _, _ := strings.Cut(record, SymSemicolon)
+		firstKey, _, hasValue := strings.Cut(strings.TrimSpace(firstPart), SymEquals)
+		if !hasValue || !strings.EqualFold(strings.TrimSpace(firstKey), DNSPolicyTagVersion) || version != DKIMVersion {
+			return false
+		}
 	}
 	keyType := strings.ToLower(tags[DKIMTagKeyType])
 	if keyType != StrEmpty && keyType != DKIMKeyTypeRSA && keyType != DKIMKeyTypeEd25519 {
@@ -819,6 +827,11 @@ func validDKIMPublicKey(keyType, key string) bool {
 	if keyType == DKIMKeyTypeEd25519 {
 		return len(decoded) == ed25519.PublicKeySize
 	}
+	if parsed, parseErr := x509.ParsePKCS1PublicKey(decoded); parseErr == nil && parsed != nil {
+		return true
+	}
+	// Accept SubjectPublicKeyInfo as a compatibility extension because it is
+	// commonly published even though RFC 6376 specifies PKCS#1 RSAPublicKey.
 	parsed, err := x509.ParsePKIXPublicKey(decoded)
 	if err != nil {
 		return false
@@ -828,13 +841,7 @@ func validDKIMPublicKey(keyType, key string) bool {
 }
 
 func hasValidDMARCPolicy(record string) bool {
-	var firstPart string
-	if idx := strings.IndexByte(record, ';'); idx != -1 {
-		firstPart = record[:idx]
-	} else {
-		firstPart = record
-	}
-	if !strings.EqualFold(strings.TrimSpace(firstPart), DMARCPrefix) {
+	if !hasDMARCVersion(record) {
 		return false
 	}
 	tags, valid := parseSemicolonTags(record)
@@ -857,18 +864,116 @@ func hasValidDMARCPolicy(record string) bool {
 			return false
 		}
 	}
-	if psd, ok := tags[StrPsd]; ok && !strings.EqualFold(psd, StrY) && !strings.EqualFold(psd, StrN2) {
+	if psd, ok := tags[StrPsd]; ok && !strings.EqualFold(psd, StrY) && !strings.EqualFold(psd, StrN2) && !strings.EqualFold(psd, StrU) {
 		return false
 	}
 	return true
 }
 
+func hasDMARCVersion(record string) bool {
+	firstPart := record
+	if idx := strings.IndexByte(record, ';'); idx != -1 {
+		firstPart = record[:idx]
+	}
+	key, value, ok := strings.Cut(strings.TrimSpace(firstPart), SymEquals)
+	return ok && strings.EqualFold(strings.TrimSpace(key), DNSPolicyTagVersion) && strings.TrimSpace(value) == DMARCVersion
+}
+
+// selectDMARCPolicyRecord applies RFC 9989's per-node filtering. Multiple
+// DMARC records are all discarded; a single malformed policy stops discovery.
+func selectDMARCPolicyRecord(records []string) (record string, invalid bool) {
+	var candidates []string
+	for _, candidate := range records {
+		if hasDMARCVersion(candidate) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) != 1 {
+		return StrEmpty, false
+	}
+	if !hasValidDMARCPolicy(candidates[0]) {
+		return StrEmpty, true
+	}
+	return candidates[0], false
+}
+
+func dmarcPSDValue(record string) string {
+	tags, valid := parseSemicolonTags(record)
+	if !valid {
+		return StrEmpty
+	}
+	return strings.ToLower(tags[StrPsd])
+}
+
+func parentDomain(domain string) string {
+	if idx := strings.IndexByte(domain, '.'); idx != -1 {
+		return domain[idx+1:]
+	}
+	return StrEmpty
+}
+
+func fetchDMARCPolicy(ctx context.Context, app *AppState, domain string) ([]string, error) {
+	currentDomain := NormalizeDomain(domain)
+	var candidateRecord, candidateDomain string
+	// RFC 9989 Section 4.10 permits at most eight DNS Tree Walk queries. For
+	// longer names, query the exact name and then resume at its last seven labels.
+	for queryCount := 0; queryCount < 8; queryCount++ {
+		dmarcHost := StrDMARC + currentDomain
+		dmarcTxts, dmarcErr := queryDNS(ctx, app, dmarcHost, dns.TypeTXT, app.resolvers())
+		if dmarcErr != nil && !errors.Is(dmarcErr, ErrNXDOMAIN) {
+			return nil, dmarcErr // A transient failure cannot be replaced by parent evidence.
+		}
+		if dmarcErr == nil {
+			dmarcRecord, invalidPolicy := selectDMARCPolicyRecord(dmarcTxts)
+			if invalidPolicy {
+				return nil, fmt.Errorf(MsgErrInvalidDMARCPolicyAt, dmarcHost)
+			}
+			if dmarcRecord != StrEmpty {
+				if queryCount == 0 {
+					return []string{dmarcRecord}, nil
+				}
+				switch dmarcPSDValue(dmarcRecord) {
+				case StrN2:
+					return []string{dmarcRecord}, nil
+				case StrY:
+					if candidateRecord == StrEmpty || parentDomain(candidateDomain) != currentDomain {
+						candidateRecord = dmarcRecord
+					}
+					return []string{candidateRecord}, nil
+				default:
+					candidateRecord, candidateDomain = dmarcRecord, currentDomain
+				}
+			}
+		}
+
+		idx := strings.IndexByte(currentDomain, '.')
+		if idx == -1 {
+			break
+		}
+		if queryCount == 0 {
+			labelCount := 1 + strings.Count(currentDomain, SymDot)
+			if labelCount > 8 {
+				for range labelCount - 7 {
+					currentDomain = parentDomain(currentDomain)
+				}
+				continue
+			}
+		}
+		currentDomain = currentDomain[idx+1:]
+	}
+	if candidateRecord == StrEmpty {
+		return nil, nil
+	}
+	return []string{candidateRecord}, nil
+}
+
 // FetchEmailSnapshot queries MX, SPF, DMARC, and configured DKIM selectors.
 func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig) EmailSnapshot {
 	var snap EmailSnapshot
-	if !target.CheckEmailSecurity {
+	if target.Email == nil {
 		return snap
 	}
+	email := target.Email
 
 	mxs, mxErr := queryDNS(ctx, app, target.Domain, dns.TypeMX, app.resolvers())
 	if mxErr != nil && errors.Is(mxErr, ErrNXDOMAIN) {
@@ -880,68 +985,13 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 
 	snap.SPFRecords, snap.SPFErr = queryDNS(ctx, app, target.Domain, dns.TypeTXT, app.resolvers())
 
-	currentDomain := NormalizeDomain(target.Domain)
-	// RFC 9989 Section 4.10 permits at most eight DNS Tree Walk queries. For
-	// longer names, query the exact name and then resume at its last seven labels.
-	for queryCount := 0; queryCount < 8; queryCount++ {
-		dmarcHost := StrDMARC + currentDomain
-		dmarcTxts, dmarcErr := queryDNS(ctx, app, dmarcHost, dns.TypeTXT, app.resolvers())
-		if dmarcErr != nil {
-			snap.DMARCErr = dmarcErr
-			if !errors.Is(dmarcErr, ErrNXDOMAIN) {
-				break // A transient failure cannot be replaced by parent evidence.
-			}
-		} else {
-			snap.DMARCErr = nil
-			snap.DMARCRecords = dmarcTxts
-			dmarcFound := false
-			invalidPolicy := false
-			for _, txt := range dmarcTxts {
-				if hasValidDMARCPolicy(txt) {
-					dmarcFound = true
-				} else if strings.HasPrefix(strings.ToLower(strings.TrimSpace(txt)), DMARCPrefix) {
-					invalidPolicy = true
-				}
-			}
-			if invalidPolicy {
-				snap.DMARCErr = fmt.Errorf(MsgErrInvalidDMARCPolicyAt, dmarcHost)
-				break
-			}
-			if dmarcFound {
-				break
-			}
-		}
-
-		idx := strings.IndexByte(currentDomain, '.')
-		if idx == -1 {
-			break
-		}
-		if queryCount == 0 {
-			labelCount := 1
-			for i := 0; i < len(currentDomain); i++ {
-				if currentDomain[i] == '.' {
-					labelCount++
-				}
-			}
-			if labelCount > 8 {
-				drop := labelCount - 7
-				for i := 0; i < drop; i++ {
-					currentDomain = currentDomain[strings.IndexByte(currentDomain, '.')+1:]
-				}
-			} else {
-				currentDomain = currentDomain[idx+1:]
-			}
-		} else {
-			currentDomain = currentDomain[idx+1:]
-		}
-	}
-	// Note: if last query failed with non-NXDOMAIN, snap.DMARCErr retains it
+	snap.DMARCRecords, snap.DMARCErr = fetchDMARCPolicy(ctx, app, target.Domain)
 
 	var selectorsToCheck []string
-	if target.MailProvider != StrEmpty && app != nil {
-		selectorsToCheck = append(selectorsToCheck, app.EmailProviders[target.MailProvider].DKIMSelectors...)
+	if email.Provider != StrEmpty && app != nil {
+		selectorsToCheck = append(selectorsToCheck, app.EmailProviders[email.Provider].DKIMSelectors...)
 	}
-	selectorsToCheck = append(selectorsToCheck, target.DKIMSelectors...)
+	selectorsToCheck = append(selectorsToCheck, email.DKIMSelectors...)
 
 	for _, selector := range DeduplicateNonEmptyStrings(selectorsToCheck) {
 		dkimHost := selector + StrDomainkey + target.Domain
@@ -978,9 +1028,10 @@ func FetchEmailSnapshot(ctx context.Context, app *AppState, target DomainConfig)
 
 // EvaluateEmailSecurity evaluates published email records without sending alerts.
 func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers map[string]ProviderConfig) (CheckStatus, StateCondition, EmailState) {
-	if !target.CheckEmailSecurity {
+	if target.Email == nil {
 		return StatusOK, StateCondition{}, EmailState{}
 	}
+	email := target.Email
 
 	var conditions []StateCondition
 	emailStatus := StatusOK
@@ -999,16 +1050,16 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 		conditions = append(conditions, StateCondition{Code: CodeEmailMissingMX})
 	default:
 		liveMXs = append(liveMXs, snap.MXRecords...)
-		if len(target.MXRecords) > 0 {
+		if len(email.MXRecords) > 0 {
 			allMatch := true
-			for _, expected := range target.MXRecords {
+			for _, expected := range email.MXRecords {
 				if !slices.Contains(liveMXs, expected) {
 					allMatch = false
 					conditions = append(conditions, StateCondition{Code: CodeEmailMissingMX, Target: expected})
 				}
 			}
 			for _, found := range liveMXs {
-				if !slices.Contains(target.MXRecords, found) {
+				if !slices.Contains(email.MXRecords, found) {
 					allMatch = false
 					conditions = append(conditions, StateCondition{Code: CodeEmailUnauthorizedMX, Target: found})
 				}
@@ -1016,16 +1067,16 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 			if !allMatch && emailStatus == StatusOK {
 				emailStatus = StatusMismatch
 			}
-		} else if target.MailProvider != StrEmpty {
+		} else if email.Provider != StrEmpty {
 			var safe, known bool
 			if providers != nil {
-				if provider, ok := providers[target.MailProvider]; ok {
+				if provider, ok := providers[email.Provider]; ok {
 					known = true
 					safe = isProviderMXSafeDynamic(liveMXs, provider)
 				}
 			}
 			if !known {
-				LogWarnf(MsgLogEmailUnknownProvider, target.MailProvider, target.Domain)
+				LogWarnf(MsgLogEmailUnknownProvider, email.Provider, target.Domain)
 			} else if !safe {
 				emailStatus = StatusHijacked
 				conditions = append(conditions, StateCondition{Code: CodeEmailHijackedMX, Target: strings.Join(liveMXs, SymCommaSpace)})
@@ -1111,8 +1162,8 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 		}
 	}
 
-	hasDKIMExpected := len(target.DKIMSelectors) > 0
-	if len(providers[target.MailProvider].DKIMSelectors) > 0 {
+	hasDKIMExpected := len(email.DKIMSelectors) > 0
+	if len(providers[email.Provider].DKIMSelectors) > 0 {
 		hasDKIMExpected = true
 	}
 	slices.Sort(validDKIMs)
@@ -1144,7 +1195,7 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 
 	state := EmailState{
 		Status:       emailStatus,
-		Provider:     target.MailProvider,
+		Provider:     email.Provider,
 		SPF:          spfFound,
 		DMARC:        dmarcFound,
 		DKIMExpected: hasDKIMExpected,
@@ -1191,9 +1242,9 @@ func isProviderMXSafeDynamic(liveMXs []string, provider ProviderConfig) bool {
 }
 
 // FetchNSSnapshot queries SOA and optional DNSKEY evidence for one nameserver.
-func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimary bool, target DomainConfig) NSSnapshot {
-	srv := NSSnapshot{Nameserver: nsName, IsPrimary: isPrimary}
-	addresses, partial, err := resolveNSAddresses(ctx, app, nsName)
+func FetchNSSnapshot(ctx context.Context, app *AppState, nameserver NameserverConfig, target DomainConfig) NSSnapshot {
+	srv := NSSnapshot{Nameserver: nameserver.Hostname, Hidden: nameserver.Hidden}
+	addresses, partial, err := resolveNSAddresses(ctx, app, nameserver.Hostname)
 	srv.PartialError = partial
 	if err != nil {
 		srv.Err, srv.Unreachable = err, true
@@ -1209,11 +1260,7 @@ func FetchNSSnapshot(ctx context.Context, app *AppState, nsName string, isPrimar
 	}
 	srv.Authoritative = soaMsg.Authoritative
 	if !srv.Authoritative {
-		if isPrimary {
-			srv.Err = errors.New(MsgErrPrimaryNSNotAuthoritative) //nolint:staticcheck // ST1005: preserve existing diagnostic text.
-		} else {
-			srv.Err = errors.New(MsgErrSecondaryNSNotAuthoritative) //nolint:staticcheck // ST1005: preserve existing diagnostic text.
-		}
+		srv.Err = errors.New(MsgErrNSNotAuthoritative) //nolint:staticcheck // ST1005: preserve existing diagnostic text.
 	}
 
 	srv.SOASerial, srv.HasSOA = findSOASerial(soaMsg, target.Domain)
@@ -1331,20 +1378,21 @@ func fetchNSDNSKEY(ctx context.Context, app *AppState, domain, address string, s
 
 // FetchNSHealthSnapshots queries each distinct configured nameserver in order.
 func FetchNSHealthSnapshots(ctx context.Context, app *AppState, target DomainConfig) []NSSnapshot {
-	if !target.VerifyNSHealth || len(target.ExpectedNS) == 0 {
+	if len(target.Nameservers) == 0 {
 		return nil
 	}
 
-	snapshots := make([]NSSnapshot, 0, len(target.ExpectedNS)+len(target.SecondaryNS))
+	snapshots := make([]NSSnapshot, 0, len(target.Nameservers))
 	seen := make(map[string]bool)
-	for index, name := range append(slices.Clone(target.ExpectedNS), target.SecondaryNS...) {
-		name = strings.TrimSpace(name)
+	for _, nameserver := range target.Nameservers {
+		name := strings.TrimSpace(nameserver.Hostname)
 		key := strings.ToLower(strings.TrimSuffix(name, SymDot))
 		if key == StrEmpty || seen[key] {
 			continue
 		}
 		seen[key] = true
-		snapshots = append(snapshots, FetchNSSnapshot(ctx, app, name, index < len(target.ExpectedNS), target))
+		nameserver.Hostname = name
+		snapshots = append(snapshots, FetchNSSnapshot(ctx, app, nameserver, target))
 	}
 
 	return snapshots
@@ -1353,6 +1401,9 @@ func FetchNSHealthSnapshots(ctx context.Context, app *AppState, target DomainCon
 // EvaluateNSHealth checks authority, SOA consistency, and optional DNSKEY agreement.
 func EvaluateNSHealth(target DomainConfig, snapshots []NSSnapshot) (CheckStatus, StateCondition) {
 	if len(snapshots) == 0 {
+		if len(target.Nameservers) > 0 {
+			return StatusFailed, StateCondition{Code: CodeNSUnreachable, Target: target.Domain}
+		}
 		return StatusOK, StateCondition{}
 	}
 
@@ -1383,7 +1434,7 @@ func EvaluateNSHealth(target DomainConfig, snapshots []NSSnapshot) (CheckStatus,
 			continue
 		}
 		if srv.SOASerial != baseline.SOASerial {
-			ct.Promote(StatusWarning, CodeNSSOALags, srv.Nameserver)
+			ct.Promote(StatusWarning, CodeNSSOAMismatch, srv.Nameserver)
 		}
 		if target.DNSSEC && !slices.Equal(baseline.DNSKEYs, srv.DNSKEYs) {
 			ct.Promote(StatusFailed, CodeNSDNSKEYMismatch, srv.Nameserver)

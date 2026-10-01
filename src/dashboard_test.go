@@ -40,8 +40,8 @@ func TestDashboardBrowserRegressions(t *testing.T) {
             'custom.example.com': {status:'ok', mx:['mail.custom.example.com'], spf:true, dmarc:true}
           },
           dnssec_checks: {'example.com': {source:'doh', valid:true, ds_matches_dnskey:true, rrsig_valid:true, chain_intact:true, algorithms:['ED25519']}},
-          ns_health: {'example.com': {status:'ok', valid:true, primary:'ns1.example.com', servers:[
-            {nameserver:'ns1.example.com',is_primary:true},{nameserver:'ns2.example.com',is_primary:true},{nameserver:'ns3.example.com',is_primary:false}
+          ns_health: {'example.com': {status:'ok', valid:true, servers:[
+            {nameserver:'ns1.example.com'},{nameserver:'ns2.example.com'},{nameserver:'hidden.example.com',hidden:true}
           ]}},
           dns_checks: {
             web: {hostname:'example.com', name:'web', type:'A', status:'ok', expected:['192.0.2.1'], found:['192.0.2.1']},

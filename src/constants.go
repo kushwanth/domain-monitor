@@ -186,8 +186,8 @@ const (
 // Email Security & Protocol Sentinels
 const (
 	SPFPrefix             = "v=spf1"
-	DMARCPrefix           = "v=dmarc1"
-	DKIMPrefix            = "v=dkim1"
+	DMARCVersion          = "DMARC1"
+	DKIMVersion           = "DKIM1"
 	DNSPolicyTagVersion   = "v"
 	DNSPolicyTagPublicKey = "p"
 	DKIMTagKeyType        = "k"
@@ -291,10 +291,11 @@ const (
 	CodeNSUnreachable
 	CodeNSNotAuthoritative
 	CodeNSMissingSOA
-	CodeNSSOALags
+	CodeNSSOAMismatch
 	CodeNSDNSKEYMismatch
 	CodeExpectedNSMissing
 	CodeUnauthorizedNS
+	CodeNSHiddenExposed
 
 	// DNS Records
 	CodeDNSMatchVerified
@@ -378,10 +379,11 @@ var resultCodeNames = [...]string{
 	CodeNSUnreachable:      "nsUnreachable",
 	CodeNSNotAuthoritative: "nsNotAuthoritative",
 	CodeNSMissingSOA:       "nsMissingSoa",
-	CodeNSSOALags:          "nsSoaLags",
+	CodeNSSOAMismatch:      "nsSoaMismatch",
 	CodeNSDNSKEYMismatch:   "nsDnskeyMismatch",
 	CodeExpectedNSMissing:  "expectedNsMissing",
 	CodeUnauthorizedNS:     "unauthorizedNs",
+	CodeNSHiddenExposed:    "nsHiddenExposed",
 
 	// DNS Records
 	CodeDNSMatchVerified:     "dnsMatchVerified",
@@ -746,7 +748,7 @@ var CCTLDWHOISServers = map[string]string{
 // Alert & Log Notification Messages
 const (
 	// Email Security Info
-	MsgLogEmailUnknownProvider = "Unknown mail_provider '%s' for %s. Skipping MX hijack prevention."
+	MsgLogEmailUnknownProvider = "Unknown email provider '%s' for %s. Skipping MX hijack prevention."
 
 	// WHOIS Info
 	MsgLogWHOISFallback = "RDAP failed for %s, attempting WHOIS fallback..."
@@ -949,6 +951,7 @@ const (
 	MsgErrInternalRDAPCheckPanic = "internal rdap check panic: %s"
 
 	MsgErrLookupEmptyResponse    = "lookup %s on %s: empty response"
+	MsgErrLookupIDMismatch       = "lookup %s on %s: response ID mismatch"
 	MsgErrLookupQuestionMismatch = "lookup %s on %s: response question mismatch or missing"
 	MsgErrLookupServerError      = "lookup %s on %s: server error (%s)"
 	MsgErrLookupServerErrorCode  = "lookup %s on %s: server returned error code %d"
@@ -972,14 +975,17 @@ const (
 	MsgErrResolversExceedLimit               = "configured resolvers exceed maximum limit of 9"
 	MsgErrDomainEmptyDomain                  = "domain entry at index %d has an empty domain"
 	MsgErrDuplicateDomain                    = "duplicate domain %s; each domain entry must be unique"
-	MsgErrDomainEmptyExpectedNS              = "domain %s has an empty entry in expected_ns at index %d"
-	MsgErrDomainEmptySecondaryNS             = "domain %s has an empty entry in secondary_ns at index %d"
+	MsgErrDomainEmptyNameserver              = "domain %s has an empty nameserver hostname at index %d"
+	MsgErrDomainInvalidNameserver            = "domain %s has invalid nameserver hostname %s"
+	MsgErrDomainDuplicateNameserver          = "domain %s has duplicate nameserver %s"
+	MsgErrDomainNeedsAnsweringNameserver     = "domain %s must configure at least one non-hidden nameserver"
+	MsgErrDomainInvalidRootZone              = "domain %s has invalid root zone %s"
+	MsgErrRemovedDomainConfig                = "domain %s uses removed configuration fields; update it to the current domain schema"
 	MsgErrDomainMissingName                  = "domain %s is missing a mandatory 'name' field"
 	MsgErrDuplicateDomainName                = "duplicate domain name %s; each domain must have a unique name"
-	MsgErrSecondaryNSWithoutPrimary          = "domain %s has secondary_ns configured but no primary expected_ns configured"
-	MsgErrVerifyNSHealthWithoutPrimary       = "domain %s has verify_ns_health enabled but no primary expected_ns configured"
-	MsgErrDelegatedMissingRootZone           = "delegated domain %s is missing a mandatory 'root_zone' field"
-	MsgErrMailProviderAndMXMutuallyExclusive = "domain %s has both mail_provider and mx_records set; these are mutually exclusive"
+	MsgErrMailProviderAndMXMutuallyExclusive = "domain %s has both email.provider and email.mx_records set; these are mutually exclusive"
+	MsgErrDomainInvalidMX                    = "domain %s has invalid expected MX hostname %s"
+	MsgErrDomainInvalidDKIMSelector          = "domain %s has invalid DKIM selector %s"
 	MsgErrDNSEmptyHostname                   = "dns record at index %d has an empty hostname"
 	MsgErrDNSMissingName                     = "dns record %s (%s) is missing a mandatory 'name' field"
 	MsgErrDuplicateDNSName                   = "duplicate dns record name %s; each dns record must have a unique name"
@@ -1014,8 +1020,7 @@ const (
 	MsgErrDMARCLookupError               = "DMARC lookup error: %s"
 	MsgErrDKIMLookupError                = "DKIM lookup error: %s"
 	MsgErrSOALookupFailed                = "SOA lookup failed: %w"
-	MsgErrPrimaryNSNotAuthoritative      = "Primary nameserver not authoritative (AA flag missing)"
-	MsgErrSecondaryNSNotAuthoritative    = "Secondary nameserver not authoritative (AA flag missing)"
+	MsgErrNSNotAuthoritative             = "Nameserver not authoritative (AA flag missing)"
 	MsgErrNoSOARecordReturned            = "No SOA record returned in answer or authority sections"
 	MsgErrRDAPAndWHOIS                   = "RDAP: %w | WHOIS: %w"
 )
@@ -1237,6 +1242,7 @@ const (
 	SymSemicolonSpace                     = "; "
 	SymSemicolon                          = ";"
 	SymEquals                             = "="
+	SymDoubleQuote                        = `"`
 	SymQuoteSpace                         = `"' `
 	SymHash                               = "#"
 	SymParenClose                         = ")"
@@ -1251,6 +1257,7 @@ const (
 	StrTemporaryFailure                   = "temporary failure"
 	StrTerminationSignal                  = "termination signal"
 	StrTooMany                            = "too many"
+	StrU                                  = "u"
 	StrTransferlock                       = "transferlock"
 	StrTransferprohibited                 = "transferprohibited"
 	StrUpdated                            = "updated"

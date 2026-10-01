@@ -60,18 +60,17 @@ func TestReadConfigFileRejectsOversizedInput(t *testing.T) {
 	assert.ErrorIs(t, err, ErrReadLimitExceeded)
 }
 
-func TestExpiryPolicyConfigAliases(t *testing.T) {
-	configJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"unused-one.example","name":"Unused One","unused":true},{"domain":"unused-two.example","name":"Unused Two","unused":true,"allow_expiry":true},{"domain":"renewing.example","name":"Renewing","allow_expiry":true}]}`
+func TestAllowExpiryPolicy(t *testing.T) {
+	configJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"unused-one.example","name":"Unused One","allow_expiry":true},{"domain":"renewing.example","name":"Renewing","allow_expiry":true}]}`
 	cfg, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
 		return []byte(configJSON), nil
 	})
 	require.NoError(t, err)
-	require.Len(t, cfg.Domains, 3)
-	assert.True(t, cfg.Domains[0].Unused)
-	assert.True(t, cfg.Domains[1].Unused)
-	assert.True(t, cfg.Domains[2].Unused)
+	require.Len(t, cfg.Domains, 2)
+	assert.True(t, cfg.Domains[0].AllowExpiry)
+	assert.True(t, cfg.Domains[1].AllowExpiry)
 	for _, domain := range cfg.Domains {
-		assert.True(t, domain.allowsExpiry())
+		assert.True(t, domain.AllowExpiry)
 		futureStatus, _ := EvaluateRDAP(domain, RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).UTC().Format(time.RFC3339)})
 		expiredStatus, _ := EvaluateRDAP(domain, RDAPSnapshot{Expiration: time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339)})
 		assert.Equal(t, StatusOK, futureStatus)
@@ -80,10 +79,8 @@ func TestExpiryPolicyConfigAliases(t *testing.T) {
 
 	state := newCycleState(AppConfig{Domains: cfg.Domains}, activeChecks{})
 	assert.False(t, state.RDAP["unused-one.example"].Unused)
-	assert.False(t, state.RDAP["unused-two.example"].Unused)
 	assert.False(t, state.RDAP["renewing.example"].Unused)
 	assert.True(t, state.RDAP["unused-one.example"].AllowExpiry)
-	assert.True(t, state.RDAP["unused-two.example"].AllowExpiry)
 	assert.True(t, state.RDAP["renewing.example"].AllowExpiry)
 	assert.Equal(t, StatusPending, state.RDAP["renewing.example"].Status)
 }
@@ -139,10 +136,8 @@ func TestLoadConfig(t *testing.T) {
 					{
 						"domain": "EXAMPLE.COM.",
 						"name": "Test Domain",
-						"expected_ns": ["NS1.EXAMPLE.COM."],
-						"check_email_security": true,
-						"mail_provider": "GOOGLE",
-						"dkim_selectors": ["SEL1"],
+						"nameservers": [{"hostname":"NS1.EXAMPLE.COM."}],
+						"email": {"provider":"GOOGLE","dkim_selectors":["SEL1"]},
 						"caa": {
 							"issue": ["LETSENCRYPT.ORG"],
 							"issuewild": ["LETSENCRYPT.ORG"],
@@ -172,14 +167,14 @@ func TestLoadConfig(t *testing.T) {
 				if d.Domain != "example.com" {
 					t.Errorf("Expected domain example.com, got %s", d.Domain)
 				}
-				if d.ExpectedNS[0] != "ns1.example.com" {
-					t.Errorf("Expected ns1.example.com, got %s", d.ExpectedNS[0])
+				if d.Nameservers[0].Hostname != "ns1.example.com" {
+					t.Errorf("Expected ns1.example.com, got %s", d.Nameservers[0].Hostname)
 				}
-				if d.MailProvider != "google" {
-					t.Errorf("Expected mail_provider google, got %s", d.MailProvider)
+				if d.Email.Provider != "google" {
+					t.Errorf("Expected email provider google, got %s", d.Email.Provider)
 				}
-				if d.DKIMSelectors[0] != "sel1" {
-					t.Errorf("Expected dkim selector sel1, got %s", d.DKIMSelectors[0])
+				if d.Email.DKIMSelectors[0] != "sel1" {
+					t.Errorf("Expected dkim selector sel1, got %s", d.Email.DKIMSelectors[0])
 				}
 
 				r := app.Config().DNSRecords[0]
@@ -199,16 +194,15 @@ func TestLoadConfig(t *testing.T) {
 					{
 						"domain": "nomail.example.com",
 						"name": "NoMail Domain",
-						"check_email_security": true,
-						"mx_records": ["."]
+						"email": {"mx_records":["."]}
 					}
 				]
 			}`,
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
 				d := app.Config().Domains[0]
-				if len(d.MXRecords) != 1 || d.MXRecords[0] != "." {
-					t.Errorf("Expected Null MX '.' to be preserved, got %v", d.MXRecords)
+				if len(d.Email.MXRecords) != 1 || d.Email.MXRecords[0] != "." {
+					t.Errorf("Expected Null MX '.' to be preserved, got %v", d.Email.MXRecords)
 				}
 			},
 		},
@@ -221,22 +215,12 @@ func TestLoadConfig(t *testing.T) {
 			errContains: "missing a mandatory 'name' field",
 		},
 		{
-			name: "Delegated Zone Missing Root Zone",
-			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-				"domains": [{"domain": "api.example.com", "name": "API", "is_delegated_zone": true}]
-			}`,
-			expectErr:   true,
-			errContains: "missing a mandatory 'root_zone' field",
-		},
-		{
 			name: "Mail Provider and MX Records Mutually Exclusive",
 			configJSON: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 				"domains": [{
 					"domain": "example.com",
 					"name": "Example",
-					"check_email_security": true,
-					"mail_provider": "google",
-					"mx_records": ["mail.example.com"]
+					"email": {"provider":"google","mx_records":["mail.example.com"]}
 				}]
 			}`,
 			expectErr:   true,
@@ -425,9 +409,8 @@ func TestIDNNormalizationAndAliasCase(t *testing.T) {
 			{
 				"domain": "münchen.de",
 				"name": "Munich Domain",
-				"expected_ns": ["ns1.münchen.de"],
-				"check_email_security": true,
-				"mx_records": ["mail.münchen.de"]
+				"nameservers": [{"hostname":"ns1.münchen.de"}],
+				"email": {"mx_records":["mail.münchen.de"]}
 			}
 		],
 		"dns_records": [
@@ -455,11 +438,11 @@ func TestIDNNormalizationAndAliasCase(t *testing.T) {
 	if d.Domain != "xn--mnchen-3ya.de" {
 		t.Errorf("Expected Punycode xn--mnchen-3ya.de, got %s", d.Domain)
 	}
-	if d.ExpectedNS[0] != "ns1.xn--mnchen-3ya.de" {
-		t.Errorf("Expected Punycode NS ns1.xn--mnchen-3ya.de, got %s", d.ExpectedNS[0])
+	if d.Nameservers[0].Hostname != "ns1.xn--mnchen-3ya.de" {
+		t.Errorf("Expected Punycode NS ns1.xn--mnchen-3ya.de, got %s", d.Nameservers[0].Hostname)
 	}
-	if d.MXRecords[0] != "mail.xn--mnchen-3ya.de" {
-		t.Errorf("Expected Punycode MX mail.xn--mnchen-3ya.de, got %s", d.MXRecords[0])
+	if d.Email.MXRecords[0] != "mail.xn--mnchen-3ya.de" {
+		t.Errorf("Expected Punycode MX mail.xn--mnchen-3ya.de, got %s", d.Email.MXRecords[0])
 	}
 
 	r := cfg.DNSRecords[0]
@@ -471,194 +454,138 @@ func TestIDNNormalizationAndAliasCase(t *testing.T) {
 	}
 }
 
-func TestConfig_RegistrarBothAllowed(t *testing.T) {
+func TestConfig_RegistrarNormalization(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-
-	// Both set -> config allows both
-	bothJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-		"domains": [
-			{
-				"domain": "example.com",
-				"name": "Both Registrar Fields Test",
-				"expected_registrar_id": "292",
-				"expected_registrar_name": "markmonitor"
-			}
-		]
-	}`
-	cfgPath := tmpDir + "/both_reg.json"
-	if err := os.WriteFile(cfgPath, []byte(bothJSON), 0644); err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
-	cfgBoth, err := LoadConfig(context.Background(), cfgPath)
-	if err != nil {
-		t.Fatalf("Expected config with both registrar fields to load successfully, got error: %v", err)
-	}
-	if cfgBoth.Domains[0].ExpectedRegistrarID != "292" {
-		t.Errorf("Expected ExpectedRegistrarID '292', got %q", cfgBoth.Domains[0].ExpectedRegistrarID)
-	}
-	if cfgBoth.Domains[0].ExpectedRegistrarName != "markmonitor" {
-		t.Errorf("Expected ExpectedRegistrarName 'markmonitor', got %q", cfgBoth.Domains[0].ExpectedRegistrarName)
-	}
-
-	// Only ID set -> valid
-	validIDJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-		"domains": [
-			{
-				"domain": "example.com",
-				"name": "Registrar ID Test",
-				"expected_registrar_id": "292"
-			}
-		]
-	}`
-	cfgPathID := tmpDir + "/valid_id.json"
-	_ = os.WriteFile(cfgPathID, []byte(validIDJSON), 0644)
-	cfgID, err := LoadConfig(context.Background(), cfgPathID)
-	if err != nil {
-		t.Fatalf("Expected valid config with only expected_registrar_id, got error: %v", err)
-	}
-	if cfgID.Domains[0].ExpectedRegistrarID != "292" {
-		t.Errorf("Expected ExpectedRegistrarID '292', got %q", cfgID.Domains[0].ExpectedRegistrarID)
-	}
-
-	// Only Name set -> valid
-	validNameJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-		"domains": [
-			{
-				"domain": "example.com",
-				"name": "Registrar Name Test",
-				"expected_registrar_name": "markmonitor"
-			}
-		]
-	}`
-	cfgPathName := tmpDir + "/valid_name.json"
-	_ = os.WriteFile(cfgPathName, []byte(validNameJSON), 0644)
-	cfgName, err := LoadConfig(context.Background(), cfgPathName)
-	if err != nil {
-		t.Fatalf("Expected valid config with only expected_registrar_name, got error: %v", err)
-	}
-	if cfgName.Domains[0].ExpectedRegistrarName != "markmonitor" {
-		t.Errorf("Expected ExpectedRegistrarName 'markmonitor', got %q", cfgName.Domains[0].ExpectedRegistrarName)
-	}
+	body := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"Registrar","registrar":" 292 "}]}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0600))
+	cfg, err := LoadConfig(context.Background(), path)
+	require.NoError(t, err)
+	assert.Equal(t, "292", cfg.Domains[0].Registrar)
 }
 
-func TestConfig_VerifyNSHealthRequirements(t *testing.T) {
+func TestConfig_NameserverRequirements(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
 
-	// 1. verify_ns_health: true but no expected_ns -> must error
-	invalidJSON1 := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
+	hiddenOnlyJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
-				"name": "No Expected NS Test",
-				"verify_ns_health": true,
-				"secondary_ns": ["slave.example.com"]
+				"name": "Hidden Only",
+				"nameservers": [{"hostname":"hidden.example.com","hidden":true}]
 			}
 		]
 	}`
-	cfgPath1 := tmpDir + "/invalid_ns_health1.json"
-	_ = os.WriteFile(cfgPath1, []byte(invalidJSON1), 0644)
+	cfgPath1 := tmpDir + "/hidden_only.json"
+	_ = os.WriteFile(cfgPath1, []byte(hiddenOnlyJSON), 0644)
 	_, err1 := LoadConfig(context.Background(), cfgPath1)
-	if err1 == nil || !strings.Contains(err1.Error(), "no primary expected_ns") {
-		t.Fatalf("Expected error when verify_ns_health is enabled without expected_ns, got: %v", err1)
+	if err1 == nil || !strings.Contains(err1.Error(), "at least one non-hidden") {
+		t.Fatalf("expected hidden-only nameservers to fail, got: %v", err1)
 	}
 
-	// 2. verify_ns_health: true with expected_ns but no secondary_ns -> valid (secondary_ns is optional)
-	validPrimaryOnlyJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-		"domains": [
-			{
-				"domain": "example.com",
-				"name": "Primary Only NS Health Test",
-				"expected_ns": ["ns1.example.com"],
-				"verify_ns_health": true
-			}
-		]
-	}`
-	cfgPath2 := tmpDir + "/valid_primary_only.json"
-	_ = os.WriteFile(cfgPath2, []byte(validPrimaryOnlyJSON), 0644)
-	cfg2, err2 := LoadConfig(context.Background(), cfgPath2)
-	if err2 != nil {
-		t.Fatalf("Expected valid config when secondary_ns is omitted, got error: %v", err2)
-	}
-	if len(cfg2.Domains[0].SecondaryNS) != 0 {
-		t.Errorf("Expected 0 secondary_ns, got %v", cfg2.Domains[0].SecondaryNS)
-	}
-
-	// 3. verify_ns_health: true with both expected_ns and secondary_ns -> valid
 	validJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
-				"name": "Valid Dual-DNS",
-				"expected_ns": ["ns1.example.com"],
-				"secondary_ns": ["slave.otherprovider.com"],
-				"verify_ns_health": true
+				"name": "Public And Hidden",
+				"nameservers": [
+					{"hostname":"NS1.EXAMPLE.COM."},
+					{"hostname":"hidden.example.com","hidden":true}
+				]
 			}
 		]
 	}`
-	cfgPath3 := tmpDir + "/valid_ns_health.json"
-	_ = os.WriteFile(cfgPath3, []byte(validJSON), 0644)
-	cfg3, err3 := LoadConfig(context.Background(), cfgPath3)
-	if err3 != nil {
-		t.Fatalf("Expected valid config with expected_ns and secondary_ns, got error: %v", err3)
+	cfgPath2 := tmpDir + "/valid_nameservers.json"
+	_ = os.WriteFile(cfgPath2, []byte(validJSON), 0644)
+	cfg2, err2 := LoadConfig(context.Background(), cfgPath2)
+	if err2 != nil {
+		t.Fatalf("expected valid nameserver config, got: %v", err2)
 	}
-	if len(cfg3.Domains[0].SecondaryNS) != 1 || cfg3.Domains[0].SecondaryNS[0] != "slave.otherprovider.com" {
-		t.Errorf("Expected secondary_ns 'slave.otherprovider.com', got %v", cfg3.Domains[0].SecondaryNS)
+	if got := cfg2.Domains[0].Nameservers; len(got) != 2 || got[0].Hostname != "ns1.example.com" || !got[1].Hidden {
+		t.Fatalf("unexpected normalized nameservers: %#v", got)
 	}
 
-	// 4. empty entry in expected_ns -> must error
-	emptyExpectedNSJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
+	emptyJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
 		"domains": [
 			{
 				"domain": "example.com",
-				"name": "Empty Expected NS Test",
-				"expected_ns": ["   "]
+				"name": "Empty Nameserver",
+				"nameservers": [{"hostname":"   "}]
 			}
 		]
 	}`
-	cfgPath4 := tmpDir + "/empty_expected_ns.json"
-	_ = os.WriteFile(cfgPath4, []byte(emptyExpectedNSJSON), 0644)
+	cfgPath3 := tmpDir + "/empty_nameserver.json"
+	_ = os.WriteFile(cfgPath3, []byte(emptyJSON), 0644)
+	_, err3 := LoadConfig(context.Background(), cfgPath3)
+	if err3 == nil || !strings.Contains(err3.Error(), "empty nameserver hostname") {
+		t.Fatalf("expected empty hostname error, got: %v", err3)
+	}
+
+	duplicateJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
+		"domains": [
+			{
+				"domain": "example.com",
+				"name": "Duplicate Nameserver",
+				"nameservers": [
+					{"hostname":"ns1.example.com"},
+					{"hostname":"NS1.EXAMPLE.COM.","hidden":true}
+				]
+			}
+		]
+	}`
+	cfgPath4 := tmpDir + "/duplicate_nameserver.json"
+	_ = os.WriteFile(cfgPath4, []byte(duplicateJSON), 0644)
 	_, err4 := LoadConfig(context.Background(), cfgPath4)
-	if err4 == nil || !strings.Contains(err4.Error(), "empty entry in expected_ns") {
-		t.Fatalf("Expected error for empty entry in expected_ns, got: %v", err4)
+	if err4 == nil || !strings.Contains(err4.Error(), "duplicate nameserver") {
+		t.Fatalf("expected duplicate hostname error, got: %v", err4)
 	}
+}
 
-	// 5. empty entry in secondary_ns -> must error
-	emptySecondaryNSJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-		"domains": [
-			{
-				"domain": "example.com",
-				"name": "Empty Secondary NS Test",
-				"expected_ns": ["ns1.example.com"],
-				"secondary_ns": [""]
-			}
-		]
-	}`
-	cfgPath5 := tmpDir + "/empty_secondary_ns.json"
-	_ = os.WriteFile(cfgPath5, []byte(emptySecondaryNSJSON), 0644)
-	_, err5 := LoadConfig(context.Background(), cfgPath5)
-	if err5 == nil || !strings.Contains(err5.Error(), "empty entry in secondary_ns") {
-		t.Fatalf("Expected error for empty entry in secondary_ns, got: %v", err5)
+func TestConfigRejectsMalformedDomainEndpoints(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, domainField, want string
+	}{
+		{"invalid nameserver", `"nameservers":[{"hostname":"ns.example.com/path"}]`, "invalid nameserver"},
+		{"invalid root zone", `"root_zone":"bad zone"`, "invalid root zone"},
+		{"empty expected MX", `"email":{"mx_records":[" "]}`, "invalid expected MX"},
+		{"invalid DKIM selector", `"email":{"dkim_selectors":["bad selector"]}`, "invalid DKIM selector"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"sub.example.com","name":"Test",` + tc.domainField + `}]}`
+			cfgPath := filepath.Join(t.TempDir(), "config.json")
+			require.NoError(t, os.WriteFile(cfgPath, []byte(body), 0600))
+			_, err := LoadConfig(context.Background(), cfgPath)
+			require.ErrorContains(t, err, tc.want)
+		})
 	}
+}
 
-	// 6. secondary_ns configured but no expected_ns -> must error
-	secondaryNoExpectedJSON := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},
-		"domains": [
-			{
-				"domain": "example.com",
-				"name": "Secondary Without Expected Test",
-				"secondary_ns": ["b.iana-servers.net"]
-			}
-		]
-	}`
-	cfgPath6 := tmpDir + "/secondary_no_expected.json"
-	_ = os.WriteFile(cfgPath6, []byte(secondaryNoExpectedJSON), 0644)
-	_, err6 := LoadConfig(context.Background(), cfgPath6)
-	if err6 == nil || !strings.Contains(err6.Error(), "no primary expected_ns configured") {
-		t.Fatalf("Expected error for secondary_ns without expected_ns, got: %v", err6)
+func TestConfig_RejectsRemovedDomainFields(t *testing.T) {
+	t.Parallel()
+
+	for _, field := range []string{
+		`"expected_ns":["ns1.example.com"]`,
+		`"secondary_ns":["ns2.example.com"]`,
+		`"verify_ns_health":false`,
+		`"check_email_security":false`,
+		`"mail_provider":"google"`,
+		`"mx_records":["mail.example.com"]`,
+		`"dkim_selectors":["default"]`,
+		`"is_delegated_zone":false`,
+		`"unused":false`,
+		`"expected_registrar_id":"292"`,
+		`"expected_registrar_name":"example"`,
+	} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		body := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example",` + field + `}]}`
+		require.NoError(t, os.WriteFile(path, []byte(body), 0600))
+		_, err := LoadConfig(context.Background(), path)
+		require.ErrorContains(t, err, "removed configuration fields")
 	}
 }
 
@@ -996,17 +923,16 @@ func TestConfigSnapshotOwnsNestedData(t *testing.T) {
 	config := AppConfig{
 		Resolvers:     []string{"1.1.1.1"},
 		Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}},
-		Domains:       []DomainConfig{{Domain: "example.com", ExpectedNS: []string{"ns.example.com"}, SecondaryNS: []string{"secondary.example.com"}, MXRecords: []string{"mail.example.com"}, DKIMSelectors: []string{"selector"}}},
+		Domains:       []DomainConfig{{Domain: "example.com", Nameservers: []NameserverConfig{{Hostname: "ns.example.com"}, {Hostname: "hidden.example.com", Hidden: true}}, Email: &EmailConfig{MXRecords: []string{"mail.example.com"}, DKIMSelectors: []string{"selector"}}}},
 		DNSRecords:    []DNSTask{{Expected: StringList{"192.0.2.1"}}},
 	}
 	app := NewAppState(config)
 	original := app.Config()
 	mutate := func(snapshot AppConfig) {
 		snapshot.Resolvers[0] = "8.8.8.8"
-		snapshot.Domains[0].ExpectedNS[0] = "changed.example"
-		snapshot.Domains[0].SecondaryNS[0] = "changed.example"
-		snapshot.Domains[0].MXRecords[0] = "changed.example"
-		snapshot.Domains[0].DKIMSelectors[0] = "changed"
+		snapshot.Domains[0].Nameservers[0].Hostname = "changed.example"
+		snapshot.Domains[0].Email.MXRecords[0] = "changed.example"
+		snapshot.Domains[0].Email.DKIMSelectors[0] = "changed"
 
 		snapshot.DNSRecords[0].Expected[0] = "192.0.2.2"
 		snapshot.Notifications.Ntfy.URL = "https://changed.invalid"
@@ -1096,7 +1022,7 @@ func TestExternalEmailProviderValidation(t *testing.T) {
 	}
 	_, err := InitializeApp(context.Background(), AppConfig{EmailProvidersDir: filepath.Join(t.TempDir(), "missing")})
 	require.Error(t, err)
-	_, err = InitializeApp(context.Background(), AppConfig{Domains: []DomainConfig{{Domain: "example.com", CheckEmailSecurity: true, MailProvider: "unknown"}}})
+	_, err = InitializeApp(context.Background(), AppConfig{Domains: []DomainConfig{{Domain: "example.com", Email: &EmailConfig{Provider: "unknown"}}}})
 	require.ErrorContains(t, err, "unknown mail provider")
 }
 
@@ -1138,8 +1064,8 @@ func TestLoadConfigAdditionalValidationFailures(t *testing.T) {
 	}
 	for _, tc := range []struct{ name, checks, want string }{
 		{"duplicate names", `"domains":[{"domain":"one.example","name":"same"},{"domain":"two.example","name":"same"}]`, "duplicate"},
-		{"health without primary", `"domains":[{"domain":"example.com","name":"example","verify_ns_health":true}]`, "expected_ns"},
-		{"wrong parent zone", `"domains":[{"domain":"example.com","name":"example","is_delegated_zone":true,"root_zone":"example.org"}]`, "root zone"},
+		{"hidden nameserver only", `"domains":[{"domain":"example.com","name":"example","nameservers":[{"hostname":"hidden.example","hidden":true}]}]`, "non-hidden"},
+		{"wrong parent zone", `"domains":[{"domain":"example.com","name":"example","root_zone":"example.org"}]`, "root zone"},
 		{"invalid resolver port", `"dns_records":[{"hostname":"example.com","name":"web","type":"A","expected":[],"custom_resolver":"192.0.2.1:0"}]`, "resolver"},
 		{"invalid IPv6", `"dns_records":[{"hostname":"example.com","name":"web","type":"AAAA","expected":["invalid"]}]`, "IPv6"},
 		{"invalid IP", `"dns_records":[{"hostname":"example.com","name":"web","type":"IP","expected":["invalid"]}]`, "IP"},

@@ -50,14 +50,13 @@ func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte,
 	if err := jsonv2.Unmarshal(jsonBytes, &rawCfg); err != nil {
 		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
-	// unused and allow_expiry are equivalent configuration keys.
-	var aliases configAliases
-	if err := jsonv2.Unmarshal(jsonBytes, &aliases); err != nil {
+	var removed removedConfigFields
+	if err := jsonv2.Unmarshal(jsonBytes, &removed); err != nil {
 		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
 	for i := range rawCfg.Domains {
-		if i < len(aliases.Domains) && aliases.Domains[i].AllowExpiry {
-			rawCfg.Domains[i].Unused = true
+		if i < len(removed.Domains) && removed.Domains[i].hasAny() {
+			return AppConfig{}, fmt.Errorf(MsgErrRemovedDomainConfig, rawCfg.Domains[i].Domain)
 		}
 	}
 
@@ -70,6 +69,13 @@ func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte,
 	}
 	applyLoopIntervalBounds(&rawCfg)
 	return rawCfg, nil
+}
+
+func (r removedDomainFields) hasAny() bool {
+	return r.ExpectedNS != nil || r.SecondaryNS != nil || r.VerifyNSHealth != nil ||
+		r.CheckEmailSecurity != nil || r.MailProvider != nil || r.MXRecords != nil ||
+		r.DKIMSelectors != nil || r.IsDelegatedZone != nil || r.Unused != nil ||
+		r.ExpectedRegistrarID != nil || r.ExpectedRegistrarName != nil
 }
 
 func applyConfigOverrides(rawCfg *AppConfig) {
@@ -338,19 +344,26 @@ func normalizeDomainName(domainCfg *DomainConfig, i int, seenDomains map[string]
 }
 
 func normalizeDomainNameservers(domainCfg *DomainConfig) error {
-	for j := range domainCfg.ExpectedNS {
-		nsClean := NormalizeDomainToASCIIText(domainCfg.ExpectedNS[j])
+	seen := make(map[string]bool, len(domainCfg.Nameservers))
+	hasAnswering := false
+	for j := range domainCfg.Nameservers {
+		nameserver := &domainCfg.Nameservers[j]
+		nsClean := NormalizeDomainToASCIIText(nameserver.Hostname)
 		if nsClean == StrEmpty {
-			return fmt.Errorf(MsgErrDomainEmptyExpectedNS, domainCfg.Domain, j)
+			return fmt.Errorf(MsgErrDomainEmptyNameserver, domainCfg.Domain, j)
 		}
-		domainCfg.ExpectedNS[j] = nsClean
+		if !ReValidDomain.MatchString(nsClean) || len(nsClean) > 253 {
+			return fmt.Errorf(MsgErrDomainInvalidNameserver, domainCfg.Domain, strconv.Quote(nsClean))
+		}
+		if seen[nsClean] {
+			return fmt.Errorf(MsgErrDomainDuplicateNameserver, domainCfg.Domain, nsClean)
+		}
+		seen[nsClean] = true
+		nameserver.Hostname = nsClean
+		hasAnswering = hasAnswering || !nameserver.Hidden
 	}
-	for j := range domainCfg.SecondaryNS {
-		nsClean := NormalizeDomainToASCIIText(domainCfg.SecondaryNS[j])
-		if nsClean == StrEmpty {
-			return fmt.Errorf(MsgErrDomainEmptySecondaryNS, domainCfg.Domain, j)
-		}
-		domainCfg.SecondaryNS[j] = nsClean
+	if len(domainCfg.Nameservers) > 0 && !hasAnswering {
+		return fmt.Errorf(MsgErrDomainNeedsAnsweringNameserver, domainCfg.Domain)
 	}
 	return nil
 }
@@ -364,27 +377,16 @@ func normalizeDomainMetadata(domainCfg *DomainConfig, seenDomainNames map[string
 	}
 	seenDomainNames[domainCfg.Name] = true
 
-	domainCfg.ExpectedRegistrarID = strings.TrimSpace(domainCfg.ExpectedRegistrarID)
-	domainCfg.ExpectedRegistrarName = strings.TrimSpace(domainCfg.ExpectedRegistrarName)
+	domainCfg.Registrar = strings.TrimSpace(domainCfg.Registrar)
 
 	if domainCfg.RenewalPrice < 0 {
 		return fmt.Errorf(MsgErrDomainNegativeRenewalPrice, domainCfg.Domain)
 	}
 
-	if len(domainCfg.SecondaryNS) > 0 && len(domainCfg.ExpectedNS) == 0 {
-		return fmt.Errorf(MsgErrSecondaryNSWithoutPrimary, domainCfg.Domain)
-	}
-
-	if domainCfg.VerifyNSHealth {
-		if len(domainCfg.ExpectedNS) == 0 {
-			return fmt.Errorf(MsgErrVerifyNSHealthWithoutPrimary, domainCfg.Domain)
-		}
-	}
-
-	if domainCfg.IsDelegatedZone {
-		domainCfg.RootZone = NormalizeDomainToASCIIText(domainCfg.RootZone)
-		if domainCfg.RootZone == StrEmpty {
-			return fmt.Errorf(MsgErrDelegatedMissingRootZone, domainCfg.Domain)
+	domainCfg.RootZone = NormalizeDomainToASCIIText(domainCfg.RootZone)
+	if domainCfg.isDelegatedZone() {
+		if !ReValidDomain.MatchString(domainCfg.RootZone) || len(domainCfg.RootZone) > 253 {
+			return fmt.Errorf(MsgErrDomainInvalidRootZone, domainCfg.Domain, strconv.Quote(domainCfg.RootZone))
 		}
 		if !strings.HasSuffix(domainCfg.Domain, SymDot+domainCfg.RootZone) {
 			return fmt.Errorf(MsgErrRootZoneIsNotA, domainCfg.RootZone, domainCfg.Domain)
@@ -394,23 +396,31 @@ func normalizeDomainMetadata(domainCfg *DomainConfig, seenDomainNames map[string
 }
 
 func normalizeDomainEmail(domainCfg *DomainConfig) error {
-	if domainCfg.CheckEmailSecurity {
-		if domainCfg.MailProvider != StrEmpty && len(domainCfg.MXRecords) > 0 {
+	if domainCfg.Email != nil {
+		email := domainCfg.Email
+		if email.Provider != StrEmpty && len(email.MXRecords) > 0 {
 			return fmt.Errorf(MsgErrMailProviderAndMXMutuallyExclusive, domainCfg.Domain)
 		}
-		domainCfg.MailProvider = strings.ToLower(strings.TrimSpace(domainCfg.MailProvider))
-		for j := range domainCfg.MXRecords {
-			rawMX := strings.TrimSpace(domainCfg.MXRecords[j])
+		email.Provider = strings.ToLower(strings.TrimSpace(email.Provider))
+		for j := range email.MXRecords {
+			rawMX := strings.TrimSpace(email.MXRecords[j])
 			var mxClean string
 			if rawMX == NullMXRecord {
 				mxClean = NullMXRecord
 			} else {
 				mxClean = NormalizeDomainToASCIIText(rawMX)
 			}
-			domainCfg.MXRecords[j] = mxClean
+			if mxClean != NullMXRecord && (!ReValidDomain.MatchString(mxClean) || len(mxClean) > 253) {
+				return fmt.Errorf(MsgErrDomainInvalidMX, domainCfg.Domain, strconv.Quote(mxClean))
+			}
+			email.MXRecords[j] = mxClean
 		}
-		for j := range domainCfg.DKIMSelectors {
-			domainCfg.DKIMSelectors[j] = strings.ToLower(strings.TrimSpace(domainCfg.DKIMSelectors[j]))
+		for j := range email.DKIMSelectors {
+			selector := strings.ToLower(strings.TrimSpace(email.DKIMSelectors[j]))
+			if !ReValidDomain.MatchString(selector+ValidationDomainSuffix) || len(selector) > 200 {
+				return fmt.Errorf(MsgErrDomainInvalidDKIMSelector, domainCfg.Domain, strconv.Quote(selector))
+			}
+			email.DKIMSelectors[j] = selector
 		}
 	}
 
@@ -594,9 +604,9 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 		return nil, err
 	}
 	for _, domain := range app.configuration().Domains {
-		if domain.CheckEmailSecurity && domain.MailProvider != StrEmpty {
-			if _, known := providers[domain.MailProvider]; !known {
-				return nil, fmt.Errorf(MsgErrUnknownMailProviderFor, domain.MailProvider, domain.Domain)
+		if domain.Email != nil && domain.Email.Provider != StrEmpty {
+			if _, known := providers[domain.Email.Provider]; !known {
+				return nil, fmt.Errorf(MsgErrUnknownMailProviderFor, domain.Email.Provider, domain.Domain)
 			}
 		}
 	}

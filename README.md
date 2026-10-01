@@ -41,10 +41,13 @@ Changes require a restart.
     {
       "domain": "example.com",
       "name": "Prod Domain",
-      "expected_ns": ["ns1.example.com", "ns2.example.com"],
-      "expected_registrar_id": "292",
+      "nameservers": [
+        {"hostname": "ns1.example.com"},
+        {"hostname": "hidden-ns.example.com", "hidden": true}
+      ],
+      "registrar": "292",
       "domain_transfer_locked": true,
-      "check_email_security": true,
+      "email": {"provider": "google"},
       "dnssec": true
     }
   ],
@@ -123,7 +126,7 @@ Provider files use the filename as the provider name, for example `custom.json`:
 
 MX entries are normalized hostname suffixes, matched at label boundaries. At
 least one MX suffix is required. DKIM selectors may be omitted when no default
-selector is known. Set `mail_provider` to `custom` to use this definition. Provider
+selector is known. Set `email.provider` to `custom` to use this definition. Provider
 files are read once; changes require a restart.
 
 ### Domain Options (`domains[]`)
@@ -131,34 +134,32 @@ files are read once; changes require a restart.
 | Parameter | Type | Required | Description |
 | :--- | :--- | :---: | :--- |
 | `domain` | string | **Yes** | Valid domain name to monitor (e.g. `"example.com"`), normalized to ASCII and limited to 253 bytes. |
-| `name` | string | **Yes** | Human-readable identifier. |
-| `expected_ns` | array | No | Expected primary authoritative nameservers, including redundant primaries. Every entry has the configured primary role. |
-| `secondary_ns` | array | No | Explicit secondary (slave) nameservers expected to replicate the zone. Other primary entries are never inferred to be secondary. |
-| `is_delegated_zone`| bool | No | Set to `true` for subzones; queries authoritative NS directly. |
-| `root_zone` | string | Cond. | Mandatory when `is_delegated_zone: true`. |
-| `check_email_security` | bool | No | Enables SPF, DMARC, DKIM, and MX integrity monitoring. |
-| `mail_provider` | string | No | Pre-configured mail provider name. |
-| `mx_records` | array | No | Explicit expected MX records. |
-| `dkim_selectors` | array | No | Custom DKIM selector prefixes to query. |
+| `name` | string | **Yes** | Privacy-safe identifier used in notifications instead of sending the domain name to notification providers. |
+| `nameservers` | array | No | Authoritative nameservers to validate and health-check. Each entry contains `hostname` and optional `hidden`; omitted `hidden` defaults to `false`. |
+| `root_zone` | string | No | Parent zone for a delegated subzone. Its presence marks the domain as delegated and enables direct authoritative queries. |
+| `email` | object | No | Its presence enables MX, SPF, DMARC, and DKIM monitoring. Optional fields are `provider`, `mx_records`, and `dkim_selectors`; use `{}` for baseline checks without an expected provider or MX set. `provider` and `mx_records` are mutually exclusive. |
 | `dnssec` | bool | No | Enables 2-tier local cryptographic and upstream DoH DNSSEC validation. |
 | `caa` | object | No | CAA validation policy (`issue`, `issuewild`, `issuemail`). |
-| `expected_registrar_id` | string | No | Expected IANA Registrar ID (e.g. `"292"`). |
-| `expected_registrar_name` | string | No | Expected registrar name when name matching is needed. |
+| `registrar` | string | No | Expected registrar. A numeric value matches the IANA Registrar ID (e.g. `"292"`); any other value matches the registrar name. |
 | `domain_transfer_locked` | bool | No | Alert if the domain transfer lock is missing. |
 | `renewal_price` | float | No | Manual renewal price override (e.g. for premium domains or custom contracts). If omitted or `0`, the daemon looks for a renewal price in the DotSweep TLD catalog; unavailable prices remain unknown. |
-| `unused` | bool | No | Allows the domain to expire without expiry alerts and keeps it in the separate Allowed to Expire dashboard section. The daemon continues gathering, displaying, and validating it normally until RDAP confirms expiration or absence, then suppresses its dependent checks and alerts. RDAP continues so re-registration reactivates the other checks. |
-| `allow_expiry` | bool | No | Exact alias of `unused`; both keys have identical runtime behavior. |
-| `verify_ns_health` | bool | No | Queries primary/secondary NS for reachability and SOA consistency. |
+| `allow_expiry` | bool | No | Allows the domain to expire without expiry alerts and keeps it in the separate Allowed to Expire dashboard section. The daemon continues gathering, displaying, and validating it normally until RDAP confirms expiration or absence, then suppresses its dependent checks and alerts. RDAP continues so re-registration reactivates the other checks. |
 | `suppress_alerts` | bool | No | Mutes notification alerts for this domain. |
 
-Nameserver roles come from configuration, not DNS responses or list order.
-The first `expected_ns` is the comparison reference; additional entries remain
-primaries. Only `secondary_ns` entries are labeled secondary (slave). If a server
-appears in both lists, it is checked once as primary. Health checks compare
-authority, SOA serials, and optional DNSKEY evidence; matching answers do not
-prove that zone transfer or replication is working. The dashboard count is the
-number of distinct configured nameservers queried, including failed attempts;
-it does not count nameservers discovered from DNS.
+When `nameservers` is non-empty, every entry is queried directly for authoritative
+SOA and optional DNSKEY evidence. Non-hidden entries must appear in public
+delegation; hidden entries must not. Public delegation containing an unconfigured
+server also fails validation. At least one non-hidden server is required, and
+hostnames must be unique. A differing SOA serial is reported as a synchronization
+mismatch because the monitor does not infer primary/secondary roles or perform
+zone transfers. Omit `nameservers` to disable expected-delegation and direct
+nameserver-health validation.
+
+The former `expected_ns`, `secondary_ns`, `verify_ns_health`,
+`check_email_security`, `mail_provider`, `mx_records`, `dkim_selectors`,
+`is_delegated_zone`, `unused`, `expected_registrar_id`, and
+`expected_registrar_name` fields are no longer supported; startup rejects
+configurations that still contain them.
 
 CAA tag lists distinguish omission from explicit denial. For example,
 `"caa": {"issue": ["ca.example"], "issuewild": []}` expects the configured issuer

@@ -63,48 +63,47 @@ func TestRDAPValidation(t *testing.T) {
 
 	tests := []struct {
 		name          string
-		targetNS      []string
-		secondaryNS   []string
+		nameservers   []NameserverConfig
 		liveNS        []string
 		expectUnauth  bool
 		expectMissing bool
+		expectHidden  bool
 	}{
 		{
 			name:          "Perfect Match",
-			targetNS:      []string{"ns1.example.com", "ns2.example.com"},
+			nameservers:   []NameserverConfig{{Hostname: "ns1.example.com"}, {Hostname: "ns2.example.com"}},
 			liveNS:        []string{"ns1.example.com", "ns2.example.com"},
 			expectUnauth:  false,
 			expectMissing: false,
 		},
 		{
 			name:          "Missing NS",
-			targetNS:      []string{"ns1.example.com", "ns2.example.com"},
+			nameservers:   []NameserverConfig{{Hostname: "ns1.example.com"}, {Hostname: "ns2.example.com"}},
 			liveNS:        []string{"ns1.example.com"},
 			expectUnauth:  false,
 			expectMissing: true,
 		},
 		{
 			name:          "Unauthorized NS",
-			targetNS:      []string{"ns1.example.com"},
+			nameservers:   []NameserverConfig{{Hostname: "ns1.example.com"}},
 			liveNS:        []string{"ns1.example.com", "rogue.ns.com"},
 			expectUnauth:  true,
 			expectMissing: false,
 		},
 		{
-			name:          "Secondary/Slave NS Authorized At Registrar",
-			targetNS:      []string{"ns1.example.com", "ns2.example.com"},
-			secondaryNS:   []string{"slave1.example.com", "slave2.example.com"},
-			liveNS:        []string{"ns1.example.com", "ns2.example.com", "slave1.example.com", "slave2.example.com"},
+			name:          "Hidden NS Stays Out Of Delegation",
+			nameservers:   []NameserverConfig{{Hostname: "ns1.example.com"}, {Hostname: "hidden.example.com", Hidden: true}},
+			liveNS:        []string{"ns1.example.com"},
 			expectUnauth:  false,
 			expectMissing: false,
 		},
 		{
-			name:          "Unauthorized NS Even With Secondary NS Configured",
-			targetNS:      []string{"ns1.example.com"},
-			secondaryNS:   []string{"slave.example.com"},
-			liveNS:        []string{"ns1.example.com", "slave.example.com", "rogue.ns.com"},
-			expectUnauth:  true,
+			name:          "Hidden NS Exposed",
+			nameservers:   []NameserverConfig{{Hostname: "ns1.example.com"}, {Hostname: "hidden.example.com", Hidden: true}},
+			liveNS:        []string{"ns1.example.com", "hidden.example.com"},
+			expectUnauth:  false,
 			expectMissing: false,
+			expectHidden:  true,
 		},
 	}
 
@@ -115,8 +114,7 @@ func TestRDAPValidation(t *testing.T) {
 			target := DomainConfig{
 				Domain:      "example.com",
 				Name:        "Example",
-				ExpectedNS:  tt.targetNS,
-				SecondaryNS: tt.secondaryNS,
+				Nameservers: tt.nameservers,
 			}
 
 			snapshot := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
@@ -128,6 +126,7 @@ func TestRDAPValidation(t *testing.T) {
 
 			unauthAlert := !cond.IsZero() && cond.Code == CodeUnauthorizedNS
 			missingAlert := !cond.IsZero() && cond.Code == CodeExpectedNSMissing
+			hiddenAlert := !cond.IsZero() && cond.Code == CodeNSHiddenExposed
 
 			if unauthAlert != tt.expectUnauth {
 				t.Errorf("Expected Unauth alert=%v, got %v", tt.expectUnauth, unauthAlert)
@@ -135,8 +134,11 @@ func TestRDAPValidation(t *testing.T) {
 			if missingAlert != tt.expectMissing {
 				t.Errorf("Expected Missing alert=%v, got %v", tt.expectMissing, missingAlert)
 			}
+			if hiddenAlert != tt.expectHidden {
+				t.Errorf("Expected Hidden alert=%v, got %v", tt.expectHidden, hiddenAlert)
+			}
 			expectedStatus := StatusOK
-			if tt.expectUnauth || tt.expectMissing {
+			if tt.expectUnauth || tt.expectMissing || tt.expectHidden {
 				expectedStatus = StatusFailed
 			}
 			if status != expectedStatus {
@@ -402,7 +404,7 @@ func TestValidateRDAPStateAlertsAndStatus(t *testing.T) {
 	target := DomainConfig{
 		Domain:         "example.com",
 		Name:           "Example Domain",
-		ExpectedNS:     []string{"ns1.example.com", "ns2.example.com"},
+		Nameservers:    []NameserverConfig{{Hostname: "ns1.example.com"}, {Hostname: "ns2.example.com"}},
 		SuppressAlerts: false,
 	}
 
@@ -436,7 +438,7 @@ func TestValidateRDAPState_SuppressAlertsStoresSnapshot(t *testing.T) {
 	target := DomainConfig{
 		Domain:         "suppressed.example.com",
 		Name:           "Suppressed Domain",
-		ExpectedNS:     []string{"ns1.example.com"},
+		Nameservers:    []NameserverConfig{{Hostname: "ns1.example.com"}},
 		SuppressAlerts: true,
 	}
 
@@ -457,10 +459,10 @@ func TestValidateRDAPState_SuppressAlertsStoresSnapshot(t *testing.T) {
 func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 	t.Parallel()
 
-	// 1. ExpectedRegistrarID Match
+	// 1. Registrar ID match
 	target1 := DomainConfig{
-		Domain:              "example.com",
-		ExpectedRegistrarID: "292",
+		Domain:    "example.com",
+		Registrar: "292",
 	}
 	snapshot1 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:       "MarkMonitor Inc.",
@@ -475,10 +477,10 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		t.Errorf("Expected no mismatch")
 	}
 
-	// 2. ExpectedRegistrarID Mismatch
+	// 2. Registrar ID mismatch
 	target2 := DomainConfig{
-		Domain:              "example.com",
-		ExpectedRegistrarID: "292",
+		Domain:    "example.com",
+		Registrar: "292",
 	}
 	snapshot2 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:       "Other Registrar LLC",
@@ -493,10 +495,10 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		t.Errorf("Expected mismatch condition")
 	}
 
-	// 3. ExpectedRegistrarName Match (case-insensitive substring)
+	// 3. Registrar name match (case-insensitive substring)
 	target3 := DomainConfig{
-		Domain:                "example.com",
-		ExpectedRegistrarName: "markmonitor",
+		Domain:    "example.com",
+		Registrar: "markmonitor",
 	}
 	snapshot3 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:    "MarkMonitor, Inc.",
@@ -510,10 +512,10 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		t.Errorf("Expected no mismatch")
 	}
 
-	// 4. ExpectedRegistrarName Mismatch
+	// 4. Registrar name mismatch
 	target4 := DomainConfig{
-		Domain:                "example.com",
-		ExpectedRegistrarName: "markmonitor",
+		Domain:    "example.com",
+		Registrar: "markmonitor",
 	}
 	snapshot4 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
 		Registrar:    "GoDaddy.com, LLC",
@@ -524,44 +526,6 @@ func TestValidateRDAPState_RegistrarValidation(t *testing.T) {
 		t.Errorf("Expected StatusFailed, got %s", status4)
 	}
 	if cond4.IsZero() || cond4.Code != CodeRDAPRegistrarMismatch {
-		t.Errorf("Expected mismatch condition")
-	}
-
-	// 5. Both set: Priority 1 (ID) matches, while Priority 2 (Name) would mismatch -> Passes on prioritized ID
-	target5 := DomainConfig{
-		Domain:                "example.com",
-		ExpectedRegistrarID:   "292",
-		ExpectedRegistrarName: "godaddy", // Name would mismatch, but ID 292 matches!
-	}
-	snapshot5 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
-		Registrar:       "MarkMonitor Inc.",
-		RegistrarIANAID: "292",
-		DomainStatus:    []string{"clientTransferProhibited"},
-	}
-	status5, cond5 := EvaluateRDAP(target5, snapshot5)
-	if status5 != StatusOK {
-		t.Errorf("Expected StatusOK, got %s", status5)
-	}
-	if !cond5.IsZero() && cond5.Code == CodeRDAPRegistrarMismatch {
-		t.Errorf("Expected no mismatch")
-	}
-
-	// 6. Both set: Priority 1 (ID) mismatches, even though Priority 2 (Name) matches -> Fails on prioritized ID
-	target6 := DomainConfig{
-		Domain:                "example.com",
-		ExpectedRegistrarID:   "999",         // ID mismatches
-		ExpectedRegistrarName: "markmonitor", // Name matches
-	}
-	snapshot6 := RDAPSnapshot{Expiration: time.Now().AddDate(1, 0, 0).Format(time.RFC3339),
-		Registrar:       "MarkMonitor Inc.",
-		RegistrarIANAID: "292",
-		DomainStatus:    []string{"clientTransferProhibited"},
-	}
-	status6, cond6 := EvaluateRDAP(target6, snapshot6)
-	if status6 != StatusFailed {
-		t.Errorf("Expected StatusFailed, got %s", status6)
-	}
-	if cond6.IsZero() || cond6.Code != CodeRDAPRegistrarMismatch {
 		t.Errorf("Expected mismatch condition")
 	}
 }
@@ -1791,7 +1755,7 @@ func TestEvaluateRDAP_ExpiryEvidence(t *testing.T) {
 }
 
 func TestEvaluateRDAP_AllowedExpiryPolicy(t *testing.T) {
-	target := DomainConfig{Domain: "example.com", Unused: true}
+	target := DomainConfig{Domain: "example.com", AllowExpiry: true}
 
 	status, condition := EvaluateRDAP(target, RDAPSnapshot{
 		Expiration:   time.Now().Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339),
@@ -1840,8 +1804,8 @@ func TestEvaluateRDAP(t *testing.T) {
 		Notifier: &NotificationManager{},
 	}
 	target := DomainConfig{
-		Domain:     "example.com",
-		ExpectedNS: []string{"ns1.example.com"},
+		Domain:      "example.com",
+		Nameservers: []NameserverConfig{{Hostname: "ns1.example.com"}},
 	}
 
 	// Fast fail because RDAP needs a bootstrap server
@@ -1982,8 +1946,8 @@ func TestEvaluateNSDelegation(t *testing.T) {
 		Notifier: &NotificationManager{},
 	}
 	target := DomainConfig{
-		Domain:     "example.com",
-		ExpectedNS: []string{"ns1.example.com", "ns2.example.com"},
+		Domain:      "example.com",
+		Nameservers: []NameserverConfig{{Hostname: "ns1.example.com"}, {Hostname: "ns2.example.com"}},
 	}
 
 	snapshot := FetchNSDelegationSnapshot(context.Background(), app, target)
@@ -2081,7 +2045,7 @@ func TestParentDelegationRejectsWrongAnswerOwner(t *testing.T) {
 		response.Answer = []dns.RR{record}
 		return response, 0, nil
 	}}
-	target := DomainConfig{Domain: "example.com", ExpectedNS: []string{"ns1.example.com"}}
+	target := DomainConfig{Domain: "example.com", Nameservers: []NameserverConfig{{Hostname: "ns1.example.com"}}}
 	snapshot := FetchNSDelegationSnapshot(context.Background(), app, target)
 	assert.Empty(t, snapshot.Nameservers)
 	status, condition := EvaluateNSDelegation(target, snapshot)

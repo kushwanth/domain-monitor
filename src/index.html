@@ -1415,16 +1415,19 @@
         }
 
         let nsHealthHtml = '';
-        if (nsHealthState && (nsHealthState.servers || nsHealthState.primary)) {
+        if (nsHealthState && nsHealthState.servers) {
           const isNSPending = !nsHealthState.servers || nsHealthState.servers.length === 0;
           const statusText = isNSPending ? 'Pending' : (nsHealthState.valid ? 'In Sync' : 'Issues Detected');
           const statusClass = isNSPending ? 'text-warning' : (nsHealthState.valid ? 'text-success' : 'text-error');
           const serverCount = nsHealthState.servers ? nsHealthState.servers.length : 0;
+          const hiddenServerCount = nsHealthState.servers ? nsHealthState.servers.filter(server => server.hidden).length : 0;
+          const answeringServerCount = serverCount - hiddenServerCount;
           nsHealthHtml = `
             <div class="detail-panel">
               <h3>Nameserver Health</h3>
               <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value emphasis ${statusClass}">${statusText}</div></div>
               <div class="detail-row"><div class="detail-label">Configured NS checked:</div><div class="detail-value">${isNSPending ? 'Query Pending' : serverCount}</div></div>
+              ${isNSPending ? '' : `<div class="detail-row"><div class="detail-label">Answering / Hidden:</div><div class="detail-value">${answeringServerCount} / ${hiddenServerCount}</div></div>`}
               ${rdapState.source ? `<div class="detail-row"><div class="detail-label">Lookup Source:</div><div class="detail-value text-uppercase lookup-source">${escapeHTML(rdapState.source)}</div></div>` : ''}
             </div>
           `;

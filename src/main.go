@@ -26,7 +26,7 @@ var indexHTML []byte
 
 func storePublishedState(app *AppState, body []byte) {
 	digest := sha256.Sum256(body)
-	app.publishedState.Store(&publishedState{body: body, etag: `"` + hex.EncodeToString(digest[:]) + `"`})
+	app.publishedState.Store(&publishedState{body: body, etag: SymDoubleQuote + hex.EncodeToString(digest[:]) + SymDoubleQuote})
 }
 
 func securityHeadersMiddleware(next http.Handler) http.Handler {
@@ -187,11 +187,11 @@ func gatherDomainEvidence(ctx context.Context, app *AppState, domain DomainConfi
 		}
 	}()
 	evidence.email = FetchEmailSnapshot(ctx, app, domain)
-	if domain.IsDelegatedZone {
+	if domain.isDelegatedZone() {
 		evidence.delegation = FetchNSDelegationSnapshot(ctx, app, domain)
 	}
 	evidence.dnssec = FetchDNSSECEvidence(ctx, app, domain)
-	if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
+	if len(domain.Nameservers) > 0 {
 		evidence.nsHealth = FetchNSHealthSnapshots(ctx, app, domain)
 	}
 	return evidence
@@ -215,12 +215,12 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 		state.Email[domain.Domain] = emailState
 	}
 
-	if domain.IsDelegatedZone {
+	if domain.isDelegatedZone() {
 		status, cond := EvaluateNSDelegation(domain, evidence.delegation)
 		state.RDAP[domain.Domain] = RDAPState{
 			Status:          status,
 			Condition:       cond,
-			AllowExpiry:     domain.allowsExpiry(),
+			AllowExpiry:     domain.AllowExpiry,
 			IsDelegatedZone: true,
 			Source:          SourceDNSDelegation,
 			Nameservers:     evidence.delegation.Nameservers,
@@ -234,22 +234,29 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 		state.DNSSEC[domain.Domain] = dnssecResult
 	}
 
-	if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
+	if len(domain.Nameservers) > 0 {
 		status, nsCondition := EvaluateNSHealth(domain, evidence.nsHealth)
 
 		servers := make([]NSHealthServerResult, 0, len(evidence.nsHealth))
-		for index, serverSnapshot := range evidence.nsHealth {
+		var dnskeyBaseline []string
+		for _, serverSnapshot := range evidence.nsHealth {
+			if serverSnapshot.Authoritative && serverSnapshot.HasSOA {
+				dnskeyBaseline = serverSnapshot.DNSKEYs
+				break
+			}
+		}
+		for _, serverSnapshot := range evidence.nsHealth {
 			errStr := StrEmpty
 			if combined := errors.Join(serverSnapshot.Err, serverSnapshot.PartialError, serverSnapshot.DNSKEYErr); combined != nil {
 				errStr = combined.Error()
 			}
 			dnskeyMatch := true
-			if index > 0 && (len(evidence.nsHealth[0].DNSKEYs) > 0 || len(serverSnapshot.DNSKEYs) > 0) {
-				dnskeyMatch = slices.Equal(evidence.nsHealth[0].DNSKEYs, serverSnapshot.DNSKEYs)
+			if len(dnskeyBaseline) > 0 || len(serverSnapshot.DNSKEYs) > 0 {
+				dnskeyMatch = slices.Equal(dnskeyBaseline, serverSnapshot.DNSKEYs)
 			}
 			servers = append(servers, NSHealthServerResult{
 				Nameserver:    serverSnapshot.Nameserver,
-				IsPrimary:     serverSnapshot.IsPrimary,
+				Hidden:        serverSnapshot.Hidden,
 				Authoritative: serverSnapshot.Authoritative,
 				HasSOA:        serverSnapshot.HasSOA,
 				SOASerial:     serverSnapshot.SOASerial,
@@ -261,8 +268,7 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 		}
 
 		state.NSHealth[domain.Domain] = NSHealthResult{
-			Valid:     status != StatusFailed,
-			Primary:   domain.ExpectedNS[0],
+			Valid:     status == StatusOK,
 			Status:    status,
 			Condition: nsCondition,
 			Servers:   servers,
@@ -309,17 +315,21 @@ func fastCheckSlot(position, dnsCount, domainCount int) (isDNS bool, checkIndex 
 
 func storePanicDomainResults(domain DomainConfig, state *CheckState, recovered any) {
 	message := fmt.Sprintf(MsgErrDomainCheckPanic, AnyToString(recovered))
-	if current := state.Email[domain.Domain]; domain.CheckEmailSecurity && current.Status == StatusUnknown {
-		state.Email[domain.Domain] = EmailState{Provider: domain.MailProvider, Status: StatusFailed, Error: message, Condition: StateCondition{Code: CodeDNSLookupFailed, Target: message}}
+	if current := state.Email[domain.Domain]; domain.Email != nil && current.Status == StatusUnknown {
+		provider := StrEmpty
+		if domain.Email != nil {
+			provider = domain.Email.Provider
+		}
+		state.Email[domain.Domain] = EmailState{Provider: provider, Status: StatusFailed, Error: message, Condition: StateCondition{Code: CodeDNSLookupFailed, Target: message}}
 	}
-	if current := state.RDAP[domain.Domain]; domain.IsDelegatedZone && current.Status == StatusUnknown {
-		state.RDAP[domain.Domain] = RDAPState{Status: StatusFailed, Error: message, AllowExpiry: domain.allowsExpiry(), IsDelegatedZone: true, Condition: StateCondition{Code: CodeRDAPHTTPError, Target: message}}
+	if current := state.RDAP[domain.Domain]; domain.isDelegatedZone() && current.Status == StatusUnknown {
+		state.RDAP[domain.Domain] = RDAPState{Status: StatusFailed, Error: message, AllowExpiry: domain.AllowExpiry, IsDelegatedZone: true, Condition: StateCondition{Code: CodeRDAPHTTPError, Target: message}}
 	}
 	if current := state.DNSSEC[domain.Domain]; domain.DNSSEC && current.Status == StatusUnknown {
 		state.DNSSEC[domain.Domain] = DNSSECResult{Status: StatusFailed, Error: message, Condition: StateCondition{Code: CodeDNSSECNetworkError, Target: message}}
 	}
 
-	if current := state.NSHealth[domain.Domain]; domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 && current.Status == StatusUnknown {
+	if current := state.NSHealth[domain.Domain]; len(domain.Nameservers) > 0 && current.Status == StatusUnknown {
 		state.NSHealth[domain.Domain] = NSHealthResult{Status: StatusFailed, Condition: StateCondition{Code: CodeNSUnreachable, Target: message}}
 	}
 }
@@ -338,7 +348,7 @@ func gatherRDAPEvidence(ctx context.Context, app *AppState, domain DomainConfig,
 func gatherRateLimitedEvidence(ctx context.Context, app *AppState, domains []DomainConfig, active []int, rdapHTTPClient *http.Client, evidence *cycleEvidence) {
 	for position, index := range active {
 		domain := domains[index]
-		if domain.IsDelegatedZone {
+		if domain.isDelegatedZone() {
 			continue
 		}
 		evidence.rdap[position] = gatherRDAPEvidence(ctx, app, domain, rdapHTTPClient)
@@ -351,7 +361,7 @@ func evaluateRDAPCheck(domainConfig DomainConfig, snapshot RDAPSnapshot) (result
 			LogError(MsgLogPanicRDAP, FieldDomain, domainConfig.Domain, FieldPanic, r)
 			result = RDAPState{
 				Status:      StatusFailed,
-				AllowExpiry: domainConfig.allowsExpiry(),
+				AllowExpiry: domainConfig.AllowExpiry,
 				Error:       fmt.Sprintf(MsgErrInternalRDAPCheckPanic, AnyToString(r)),
 				Condition:   StateCondition{Code: CodeRDAPHTTPError, Target: StrInternalRDAPCheckPanic},
 			}
@@ -369,8 +379,8 @@ func evaluateRDAPCheck(domainConfig DomainConfig, snapshot RDAPSnapshot) (result
 		DomainStatus:    snapshot.DomainStatus,
 		DNSSEC:          snapshot.DNSSEC,
 		RenewalPrice:    domainConfig.RenewalPrice,
-		AllowExpiry:     domainConfig.allowsExpiry(),
-		Unused:          domainConfig.allowsExpiry() && status == StatusSkipped,
+		AllowExpiry:     domainConfig.AllowExpiry,
+		Unused:          domainConfig.AllowExpiry && status == StatusSkipped,
 		Source:          snapshot.Source,
 		ProtocolUsed:    snapshot.ProtocolUsed,
 		QueryDurationMs: snapshot.QueryDurationMs,
@@ -393,7 +403,7 @@ func evaluateRDAPCheck(domainConfig DomainConfig, snapshot RDAPSnapshot) (result
 func evaluateRateLimitedEvidence(domains []DomainConfig, active []int, evidence cycleEvidence, state *CheckState) {
 	for position, index := range active {
 		domain := domains[index]
-		if domain.IsDelegatedZone {
+		if domain.isDelegatedZone() {
 			continue
 		}
 		state.RDAP[domain.Domain] = evaluateRDAPCheck(domain, evidence.rdap[position])
@@ -417,10 +427,10 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 		}
 
 		for _, rec := range res.State.Found {
-			parts := strings.SplitN(rec, " ", 3)
+			parts := strings.SplitN(rec, SymSpace, 3)
 			if len(parts) == 3 {
 				tag := strings.ToLower(parts[1])
-				val := strings.Trim(parts[2], `"`)
+				val := strings.Trim(parts[2], SymDoubleQuote)
 				switch tag {
 				case CAATagIssue:
 					caaRes.Issue = append(caaRes.Issue, val)
@@ -433,7 +443,7 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 
 			if !caaRes.Valid && !expectedSet[rec] {
 				if len(parts) == 3 {
-					caaRes.UnknownCAs = append(caaRes.UnknownCAs, strings.Trim(parts[2], `"`))
+					caaRes.UnknownCAs = append(caaRes.UnknownCAs, strings.Trim(parts[2], SymDoubleQuote))
 				} else {
 					caaRes.UnknownCAs = append(caaRes.UnknownCAs, rec)
 				}
@@ -582,13 +592,13 @@ func newCycleState(cfg AppConfig, active activeChecks) *CheckState {
 	emailCount, dnssecCount, nsHealthCount, caaCount := 0, 0, 0, 0
 	for _, index := range active.domains {
 		domain := cfg.Domains[index]
-		if domain.CheckEmailSecurity {
+		if domain.Email != nil {
 			emailCount++
 		}
 		if domain.DNSSEC {
 			dnssecCount++
 		}
-		if domain.VerifyNSHealth && len(domain.ExpectedNS) > 0 {
+		if len(domain.Nameservers) > 0 {
 			nsHealthCount++
 		}
 	}
@@ -613,7 +623,7 @@ func newCycleState(cfg AppConfig, active activeChecks) *CheckState {
 		state.CAA = make(map[string]CAAResult, caaCount)
 	}
 	for _, domain := range cfg.Domains {
-		state.RDAP[domain.Domain] = RDAPState{Status: StatusPending, AllowExpiry: domain.allowsExpiry()}
+		state.RDAP[domain.Domain] = RDAPState{Status: StatusPending, AllowExpiry: domain.AllowExpiry}
 	}
 	return state
 }
@@ -621,7 +631,7 @@ func newCycleState(cfg AppConfig, active activeChecks) *CheckState {
 func suppressExpiredDomainChecks(cfg AppConfig, state *CheckState) {
 	var expired map[string]bool
 	for _, domain := range cfg.Domains {
-		if domain.allowsExpiry() && state.RDAP[domain.Domain].Unused {
+		if domain.AllowExpiry && state.RDAP[domain.Domain].Unused {
 			if expired == nil {
 				expired = make(map[string]bool)
 			}
@@ -677,7 +687,7 @@ func activeChecksForCycle(app *AppState, cfg AppConfig) activeChecks {
 
 func updateExpiredDomains(app *AppState, cfg AppConfig, state *CheckState) {
 	for _, domain := range cfg.Domains {
-		if !domain.allowsExpiry() {
+		if !domain.AllowExpiry {
 			delete(app.expiredDomains, domain.Domain)
 			continue
 		}

@@ -15,16 +15,13 @@
     {
       "domain": "example.com",
       "name": "Example Prod Domain",
-      "expected_ns": [
-        "a.iana-servers.net",
-        "b.iana-servers.net"
+      "nameservers": [
+        {"hostname": "a.iana-servers.net"},
+        {"hostname": "b.iana-servers.net"}
       ],
-      "expected_registrar_id": "292",
+      "registrar": "292",
       "renewal_price": 0,
-      "unused": false,
-      "verify_ns_health": true,
       "domain_transfer_locked": true,
-      "check_email_security": false,
       "dnssec": true,
       "caa": {
         "issue": [
@@ -37,13 +34,11 @@
     {
       "domain": "api.example.com",
       "name": "Example API Zone",
-      "is_delegated_zone": true,
       "root_zone": "example.com",
-      "expected_ns": [
-        "ns1.example.net",
-        "ns2.example.net"
+      "nameservers": [
+        {"hostname": "ns1.example.net"},
+        {"hostname": "ns2.example.net"}
       ],
-      "check_email_security": false,
       "dnssec": true,
       "caa": {
         "issue": [
@@ -56,15 +51,13 @@
       "domain": "example.net",
       "name": "Example Net Main",
       "renewal_price": 199.5,
-      "expected_ns": [
-        "a.iana-servers.net"
+      "nameservers": [
+        {"hostname": "a.iana-servers.net"},
+        {"hostname": "b.iana-servers.net"}
       ],
-      "secondary_ns": [
-        "b.iana-servers.net"
-      ],
-      "verify_ns_health": true,
-      "check_email_security": true,
-      "mail_provider": "google",
+      "email": {
+        "provider": "google"
+      },
       "dnssec": true,
       "caa": {
         "issue": [
@@ -81,17 +74,18 @@
     {
       "domain": "example.org",
       "name": "Example Org Main",
-      "expected_ns": [
-        "a.iana-servers.net",
-        "b.iana-servers.net"
+      "nameservers": [
+        {"hostname": "a.iana-servers.net"},
+        {"hostname": "b.iana-servers.net"}
       ],
-      "check_email_security": true,
-      "mx_records": [
-        "mail.example.org"
-      ],
-      "dkim_selectors": [
-        "default"
-      ],
+      "email": {
+        "mx_records": [
+          "mail.example.org"
+        ],
+        "dkim_selectors": [
+          "default"
+        ]
+      },
       "dnssec": true,
       "caa": {
         "issue": [
@@ -103,11 +97,10 @@
     {
       "domain": "example.edu",
       "name": "Example Edu Fallback",
-      "expected_ns": [
-        "a.iana-servers.net",
-        "b.iana-servers.net"
+      "nameservers": [
+        {"hostname": "a.iana-servers.net"},
+        {"hostname": "b.iana-servers.net"}
       ],
-      "check_email_security": false,
       "dnssec": false,
       "suppress_alerts": true
     }

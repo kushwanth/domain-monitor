@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unique"
@@ -1007,7 +1008,7 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 
 	if snapshot.Err != nil {
 		if errors.Is(snapshot.Err, ErrDomainNotFound) || errors.Is(snapshot.Err, ErrRDAPNotFound) {
-			if target.allowsExpiry() {
+			if target.AllowExpiry {
 				return StatusSkipped, StateCondition{}
 			}
 			return StatusFailed, StateCondition{Code: CodeDomainNotFound}
@@ -1027,11 +1028,11 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 	if t, _, err := parseFlexibleDate(snapshot.Expiration); err == nil {
 		days := time.Until(t).Hours() / 24
 		if days < 0 {
-			if target.allowsExpiry() {
+			if target.AllowExpiry {
 				return StatusSkipped, StateCondition{}
 			}
 			ct.Promote(StatusFailed, CodeRDAPExpired, StrEmpty)
-		} else if days <= DefaultRDAPExpiryWarningDays && !target.allowsExpiry() {
+		} else if days <= DefaultRDAPExpiryWarningDays && !target.AllowExpiry {
 			priority := StatusWarning
 			if days <= 7 {
 				priority = StatusFailed
@@ -1042,42 +1043,8 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 		ct.Promote(StatusFailed, CodeRDAPExpiryUnavailable, snapshot.Expiration)
 	}
 
-	// 2. Checks NS delegation
-	if len(target.ExpectedNS) > 0 {
-		liveNS := make(map[string]bool)
-		authorizedMap := make(map[string]bool)
-
-		for _, ns := range target.ExpectedNS {
-			norm := NormalizeDomain(ns)
-			if norm != StrEmpty {
-				authorizedMap[norm] = true
-			}
-		}
-		for _, ns := range target.SecondaryNS {
-			norm := NormalizeDomain(ns)
-			if norm != StrEmpty {
-				authorizedMap[norm] = true
-			}
-		}
-
-		for _, raw := range snapshot.Nameservers {
-			ns := NormalizeDomain(raw)
-			if ns == StrEmpty {
-				continue
-			}
-			liveNS[ns] = true
-			if !authorizedMap[ns] {
-				ct.Promote(StatusFailed, CodeUnauthorizedNS, ns)
-			}
-		}
-
-		for _, expectedRaw := range target.ExpectedNS {
-			expected := NormalizeDomain(expectedRaw)
-			if expected != StrEmpty && !liveNS[expected] {
-				ct.Promote(StatusFailed, CodeExpectedNSMissing, expectedRaw)
-			}
-		}
-	}
+	// 2. Checks public NS delegation and hidden-server non-exposure.
+	evaluateNameserverDelegation(target.Nameservers, snapshot.Nameservers, &ct)
 
 	// 3. Checks EPP statuses
 	if isSusp, suspStatus := isDomainSuspended(snapshot.DomainStatus); isSusp {
@@ -1103,13 +1070,13 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 	}
 
 	// 5. Checks registrar match
-	if target.ExpectedRegistrarID != StrEmpty {
-		if snapshot.RegistrarIANAID != target.ExpectedRegistrarID {
-			ct.Promote(StatusFailed, CodeRDAPRegistrarMismatch, StrIANA+target.ExpectedRegistrarID)
-		}
-	} else if target.ExpectedRegistrarName != StrEmpty {
-		if !strings.Contains(strings.ToLower(snapshot.Registrar), strings.ToLower(target.ExpectedRegistrarName)) {
-			ct.Promote(StatusFailed, CodeRDAPRegistrarMismatch, target.ExpectedRegistrarName)
+	if target.Registrar != StrEmpty {
+		if _, err := strconv.Atoi(target.Registrar); err == nil {
+			if snapshot.RegistrarIANAID != target.Registrar {
+				ct.Promote(StatusFailed, CodeRDAPRegistrarMismatch, StrIANA+target.Registrar)
+			}
+		} else if !strings.Contains(strings.ToLower(snapshot.Registrar), strings.ToLower(target.Registrar)) {
+			ct.Promote(StatusFailed, CodeRDAPRegistrarMismatch, target.Registrar)
 		}
 	}
 
@@ -1555,43 +1522,45 @@ func EvaluateNSDelegation(target DomainConfig, snapshot NSDelegationSnapshot) (C
 		return StatusFailed, StateCondition{Code: CodeDNSLookupFailed, Target: StrDelegationReturnedNoNameservers}
 	}
 
-	liveNS := make(map[string]bool)
-	authorizedMap := make(map[string]bool)
-
-	for _, ns := range target.ExpectedNS {
-		norm := NormalizeDomain(ns)
-		if norm != StrEmpty {
-			authorizedMap[norm] = true
-		}
-	}
-	for _, ns := range target.SecondaryNS {
-		norm := NormalizeDomain(ns)
-		if norm != StrEmpty {
-			authorizedMap[norm] = true
-		}
-	}
-
-	hasConfiguredNS := len(authorizedMap) > 0
-
 	ct := ConditionTracker{Status: StatusOK}
+	evaluateNameserverDelegation(target.Nameservers, snapshot.Nameservers, &ct)
+	return ct.Status, ct.Cond
+}
 
-	for _, raw := range snapshot.Nameservers {
+func evaluateNameserverDelegation(configured []NameserverConfig, observed []string, ct *ConditionTracker) {
+	if len(configured) == 0 {
+		return
+	}
+
+	liveNS := make(map[string]bool, len(observed))
+	answering := make(map[string]bool, len(configured))
+	hidden := make(map[string]bool, len(configured))
+	for _, nameserver := range configured {
+		name := NormalizeDomain(nameserver.Hostname)
+		if nameserver.Hidden {
+			hidden[name] = true
+		} else {
+			answering[name] = true
+		}
+	}
+
+	for _, raw := range observed {
 		ns := NormalizeDomain(raw)
 		if ns == StrEmpty {
 			continue
 		}
 		liveNS[ns] = true
-		if hasConfiguredNS && !authorizedMap[ns] {
+		switch {
+		case hidden[ns]:
+			ct.Promote(StatusFailed, CodeNSHiddenExposed, ns)
+		case !answering[ns]:
 			ct.Promote(StatusFailed, CodeUnauthorizedNS, ns)
 		}
 	}
 
-	for _, expectedRaw := range target.ExpectedNS {
-		expected := NormalizeDomain(expectedRaw)
-		if expected != StrEmpty && !liveNS[expected] {
-			ct.Promote(StatusFailed, CodeExpectedNSMissing, expectedRaw)
+	for _, nameserver := range configured {
+		if !nameserver.Hidden && !liveNS[NormalizeDomain(nameserver.Hostname)] {
+			ct.Promote(StatusFailed, CodeExpectedNSMissing, nameserver.Hostname)
 		}
 	}
-
-	return ct.Status, ct.Cond
 }

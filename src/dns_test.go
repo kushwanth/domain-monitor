@@ -181,7 +181,7 @@ func TestQueryIPRecords_PartialLookupDoesNotPass(t *testing.T) {
 }
 
 func TestEvaluateEmailSecurity_DMARCFailurePromotesSPFWarning(t *testing.T) {
-	status, cond, state := EvaluateEmailSecurity(DomainConfig{Domain: "example.com", CheckEmailSecurity: true}, EmailSnapshot{
+	status, cond, state := EvaluateEmailSecurity(DomainConfig{Domain: "example.com", Email: &EmailConfig{}}, EmailSnapshot{
 		MXRecords: []string{"mx.example.com"},
 		DMARCErr:  errors.New(MsgErrResolverTimeout),
 	}, nil)
@@ -318,9 +318,9 @@ func TestEmailSecurity_DNSLookupError_NoFalseAlerts(t *testing.T) {
 		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{
-		Domain:             "unreachable-domain.com",
-		Name:               "Unreachable",
-		CheckEmailSecurity: true,
+		Domain: "unreachable-domain.com",
+		Name:   "Unreachable",
+		Email:  &EmailConfig{},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -419,11 +419,9 @@ func TestEmailSecurity_MultiSelectorDKIM_NXDOMAIN(t *testing.T) {
 		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{
-		Domain:             "example.com",
-		Name:               "Example Test",
-		CheckEmailSecurity: true,
-		MXRecords:          []string{"mail.example.com"},
-		DKIMSelectors:      []string{"s1", "s2"},
+		Domain: "example.com",
+		Name:   "Example Test",
+		Email:  &EmailConfig{MXRecords: []string{"mail.example.com"}, DKIMSelectors: []string{"s1", "s2"}},
 	}
 	state := &CheckState{
 		Email: make(map[string]EmailState),
@@ -552,6 +550,11 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 		}
 		_ = w.WriteMsg(m)
 	})
+	mux.HandleFunc("_dmarc.com.", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		_ = w.WriteMsg(m)
+	})
 
 	server := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
 	l, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -567,9 +570,9 @@ func TestDMARC_SubdomainInheritance(t *testing.T) {
 		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{
-		Domain:             "api.example.com",
-		Name:               "API Subdomain",
-		CheckEmailSecurity: true,
+		Domain: "api.example.com",
+		Name:   "API Subdomain",
+		Email:  &EmailConfig{},
 	}
 
 	state := evaluateEmailSecurityForTest(context.Background(), app, target)
@@ -597,7 +600,7 @@ func TestDMARCTreeWalkQueriesPublicSuffix(t *testing.T) {
 			return response, 0, nil
 		}},
 	}
-	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "a.example.com", CheckEmailSecurity: true})
+	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "a.example.com", Email: &EmailConfig{}})
 	require.NoError(t, snapshot.DMARCErr)
 	require.Equal(t, []string{"_dmarc.a.example.com.", "_dmarc.example.com.", "_dmarc.com."}, queried)
 	require.Equal(t, []string{"v=DMARC1; p=reject; psd=y"}, snapshot.DMARCRecords)
@@ -617,7 +620,7 @@ func TestDMARCTreeWalkBoundsLongNames(t *testing.T) {
 		}},
 	}
 	domain := "a.b.c.d.e.f.g.h.i.example.com"
-	_ = FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: domain, CheckEmailSecurity: true})
+	_ = FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: domain, Email: &EmailConfig{}})
 	require.Len(t, queried, 8)
 	assert.Equal(t, "_dmarc."+domain+".", queried[0])
 	assert.Equal(t, "_dmarc.com.", queried[len(queried)-1])
@@ -865,7 +868,7 @@ func TestQueryDNSMsgRetriesTruncatedAnswerOverInjectedTCP(t *testing.T) {
 	require.ErrorContains(t, err, "TCP resolver is not configured")
 }
 
-func TestQueryDNSMsgUsesFreshIDsAndRejectsWrongQuestionClass(t *testing.T) {
+func TestQueryDNSMsgUsesFreshIDsAndRejectsMismatchedResponses(t *testing.T) {
 	t.Parallel()
 	app := NewAppState(AppConfig{})
 	ids := make(map[uint16]bool)
@@ -889,6 +892,15 @@ func TestQueryDNSMsgUsesFreshIDsAndRejectsWrongQuestionClass(t *testing.T) {
 	}}
 	_, err := queryDNSMsg(context.Background(), app, "example.com", dns.TypeA, []string{"192.0.2.53"})
 	require.ErrorContains(t, err, "mismatch")
+
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		response.Id++
+		return response, 0, nil
+	}}
+	_, err = queryDNSMsg(context.Background(), app, "example.com", dns.TypeA, []string{"192.0.2.53"})
+	require.ErrorContains(t, err, "response ID mismatch")
 }
 
 func TestDNSAnswerOwnerFiltering(t *testing.T) {
@@ -948,7 +960,7 @@ func TestDNSAnswerOwnerFiltering(t *testing.T) {
 // For CAA or other types, return empty Answer (NODATA)
 
 func evaluateNSHealthForTest(ctx context.Context, app *AppState, target DomainConfig) NSHealthResult {
-	if !target.VerifyNSHealth || len(target.ExpectedNS) == 0 {
+	if len(target.Nameservers) == 0 {
 		return NSHealthResult{}
 	}
 	snapshots := FetchNSHealthSnapshots(ctx, app, target)
@@ -961,7 +973,7 @@ func evaluateNSHealthForTest(ctx context.Context, app *AppState, target DomainCo
 		}
 		servers = append(servers, NSHealthServerResult{
 			Nameserver:    srvSnap.Nameserver,
-			IsPrimary:     srvSnap.IsPrimary,
+			Hidden:        srvSnap.Hidden,
 			Authoritative: srvSnap.Authoritative,
 			HasSOA:        srvSnap.HasSOA,
 			SOASerial:     srvSnap.SOASerial,
@@ -972,8 +984,7 @@ func evaluateNSHealthForTest(ctx context.Context, app *AppState, target DomainCo
 		})
 	}
 	return NSHealthResult{
-		Valid:   status != StatusFailed,
-		Primary: target.ExpectedNS[0],
+		Valid:   status == StatusOK,
 		Servers: servers,
 	}
 }
@@ -1037,12 +1048,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Sync Domain",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    []string{sAddr},
-			VerifyNSHealth: true,
-			DNSSEC:         true,
+			Domain:      "example.com",
+			Name:        "Sync Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}, {Hostname: sAddr, Hidden: true}},
+			DNSSEC:      true,
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1060,12 +1069,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Unsigned Domain",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    []string{sAddr},
-			VerifyNSHealth: true,
-			DNSSEC:         true,
+			Domain:      "example.com",
+			Name:        "Unsigned Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}, {Hostname: sAddr, Hidden: true}},
+			DNSSEC:      true,
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1083,12 +1090,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Mismatched DNSKEY Domain",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    []string{sAddr},
-			VerifyNSHealth: true,
-			DNSSEC:         true,
+			Domain:      "example.com",
+			Name:        "Mismatched DNSKEY Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}, {Hostname: sAddr, Hidden: true}},
+			DNSSEC:      true,
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1106,12 +1111,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Unexpected DNSKEY Domain",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    []string{sAddr},
-			VerifyNSHealth: true,
-			DNSSEC:         true,
+			Domain:      "example.com",
+			Name:        "Unexpected DNSKEY Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}, {Hostname: sAddr, Hidden: true}},
+			DNSSEC:      true,
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1129,12 +1132,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Dumb Secondary Unsigned Violation",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    []string{sAddr},
-			VerifyNSHealth: true,
-			DNSSEC:         false, // Explicitly false!
+			Domain:      "example.com",
+			Name:        "Dumb Secondary Unsigned Violation",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}, {Hostname: sAddr, Hidden: true}},
+			DNSSEC:      false, // Explicitly false!
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1152,12 +1153,10 @@ func TestEvaluateNSHealth(t *testing.T) {
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Missing DNSKEY Domain",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    []string{sAddr},
-			VerifyNSHealth: true,
-			DNSSEC:         true,
+			Domain:      "example.com",
+			Name:        "Missing DNSKEY Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}, {Hostname: sAddr, Hidden: true}},
+			DNSSEC:      true,
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1175,33 +1174,29 @@ func TestEvaluateNSHealth(t *testing.T) {
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Lagging Domain",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    []string{sAddr},
-			VerifyNSHealth: true,
+			Domain:      "example.com",
+			Name:        "Lagging Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}, {Hostname: sAddr, Hidden: true}},
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
 		status, condition := EvaluateNSHealth(target, FetchNSHealthSnapshots(context.Background(), app, target))
 		assert.Equal(t, StatusWarning, status)
-		assert.Equal(t, CodeNSSOALags, condition.Code)
-		assert.True(t, res.Valid)
+		assert.Equal(t, CodeNSSOAMismatch, condition.Code)
+		assert.False(t, res.Valid)
 	})
 
-	// 7. Happy Path: Primary Only (secondary_ns omitted -> secondary checks skipped)
+	// 7. Happy Path: One answering nameserver.
 	t.Run("HappyPathPrimaryOnly", func(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, true, []dns.RR{primaryKey})
 		defer pClose()
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Primary Only Domain",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    nil, // secondary_ns is omitted!
-			VerifyNSHealth: true,
-			DNSSEC:         true,
+			Domain:      "example.com",
+			Name:        "Primary Only Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}},
+			DNSSEC:      true,
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1211,8 +1206,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		if len(res.Servers) != 1 {
 			t.Errorf("Expected exactly 1 server (primary), got %d", len(res.Servers))
 		}
-		if !res.Servers[0].IsPrimary {
-			t.Errorf("Expected server to be marked primary")
+		if res.Servers[0].Hidden {
+			t.Errorf("Expected server to be answering")
 		}
 		if !res.Servers[0].Authoritative {
 			t.Errorf("Expected primary server to be authoritative")
@@ -1222,18 +1217,16 @@ func TestEvaluateNSHealth(t *testing.T) {
 		}
 	})
 
-	// 8. Primary Only Non-Authoritative (fails and alerts even without secondary_ns)
+	// 8. A non-authoritative nameserver fails health validation.
 	t.Run("PrimaryOnlyNonAuthoritative", func(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, false, nil) // AA=0!
 		defer pClose()
 
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Non-Authoritative Primary Domain",
-			ExpectedNS:     []string{pAddr},
-			SecondaryNS:    nil, // secondary_ns is omitted!
-			VerifyNSHealth: true,
+			Domain:      "example.com",
+			Name:        "Non-Authoritative Primary Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}},
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1263,10 +1256,9 @@ func TestEvaluateNSHealth(t *testing.T) {
 		pAddr := l.LocalAddr().String()
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "Missing SOA Primary Domain",
-			ExpectedNS:     []string{pAddr},
-			VerifyNSHealth: true,
+			Domain:      "example.com",
+			Name:        "Missing SOA Primary Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}},
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1311,10 +1303,9 @@ func TestEvaluateNSHealth(t *testing.T) {
 		pAddr := l.LocalAddr().String()
 		app := &AppState{config: AppConfig{Resolvers: []string{pAddr}}, Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"}}
 		target := DomainConfig{
-			Domain:         "example.com",
-			Name:           "SOA In Authority Domain",
-			ExpectedNS:     []string{pAddr},
-			VerifyNSHealth: true,
+			Domain:      "example.com",
+			Name:        "SOA In Authority Domain",
+			Nameservers: []NameserverConfig{{Hostname: pAddr}},
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
@@ -1344,11 +1335,11 @@ func TestNSHealthChecksAllExpectedServersAndSOAOwner(t *testing.T) {
 		}
 		return response, 0, nil
 	}}}
-	target := DomainConfig{Domain: "example.com", ExpectedNS: []string{"93.184.216.34", "93.184.216.35"}, SecondaryNS: []string{"93.184.216.34"}, VerifyNSHealth: true}
+	target := DomainConfig{Domain: "example.com", Nameservers: []NameserverConfig{{Hostname: "93.184.216.34"}, {Hostname: "93.184.216.35"}}}
 	snapshots := FetchNSHealthSnapshots(context.Background(), app, target)
 	require.Len(t, snapshots, 2)
-	assert.True(t, snapshots[0].IsPrimary)
-	assert.True(t, snapshots[1].IsPrimary)
+	assert.False(t, snapshots[0].Hidden)
+	assert.False(t, snapshots[1].Hidden)
 	assert.Equal(t, 1, queries["93.184.216.34:53"])
 	assert.Equal(t, 1, queries["93.184.216.35:53"])
 	assert.False(t, snapshots[1].HasSOA)
@@ -1372,7 +1363,7 @@ func TestNSHealthIgnoresWrongClassSOAAndDNSKEY(t *testing.T) {
 		}
 		return response, 0, nil
 	}}}
-	target := DomainConfig{Domain: "example.com", ExpectedNS: []string{"192.0.2.53"}, VerifyNSHealth: true, DNSSEC: true}
+	target := DomainConfig{Domain: "example.com", Nameservers: []NameserverConfig{{Hostname: "192.0.2.53"}}, DNSSEC: true}
 	snapshots := FetchNSHealthSnapshots(context.Background(), app, target)
 	require.Len(t, snapshots, 1)
 	assert.False(t, snapshots[0].HasSOA)
@@ -1568,8 +1559,8 @@ func TestValidateMX_TransientErrorNoFalseAlert(t *testing.T) {
 		Notifier: &NotificationManager{NtfyURL: "https://ntfy.invalid/test"},
 	}
 	target := DomainConfig{
-		Domain:             "transient-error.example.com",
-		CheckEmailSecurity: true,
+		Domain: "transient-error.example.com",
+		Email:  &EmailConfig{},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
@@ -1911,7 +1902,7 @@ func TestEvaluateEmailSecurity_MockedPaths(t *testing.T) {
 	app.EmailProviders = map[string]ProviderConfig{
 		"google": {MXRecords: []string{"aspmx.l.google.com"}},
 	}
-	res := evaluateEmailSecurityForTest(ctx, app, DomainConfig{Domain: "example.com", CheckEmailSecurity: true, MailProvider: "google", DKIMSelectors: []string{"google"}})
+	res := evaluateEmailSecurityForTest(ctx, app, DomainConfig{Domain: "example.com", Email: &EmailConfig{Provider: "google", DKIMSelectors: []string{"google"}}})
 	assert.Equal(t, StatusOK, res.Status)
 }
 
@@ -1955,12 +1946,16 @@ func TestHasUsableDKIMKey(t *testing.T) {
 	require.NoError(t, err)
 	rsaDER, err := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
 	require.NoError(t, err)
+	rsaPKCS1DER := x509.MarshalPKCS1PublicKey(&rsaKey.PublicKey)
 	for _, tt := range []struct {
 		record string
 		usable bool
 	}{
+		{"v=DKIM1; k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaPKCS1DER), true},
 		{"v=DKIM1; k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaDER), true},
 		{"v=DKIM1; k=ed25519; p=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", true},
+		{"v=dkim1; k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaPKCS1DER), false},
+		{"k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaPKCS1DER) + "; v=DKIM1", false},
 		{"v=DKIM1; k=rsa; p=QUJD", false},
 		{"v=DKIM1; p=", false},
 		{"v=DKIM1; note=incidental p=QUJD", false},
@@ -1985,7 +1980,7 @@ func TestDMARCTransientFailureStopsParentDiscovery(t *testing.T) {
 		response.SetReply(q)
 		return response, 0, nil
 	}}
-	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "sub.example.com", CheckEmailSecurity: true})
+	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "sub.example.com", Email: &EmailConfig{}})
 	require.Error(t, snapshot.DMARCErr)
 	assert.Equal(t, []string{"_dmarc.sub.example.com."}, dmarcQueries)
 }
@@ -1998,6 +1993,8 @@ func TestHasValidDMARCPolicy(t *testing.T) {
 		{"v=DMARC1; p=reject; rua=mailto:dmarc@example.com", true},
 		{"v=DMARC1; p=none", true},
 		{"v=DMARC1; p=reject; sp=quarantine; np=none; psd=n", true},
+		{"v = DMARC1; p=reject; psd=u", true},
+		{"v=dmarc1; p=reject", false},
 		{"v=DMARC1", false},
 		{"v=DMARC1; p=invalid", false},
 		{"v=DMARC1; p=reject; sp=invalid", false},
@@ -2008,6 +2005,37 @@ func TestHasValidDMARCPolicy(t *testing.T) {
 	} {
 		assert.Equal(t, tt.valid, hasValidDMARCPolicy(tt.record), tt.record)
 	}
+}
+
+func TestDMARCTreeWalkSelectsOrganizationalPolicy(t *testing.T) {
+	var dmarcQueries []string
+	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, q *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(q)
+		name := q.Question[0].Name
+		if strings.HasPrefix(name, "_dmarc.") {
+			dmarcQueries = append(dmarcQueries, name)
+			var policies []string
+			switch name {
+			case "_dmarc.a.mail.example.com.":
+				policies = []string{"v=DMARC1; p=none", "v=DMARC1; p=reject"}
+			case "_dmarc.mail.example.com.":
+				policies = []string{"v=DMARC1; p=quarantine"}
+			case "_dmarc.example.com.":
+				policies = []string{"v=DMARC1; p=reject"}
+			}
+			for _, policy := range policies {
+				response.Answer = append(response.Answer, &dns.TXT{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{policy}})
+			}
+		}
+		return response, 0, nil
+	}}
+
+	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "a.mail.example.com", Email: &EmailConfig{}})
+	require.NoError(t, snapshot.DMARCErr)
+	assert.Equal(t, []string{"_dmarc.a.mail.example.com.", "_dmarc.mail.example.com.", "_dmarc.example.com.", "_dmarc.com."}, dmarcQueries)
+	assert.Equal(t, []string{"v=DMARC1; p=reject"}, snapshot.DMARCRecords)
 }
 
 func TestMalformedDMARCDoesNotInheritParentPolicy(t *testing.T) {
@@ -2023,7 +2051,7 @@ func TestMalformedDMARCDoesNotInheritParentPolicy(t *testing.T) {
 		}
 		return response, 0, nil
 	}}
-	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "sub.example.com", CheckEmailSecurity: true})
+	snapshot := FetchEmailSnapshot(context.Background(), app, DomainConfig{Domain: "sub.example.com", Email: &EmailConfig{}})
 	require.ErrorContains(t, snapshot.DMARCErr, "invalid DMARC policy")
 	assert.Equal(t, []string{"_dmarc.sub.example.com."}, dmarcQueries)
 }
@@ -2058,7 +2086,7 @@ func TestEmailUnavailableSelectorCannotHideBehindValidKey(t *testing.T) {
 		DMARCRecords: []string{"v=DMARC1; p=reject"},
 		DKIMResults:  map[string]bool{"good": true}, DKIMErrs: map[string]error{"other": errors.New(MsgErrDNSTimeout)},
 	}
-	target := DomainConfig{CheckEmailSecurity: true, DKIMSelectors: []string{"good", "other"}}
+	target := DomainConfig{Email: &EmailConfig{DKIMSelectors: []string{"good", "other"}}}
 	status, condition, state := EvaluateEmailSecurity(target, snapshot, nil)
 	assert.Equal(t, StatusWarning, status)
 	require.False(t, condition.IsZero())
@@ -2108,7 +2136,7 @@ func TestLiveNullMX(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	target := DomainConfig{Domain: "example.com", CheckEmailSecurity: true, MXRecords: []string{"."}}
+	target := DomainConfig{Domain: "example.com", Email: &EmailConfig{MXRecords: []string{"."}}}
 	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1", "8.8.8.8"}})
 	snapshot := FetchEmailSnapshot(ctx, app, target)
 	status, condition, state := EvaluateEmailSecurity(target, snapshot, nil)

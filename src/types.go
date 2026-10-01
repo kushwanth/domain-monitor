@@ -208,41 +208,57 @@ type AppConfig struct {
 	DNSRecords []DNSTask      `json:"dns_records"`
 }
 
-// configAliases reads supported compatibility keys that normalize into AppConfig.
-type configAliases struct {
-	Domains []domainConfigAliases `json:"domains"`
+// removedConfigFields detects obsolete per-domain fields so they cannot be silently ignored.
+type removedConfigFields struct {
+	Domains []removedDomainFields `json:"domains"`
 }
 
-// domainConfigAliases contains alternative per-domain configuration keys.
-type domainConfigAliases struct {
-	AllowExpiry bool `json:"allow_expiry"`
+// removedDomainFields contains unsupported per-domain configuration keys.
+type removedDomainFields struct {
+	ExpectedNS            *[]string `json:"expected_ns"`
+	SecondaryNS           *[]string `json:"secondary_ns"`
+	VerifyNSHealth        *bool     `json:"verify_ns_health"`
+	CheckEmailSecurity    *bool     `json:"check_email_security"`
+	MailProvider          *string   `json:"mail_provider"`
+	MXRecords             *[]string `json:"mx_records"`
+	DKIMSelectors         *[]string `json:"dkim_selectors"`
+	IsDelegatedZone       *bool     `json:"is_delegated_zone"`
+	Unused                *bool     `json:"unused"`
+	ExpectedRegistrarID   *string   `json:"expected_registrar_id"`
+	ExpectedRegistrarName *string   `json:"expected_registrar_name"`
 }
 
 // DomainConfig defines expected registration, DNS, and email evidence for a domain.
 type DomainConfig struct {
-	Domain                string     `json:"domain"`
-	Name                  string     `json:"name"`
-	RootZone              string     `json:"root_zone"`
-	ExpectedRegistrarID   string     `json:"expected_registrar_id,omitempty"`
-	ExpectedRegistrarName string     `json:"expected_registrar_name,omitempty"`
-	MailProvider          string     `json:"mail_provider"`
-	ExpectedNS            []string   `json:"expected_ns"`
-	SecondaryNS           []string   `json:"secondary_ns,omitempty"`
-	MXRecords             []string   `json:"mx_records"`
-	DKIMSelectors         []string   `json:"dkim_selectors"`
-	CAA                   *CAAConfig `json:"caa,omitempty"`
-	RenewalPrice          float64    `json:"renewal_price,omitempty"`
-	IsDelegatedZone       bool       `json:"is_delegated_zone"`
-	Unused                bool       `json:"unused,omitempty"`
-	DomainTransferLocked  bool       `json:"domain_transfer_locked,omitempty"`
-	VerifyNSHealth        bool       `json:"verify_ns_health,omitempty"`
-	CheckEmailSecurity    bool       `json:"check_email_security"`
-	DNSSEC                bool       `json:"dnssec"`
-	SuppressAlerts        bool       `json:"suppress_alerts"`
+	Domain               string             `json:"domain"`
+	Name                 string             `json:"name"`
+	RootZone             string             `json:"root_zone,omitempty"`
+	Registrar            string             `json:"registrar,omitempty"`
+	Nameservers          []NameserverConfig `json:"nameservers,omitempty"`
+	Email                *EmailConfig       `json:"email,omitempty"`
+	CAA                  *CAAConfig         `json:"caa,omitempty"`
+	RenewalPrice         float64            `json:"renewal_price,omitempty"`
+	AllowExpiry          bool               `json:"allow_expiry,omitempty"`
+	DomainTransferLocked bool               `json:"domain_transfer_locked,omitempty"`
+	DNSSEC               bool               `json:"dnssec"`
+	SuppressAlerts       bool               `json:"suppress_alerts"`
 }
 
-func (d DomainConfig) allowsExpiry() bool {
-	return d.Unused
+// NameserverConfig describes one authoritative nameserver and whether it must stay out of public delegation.
+type NameserverConfig struct {
+	Hostname string `json:"hostname"`
+	Hidden   bool   `json:"hidden,omitempty"`
+}
+
+func (d DomainConfig) isDelegatedZone() bool {
+	return d.RootZone != StrEmpty
+}
+
+// EmailConfig enables email-security checks and optionally constrains MX and DKIM evidence.
+type EmailConfig struct {
+	Provider      string   `json:"provider,omitempty"`
+	MXRecords     []string `json:"mx_records,omitempty"`
+	DKIMSelectors []string `json:"dkim_selectors,omitempty"`
 }
 
 // CAAConfig specifies expected certificate-authority records.
@@ -412,10 +428,13 @@ func cloneConfig(cfg AppConfig) AppConfig {
 	}
 	for i := range cfg.Domains {
 		domain := &cfg.Domains[i]
-		domain.ExpectedNS = slices.Clone(domain.ExpectedNS)
-		domain.SecondaryNS = slices.Clone(domain.SecondaryNS)
-		domain.MXRecords = slices.Clone(domain.MXRecords)
-		domain.DKIMSelectors = slices.Clone(domain.DKIMSelectors)
+		domain.Nameservers = slices.Clone(domain.Nameservers)
+		if domain.Email != nil {
+			email := *domain.Email
+			email.MXRecords = slices.Clone(email.MXRecords)
+			email.DKIMSelectors = slices.Clone(email.DKIMSelectors)
+			domain.Email = &email
+		}
 		if domain.CAA != nil {
 			caa := *domain.CAA
 			caa.Issue = slices.Clone(caa.Issue)
@@ -588,7 +607,7 @@ type DNSSECResult struct {
 // NSHealthServerResult stores the evaluation metrics for an individual authoritative nameserver.
 type NSHealthServerResult struct {
 	Nameserver    string `json:"nameserver"`
-	IsPrimary     bool   `json:"is_primary"`
+	Hidden        bool   `json:"hidden,omitempty"`
 	Authoritative bool   `json:"authoritative"`
 	HasSOA        bool   `json:"has_soa"`
 	SOASerial     uint32 `json:"soa_serial,omitempty"`
@@ -598,10 +617,9 @@ type NSHealthServerResult struct {
 	Error         string `json:"error,omitempty"`
 }
 
-// NSHealthResult stores the aggregated nameserver health and dumb secondary replication status for a domain.
+// NSHealthResult stores the aggregated authoritative nameserver health for a domain.
 type NSHealthResult struct {
 	Valid     bool                   `json:"valid"`
-	Primary   string                 `json:"primary"`
 	Status    CheckStatus            `json:"status"`
 	Condition StateCondition         `json:"condition,omitzero"`
 	Servers   []NSHealthServerResult `json:"servers"`
@@ -664,7 +682,7 @@ type NSDelegationSnapshot struct {
 // NSSnapshot holds raw data fetched from a single authoritative nameserver.
 type NSSnapshot struct {
 	Nameserver    string
-	IsPrimary     bool
+	Hidden        bool
 	Authoritative bool
 	HasSOA        bool
 	SOASerial     uint32
