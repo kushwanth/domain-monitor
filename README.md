@@ -1,24 +1,57 @@
 # Domain & DNS Security Monitor
 
-> **This project was developed and refactored with the assistance of a LLMs**
+A small, self-hosted monitor for the domains and DNS records you look after.
+It runs as a single Go process, serves its own dashboard, and sends concise
+alerts through ntfy or Telegram.
 
-A self-hosted Go daemon that monitors domain registrations, DNS records, CAA policies, and published email security records.
+> **Development note:** This project has been developed and refactored with
+> LLM assistance. Changes are reviewed against the documented behavior and
+> exercised by the repository test suite before release.
 
-It runs as one process with bounded concurrency, resource limits, an embedded dashboard, and alerts. Upstream failures and incomplete evidence remain visible.
+This project is intended for a personal server, homelab, or small domain
+portfolio. It favors a plain configuration file, predictable resource use, and
+visible failures over a multi-service stack. There are no external databases,
+accounts, or hosted control planes to maintain.
 
----
+This README is the primary setup and operator reference. For protocol-specific
+scope, standards, and release assurance, see
+[`docs/protocols.md`](docs/protocols.md).
 
-## Key Features
+## What it monitors
 
-*   **RDAP & WHOIS Monitoring:** IANA bootstrap discovery, registry-first RDAP, and safe registrar RDAP referrals for thin registry responses. WHOIS is used only when RDAP is unavailable or all applicable RDAP paths fail; successful or authoritative-not-found RDAP never triggers WHOIS.
-*   **DNS Record Integrity:** Validates `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, `IP`, and `ALIAS` records. Global checks compare two configured resolver observations when available. A per-record custom resolver is queried alone with no global fallback.
-*   **CAA Publication Checks:** Compares configured issuer-tag values and supports explicit deny-all lists. This monitors DNS publication; it does not verify certificates or evaluate CA issuance policy.
-*   **Email Security Suite:** Checks MX records against configured providers, discovers SPF and DMARC records, and checks configured DKIM selectors. It does not evaluate complete mail authentication policy. Bundled provider presets can be extended or overridden at startup using JSON files in `./data/email_providers/` or `email_providers_dir`. Both MX suffixes and DKIM selectors come from those files.
-*   **2-Tier DNSSEC Verification:** Checks local DS/DNSKEY and RRSIG evidence and requires an authenticated DNS-over-HTTPS (DoH) response for a verified result.
-*   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Each successful cycle produces one bounded, deterministically ordered report and at most one request per provider, excluding bounded transient retries. Domain-name redaction remains supported.
-*   **Embedded Web Dashboard:** A single-page dashboard with Dark and Light modes, periodic state polling, and a `/health` liveness endpoint. Provider quotas can still defer checks despite local rate limiting.
+- **Domain registration:** Registry-first RDAP checks with safe registrar
+  referrals and bounded WHOIS fallback when RDAP cannot provide an answer.
+- **DNS records:** `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, `IP`, and
+  `ALIAS` expectations, including explicit absence checks and optional custom
+  resolvers.
+- **Nameservers and DNSSEC:** Public delegation, direct authoritative SOA and
+  DNSKEY checks, and local DS/RRSIG evidence corroborated through trusted DoH.
+- **Email DNS posture:** MX expectations, SPF publication, DMARC discovery, and
+  configured DKIM selectors. This is publication monitoring, not per-message
+  mail authentication.
+- **CAA policy:** Expected issuer tags and explicit deny-all publication.
+- **Renewal planning:** Expiration dates and estimated renewal costs using a
+  cached public TLD price catalog, with manual overrides for premium domains.
 
----
+The embedded dashboard provides light and dark themes, while each completed
+cycle can send one bounded, deterministically ordered report. Network failures,
+resolver disagreement, and incomplete evidence remain visible instead of being
+silently treated as healthy.
+
+## Quick start
+
+1. Save the example below as `config.json` and replace its sample values.
+2. Build and start the monitor:
+
+   ```bash
+   go build -o domain-monitor ./src/cmd/domain-monitor
+   ./domain-monitor -config config.json
+   ```
+
+3. Open `http://localhost:8080`.
+
+For an always-on homelab deployment, use the container or Podman Quadlet
+instructions below.
 
 ## Configuration
 
@@ -26,7 +59,7 @@ The daemon reads `config.json` once, applies environment overrides, validates it
 and initializes an owned configuration snapshot. Files are limited to 8 MiB.
 Changes require a restart.
 
-### Standard `config.json` Example
+### Example `config.json`
 
 ```json
 {
@@ -39,7 +72,7 @@ Changes require a restart.
   "domains": [
     {
       "domain": "example.com",
-      "name": "Prod Domain",
+      "name": "Primary Domain",
       "nameservers": [
         {"hostname": "ns1.example.com"},
         {"hostname": "hidden-ns.example.com", "hidden": true}
@@ -61,11 +94,9 @@ Changes require a restart.
 }
 ```
 
----
+## Configuration reference
 
-## Configuration Reference
-
-### Global Options
+### Global options
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -78,41 +109,23 @@ Changes require a restart.
 
 RDAP and public-metadata clients connect directly so proxy resolution cannot bypass destination policy. The operator-selected notification client may use environment proxy settings; credentials are never followed across origins.
 
-### Runtime state
+### Runtime behavior
 
-Configuration and resolver lists are owned at startup and shared read-only inside
-the daemon; explicit snapshot access returns independent copies. Internal status
-and priority values are byte enums, and condition codes are 16-bit enums. API and
-result status names retain their string representation. Conditions are embedded
-values with an explicit zero state. Condition history keeps only codes and start
-times, avoiding retention of old error messages.
+Configuration is loaded and validated once at startup; changes require a
+restart. Each cycle gathers bounded network evidence, evaluates it locally, and
+publishes one coherent JSON snapshot. Dashboard readers therefore see either
+the previous completed cycle or the new one, never a half-written state.
 
-Domain names, DNS values and diagnostics still need strings; variable-sized
-results need bounded slices/maps. Configuration snapshots own their CAA policy
-slices. Active check lists store indices into the daemon's owned configuration,
-without retaining pointers into backing arrays. A fixed pool of at most 32
-workers gathers network evidence into one cycle-owned snapshot. Serial RDAP and
-WHOIS evidence is evaluated first so newly expired or re-registered domains
-select the correct dependent workload in the same cycle. Final evaluation
-performs no network requests. Expected DNS values are copied once so returned
-cycle state remains independent of configuration.
-Completed cycles publish one immutable cached JSON snapshot; in-progress
-changes do not affect HTTP readers.
+The worker pool is capped at 32. Transient HTTP failures use bounded retries
+with backoff and `Retry-After` support, while DNS and WHOIS use their own small
+retry budgets. Resolver disagreement and partial results are reported as such.
+Notifications are assembled after publication, ordered by severity, and sent
+independently to each configured provider.
 
-Between cycles, the engine retains status/condition history and the latest JSON
-snapshot rather than prior result trees. Bootstrap access returns independent
-server lists. Pricing refreshes replace an immutable catalog; callers receive
-scalar prices without copying or exposing its map. Existing catalog readers
-remain stable across refreshes, with the same freshness and stale-data limits.
-State, condition ages, pricing/bootstrap caches, and notification queues are
-in memory only. Restarting rebuilds them; the daemon does not persist check
-history or failed notification deliveries. HTTP gathering retries transient
-transport failures and retryable statuses up to three total attempts with
-context-aware exponential backoff and `Retry-After` support. DNS tries at most
-three distinct resolvers or nameserver addresses. WHOIS uses conservative
-rate-limited retries. Notifications are rendered after state publication as one
-bounded, high-severity-first report. Each provider is isolated and receives one
-request per report, with separate timeout and retry budgets.
+All state is kept in memory. A restart rebuilds condition ages, caches, and the
+latest results; failed notification deliveries are not persisted. This keeps
+the daemon simple to operate, but it is not intended to be a long-term history
+or reporting database.
 
 Provider files use the filename as the provider name, for example `custom.json`:
 
@@ -128,7 +141,7 @@ least one MX suffix is required. DKIM selectors may be omitted when no default
 selector is known. Set `email.provider` to `custom` to use this definition. Provider
 files are read once; changes require a restart.
 
-### Domain Options (`domains[]`)
+### Domain options (`domains[]`)
 
 | Parameter | Type | Required | Description |
 | :--- | :--- | :---: | :--- |
@@ -178,7 +191,7 @@ other observed tags remain visible without causing a mismatch.
 Issuer domain names are compared case-insensitively; issuer-defined parameter
 values retain their original case.
 
-### DNS Record Options (`dns_records[]`)
+### DNS record options (`dns_records[]`)
 
 | Parameter | Type | Required | Description |
 | :--- | :--- | :---: | :--- |
@@ -189,55 +202,59 @@ values retain their original case.
 | `match_type` | string | No | Strategy: `"exact"` (default), `"prefix"`, `"contains"`, `"any_of"`. |
 | `custom_resolver` | string | No | Resolver IP used exclusively for this record. No global-resolver fallback occurs. |
 
----
+## Environment variables
 
-## Environment Variables
-
-Tokens and runtime paths can be configured via environment variables for easy container injection:
+Tokens and runtime paths can be configured through environment variables for
+container deployments:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `CONFIG_PATH` | `"config.json"` | Path to the `config.json` file |
-| `PORT` | `"8080"` | HTTP server listening port |
-| `NTFY_AUTH` | Config value | Authorization header/token for Ntfy |
-| `TELEGRAM_TOKEN` | Config value | Telegram Bot API token |
-| `TELEGRAM_CHAT_ID` | Config value | Telegram chat or channel ID |
-| `DOH_URL` | `"https://dns.google/resolve"` | Upstream DNS-over-HTTPS endpoint |
+| `CONFIG_PATH` | `"config.json"` | Path to the configuration file. |
+| `PORT` | `"8080"` | HTTP server listening port. |
+| `NTFY_AUTH` | Config value | Authorization header or token for ntfy. |
+| `TELEGRAM_TOKEN` | Config value | Telegram Bot API token. |
+| `TELEGRAM_CHAT_ID` | Config value | Telegram chat or channel ID. |
+| `DOH_URL` | `"https://dns.google/resolve"` | Upstream DNS-over-HTTPS endpoint. |
 
----
+## Web dashboard and API
 
-## Web Dashboard & API
+The daemon provides an embedded web UI and JSON API:
 
-The daemon provides an embedded Web UI and JSON API:
-
-*   **`GET /`:** Interactive Web Dashboard grouping checked domains into Healthy, Issues, and Allowed to Expire sections and DNS records into Matched and Not Matched sections. Empty sections are hidden; pending results appear after checks finish. Domain cards show days to expiry, and the sidebar shows annual and upcoming renewal costs.
-*   **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
-*   **`GET /api/state`:** Latest coherent JSON snapshot with deterministic check arrays and compact cycle attempt/freshness metadata. Pending checks are published at startup; a failed attempt retains prior evidence. Responses include an ETag, and matching `If-None-Match` requests return 304 without a body.
+- **`GET /`:** Dashboard grouping domains into Healthy, Issues, and Allowed to
+  Expire, with separate matched and unmatched DNS records. Domain cards show
+  expiry and renewal details.
+- **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
+- **`GET /api/state`:** Latest coherent JSON snapshot. Pending checks are
+  published at startup, failed attempts retain prior evidence, and ETag support
+  avoids sending unchanged responses.
 
 RDAP state sets `expiry_confirmed` only after a domain configured with
 `allow_expiry` is confirmed expired or absent; that transition suppresses its
 dependent checks until registration reappears.
 
----
-
-## Domain Renewal Pricing & Privacy
+## Renewal pricing and privacy
 
 The daemon tracks estimated annual domain renewal costs for your portfolio:
 
-* **Automatic Standard TLD Pricing**: Standard domain extensions (e.g., `.com`, `.org`, `.co.uk`) are automatically priced using the open [DotSweep](https://dotsweep.com/tlds) TLD catalog.
-* **Pricing catalog privacy**: The daemon queries `https://dotsweep.com/tlds` to download a public TLD catalog without sending portfolio domain names, TLD lists, or registrar identities in that request. Domain and DNS checks contact their configured upstream services separately.
-* **Catalog caching**: Upstream catalog responses are cached in memory for 24 hours (`PricingCacheTTL`). Temporary upstream failures or unusable catalogs retain existing cached data for up to 7 days.
-* **Premium Domains & Custom Overrides**: Because premium domains have custom renewal prices that cannot be inferred from standard TLD rates, you can specify `renewal_price` in `config.json` (e.g., `"renewal_price": 250.00`). A manual amount takes precedence. Monitored domain cards show the annual price or `Unknown`; delegated zones show `Not applicable`. Domains allowed to expire are excluded from the portfolio total, which is partial when some monitored prices are unknown.
-* **Sidebar totals**: Minimum annual renewal cost sums known prices for monitored domains. Renewals due in the next 12 months sum known prices for monitored domains whose reported expiration date falls within the next 365 days. Unknown prices are marked as partial; domains without a known expiration date are excluded from the upcoming total.
-
-
----
+- **Standard TLD pricing:** Common extensions such as `.com`, `.org`, and
+  `.co.uk` use the public [DotSweep](https://dotsweep.com/tlds) catalog.
+- **Privacy:** The catalog request does not include your domain names, TLD list,
+  or registrar identities. Domain checks still contact their relevant upstream
+  services normally.
+- **Caching:** The catalog is cached in memory for 24 hours. Usable stale data
+  may be retained for up to seven days during an outage.
+- **Manual prices:** Set `renewal_price` for premium domains or custom rates. A
+  configured value always takes precedence.
+- **Dashboard totals:** Known annual and upcoming renewal costs are summed.
+  Totals are marked partial when some prices are unknown, and domains allowed
+  to expire are excluded.
 
 ## Deployment
 
 ### Docker
 
-Pre-built multi-architecture Docker images are available via the GitHub Container Registry.
+Pre-built multi-architecture Docker images are available through GitHub
+Container Registry.
 
 ```bash
 docker run -d \
@@ -254,16 +271,18 @@ reviewed release image. Using an immutable digest prevents an unattended image
 update from changing runtime behavior or requiring an unreviewed configuration
 migration.
 
-To add custom email providers, mount their directory read-only at `/app/data/email_providers`. Bundled presets are used when this directory is absent.
+To add custom email providers, mount their directory read-only at
+`/app/data/email_providers`. Bundled presets are used when this directory is
+absent.
 
-### Local Execution
+### Local execution
 
 ```bash
-go build -o domain_monitor ./src/cmd/domain-monitor
-./domain_monitor -config config.json
+go build -o domain-monitor ./src/cmd/domain-monitor
+./domain-monitor -config config.json
 ```
 
-### Systemd / Podman Quadlet
+### Podman Quadlet
 
 Deploy using the included `domain-monitor.container` Quadlet file:
 
@@ -275,16 +294,18 @@ Deploy using the included `domain-monitor.container` Quadlet file:
    systemctl --user start domain-monitor.service
    ```
 
----
+## Project notes
 
-## Acknowledgements
+Useful upstream projects:
 
-*   [**lissy93/who-dat**](https://github.com/lissy93/who-dat): Reference implementation for unified WHOIS/RDAP JSON lookups.
-*   [**likexian/whois-parser**](https://github.com/likexian/whois-parser): WHOIS schema parser. Port-43 transport is implemented locally with context cancellation and response bounds.
-*   [**miekg/dns**](https://github.com/miekg/dns): DNS wire protocol and cryptographic DNSSEC verification library for Go.
----
+- [lissy93/who-dat](https://github.com/lissy93/who-dat): Reference for unified
+  WHOIS and RDAP lookups.
+- [likexian/whois-parser](https://github.com/likexian/whois-parser): WHOIS
+  response parser. The bounded port-43 transport is implemented locally.
+- [miekg/dns](https://github.com/miekg/dns): DNS wire protocol and DNSSEC
+  primitives for Go.
 
-## Development & Testing
+## Development and checks
 
 The [protocol reference](docs/protocols.md) links the RFCs and states which
 parts the monitor uses. Durable behavior is documented here and in that scoped
@@ -295,7 +316,8 @@ executable entry point, `src/internal/monitor` owns daemon behavior and embedded
 assets, and `src/internal/netpolicy` owns reusable outbound-target policy.
 Maintained project documentation lives under `docs`.
 
-The test suite uses injected clients, local HTTP/DNS fixtures, and a committed synthetic WHOIS corpus.
+The test suite uses injected clients, local HTTP/DNS fixtures, and a committed
+synthetic WHOIS corpus.
 
 Enable the tracked pre-push hook once per clone:
 
@@ -307,9 +329,9 @@ Before every push, `.githooks/pre-push` runs formatting, race tests, the
 recommended 90% coverage check, `go vet`, and `revive` as best-effort advisory
 checks; it never blocks a push. On Arch Linux, install its tools with
 `pacman -S go revive`. Release CI remains the strict enforcement boundary and
-applies the complete pinned `.golangci.yml` suite. The scheduler owns an injectable clock/timer
-seam for deterministic lifecycle tests; protocol clients and caches still use
-wall-clock time internally.
+applies the complete pinned `.golangci.yml` suite. The scheduler owns an
+injectable clock/timer seam for deterministic lifecycle tests; protocol clients
+and caches still use wall-clock time internally.
 
 Dashboard delivery, API integration, and embedded assets use deterministic
 non-browser tests. Review interactive and visual behavior manually when changing
@@ -322,8 +344,8 @@ the supported-scope release gate; passing tests alone is not a bug-free guarante
 
 For parser fuzzing, run `go test -fuzz=FuzzFlexibleDateParsing -fuzztime=30s ./src/internal/monitor`.
 
-### CI/CD Pipeline
+### Release checks
 
-The GitHub Actions workflow only builds and publishes optimized multi-platform
-containers for release tags on `main`; validation is owned by the local
-pre-push hook.
+The local pre-push hook is intentionally advisory. Release tags run the strict
+race, coverage, vet, formatting, diff-hygiene, and lint gates before the
+multi-platform container is published.
