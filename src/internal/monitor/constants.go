@@ -1,12 +1,10 @@
-package main
+package monitor
 
 import (
 	"errors"
 	"regexp"
 	"slices"
 	"time"
-
-	"github.com/miekg/dns"
 )
 
 // System & Default Paths and Files
@@ -31,17 +29,18 @@ const (
 
 // Standard Timeouts & Intervals
 const (
-	DefaultDNSTimeout           = 5 * time.Second
-	DefaultHTTPTimeout          = 10 * time.Second
-	PricingCacheTTL             = 24 * time.Hour
-	PricingMaxStaleAge          = 7 * 24 * time.Hour
-	DefaultWHOISTimeout         = 10 * time.Second
-	DefaultWHOISQueryTimeout    = 15 * time.Second
-	MaxWHOISResponseBytes       = 1 << 20
-	DefaultTCPKeepAlive         = 30 * time.Second
-	ShutdownTimeout             = 5 * time.Second
-	DefaultLoopDurationFallback = 6 * time.Hour
-	RDAPRateLimitInterval       = 10 * time.Second
+	DefaultDNSTimeout            = 5 * time.Second
+	DefaultHTTPTimeout           = 10 * time.Second
+	DefaultExpectContinueTimeout = time.Second
+	PricingCacheTTL              = 24 * time.Hour
+	PricingMaxStaleAge           = 7 * 24 * time.Hour
+	DefaultWHOISTimeout          = 10 * time.Second
+	DefaultWHOISQueryTimeout     = 15 * time.Second
+	MaxWHOISResponseBytes        = 1 << 20
+	DefaultTCPKeepAlive          = 30 * time.Second
+	ShutdownTimeout              = 5 * time.Second
+	DefaultLoopDurationFallback  = 6 * time.Hour
+	RDAPRateLimitInterval        = 10 * time.Second
 )
 
 // WHOIS transport protocol and known server aliases.
@@ -73,6 +72,8 @@ const (
 	MaxProviderMessageBytes           = 3500
 	MaxTelegramAlertRunes             = 400
 	MaxAlertNameRunes                 = 80
+	MaxCycleReportItems               = 64
+	MaxFindingsPerCheck               = 16
 	AlertTruncationNotice             = " [truncated; see local state]"
 	HoursPerDay                       = 24
 )
@@ -105,6 +106,7 @@ const (
 	HeaderNtfyTitle             = "Title"
 	HeaderNtfyPriority          = "Priority"
 	HeaderNtfyTags              = "Tags"
+	HeaderReportID              = "X-Domain-Monitor-Report-ID"
 	HeaderXContentTypeOptions   = "X-Content-Type-Options"
 	HeaderXFrameOptions         = "X-Frame-Options"
 	HeaderReferrerPolicy        = "Referrer-Policy"
@@ -189,7 +191,7 @@ const (
 	DMARCVersion          = "DMARC1"
 	DKIMVersion           = "DKIM1"
 	DNSPolicyTagVersion   = "v"
-	DNSPolicyTagPublicKey = "p"
+	DNSPolicyTagP         = "p"
 	DKIMTagKeyType        = "k"
 	DKIMKeyTypeRSA        = "rsa"
 	DKIMKeyTypeEd25519    = "ed25519"
@@ -208,7 +210,6 @@ const (
 // Protocols
 const (
 	ProtocolRDAP        = "rdap"
-	ProtocolHybrid      = "hybrid"
 	ProtocolWHOIS       = "whois"
 	ProtocolWHOISFailed = "whois_failed"
 	ProtocolTCP         = "tcp"
@@ -264,6 +265,14 @@ const (
 
 var checkStatusNames = [...]string{"", "pending", "ok", "failed", "mismatch", "warning", "hijacked", "skipped"}
 var alertPriorityNames = [...]string{"default", "warning", "high", "urgent"}
+var findingSeverityNames = [...]string{"info", "warning", "error"}
+
+const (
+	CyclePhaseIdle         = "idle"
+	CyclePhaseInitializing = "initializing"
+	CycleOutcomeFailed     = "failed"
+	CycleOutcomeSuccess    = "success"
+)
 
 const (
 	CodeNone ResultCode = iota
@@ -446,6 +455,8 @@ var (
 	ErrDomainNotFound    = errors.New("domain not found in whois (404)")
 	ErrNoResolvers       = errors.New("no resolvers configured")
 	ErrEmptyDNSResponse  = errors.New("empty dns response")
+	ErrEmptyHTTPResponse = errors.New("empty HTTP response")
+	ErrHTTPClientNil     = errors.New("HTTP client is nil")
 	ErrInvalidNullMX     = errors.New("invalid null MX record")
 	ErrReadLimitExceeded = errors.New("read limit exceeded")
 
@@ -455,17 +466,6 @@ var (
 	ErrEmptyDate              = errors.New("empty date string")
 	ErrEmptyBootstrapRegistry = errors.New("empty bootstrap registry")
 )
-
-// DNSTypeMap maps record type string names to miekg/dns uint16 type constants.
-var DNSTypeMap = map[string]uint16{
-	RecordTypeA:     dns.TypeA,
-	RecordTypeAAAA:  dns.TypeAAAA,
-	RecordTypeCNAME: dns.TypeCNAME,
-	RecordTypeMX:    dns.TypeMX,
-	RecordTypeTXT:   dns.TypeTXT,
-	RecordTypeCAA:   dns.TypeCAA,
-	RecordTypeNS:    dns.TypeNS,
-}
 
 // Compact domain statuses from RFC 5731, RGP (RFC 3915), and generic RDAP evidence.
 const (
@@ -526,8 +526,8 @@ var eppCodeKeys = [...]string{
 	EPPHold:                     "hold",
 }
 
-// EPPStatusMap maps raw or formatted EPP/RDAP tokens to canonical camelCase strings.
-var EPPStatusMap = map[string]string{
+// eppStatusMap maps raw or formatted EPP/RDAP tokens to canonical camelCase strings.
+var eppStatusMap = map[string]string{
 	"clienttransferprohibited": "clientTransferProhibited",
 	"servertransferprohibited": "serverTransferProhibited",
 	"transferprohibited":       "transferProhibited",
@@ -563,8 +563,8 @@ var EPPStatusMap = map[string]string{
 	"connected":                "active",
 }
 
-// TZOffsets maps common global registrar and WHOIS timezone abbreviations to ISO numeric offsets.
-var TZOffsets = map[string]string{
+// timezoneOffsets maps common global registrar and WHOIS timezone abbreviations to ISO numeric offsets.
+var timezoneOffsets = map[string]string{
 	" UTC":  " +0000",
 	" GMT":  " +0000",
 	" Z":    " +0000",
@@ -585,8 +585,8 @@ var TZOffsets = map[string]string{
 	" BST":  " +0100",
 }
 
-// WHOISNotFoundIndicators lists indicators across global registrars and registries denoting an unregistered domain.
-var WHOISNotFoundIndicators = []string{
+// whoisNotFoundIndicators lists indicators across global registrars and registries denoting an unregistered domain.
+var whoisNotFoundIndicators = []string{
 	"no match for",
 	"not found",
 	"status: free",
@@ -615,8 +615,8 @@ var WHOISNotFoundIndicators = []string{
 	"not exist",
 }
 
-// WHOISRateLimitIndicators lists indicators across WHOIS servers denoting query rate-limiting.
-var WHOISRateLimitIndicators = []string{
+// whoisRateLimitIndicators lists indicators across WHOIS servers denoting query rate-limiting.
+var whoisRateLimitIndicators = []string{
 	"limit exceeded",
 	"query limit exceeded",
 	"too many requests",
@@ -646,7 +646,7 @@ var (
 )
 
 // Stealth RDAP Seeds for ccTLDs not yet published in IANA bootstrap
-var StealthSeeds = map[string][]string{
+var stealthSeeds = map[string][]string{
 	"ac":               {"https://rdap.identitydigital.services/rdap/"},
 	"af":               {"https://whois.nic.af/"},
 	"ag":               {"https://rdap.identitydigital.services/rdap/"},
@@ -717,7 +717,7 @@ var StealthSeeds = map[string][]string{
 }
 
 // Known ccTLD direct port-43 WHOIS server overrides for fallback resolution
-var CCTLDWHOISServers = map[string]string{
+var ccTLDWHOISServers = map[string]string{
 	"ai":    "whois.nic.ai",
 	"au":    "whois.auda.org.au",
 	"ca":    "whois.cira.ca",
@@ -782,7 +782,6 @@ const (
 	MsgLogTelegramPayloadTooLarge  = "Telegram alert exceeds provider message budget"
 	MsgLogTelegramRejected         = "Telegram rejected notification"
 	MsgLogRDAPRefreshFailed        = "Failed to refresh RDAP bootstrap from IANA; falling back to cached registry"
-	MsgLogRDAPReturned404          = "RDAP returned 404, attempting WHOIS fallback"
 	MsgLogRDAPRateLimited          = "RDAP rate limited, falling back to WHOIS"
 	MsgLogWHOISRateLimitedRetry    = "WHOIS query rate limited, retrying"
 	MsgLogWHOISUnregistered        = "WHOIS reports domain is unregistered (404)"
@@ -992,12 +991,22 @@ const (
 	MsgErrDNSMissingType                     = "dns record %s is missing a type (e.g. A, CNAME)"
 
 	MsgErrExpectedIPv6ForTypeA              = "dns record %s (%s): expected %s is an IPv6 address, but record type is A (requires IPv4)"
-	MsgErrExpectedNotValidIPv4              = "dns record %s (%s): expected %s is not a valid IPv4 address for type A"
+	MsgErrExpectedInvalidIPv4               = "dns record %s (%s): expected %s is not a valid IPv4 address for type A"
 	MsgErrExpectedIPv4ForTypeAAAA           = "dns record %s (%s): expected %s is an IPv4 address, but record type is AAAA (requires IPv6)"
-	MsgErrExpectedNotValidIPv6              = "dns record %s (%s): expected %s is not a valid IPv6 address for type AAAA"
+	MsgErrExpectedInvalidIPv6               = "dns record %s (%s): expected %s is not a valid IPv6 address for type AAAA"
 	MsgErrExpectedNotValidIP                = "dns record %s (%s): expected %s is not a valid IPv4 or IPv6 address for composite type IP"
 	MsgErrNtfyURLRequired                   = "ntfy and its URL are required"
 	MsgErrNilStringListReceiver             = "nil StringList receiver"
+	MsgErrInvalidResultCode                 = "invalid result code %d"
+	MsgErrUnknownResultCode                 = "unknown result code %q"
+	MsgErrInvalidFindingSeverity            = "invalid finding severity %d"
+	MsgErrUnknownFindingSeverity            = "unknown finding severity %q"
+	MsgErrAuthenticatedNtfyRequiresHTTPS    = "authenticated ntfy requires HTTPS"
+	MsgErrNotificationRedirectChangedOrigin = "notification redirect changed origin"
+	MsgErrIncompleteResolverEvidence        = "incomplete resolver evidence: %w"
+	MsgErrResolverDisagreementFor           = "resolver disagreement for %s"
+	MsgErrResolverDisagreement              = "resolver disagreement: %s and %s returned different answers"
+	MsgCycleFindingsOmitted                 = "\n… %d additional findings omitted"
 	MsgPrefixLookupOn                       = "lookup %s on %s"
 	MsgPrefixLookupOnWithRcode              = "lookup %s on %s (%s)"
 	MsgErrLookupFailedAandAAAA              = "lookup failed for A and AAAA"
@@ -1025,8 +1034,8 @@ const (
 	MsgErrRDAPAndWHOIS                   = "RDAP: %w | WHOIS: %w"
 )
 
-// RegistryDateLayouts specifies supported WHOIS/RDAP date format layouts for parseFlexibleDate.
-var RegistryDateLayouts = [...]string{
+// registryDateLayouts specifies supported WHOIS/RDAP date format layouts for parseFlexibleDate.
+var registryDateLayouts = [...]string{
 	time.RFC3339,
 	time.RFC3339Nano,
 	"2006-01-02T15:04:05",
@@ -1077,31 +1086,31 @@ const (
 	MsgErrLoadConfiguration     = "load configuration: %w"
 	MsgErrInitializeApplication = "initialize application: %w"
 	MsgErrHTTPServerStopped     = "HTTP server stopped: %w"
-	MsgErr2                     = "%s: %s"
+	MsgErrOperationDetail       = "%s: %s"
 	MsgErrShutDownHTTPServer    = "shut down HTTP server: %w"
 
-	MsgErrRootCause                    = "root cause"
-	MsgErrCustomError                  = "custom error"
-	MsgLogTestErrorMessage             = "Test error message"
-	MsgLogTestWarnMessage              = "Test warn message"
-	MsgLogTestInfoMessage              = "Test info message"
-	MsgLogSampleLocalizedMessage       = "Sample localized message"
-	MsgLogTestInfof                    = "Test infof %s"
-	MsgLogTestErrorf                   = "Test errorf %s"
-	MsgLogTestWarnf                    = "Test warnf %d"
-	MsgLogTestDebugMessage             = "Test debug message"
-	MsgLogTestDebugf                   = "Test debugf %s"
-	MsgErrInvalidServerPort            = "invalid server port: %w"
-	MsgErrValidateConfiguredResolvers  = "validate configured resolvers (%d): %s"
-	MsgErrInvalidResolver              = "invalid resolver %q: %w"
-	MsgErrInvalidDohURL                = "invalid DoH URL: %w"
-	MsgErrValidateNotificationsntfy    = "validate notifications.ntfy: %s"
-	MsgErrInvalidNtfyURL               = "invalid ntfy URL: %w"
-	MsgErrPortMustBeBetween1           = "port %q must be between 1 and 65535"
-	MsgErrResolverEndpointIsEmpty      = "resolver endpoint %q is empty"
-	MsgErrExpectedAnIPAddressOr        = "expected an IP address or host:port: %w"
-	MsgErrResolverEndpointHasAnInvalid = "resolver endpoint %q has an invalid host"
-	MsgErrExpectedAnHTTPSURLWith       = "expected an http(s) URL with a host"
+	MsgErrRootCause                   = "root cause"
+	MsgErrCustomError                 = "custom error"
+	MsgLogTestErrorMessage            = "Test error message"
+	MsgLogTestWarnMessage             = "Test warn message"
+	MsgLogTestInfoMessage             = "Test info message"
+	MsgLogSampleLocalizedMessage      = "Sample localized message"
+	MsgLogTestInfof                   = "Test infof %s"
+	MsgLogTestErrorf                  = "Test errorf %s"
+	MsgLogTestWarnf                   = "Test warnf %d"
+	MsgLogTestDebugMessage            = "Test debug message"
+	MsgLogTestDebugf                  = "Test debugf %s"
+	MsgErrInvalidServerPort           = "invalid server port: %w"
+	MsgErrValidateConfiguredResolvers = "validate configured resolvers (%d): %s"
+	MsgErrInvalidResolver             = "invalid resolver %q: %w"
+	MsgErrInvalidDohURL               = "invalid DoH URL: %w"
+	MsgErrValidateNotificationsNtfy   = "validate notifications.ntfy: %s"
+	MsgErrInvalidNtfyURL              = "invalid ntfy URL: %w"
+	MsgErrPortOutOfRange              = "port %q must be between 1 and 65535"
+	MsgErrResolverEndpointIsEmpty     = "resolver endpoint %q is empty"
+	MsgErrExpectedIPAddressOrHostPort = "expected an IP address or host:port: %w"
+	MsgErrResolverEndpointInvalidHost = "resolver endpoint %q has an invalid host"
+	MsgErrExpectedHTTPURLWithHost     = "expected an http(s) URL with a host"
 
 	MsgErrInvalidMonitoredDomain               = "invalid monitored domain %q"
 	MsgErrRootZoneIsNotA                       = "root zone %q is not a parent of delegated zone %q"
@@ -1113,7 +1122,7 @@ const (
 	MsgErrInvalidCustomResolverFor             = "invalid custom resolver for %s: %w"
 	MsgErrEmptyExpectedDNSRecordsFor           = "empty expected DNS records for %s with %s match"
 	MsgErrInvalidExpectedCAAValueFor           = "invalid expected CAA value %q for %s: %w"
-	MsgErrInvalidExpectedCAAValueFor2          = "invalid expected CAA value %q for %s"
+	MsgErrInvalidExpectedCAAValue              = "invalid expected CAA value %q for %s"
 	MsgErrQueryWHOISForThroughInjected         = "query WHOIS for %s through injected client: %w"
 	MsgErrWHOISTransportIsNotConfigured        = "WHOIS transport is not configured for %s"
 	MsgErrWHOISDomainHasNoToplevel             = "WHOIS domain %q has no top-level label"
@@ -1128,7 +1137,7 @@ const (
 	MsgErrWriteWHOISQueryForTo                 = "write WHOIS query for %s to %s: %w"
 	MsgErrReadWHOISResponseForFrom             = "read WHOIS response for %s from %s: %w"
 	MsgErrWHOISResponseForExceedsBytes         = "WHOIS response for %s exceeds %d bytes"
-	MsgErrRDAPHTTPClientIsNot                  = "RDAP HTTP client is not configured for %s"
+	MsgErrRDAPHTTPClientNotConfigured          = "RDAP HTTP client is not configured for %s"
 	MsgErrUnsafeRDAPURL                        = "unsafe RDAP URL: %q"
 	MsgErrRDAPLookupFor                        = "RDAP lookup for %s: %s"
 	MsgErrRDAPBootstrapIsUnavailableFor        = "RDAP bootstrap is unavailable for %s"
@@ -1164,7 +1173,7 @@ const (
 
 // Auto-generated String Literals
 const (
-	Str20060102                 = "2006-01-02"
+	DateLayoutCompact           = "2006-01-02"
 	StrAutoRenewGracePeriod     = "Auto-Renew Grace Period discrepancy: Registry expiration ("
 	StrCacheAge                 = "cache_age"
 	StrClientdeleteprohibited   = "clientdeleteprohibited"
@@ -1181,9 +1190,8 @@ const (
 	StrDeleteprohibited                   = "deleteprohibited"
 	StrDKIM                               = "DKIM: "
 	StrDMARC                              = "_dmarc."
-	StrDmarc2                             = "DMARC: "
+	StrDMARCDiagnosticPrefix              = "DMARC: "
 	StrDomain                             = "/domain/"
-	StrDomain2                            = "domain"
 	StrDomainkey                          = "._domainkey."
 	StrEmpty                              = ""
 	StrError                              = "error"
@@ -1195,10 +1203,11 @@ const (
 	StrHTTPS                              = "https"
 	StrIOTimeout                          = "i/o timeout"
 	StrIANA                               = "IANA "
-	StrIana2                              = "iana"
+	StrIANALower                          = "iana"
 	StrIANARegistrarID                    = "iana registrar id"
 	StrInternal                           = ".internal"
 	StrInternalDNSCheckPanic              = "internal DNS check panic"
+	StrInternalDomainCheckPanic           = "internal domain check panic"
 	StrInternalRDAPCheckPanic             = "internal RDAP check panic"
 	StrInternic                           = "internic"
 	StrJustNow                            = "just now"
@@ -1207,7 +1216,7 @@ const (
 	StrLimit                              = "limit"
 	StrLocal                              = ".local"
 	StrLocalhost                          = "localhost"
-	StrN2                                 = "n"
+	DMARCPSDNo                            = "n"
 	StrNameserverDesyncRegistryDelegation = "Nameserver desync: Registry delegation ["
 	StrNoSuchHost                         = "no such host"
 	StrNone                               = "none"

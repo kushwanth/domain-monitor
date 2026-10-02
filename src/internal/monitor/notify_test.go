@@ -1,9 +1,10 @@
-package main
+package monitor
 
 import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestNotificationManager(t *testing.T) {
@@ -321,7 +324,7 @@ func TestNotificationFlushPriorityAndIndependentAttempts(t *testing.T) {
 			nm.Dispatch(alert.Message, "", alert.Priority, "", "", "")
 		}
 		nm.FlushContext(context.Background())
-		want := []string{"urgent", "telegram", "critical", "telegram", "critical second", "telegram", "warning", "telegram"}
+		want := []string{"urgent\ncritical\ncritical second\nwarning", "telegram"}
 		if !slices.Equal(attempts, want) {
 			t.Errorf("delivery order = %v, want %v", attempts, want)
 		}
@@ -332,4 +335,19 @@ func TestNotificationFlushPriorityAndIndependentAttempts(t *testing.T) {
 			t.Error("completed attempts retained in queue")
 		}
 	}
+}
+
+func TestCycleReportIsBoundedAndKeepsHighestSeverity(t *testing.T) {
+	nm := NewNotificationManager("https://ntfy.invalid/topic", "", "", "")
+	for index := 0; index < MaxCycleReportItems+10; index++ {
+		nm.Dispatch(fmt.Sprintf("warning-%03d", index), "", PriorityWarning, "", "", "")
+	}
+	nm.Dispatch("urgent-last", "", PriorityUrgent, "", "", "")
+	batch, omitted := nm.takeAlertReportBatch()
+	require.Len(t, batch, MaxCycleReportItems)
+	require.Equal(t, 11, omitted)
+	require.Equal(t, "urgent-last", batch[0].Message)
+	report := buildCycleReport(batch, omitted)
+	require.Contains(t, report.Message, "11 additional findings omitted")
+	require.NotEmpty(t, report.ReportID)
 }

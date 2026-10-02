@@ -1,5 +1,4 @@
-// Package main implements domain and DNS monitoring services.
-package main
+package monitor
 
 import (
 	"context"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"domain_monitor/src/internal/netpolicy"
 )
 
 // RDAPTLSConfig returns a TLS configuration compatible with both modern and legacy ccTLD
@@ -41,7 +42,8 @@ func RDAPTLSConfig() *tls.Config {
 // NewRDAPHTTPClient creates an HTTP client configured with legacy-compatible TLS and strict timeouts.
 func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		// Direct-only: proxy resolution would bypass the dialed-IP policy.
+		Proxy: nil,
 		DialContext: (&net.Dialer{
 			Timeout:   timeout,
 			KeepAlive: DefaultTCPKeepAlive,
@@ -54,7 +56,7 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 					return WrapError(host, ErrRestrictedIP)
 				}
 				if ip := net.ParseIP(host); ip != nil {
-					if IsRestrictedIP(ip) {
+					if netpolicy.RestrictedIP(ip) {
 						return WrapError(host, ErrRestrictedIP)
 					}
 				}
@@ -64,7 +66,7 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 		TLSClientConfig:       RDAPTLSConfig(),
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
-		ExpectContinueTimeout: 1 * time.Second,
+		ExpectContinueTimeout: DefaultExpectContinueTimeout,
 	}
 	return &http.Client{
 		Transport: transport,
@@ -81,11 +83,53 @@ func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// NewPublicHTTPClient returns a bounded direct client for public metadata and
+// trusted DoH. It intentionally does not inherit proxy settings.
+func NewPublicHTTPClient(timeout time.Duration) *http.Client {
+	transport := cloneDefaultTransport()
+	transport.Proxy = nil
+	transport.MaxIdleConns = DefaultMaxConcurrency
+	transport.MaxIdleConnsPerHost = 4
+	transport.ResponseHeaderTimeout = timeout
+	transport.TLSHandshakeTimeout = timeout
+	return &http.Client{Transport: transport, Timeout: timeout}
+}
+
+// NewNotificationHTTPClient permits operator-selected private ntfy endpoints
+// and makes environment proxy use explicit for that trusted configuration.
+func NewNotificationHTTPClient(timeout time.Duration) *http.Client {
+	transport := cloneDefaultTransport()
+	transport.Proxy = http.ProxyFromEnvironment
+	transport.MaxIdleConns = 4
+	transport.MaxIdleConnsPerHost = 2
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= MaxRedirects {
+				return errors.New(MsgErrStoppedAfterRedirects)
+			}
+			if len(via) > 0 && (req.URL.Scheme != via[0].URL.Scheme || req.URL.Host != via[0].URL.Host) {
+				return errors.New(MsgErrNotificationRedirectChangedOrigin)
+			}
+			return nil
+		},
+	}
+}
+
+func cloneDefaultTransport() *http.Transport {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || transport == nil {
+		return &http.Transport{}
+	}
+	return transport.Clone()
+}
+
 // KnownWHOISServer returns a dedicated WHOIS server for a given domain suffix if known.
 func KnownWHOISServer(domain string) string {
 	suffix := NormalizeDomainToASCIIText(domain)
 	for {
-		if server, ok := CCTLDWHOISServers[suffix]; ok {
+		if server, ok := ccTLDWHOISServers[suffix]; ok {
 			return server
 		}
 		idx := strings.IndexByte(suffix, '.')
@@ -135,8 +179,14 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 	if b.isFresh() {
 		return nil
 	}
-
-	b.fetchMu.Lock()
+	hasData, cacheAge := b.cachedRegistryAge()
+	if hasData && cacheAge <= BootstrapMaxAge {
+		if !b.fetchMu.TryLock() {
+			return nil
+		}
+	} else {
+		b.fetchMu.Lock()
+	}
 	defer b.fetchMu.Unlock()
 
 	if b.isFresh() {
@@ -144,7 +194,7 @@ func (b *Bootstrap) ensure(ctx context.Context) error {
 	}
 
 	if err := b.fetch(ctx); err != nil {
-		hasData, cacheAge := b.cachedRegistryAge()
+		hasData, cacheAge = b.cachedRegistryAge()
 
 		if hasData && cacheAge <= BootstrapMaxAge {
 			LogWarn(MsgLogRDAPRefreshFailed, StrError, err, StrCacheAge, cacheAge.Round(time.Minute))
@@ -166,7 +216,7 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 	if client == nil {
 		return fmt.Errorf(MsgErrFetchRDAPBootstrapRegistry, ErrBootstrapClientNil)
 	}
-	resp, err := doHTTPWithRetry(ctx, NameOpRDAPBootstrap, client, true, func() (*http.Request, error) {
+	resp, err := doHTTPWithRetry(ctx, NameOpRDAPBootstrap, client, RetryHTTPTransient, func() (*http.Request, error) {
 		// #nosec G704 -- bootstrap URL is a configured endpoint; callers control its HTTP transport.
 		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, b.url, nil)
 		if requestErr != nil {
@@ -201,7 +251,7 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 		return ErrEmptyBootstrapRegistry
 	}
 
-	for tld, urls := range StealthSeeds {
+	for tld, urls := range stealthSeeds {
 		cleanTLD := NormalizeDomain(tld)
 		if _, ok := services[cleanTLD]; !ok {
 			services[cleanTLD] = slices.Clone(urls)

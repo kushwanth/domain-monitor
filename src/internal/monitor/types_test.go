@@ -1,18 +1,139 @@
-package main
+package monitor
 
 import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"io/fs"
 	"net/http"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/stretchr/testify/assert"
 )
+
+func TestProductionSourceConventions(t *testing.T) {
+	t.Parallel()
+
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve convention test path")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	sourceRoot := filepath.Join(repositoryRoot, "src")
+
+	err := filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path == filepath.Join(repositoryRoot, ".git") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) == ".go" && !strings.HasPrefix(path, sourceRoot+string(filepath.Separator)) {
+			t.Errorf("Go source must live under src: %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk repository: %v", err)
+	}
+
+	err = filepath.WalkDir(sourceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		checkProductionFileConventions(t, sourceRoot, path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk production source: %v", err)
+	}
+}
+
+func TestNilAppStateAccessors(t *testing.T) {
+	t.Parallel()
+
+	var app *AppState
+	body, ok := app.PublishedJSON()
+	assert.Nil(t, body)
+	assert.False(t, ok)
+	assert.Empty(t, app.Config())
+	assert.NotEmpty(t, app.Resolvers())
+	assert.NotPanics(t, func() {
+		app.SafeDispatch("message", "redacted", PriorityDefault, TagSkull, "example.com", "example")
+	})
+}
+
+func checkProductionFileConventions(t *testing.T, sourceRoot, path string) {
+	t.Helper()
+
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, path, nil, 0)
+	if err != nil {
+		t.Errorf("parse %s: %v", path, err)
+		return
+	}
+	relativePath, err := filepath.Rel(sourceRoot, path)
+	if err != nil {
+		t.Errorf("resolve source path %s: %v", path, err)
+		return
+	}
+
+	allowedStrings := make(map[token.Pos]struct{})
+	for _, spec := range file.Imports {
+		allowedStrings[spec.Path.Pos()] = struct{}{}
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		if field, ok := node.(*ast.Field); ok && field.Tag != nil {
+			allowedStrings[field.Tag.Pos()] = struct{}{}
+		}
+		return true
+	})
+
+	constantsFile := filepath.Base(path) == "constants.go"
+	typesFile := filepath.ToSlash(relativePath) == "internal/monitor/types.go"
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch current := node.(type) {
+		case *ast.GenDecl:
+			if current.Tok == token.TYPE && !typesFile {
+				t.Errorf("production type declarations belong in internal/monitor/types.go: %s:%d", relativePath, fileSet.Position(current.Pos()).Line)
+			}
+		case *ast.BasicLit:
+			if current.Kind == token.STRING && !constantsFile {
+				if _, allowed := allowedStrings[current.Pos()]; !allowed {
+					t.Errorf("runtime string literals belong in constants.go: %s:%d", relativePath, fileSet.Position(current.Pos()).Line)
+				}
+			}
+		case *ast.SelectorExpr:
+			identifier, ok := current.X.(*ast.Ident)
+			if !ok {
+				break
+			}
+			bypassesLoggingUtility := identifier.Name == "log" ||
+				(identifier.Name == "slog" && current.Sel.Name != "New" && current.Sel.Name != "NewRecord" && current.Sel.Name != "SetDefault" && current.Sel.Name != "Default") ||
+				(identifier.Name == "fmt" && strings.HasPrefix(current.Sel.Name, "Print"))
+			if bypassesLoggingUtility && filepath.Base(path) != "utils.go" {
+				t.Errorf("production logging must use project utilities: %s:%d", relativePath, fileSet.Position(current.Pos()).Line)
+			}
+		}
+		return true
+	})
+}
 
 type dummyStringer struct{}
 
@@ -111,6 +232,15 @@ func newTestCheckState() *CheckState {
 		NSHealth: make(map[string]NSHealthResult),
 		CAA:      make(map[string]CAAResult),
 	}
+}
+
+func decodePublishedState(t *testing.T, body []byte) CheckState {
+	t.Helper()
+	var wire apiState
+	if err := jsonv2.Unmarshal(body, &wire); err != nil {
+		t.Fatal(err)
+	}
+	return wire.checkState()
 }
 
 func TestStateConditionJSONOmission(t *testing.T) {

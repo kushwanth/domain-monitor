@@ -11,12 +11,12 @@ It runs as one process with bounded concurrency, resource limits, an embedded da
 
 ## Key Features
 
-*   **RDAP & WHOIS Monitoring:** IANA RDAP bootstrap discovery with registry exceptions and fallback to port-43 WHOIS. Thin RDAP responses missing expiry or registrar data are supplemented from WHOIS; successful RDAP evidence survives WHOIS failures. Monitors registration, expiry and nameserver evidence.
-*   **DNS Record Integrity:** Validates `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, `IP`, and `ALIAS` records. Supports `exact`, `prefix`, `contains`, and `any_of` matching strategies, CNAME flattening, and per-record custom resolver overrides.
+*   **RDAP & WHOIS Monitoring:** IANA bootstrap discovery, registry-first RDAP, and safe registrar RDAP referrals for thin registry responses. WHOIS is used only when RDAP is unavailable or all applicable RDAP paths fail; successful or authoritative-not-found RDAP never triggers WHOIS.
+*   **DNS Record Integrity:** Validates `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, `IP`, and `ALIAS` records. Global checks compare two configured resolver observations when available. A per-record custom resolver is queried alone with no global fallback.
 *   **CAA Publication Checks:** Compares configured issuer-tag values and supports explicit deny-all lists. This monitors DNS publication; it does not verify certificates or evaluate CA issuance policy.
 *   **Email Security Suite:** Checks MX records against configured providers, discovers SPF and DMARC records, and checks configured DKIM selectors. It does not evaluate complete mail authentication policy. Bundled provider presets can be extended or overridden at startup using JSON files in `./data/email_providers/` or `email_providers_dir`. Both MX suffixes and DKIM selectors come from those files.
 *   **2-Tier DNSSEC Verification:** Checks local DS/DNSKEY and RRSIG evidence and requires an authenticated DNS-over-HTTPS (DoH) response for a verified result.
-*   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Alerts are published through one lifecycle-bound worker, with domain-name redaction supported. Transient HTTP failures receive up to three attempts; persistent problems alert again on subsequent cycles.
+*   **Notification Engine:** Ntfy is required and attempted first. Telegram is optional. Each successful cycle produces one bounded, deterministically ordered report and at most one request per provider, excluding bounded transient retries. Domain-name redaction remains supported.
 *   **Embedded Web Dashboard:** A single-page dashboard with Dark and Light modes, periodic state polling, and a `/health` liveness endpoint. Provider quotas can still defer checks despite local rate limiting.
 
 ---
@@ -73,11 +73,11 @@ Changes require a restart.
 | `port` | string | `"8080"` | HTTP server listening port. |
 | `loop_interval_days` | number | `0.25` | Days between monitoring cycles; values outside `0.125`–`365` are clamped to those bounds. |
 | `email_providers_dir` | string | `./data/email_providers` | Optional startup directory of provider JSON files, overriding bundled presets by filename. A missing default directory uses bundled presets; an explicitly configured missing directory, malformed definition, or unknown configured provider fails startup. |
-| `resolvers` | array | `["1.1.1.1"...]` | List of up to 9 custom global DNS resolver IPs, retained for runtime failover. |
+| `resolvers` | array | `["1.1.1.1"...]` | Global DNS resolver IPs. Checks compare the first two observations when available; additional entries remain available to protocol-specific failover paths. |
 | `doh_url` | string | `"https://dns.google/resolve"` | Trusted upstream JSON DoH validator used to corroborate local DNSSEC evidence; this daemon is not an independent root-to-zone validator. |
-| `notifications` | object | Required | Must contain `ntfy.url`, a valid HTTP(S) URL. Optional `ntfy.auth`. Telegram is enabled only when both `token` and `chat_id` are nonempty after config/environment overrides. Missing or incomplete credentials disable Telegram with a warning; Ntfy remains active. Reachability is checked during delivery. |
+| `notifications` | object | Required | Must contain `ntfy.url`, a valid HTTP(S) URL. Authenticated ntfy requires HTTPS. Optional Telegram is enabled only when both `token` and `chat_id` are nonempty. Cross-origin notification redirects are rejected. |
 
-RDAP requests honor `HTTP_PROXY` and `HTTPS_PROXY`. With a proxy configured, the proxy resolves destination hostnames, so the daemon's local destination IP check applies to the proxy connection; use a trusted proxy with its own outbound restrictions.
+RDAP and public-metadata clients connect directly so proxy resolution cannot bypass destination policy. The operator-selected notification client may use environment proxy settings; credentials are never followed across origins.
 
 ### Runtime state
 
@@ -111,9 +111,9 @@ history or failed notification deliveries. HTTP gathering retries transient
 transport failures and retryable statuses up to three total attempts with
 context-aware exponential backoff and `Retry-After` support. DNS tries at most
 three distinct resolvers or nameserver addresses. WHOIS uses conservative
-rate-limited retries. Notifications are delivered after state publication in
-descending priority order by one bounded worker, with separate provider
-timeouts and retry budgets controlled by daemon cancellation.
+rate-limited retries. Notifications are rendered after state publication as one
+bounded, high-severity-first report. Each provider is isolated and receives one
+request per report, with separate timeout and retry budgets.
 
 Provider files use the filename as the provider name, for example `custom.json`:
 
@@ -176,7 +176,7 @@ other observed tags remain visible without causing a mismatch.
 | `type` | string | **Yes** | Record type (`A`, `AAAA`, `CNAME`, `MX`, `TXT`, `CAA`, `NS`, `IP`, `ALIAS`). |
 | `expected` | array | **Yes** | List of expected values. An explicit empty list with exact matching monitors for absence. Explicit CAA DNS tasks compare the full record set; omitted-tag relaxation applies only to domain `caa` policies. TXT values preserve case, punctuation, and literal `alias:` prefixes; surrounding whitespace is trimmed. |
 | `match_type` | string | No | Strategy: `"exact"` (default), `"prefix"`, `"contains"`, `"any_of"`. |
-| `custom_resolver` | string | No | Custom resolver IP for this record. |
+| `custom_resolver` | string | No | Resolver IP used exclusively for this record. No global-resolver fallback occurs. |
 
 ---
 
@@ -201,7 +201,11 @@ The daemon provides an embedded Web UI and JSON API:
 
 *   **`GET /`:** Interactive Web Dashboard grouping checked domains into Healthy, Issues, and Allowed to Expire sections and DNS records into Matched and Not Matched sections. Empty sections are hidden; pending results appear after checks finish. Domain cards show days to expiry, and the sidebar shows annual and upcoming renewal costs.
 *   **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
-*   **`GET /api/state`:** Latest completed-cycle JSON snapshot; pending checks are published at startup. Responses include an ETag, and matching `If-None-Match` requests return 304 without a body.
+*   **`GET /api/state`:** Latest coherent JSON snapshot with deterministic check arrays and compact cycle attempt/freshness metadata. Pending checks are published at startup; a failed attempt retains prior evidence. Responses include an ETag, and matching `If-None-Match` requests return 304 without a body.
+
+RDAP state sets `expiry_confirmed` only after a domain configured with
+`allow_expiry` is confirmed expired or absent; that transition suppresses its
+dependent checks until registration reappears.
 
 ---
 
@@ -239,7 +243,7 @@ To add custom email providers, mount their directory read-only at `/app/data/ema
 ### Local Execution
 
 ```bash
-go build -o domain_monitor ./src
+go build -o domain_monitor ./src/cmd/domain-monitor
 ./domain_monitor -config config.json
 ```
 
@@ -266,35 +270,42 @@ Deploy using the included `domain-monitor.container` Quadlet file:
 
 ## Development & Testing
 
-The single [protocol reference](src/docs/protocols.md) links the RFCs and states which parts the monitor uses.
+The [protocol reference](docs/protocols.md) links the RFCs and states which
+parts the monitor uses. Durable behavior is documented here and in that scoped
+reference, and enforced by regression tests alongside the affected code.
+
+All Go source remains under `src/`: `src/cmd/domain-monitor` is the thin
+executable entry point, `src/internal/monitor` owns daemon behavior and embedded
+assets, and `src/internal/netpolicy` owns reusable outbound-target policy.
+Maintained project documentation lives under `docs`.
 
 The test suite uses injected clients, local HTTP/DNS fixtures, and a committed synthetic WHOIS corpus.
 
-Run the local release checks from the repository root:
+Enable the tracked pre-push hook once per clone:
 
 ```bash
-go test -race -coverprofile=coverage.out ./...
-go vet ./...
-golangci-lint run --config .golangci.yml
-gofmt -l src
-go tool cover -func=coverage.out
+git config core.hooksPath .githooks
 ```
 
-Require no formatting differences and at least 83% total statement coverage.
-Install `golangci-lint` separately using a version built for the repository's Go
-toolchain. The repository supplies its lint configuration but currently pins
-no linter executable version. Clock-dependent code still uses system time;
-full clock injection remains an architecture improvement.
+Before every push, `.githooks/pre-push` checks formatting, runs race tests with
+the 83% coverage floor, runs `go vet`, and applies `.golangci.yml`. Install
+`golangci-lint` v2.14.0 locally. The scheduler owns an injectable clock/timer
+seam for deterministic lifecycle tests; protocol clients and caches still use
+wall-clock time internally.
 
-The dashboard regression runs in headless Chromium when installed and skips
-otherwise. Install Chromium when verifying dashboard behavior for a release.
+Dashboard delivery, API integration, and embedded assets use deterministic
+non-browser tests. Review interactive and visual behavior manually when changing
+the dashboard.
 
 Live tests are colocated with their protocol tests and skip unless explicitly
-enabled: `DOMAIN_MONITOR_LIVE=1 go test ./src -run '^TestLive' -count=1`.
-The compact [assurance checklist](src/docs/protocols.md#assurance-checklist) defines
+enabled: `DOMAIN_MONITOR_LIVE=1 go test ./src/internal/monitor -run '^TestLive' -count=1`.
+The compact [assurance checklist](docs/protocols.md#assurance-checklist) defines
 the supported-scope release gate; passing tests alone is not a bug-free guarantee.
 
-For parser fuzzing, run `go test -fuzz=FuzzFlexibleDateParsing -fuzztime=30s ./src/`.
+For parser fuzzing, run `go test -fuzz=FuzzFlexibleDateParsing -fuzztime=30s ./src/internal/monitor`.
 
 ### CI/CD Pipeline
-The GitHub Actions workflow builds and publishes containers for release tags on `main`. Run race tests, `go vet`, the configured `golangci-lint`, formatting checks, and the 83% coverage gate locally before release; the current workflow does not enforce these checks.
+
+The GitHub Actions workflow only builds and publishes optimized multi-platform
+containers for release tags on `main`; validation is owned by the local
+pre-push hook.

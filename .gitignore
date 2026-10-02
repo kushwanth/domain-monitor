@@ -5,9 +5,8 @@
 *.so
 *.dylib
 bin/
-domain-monitor
-domain_monitor
-src/src
+/domain-monitor
+/domain_monitor
 
 # Test binary, built with `go test -c`
 *.test

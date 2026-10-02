@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"context"
@@ -44,7 +44,7 @@ func TestDNSCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			_, ok := DNSTypeMap[tt.recordType]
+			_, ok := dnsTypeForName(tt.recordType)
 			assert.Equal(t, tt.expectOK, ok, "Expected OK=%v for %s, got %v", tt.expectOK, tt.recordType, ok)
 		})
 	}
@@ -122,13 +122,13 @@ func TestValidateDNSSECOfflineChain(t *testing.T) {
 					}
 					return response, 0, nil
 				}},
-				HTTPClient: &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
+				Clients: OutboundClients{Public: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 					assert.Equal(t, "example.com", req.URL.Query().Get(ParamName))
 					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tc.dohBody))}, nil
-				}},
+				})}},
 			}
 			if tc.noHTTPClient {
-				app.HTTPClient = nil
+				app.Clients.Public = nil
 			}
 			result := validateDNSSEC(context.Background(), app, "example.com", testResolvers(), "https://doh.example/resolve")
 			assert.Equal(t, tc.wantValid, result.Valid)
@@ -153,9 +153,9 @@ func TestDNSSECValidationFallback(t *testing.T) {
 }
 
 func TestDNSSECValidationDoHHTTPError(t *testing.T) {
-	app := &AppState{HTTPClient: &MockHTTPClient{MockDo: func(_ *http.Request) (*http.Response, error) {
+	app := &AppState{Clients: OutboundClients{Public: &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusInternalServerError, Body: io.NopCloser(strings.NewReader("server error"))}, nil
-	}}}
+	})}}}
 	assert.False(t, verifyDNSSECDoH(context.Background(), app, "https://doh.example/resolve", "example.com", "example.com."))
 }
 
@@ -955,6 +955,31 @@ func TestDNSAnswerOwnerFiltering(t *testing.T) {
 	}
 }
 
+func TestFetchDNSSnapshotReducesResolverObservations(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.1", "192.0.2.2"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg).SetReply(query)
+		ip := "192.0.2.10"
+		if strings.HasPrefix(address, "192.0.2.2") {
+			ip = "192.0.2.11"
+		}
+		record, err := dns.NewRR("example.com. 60 IN A " + ip)
+		require.NoError(t, err)
+		response.Answer = []dns.RR{record}
+		return response, 0, nil
+	}}
+	target := DNSTask{Hostname: "example.com", Name: "web", Type: RecordTypeA, Expected: []string{"192.0.2.10"}}
+	snapshot := FetchDNSSnapshot(context.Background(), app, target)
+	require.Len(t, snapshot.Observations, 2)
+	require.ErrorContains(t, snapshot.Err, "resolver disagreement")
+
+	target.CustomResolver = "192.0.2.1"
+	snapshot = FetchDNSSnapshot(context.Background(), app, target)
+	require.NoError(t, snapshot.Err)
+	require.Len(t, snapshot.Observations, 1)
+	require.Equal(t, "192.0.2.1", snapshot.Observations[0].Resolver)
+}
+
 // Create a cycle between loop.example. and alias.example.
 
 // For CAA or other types, return empty Answer (NODATA)
@@ -1677,7 +1702,7 @@ func TestEvaluateDNSSECConditions(t *testing.T) {
 }
 
 func TestResolveTargetExtensive(t *testing.T) {
-	app := &AppState{activeResolvers: testResolvers(), DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+	app := &AppState{config: AppConfig{Resolvers: testResolvers()}, DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 		response := new(dns.Msg)
 		response.SetReply(query)
 		var answer string
@@ -1742,7 +1767,7 @@ func TestEvaluateDNSSEC_MockedPaths(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			app.HTTPClient = &MockHTTPClient{
+			app.Clients.Public = &MockHTTPClient{
 				MockDo: func(_ *http.Request) (*http.Response, error) {
 					if tt.expectedValid {
 						return &http.Response{
@@ -1994,8 +2019,8 @@ func TestHasValidDMARCPolicy(t *testing.T) {
 		{"v=DMARC1; p=none", true},
 		{"v=DMARC1; p=reject; sp=quarantine; np=none; psd=n", true},
 		{"v = DMARC1; p=reject; psd=u", true},
+		{"v=DMARC1", true},
 		{"v=dmarc1; p=reject", false},
-		{"v=DMARC1", false},
 		{"v=DMARC1; p=invalid", false},
 		{"v=DMARC1; p=reject; sp=invalid", false},
 		{"v=DMARC1; p=reject; np=invalid", false},
@@ -2060,7 +2085,7 @@ func TestDNSSECRejectsOversizedValidPrefix(t *testing.T) {
 	key := &dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET}, Flags: 257, Protocol: 3, Algorithm: dns.ED25519, PublicKey: "AQID"}
 	valid := `{"Status":0,"AD":true,"Question":[{"name":"example.com.","type":48}],"Answer":[{"name":"example.com.","type":48,"data":"257 3 15 AQID"}]}`
 	app := NewAppState(AppConfig{})
-	app.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+	app.Clients.Public = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(valid + strings.Repeat(" ", MaxNotificationPayloadSize)))}, nil
 	}}
 	assert.False(t, verifyDNSSECDoH(context.Background(), app, DefaultDoHURL, "example.com", "example.com.", key))
@@ -2115,7 +2140,7 @@ func TestLiveDNSSECMatrix(t *testing.T) {
 			defer cancel()
 			target := DomainConfig{Domain: test.domain, DNSSEC: true}
 			app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1", "8.8.8.8"}})
-			app.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+			app.Clients.Public = &http.Client{Timeout: 10 * time.Second}
 			status, condition, result := EvaluateDNSSEC(target, FetchDNSSECEvidence(ctx, app, target))
 			t.Logf("status=%s condition=%v hasDS=%t hasDNSKEY=%t chainIntact=%t source=%s error=%q", status, condition, result.HasDS, result.HasDNSKEY, result.ChainIntact, result.Source, result.Error)
 			if status != test.status || condition.IsZero() || condition.Code != test.code {

@@ -1,9 +1,11 @@
-package main
+package monitor
 
 import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"html"
@@ -11,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"domain_monitor/src/internal/netpolicy"
 )
 
 // NewNotificationManager configures delivery providers; callers must inject its HTTP client.
@@ -48,6 +52,11 @@ func (nm *NotificationManager) Dispatch(message, redacted string, priority Alert
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 	nm.alertBatch = append(nm.alertBatch, alert)
+	sortAlerts(nm.alertBatch)
+	if len(nm.alertBatch) > MaxCycleReportItems {
+		nm.alertBatch = nm.alertBatch[:MaxCycleReportItems]
+		nm.omitted++
+	}
 }
 
 func logQueuedAlert(alert Alert) {
@@ -68,40 +77,84 @@ func (nm *NotificationManager) Flush() {
 
 // FlushContext delivers the queued batch.
 func (nm *NotificationManager) FlushContext(parent context.Context) {
-	batch := nm.takeAlertBatch()
+	batch, omitted := nm.takeAlertReportBatch()
 
 	if len(batch) == 0 {
 		return
 	}
 
-	slices.SortStableFunc(batch, func(a, b Alert) int {
-		return cmp.Compare(b.Priority, a.Priority)
-	})
+	sortAlerts(batch)
 
-	for _, alert := range batch {
-		if parent.Err() != nil {
-			break
+	report := buildCycleReport(batch, omitted)
+	if nm.NtfyURL != StrEmpty && parent.Err() == nil {
+		ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout)
+		nm.sendNtfyBatchContext(ctx, report)
+		cancel()
+	}
+	if nm.TelegramToken != StrEmpty && parent.Err() == nil {
+		ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout)
+		nm.sendTelegramBatchContext(ctx, report)
+		cancel()
+	}
+}
+
+func sortAlerts(batch []Alert) {
+	slices.SortStableFunc(batch, func(a, b Alert) int {
+		if order := cmp.Compare(b.Priority, a.Priority); order != 0 {
+			return order
 		}
-		if nm.NtfyURL != StrEmpty {
-			ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout)
-			nm.sendNtfyBatchContext(ctx, alert)
-			cancel()
+		if order := cmp.Compare(a.Check, b.Check); order != 0 {
+			return order
 		}
-		if nm.TelegramToken != StrEmpty {
-			ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout)
-			nm.sendTelegramBatchContext(ctx, alert)
-			cancel()
+		if order := cmp.Compare(a.Domain, b.Domain); order != 0 {
+			return order
 		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+}
+
+func buildCycleReport(batch []Alert, omitted int) Alert {
+	itemCount := len(batch)
+	var message, redacted strings.Builder
+	for index := range itemCount {
+		if index > 0 {
+			message.WriteByte('\n')
+			redacted.WriteByte('\n')
+		}
+		message.WriteString(batch[index].Message)
+		redacted.WriteString(formatNtfyMessage(batch[index]))
+	}
+	if omitted > 0 {
+		notice := fmt.Sprintf(MsgCycleFindingsOmitted, omitted)
+		message.WriteString(notice)
+		redacted.WriteString(notice)
+	}
+	priority := PriorityDefault
+	tag := AlertTag(StrEmpty)
+	if len(batch) > 0 {
+		priority, tag = batch[0].Priority, batch[0].Tag
+	}
+	digest := sha256.Sum256([]byte(redacted.String()))
+	return Alert{
+		Message: message.String(), Redacted: redacted.String(), Priority: priority, Tag: tag,
+		ReportID: hex.EncodeToString(digest[:8]),
 	}
 }
 
 // takeAlertBatch detaches the queue before network I/O so dispatch can continue.
 func (nm *NotificationManager) takeAlertBatch() []Alert {
+	batch, _ := nm.takeAlertReportBatch()
+	return batch
+}
+
+func (nm *NotificationManager) takeAlertReportBatch() ([]Alert, int) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 	batch := nm.alertBatch
+	omitted := nm.omitted
 	nm.alertBatch = nil
-	return batch
+	nm.omitted = 0
+	return batch, omitted
 }
 
 func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, alert Alert) bool {
@@ -111,7 +164,7 @@ func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, alert A
 		LogError(MsgLogNotificationClientMissing)
 		return false
 	}
-	resp, err := doHTTPWithRetry(ctx, NameNtfyProvider, nm.HTTPClient, false, func() (*http.Request, error) {
+	resp, err := doHTTPWithRetry(ctx, NameNtfyProvider, nm.HTTPClient, RetryHTTPTransient, func() (*http.Request, error) {
 		// #nosec G704 -- NtfyURL is an operator-selected notification endpoint.
 		req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, nm.NtfyURL, strings.NewReader(strings.TrimSpace(text)))
 		if requestErr != nil {
@@ -123,6 +176,7 @@ func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, alert A
 		}
 		req.Header.Set(HeaderNtfyTitle, NotificationAlertTitle)
 		req.Header.Set(HeaderNtfyPriority, alert.Priority.String())
+		req.Header.Set(HeaderReportID, alert.ReportID)
 		if alert.Tag != StrEmpty {
 			req.Header.Set(HeaderNtfyTags, string(alert.Tag))
 		}
@@ -130,6 +184,7 @@ func (nm *NotificationManager) sendNtfyBatchContext(ctx context.Context, alert A
 	})
 	if err != nil {
 		errStr := err.Error()
+		errStr = strings.ReplaceAll(errStr, nm.NtfyURL, netpolicy.SanitizeURL(nm.NtfyURL))
 		if nm.NtfyAuth != StrEmpty {
 			errStr = strings.ReplaceAll(errStr, nm.NtfyAuth, RedactedAuthPlaceholder)
 		}
@@ -195,7 +250,7 @@ func (nm *NotificationManager) sendTelegramBatchContext(ctx context.Context, ale
 		LogError(MsgLogNotificationClientMissing)
 		return false
 	}
-	resp, err := doHTTPWithRetry(ctx, NameTelegramProvider, nm.HTTPClient, false, func() (*http.Request, error) {
+	resp, err := doHTTPWithRetry(ctx, NameTelegramProvider, nm.HTTPClient, RetryHTTPTransient, func() (*http.Request, error) {
 		// #nosec G704 -- TelegramAPIBase is fixed; the configured token only selects its path.
 		req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewBuffer(payloadBytes))
 		if requestErr != nil {

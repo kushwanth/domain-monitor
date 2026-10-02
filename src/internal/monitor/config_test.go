@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"context"
@@ -48,6 +48,18 @@ func TestLoadConfigInjectedReader(t *testing.T) {
 	}
 }
 
+func TestRepositoryExampleConfigCompiles(t *testing.T) {
+	for _, environmentVariable := range []string{EnvPort, EnvNtfyAuth, EnvTelegramToken, EnvTelegramChatID, EnvDoHURL} {
+		t.Setenv(environmentVariable, StrEmpty)
+	}
+
+	configPath := filepath.Join("..", "..", "..", DefaultConfigFile)
+	config, err := LoadConfig(context.Background(), configPath)
+	require.NoError(t, err)
+	assert.NotEmpty(t, config.Domains)
+	assert.NotEmpty(t, config.DNSRecords)
+}
+
 func TestReadConfigFileRejectsOversizedInput(t *testing.T) {
 	t.Parallel()
 
@@ -78,8 +90,8 @@ func TestAllowExpiryPolicy(t *testing.T) {
 	}
 
 	state := newCycleState(AppConfig{Domains: cfg.Domains}, activeChecks{})
-	assert.False(t, state.RDAP["unused-one.example"].Unused)
-	assert.False(t, state.RDAP["renewing.example"].Unused)
+	assert.False(t, state.RDAP["unused-one.example"].ExpiryConfirmed)
+	assert.False(t, state.RDAP["renewing.example"].ExpiryConfirmed)
 	assert.True(t, state.RDAP["unused-one.example"].AllowExpiry)
 	assert.True(t, state.RDAP["renewing.example"].AllowExpiry)
 	assert.Equal(t, StatusPending, state.RDAP["renewing.example"].Status)
@@ -822,7 +834,7 @@ func TestConfig_CompileTimeImmutability(t *testing.T) {
 		t.Errorf("changing copied port to %s changed internal port: got %s, want 8080", copied.Port, app.Config().Port)
 	}
 
-	// activeResolvers holds a cloned slice
+	// Resolvers returns a defensive copy of the owned configuration.
 	res := app.Resolvers()
 	res[0] = "192.0.2.1"
 	if app.Resolvers()[0] == "192.0.2.1" {
@@ -844,7 +856,7 @@ func TestNormalizeDNSTaskRejectsUnsupportedAndVacuousChecks(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := normalizeDNSTask(&tt.task, 0, map[string]bool{})
+			err := normalizeDNSTask(&tt.task, 0, stringSet{})
 			if tt.wantErr && err == nil {
 				t.Fatal("expected configuration error")
 			}
@@ -946,6 +958,82 @@ func TestConfigSnapshotOwnsNestedData(t *testing.T) {
 	resolvers := app.Resolvers()
 	resolvers[0] = "9.9.9.9"
 	assert.Equal(t, original.Resolvers, app.Resolvers())
+}
+
+func TestCompileRawConfigOwnsNestedData(t *testing.T) {
+	t.Parallel()
+
+	raw := RawConfig{
+		Notifications: Notifications{
+			Ntfy:     &NtfyConfig{URL: "https://ntfy.invalid/topic", Auth: "secret"},
+			Telegram: &TelegramConfig{Token: "token", ChatID: "chat"},
+		},
+		Resolvers: []string{"1.1.1.1", "8.8.8.8"},
+		Domains: []DomainConfig{{
+			Domain:      "EXAMPLE.COM.",
+			Name:        "Example",
+			Nameservers: []NameserverConfig{{Hostname: "NS1.EXAMPLE.COM."}},
+			Email:       &EmailConfig{MXRecords: []string{"MAIL.EXAMPLE.COM."}, DKIMSelectors: []string{"SELECTOR"}},
+			CAA:         &CAAConfig{Issue: []string{"LETSENCRYPT.ORG"}},
+		}},
+		DNSRecords: []DNSTask{{
+			Hostname: "WWW.EXAMPLE.COM.",
+			Name:     "Web",
+			Type:     RecordTypeA,
+			Expected: StringList{"192.0.2.1"},
+		}},
+	}
+
+	compiled, err := compileRawConfig(raw)
+	require.NoError(t, err)
+
+	raw.Notifications.Ntfy.URL = "https://changed.invalid/topic"
+	raw.Notifications.Telegram.Token = "changed"
+	raw.Resolvers[0] = "9.9.9.9"
+	raw.Domains[0].Nameservers[0].Hostname = "changed.example"
+	raw.Domains[0].Email.MXRecords[0] = "changed.example"
+	raw.Domains[0].Email.DKIMSelectors[0] = "changed"
+	raw.Domains[0].CAA.Issue[0] = "changed.example"
+	raw.DNSRecords[0].Expected[0] = "192.0.2.2"
+
+	assert.Equal(t, "https://ntfy.invalid/topic", compiled.Notifications.Ntfy.URL)
+	assert.Equal(t, "token", compiled.Notifications.Telegram.Token)
+	assert.Equal(t, []string{"1.1.1.1", "8.8.8.8"}, compiled.Resolvers)
+	assert.Equal(t, "ns1.example.com", compiled.Domains[0].Nameservers[0].Hostname)
+	assert.Equal(t, []string{"mail.example.com"}, compiled.Domains[0].Email.MXRecords)
+	assert.Equal(t, []string{"selector"}, compiled.Domains[0].Email.DKIMSelectors)
+	assert.Equal(t, []string{"letsencrypt.org"}, compiled.Domains[0].CAA.Issue)
+	assert.Equal(t, StringList{"192.0.2.1"}, compiled.DNSRecords[0].Expected)
+
+	compiled.Domains[0].Email.MXRecords[0] = "compiled-change.example"
+	assert.Equal(t, "changed.example", raw.Domains[0].Email.MXRecords[0], "compiled values must not alias raw input")
+}
+
+func TestAppStateOwnsCompiledConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := AppConfig{
+		Port:              "9090",
+		LoopIntervalDays:  0.5,
+		Notifications:     Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}},
+		Resolvers:         []string{"1.1.1.1", "8.8.8.8"},
+		DoHURL:            "https://dns.example/resolve",
+		EmailProvidersDir: "providers",
+		Domains:           []DomainConfig{{Domain: "example.com", Name: "Example"}},
+		DNSRecords:        []DNSTask{{Hostname: "www.example.com", Name: "Web", Type: RecordTypeA, Expected: StringList{"192.0.2.1"}}},
+	}
+
+	app := NewAppState(cfg)
+	assert.Equal(t, 12*time.Hour, app.LoopDuration)
+	assert.Equal(t, cfg, app.Config())
+
+	cfg.Resolvers[0] = "9.9.9.9"
+	cfg.Domains[0].Domain = "changed.example"
+	cfg.DNSRecords[0].Expected[0] = "192.0.2.2"
+	owned := app.Config()
+	assert.Equal(t, "1.1.1.1", owned.Resolvers[0])
+	assert.Equal(t, "example.com", owned.Domains[0].Domain)
+	assert.Equal(t, StringList{"192.0.2.1"}, owned.DNSRecords[0].Expected)
 }
 
 func TestOptionalTelegramDoesNotBlockNtfyStartup(t *testing.T) {

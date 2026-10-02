@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"context"
@@ -26,21 +26,40 @@ func normalizeTLD(tld string) string {
 }
 
 func (p *PricingManager) cachedCatalog(ctx context.Context) (*pricingCatalog, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.catalog != nil && time.Since(p.catalog.fetchedAt) < PricingCacheTTL {
-		return p.catalog, nil
+	p.mu.RLock()
+	cached := p.catalog
+	p.mu.RUnlock()
+	if cached != nil && time.Since(cached.fetchedAt) < PricingCacheTTL {
+		return cached, nil
+	}
+	if cached != nil && !p.fetchMu.TryLock() {
+		if time.Since(cached.fetchedAt) <= PricingMaxStaleAge {
+			return cached, nil
+		}
+		p.fetchMu.Lock()
+	} else if cached == nil {
+		p.fetchMu.Lock()
+	}
+	defer p.fetchMu.Unlock()
+
+	p.mu.RLock()
+	cached = p.catalog
+	p.mu.RUnlock()
+	if cached != nil && time.Since(cached.fetchedAt) < PricingCacheTTL {
+		return cached, nil
 	}
 	catalog, err := p.fetch(ctx)
 	if err != nil {
-		if p.catalog != nil && time.Since(p.catalog.fetchedAt) <= PricingMaxStaleAge {
+		if cached != nil && time.Since(cached.fetchedAt) <= PricingMaxStaleAge {
 			LogWarn(MsgLogPricingFetchFailed, FieldError, err)
-			return p.catalog, nil
+			return cached, nil
 		}
 		return nil, err
 	}
+	p.mu.Lock()
 	p.catalog = catalog
-	return p.catalog, nil
+	p.mu.Unlock()
+	return catalog, nil
 }
 
 func (p *PricingManager) fetch(ctx context.Context) (*pricingCatalog, error) {
@@ -48,7 +67,7 @@ func (p *PricingManager) fetch(ctx context.Context) (*pricingCatalog, error) {
 	if client == nil {
 		return nil, errors.New(MsgErrPricingHTTPClientNotConfigured)
 	}
-	resp, err := doHTTPWithRetry(ctx, NameOpPricingCatalog, client, true, func() (*http.Request, error) {
+	resp, err := doHTTPWithRetry(ctx, NameOpPricingCatalog, client, RetryHTTPTransient, func() (*http.Request, error) {
 		// #nosec G704 -- p.url is the fixed DotSweep endpoint or a test-injected URL.
 		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
 		if requestErr != nil {
@@ -63,7 +82,7 @@ func (p *PricingManager) fetch(ctx context.Context) (*pricingCatalog, error) {
 	defer DrainAndClose(resp.Body, MaxBodyDrainSize)
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(MsgErr2, MsgErrDotSweepFetchFailed, resp.Status)
+		return nil, fmt.Errorf(MsgErrOperationDetail, MsgErrDotSweepFetchFailed, resp.Status)
 	}
 
 	var pResp DotSweepResponse
@@ -150,5 +169,5 @@ func eligibleForRenewalPrice(domainCfg DomainConfig, states map[string]RDAPState
 		return RDAPState{}, false
 	}
 	state, exists := states[domainCfg.Domain]
-	return state, exists && state.Status != StatusUnknown && !state.Unused
+	return state, exists && state.Status != StatusUnknown && !state.ExpiryConfirmed
 }

@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"bytes"
@@ -27,7 +27,30 @@ func (r ResultCode) String() string {
 	if int(r) >= 0 && int(r) < len(resultCodeNames) {
 		return resultCodeNames[r]
 	}
-	return ""
+	return StrEmpty
+}
+
+// MarshalJSONTo exposes stable readable code names while retaining compact enums internally.
+func (r ResultCode) MarshalJSONTo(enc *jsontext.Encoder) error {
+	if r.String() == StrEmpty {
+		return fmt.Errorf(MsgErrInvalidResultCode, r)
+	}
+	return enc.WriteToken(jsontext.String(r.String()))
+}
+
+// UnmarshalJSON accepts the stable code names used by the local API.
+func (r *ResultCode) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := jsonv2.Unmarshal(data, &name); err != nil {
+		return err
+	}
+	for index, known := range resultCodeNames {
+		if name == known {
+			*r = ResultCode(index)
+			return nil
+		}
+	}
+	return fmt.Errorf(MsgErrUnknownResultCode, name)
 }
 
 // EPPCode identifies known domain lifecycle statuses; unknown provider text stays on the wire.
@@ -35,6 +58,9 @@ type EPPCode uint8
 
 // StringList is a slice of strings that unmarshals from either a single JSON string or an array of strings.
 type StringList []string
+
+// stringSet stores membership without a per-entry boolean value.
+type stringSet map[string]struct{}
 
 // UnmarshalJSON accepts a single string, a string array, or null.
 func (s *StringList) UnmarshalJSON(data []byte) error {
@@ -68,6 +94,79 @@ type StateCondition struct {
 	Code   ResultCode `json:"code"`
 	Target string     `json:"target,omitempty"`
 	Since  time.Time  `json:"since,omitempty"`
+}
+
+// FindingSeverity is evaluator severity and is not a provider priority.
+type FindingSeverity uint8
+
+const (
+	FindingInfo FindingSeverity = iota
+	FindingWarning
+	FindingError
+)
+
+func (s FindingSeverity) String() string {
+	if int(s) < len(findingSeverityNames) {
+		return findingSeverityNames[s]
+	}
+	return StrEmpty
+}
+
+func (s FindingSeverity) MarshalJSONTo(enc *jsontext.Encoder) error {
+	if s.String() == StrEmpty {
+		return fmt.Errorf(MsgErrInvalidFindingSeverity, s)
+	}
+	return enc.WriteToken(jsontext.String(s.String()))
+}
+
+func (s *FindingSeverity) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := jsonv2.Unmarshal(data, &name); err != nil {
+		return err
+	}
+	for _, severity := range []FindingSeverity{FindingInfo, FindingWarning, FindingError} {
+		if name == severity.String() {
+			*s = severity
+			return nil
+		}
+	}
+	return fmt.Errorf(MsgErrUnknownFindingSeverity, name)
+}
+
+// FindingCode is the compact internal code used by findings.
+type FindingCode = ResultCode
+
+// Finding is one bounded deterministic evaluator result.
+type Finding struct {
+	Code     FindingCode     `json:"code"`
+	Severity FindingSeverity `json:"severity"`
+	Target   string          `json:"target,omitempty"`
+}
+
+func findingsFromConditions(status CheckStatus, conditions ...StateCondition) []Finding {
+	severity := FindingInfo
+	if status == StatusWarning {
+		severity = FindingWarning
+	} else if status != StatusOK && status != StatusPending && status != StatusSkipped {
+		severity = FindingError
+	}
+	findings := make([]Finding, 0, min(len(conditions), MaxFindingsPerCheck))
+	for _, condition := range conditions {
+		if condition.IsZero() || len(findings) == MaxFindingsPerCheck {
+			continue
+		}
+		duplicate := false
+		for _, finding := range findings {
+			if finding.Code == condition.Code && finding.Target == condition.Target {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			findings = append(findings, Finding{Code: condition.Code, Severity: severity, Target: condition.Target})
+		}
+	}
+	return findings
 }
 
 // IsZero reports whether no condition is present.
@@ -177,6 +276,20 @@ type ProviderConfig struct {
 
 // 2. Configuration Models
 
+// RawConfig mirrors operator-provided JSON before defaults, normalization, and
+// validation compile it into the runtime-owned AppConfig.
+type RawConfig struct {
+	Port              string        `json:"port"`
+	LoopIntervalDays  float64       `json:"loop_interval_days"`
+	Notifications     Notifications `json:"notifications"`
+	Resolvers         []string      `json:"resolvers"`
+	DoHURL            string        `json:"doh_url,omitempty"`
+	EmailProvidersDir string        `json:"email_providers_dir,omitempty"`
+
+	Domains    []DomainConfig `json:"domains"`
+	DNSRecords []DNSTask      `json:"dns_records"`
+}
+
 // NtfyConfig contains the notification topic URL and optional authorization.
 type NtfyConfig struct {
 	URL  string `json:"url"`
@@ -189,13 +302,17 @@ type TelegramConfig struct {
 	ChatID string `json:"chat_id"`
 }
 
-// Notifications contains the configured delivery providers.
-type Notifications struct {
+// NotificationConfig contains the configured delivery providers.
+type NotificationConfig struct {
 	Ntfy     *NtfyConfig     `json:"ntfy"`
 	Telegram *TelegramConfig `json:"telegram"`
 }
 
-// AppConfig defines startup settings and the checks to run.
+// Notifications is the JSON-facing name retained for configuration compatibility.
+type Notifications = NotificationConfig
+
+// AppConfig is the normalized, runtime-owned startup configuration. Public
+// snapshots are deep copies; internal readers treat its nested data as immutable.
 type AppConfig struct {
 	Port              string        `json:"port"`
 	LoopIntervalDays  float64       `json:"loop_interval_days"`
@@ -279,6 +396,7 @@ type CAAResult struct {
 	IssueMail  []string       `json:"issuemail,omitempty"`
 	UnknownCAs []string       `json:"unknown_cas,omitempty"`
 	Error      string         `json:"error,omitempty"`
+	Findings   []Finding      `json:"findings,omitempty"`
 }
 
 // DNSTask defines a DNS record query and its expected values.
@@ -297,6 +415,15 @@ type HTTPDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
+// HTTPRetryPolicy declares whether ambiguous transient transport failures may
+// be retried. HTTP temporary status responses are always handled consistently.
+type HTTPRetryPolicy uint8
+
+const (
+	RetryHTTPStatusOnly HTTPRetryPolicy = iota
+	RetryHTTPTransient
+)
+
 // Resolver defines an interface for executing DNS queries, allowing for mocking in tests.
 type Resolver interface {
 	ExchangeContext(ctx context.Context, m *dns.Msg, a string) (r *dns.Msg, rtt time.Duration, err error)
@@ -307,20 +434,43 @@ type WHOISQuerier interface {
 	Query(ctx context.Context, domain, server string) (string, error)
 }
 
+// Timer and Clock are the scheduler's only time dependencies.
+type Timer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+type Clock interface {
+	Now() time.Time
+	NewTimer(time.Duration) Timer
+}
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now() }
+func (systemClock) NewTimer(duration time.Duration) Timer {
+	return systemTimer{Timer: time.NewTimer(duration)}
+}
+
+type systemTimer struct{ *time.Timer }
+
+func (timer systemTimer) C() <-chan time.Time { return timer.Timer.C }
+
 // AppState holds application configuration, notification manager, and atomic runtime state caches.
 type AppState struct {
 	config              AppConfig
-	activeResolvers     []string
 	active              activeChecks
-	expiredDomains      map[string]bool // Owned by the monitoring loop; RDAP can reactivate entries.
+	Runtime             CycleRuntime
 	Notifier            Notifier
 	Pricing             *PricingManager
 	LoopDuration        time.Duration
-	publishedState      atomic.Pointer[publishedState]
+	Published           PublishedStore
 	GlobalResolverIndex atomic.Uint32
+	cycleSequence       atomic.Uint64
+	Clients             OutboundClients
+	Clock               Clock
 
 	Bootstrap      *Bootstrap
-	HTTPClient     HTTPDoer
 	DNSClient      Resolver
 	DNSTCPClient   Resolver
 	WHOISClient    WHOISQuerier
@@ -331,15 +481,52 @@ type AppState struct {
 	EmailProviders map[string]ProviderConfig
 }
 
+// CycleRuntime is mutable state owned exclusively by the monitoring loop.
+type CycleRuntime struct {
+	ExpiredDomains stringSet
+}
+
+// OutboundClients owns long-lived clients with destination-specific policies.
+type OutboundClients struct {
+	Public       HTTPDoer
+	Notification HTTPDoer
+	RDAP         HTTPDoer
+}
+
+func (c OutboundClients) CloseIdleConnections() {
+	for _, client := range []HTTPDoer{c.Public, c.Notification, c.RDAP} {
+		if closer, ok := client.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+	}
+}
+
 // publishedState is an immutable HTTP representation installed atomically.
 type publishedState struct {
 	body []byte
 	etag string
 }
 
+// PublishedStore owns the one immutable serialized generation visible to HTTP
+// readers. Writers install body and ETag together with one atomic swap.
+type PublishedStore struct {
+	state atomic.Pointer[publishedState]
+}
+
+func (s *PublishedStore) load() *publishedState {
+	return s.state.Load()
+}
+
+func (s *PublishedStore) store(state *publishedState) {
+	s.state.Store(state)
+}
+
 // PublishedJSON returns a copy of the last complete API snapshot.
 func (a *AppState) PublishedJSON() ([]byte, bool) {
-	state := a.publishedState.Load()
+	if a == nil {
+		return nil, false
+	}
+	state := a.Published.load()
 	if state == nil {
 		return nil, false
 	}
@@ -356,11 +543,17 @@ type activeChecks struct {
 
 // Config returns an independent copy of the startup configuration.
 func (a *AppState) Config() AppConfig {
+	if a == nil {
+		return AppConfig{}
+	}
 	return cloneConfig(a.configuration())
 }
 
 // configuration shares immutable startup data with internal read-only callers.
 func (a *AppState) configuration() AppConfig {
+	if a == nil {
+		return AppConfig{}
+	}
 	return a.config
 }
 
@@ -371,10 +564,7 @@ func (a *AppState) Resolvers() []string {
 
 // resolvers shares an immutable list with internal callers, avoiding per-query copies.
 func (a *AppState) resolvers() []string {
-	if len(a.activeResolvers) > 0 {
-		return a.activeResolvers
-	}
-	if len(a.config.Resolvers) > 0 {
+	if a != nil && len(a.config.Resolvers) > 0 {
 		return a.config.Resolvers
 	}
 	return DefaultResolvers()
@@ -383,25 +573,23 @@ func (a *AppState) resolvers() []string {
 // NewAppState constructs an AppState with the provided AppConfig value.
 func NewAppState(cfg AppConfig) *AppState {
 	cfg = cloneConfig(cfg)
-	resolvers := cfg.Resolvers
-	if len(resolvers) == 0 {
-		resolvers = DefaultResolvers()
+	if len(cfg.Resolvers) == 0 {
+		cfg.Resolvers = DefaultResolvers()
 	}
 	activeDomains := make([]int, len(cfg.Domains))
-	for i := range cfg.Domains {
-		activeDomains[i] = i
+	for index := range activeDomains {
+		activeDomains[index] = index
 	}
 	activeDNSRecords := make([]int, len(cfg.DNSRecords))
-	for i := range cfg.DNSRecords {
-		activeDNSRecords[i] = i
+	for index := range activeDNSRecords {
+		activeDNSRecords[index] = index
 	}
 	return &AppState{
-		config:          cfg,
-		activeResolvers: resolvers,
+		config: cfg,
 		active: activeChecks{
 			domains: activeDomains, rdapDomains: slices.Clone(activeDomains), dnsRecords: activeDNSRecords,
 		},
-		expiredDomains: make(map[string]bool),
+		Runtime:        CycleRuntime{ExpiredDomains: make(stringSet)},
 		Notifier:       nil,
 		Pricing:        NewPricingManager(nil),
 		Bootstrap:      NewBootstrap(nil),
@@ -411,6 +599,7 @@ func NewAppState(cfg AppConfig) *AppState {
 		DNSClient:      &dns.Client{Timeout: DefaultDNSTimeout},
 		DNSTCPClient:   &dns.Client{Net: ProtocolTCP, Timeout: DefaultDNSTimeout},
 		RDAPURLAllowed: IsSafeRDAPURL,
+		Clock:          systemClock{},
 	}
 }
 
@@ -451,14 +640,14 @@ func cloneConfig(cfg AppConfig) AppConfig {
 
 // SafeDispatch dispatches an alert when a notifier is configured and otherwise logs it.
 func (a *AppState) SafeDispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
-	if a.Notifier == nil {
+	if a == nil || a.Notifier == nil {
 		switch priority {
 		case PriorityUrgent, PriorityHigh:
-			LogError(message, StrDomain2, domain, StrPriority, priority, StrTag, tag)
+			LogError(message, FieldDomain, domain, StrPriority, priority, StrTag, tag)
 		case PriorityWarning:
-			LogWarn(message, StrDomain2, domain, StrPriority, priority, StrTag, tag)
+			LogWarn(message, FieldDomain, domain, StrPriority, priority, StrTag, tag)
 		default:
-			LogInfo(message, StrDomain2, domain, StrPriority, priority, StrTag, tag)
+			LogInfo(message, FieldDomain, domain, StrPriority, priority, StrTag, tag)
 		}
 		return
 	}
@@ -550,7 +739,7 @@ type RDAPState struct {
 	DNSSEC            bool            `json:"dnssec,omitempty"`
 	RenewalPrice      float64         `json:"renewal_price,omitempty"`
 	AllowExpiry       bool            `json:"allow_expiry,omitempty"`
-	Unused            bool            `json:"unused,omitempty"`
+	ExpiryConfirmed   bool            `json:"expiry_confirmed,omitempty"`
 	Error             string          `json:"error,omitempty"`
 	IsDelegatedZone   bool            `json:"is_delegated_zone,omitempty"`
 	Source            string          `json:"source,omitempty"`
@@ -559,6 +748,7 @@ type RDAPState struct {
 	RegistryTier      *DomainTierData `json:"registry_tier,omitempty"`
 	RegistrarTier     *DomainTierData `json:"registrar_tier,omitempty"`
 	Discrepancies     []string        `json:"discrepancies,omitempty"`
+	Findings          []Finding       `json:"findings,omitempty"`
 }
 
 // DNSState stores expected and observed DNS records with their verdict.
@@ -571,6 +761,7 @@ type DNSState struct {
 	Condition StateCondition `json:"condition,omitzero"`
 	Found     []string       `json:"found,omitempty"`
 	Error     string         `json:"error,omitempty"`
+	Findings  []Finding      `json:"findings,omitempty"`
 }
 
 // EmailState stores evaluated MX, SPF, DMARC, and DKIM publication evidence.
@@ -584,6 +775,7 @@ type EmailState struct {
 	DKIMValid    []string       `json:"dkim_valid,omitempty"`
 	MX           []string       `json:"mx,omitempty"`
 	Error        string         `json:"error,omitempty"`
+	Findings     []Finding      `json:"findings,omitempty"`
 }
 
 // DNSSECResult stores local cryptographic and upstream validation evidence.
@@ -602,6 +794,7 @@ type DNSSECResult struct {
 	NetworkError    bool           `json:"network_error,omitempty"`
 	Disabled        bool           `json:"disabled,omitempty"`
 	Error           string         `json:"error,omitempty"`
+	Findings        []Finding      `json:"findings,omitempty"`
 }
 
 // NSHealthServerResult stores the evaluation metrics for an individual authoritative nameserver.
@@ -623,6 +816,19 @@ type NSHealthResult struct {
 	Status    CheckStatus            `json:"status"`
 	Condition StateCondition         `json:"condition,omitzero"`
 	Servers   []NSHealthServerResult `json:"servers"`
+	Findings  []Finding              `json:"findings,omitempty"`
+}
+
+// CycleMetadata is compact RAM-only scheduling and publication metadata.
+type CycleMetadata struct {
+	ID            uint64 `json:"id"`
+	Phase         string `json:"phase"`
+	Outcome       string `json:"outcome,omitempty"`
+	StartedAt     string `json:"started_at,omitempty"`
+	FinishedAt    string `json:"finished_at,omitempty"`
+	LastSuccessAt string `json:"last_success_at,omitempty"`
+	DurationMS    int64  `json:"duration_ms,omitempty"`
+	Overrun       bool   `json:"overrun,omitempty"`
 }
 
 // CheckState coordinates the per-cycle aggregated state across all checks.
@@ -637,6 +843,42 @@ type CheckState struct {
 	CAA         map[string]CAAResult      `json:"caa_checks,omitempty"`
 	LastUpdated string                    `json:"last_updated"`
 	NextRefresh string                    `json:"next_refresh"`
+	Cycle       CycleMetadata             `json:"cycle"`
+}
+
+type apiCheck[T any] struct {
+	ID     string `json:"id"`
+	Result T      `json:"result"`
+}
+
+// apiState is the deterministic unversioned wire representation consumed by
+// the bundled dashboard. Runtime builders may continue using indexed maps.
+type apiState struct {
+	RDAP        []apiCheck[RDAPState]      `json:"rdap_checks"`
+	DNS         []apiCheck[DNSState]       `json:"dns_checks"`
+	Email       []apiCheck[EmailState]     `json:"email_checks"`
+	DNSSEC      []apiCheck[DNSSECResult]   `json:"dnssec_checks,omitempty"`
+	NSHealth    []apiCheck[NSHealthResult] `json:"ns_health,omitempty"`
+	CAA         []apiCheck[CAAResult]      `json:"caa_checks,omitempty"`
+	LastUpdated string                     `json:"last_updated"`
+	NextRefresh string                     `json:"next_refresh"`
+	Cycle       CycleMetadata              `json:"cycle"`
+}
+
+func mapAPIChecks[T any](checks []apiCheck[T]) map[string]T {
+	values := make(map[string]T, len(checks))
+	for _, check := range checks {
+		values[check.ID] = check.Result
+	}
+	return values
+}
+
+func (state apiState) checkState() CheckState {
+	return CheckState{
+		RDAP: mapAPIChecks(state.RDAP), DNS: mapAPIChecks(state.DNS), Email: mapAPIChecks(state.Email),
+		DNSSEC: mapAPIChecks(state.DNSSEC), NSHealth: mapAPIChecks(state.NSHealth), CAA: mapAPIChecks(state.CAA),
+		LastUpdated: state.LastUpdated, NextRefresh: state.NextRefresh, Cycle: state.Cycle,
+	}
 }
 
 // DNSResult holds the evaluation result for a single DNS task.
@@ -698,7 +940,15 @@ type NSSnapshot struct {
 type DNSSnapshot struct {
 	Records         []string
 	ExpectedRecords []string
+	Observations    []DNSObservation
 	Err             error
+}
+
+// DNSObservation retains one resolver's independent answer for reduction.
+type DNSObservation struct {
+	Resolver string
+	Records  []string
+	Err      error
 }
 
 // EmailSnapshot holds raw email security DNS lookups.
@@ -748,6 +998,8 @@ type Alert struct {
 	Tag      AlertTag
 	Domain   string
 	Name     string
+	Check    string
+	ReportID string
 }
 
 // telegramResponse is the minimal Telegram sendMessage response payload.
@@ -810,7 +1062,8 @@ type DotSweepResponse struct {
 type PricingManager struct {
 	http    HTTPDoer
 	url     string
-	mu      sync.Mutex
+	mu      sync.RWMutex
+	fetchMu sync.Mutex
 	catalog *pricingCatalog
 }
 
@@ -837,6 +1090,7 @@ type NotificationManager struct {
 
 	mu         sync.Mutex
 	alertBatch []Alert
+	omitted    int
 }
 
 // ConsoleHandler formats log records into human-readable lines without key=value syntax or source annotations.

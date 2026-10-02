@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	jsonv2 "encoding/json/v2"

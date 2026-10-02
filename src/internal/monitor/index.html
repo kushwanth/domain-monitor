@@ -1021,6 +1021,11 @@
           const nextDate = formatUserTzDate(appState.next_refresh);
           txt += `<div>Next Update: ${escapeHTML(nextDate)}</div>`;
         }
+        if (appState.cycle?.outcome === 'failed') {
+          txt += `<div>Last Attempt: Failed — showing last successful snapshot</div>`;
+        } else if (appState.cycle?.overrun) {
+          txt += `<div>Last Attempt: Completed after the configured interval</div>`;
+        }
         el.innerHTML = txt;
       } else {
         el.innerText = 'Initializing... (Please wait)';
@@ -1036,7 +1041,7 @@
       const now = Date.now();
       const nextYear = now + 365 * 24 * 60 * 60 * 1000;
       Object.values(appState.rdap_checks).forEach(c => {
-        if (!c || c.allow_expiry || c.unused || c.is_delegated_zone || !c.status || c.status === 'pending') return;
+        if (!c || c.allow_expiry || c.expiry_confirmed || c.is_delegated_zone || !c.status || c.status === 'pending') return;
         const hasPrice = Number.isFinite(c.renewal_price) && c.renewal_price > 0;
         if (hasPrice) annualTotal += c.renewal_price;
         else annualUnknown++;
@@ -1057,6 +1062,16 @@
       }
     }
 
+    function normalizeCheckCollections(data) {
+      if (!data) return data;
+      for (const field of ['rdap_checks', 'dns_checks', 'email_checks', 'dnssec_checks', 'ns_health', 'caa_checks']) {
+        if (Array.isArray(data[field])) {
+          data[field] = Object.fromEntries(data[field].map(item => [item.id, item.result]));
+        }
+      }
+      return data;
+    }
+
     async function pollState() {
       try {
         const res = await fetch('/api/state', { headers: stateETag ? { 'If-None-Match': stateETag } : {} });
@@ -1066,11 +1081,11 @@
           return;
         }
         if (!res.ok) throw new Error(`State request failed: ${res.status}`);
-        const data = await res.json();
+        const data = normalizeCheckCollections(await res.json());
         stateETag = res.headers?.get?.('ETag') || '';
         connectionError = false;
-        if (data && data.status !== 'initializing' && data.last_updated) {
-          if (data.last_updated !== appState.last_updated) {
+        if (data && data.status !== 'initializing' && (data.last_updated || data.cycle?.outcome)) {
+          if (data.last_updated !== appState.last_updated || data.cycle?.id !== appState.cycle?.id) {
             appState = data;
             updateRenewalPricing();
             if (currentView === 'domains') {
@@ -1240,10 +1255,10 @@
 
         const checkStates = [rdapState, emailState, dnssecState, caaState, nsHealthState];
         const statusClass = aggregateDomainStatus(checkStates);
-        if (!rdapState.unused && (!rdapState.status || checkStates.some(state => state && state.status === 'pending') || statusClass === 'unknown')) {
+        if (!rdapState.expiry_confirmed && (!rdapState.status || checkStates.some(state => state && state.status === 'pending') || statusClass === 'unknown')) {
           continue;
         }
-        const group = (rdapState.allow_expiry || rdapState.unused) ? 'unused' : (statusClass === 'error' || statusClass === 'warning' ? 'issues' : 'healthy');
+        const group = (rdapState.allow_expiry || rdapState.expiry_confirmed) ? 'unused' : (statusClass === 'error' || statusClass === 'warning' ? 'issues' : 'healthy');
 
         if (group === 'unused') unusedCount++;
         else if (group === 'issues') issueCount++;
@@ -1297,7 +1312,7 @@
         const caaState = item.caaState;
         const nsHealthState = item.nsHealthState;
 
-        if (item.group === 'unused' && rdapState.unused) {
+        if (item.group === 'unused' && rdapState.expiry_confirmed) {
           const card = document.createElement('div');
           card.className = 'domain-card domain-header domain-header-domains unused-card';
           card.setAttribute('data-search', domain.toLowerCase());

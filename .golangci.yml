@@ -34,7 +34,7 @@ linters:
     rules:
       # These existing protocol evaluators require focused refactors and regression tests.
       # New production functions remain subject to the complexity limit above.
-      - path: src/(dns|lookup)\.go
+      - path: src/internal/monitor/(dns|lookup)\.go
         linters:
           - gocyclo
         text: 'func `(validateDNSSEC|validateRecordsWithReason|EvaluateEmailSecurity|extractWHOISTier|synthesizeTierData|EvaluateRDAP)`'
@@ -42,7 +42,7 @@ linters:
         linters:
           - gocyclo
           - gosec
-      - path: src/utils\.go
+      - path: src/internal/monitor/utils\.go
         linters:
           - forbidigo
 

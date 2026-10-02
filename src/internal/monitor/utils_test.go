@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"bytes"
@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"domain_monitor/src/internal/netpolicy"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -87,6 +89,21 @@ func TestHTTPRetryPolicy(t *testing.T) {
 	assert.Equal(t, 7*time.Second, responseRetryAfter(response, now))
 	response.Header.Set("Retry-After", now.Add(5*time.Second).Format(http.TimeFormat))
 	assert.Equal(t, 5*time.Second, responseRetryAfter(response, now))
+
+	nilResponseClient := &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return nil, nil
+	}}
+	response, err := doHTTPWithRetry(context.Background(), "nil response", nilResponseClient, RetryHTTPTransient, func() (*http.Request, error) {
+		return http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com", nil)
+	})
+	assert.Nil(t, response)
+	assert.ErrorIs(t, err, ErrEmptyHTTPResponse)
+
+	response, err = doHTTPWithRetry(context.Background(), "nil client", nil, RetryHTTPTransient, func() (*http.Request, error) {
+		return http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com", nil)
+	})
+	assert.Nil(t, response)
+	assert.ErrorIs(t, err, ErrHTTPClientNil)
 }
 
 func TestNormalizeDomain(t *testing.T) {
@@ -329,12 +346,12 @@ func TestAnyToString(t *testing.T) {
 }
 
 func TestIsRestrictedIP(t *testing.T) {
-	assert.True(t, IsRestrictedIP(net.ParseIP("127.0.0.1")))
-	assert.True(t, IsRestrictedIP(net.ParseIP("10.0.0.1")))
-	assert.True(t, IsRestrictedIP(net.ParseIP("192.168.1.1")))
-	assert.True(t, IsRestrictedIP(net.ParseIP("224.0.0.1")))
-	assert.True(t, IsRestrictedIP(net.ParseIP("ff02::1")))
-	assert.False(t, IsRestrictedIP(net.ParseIP("93.184.216.34")))
+	assert.True(t, netpolicy.RestrictedIP(net.ParseIP("127.0.0.1")))
+	assert.True(t, netpolicy.RestrictedIP(net.ParseIP("10.0.0.1")))
+	assert.True(t, netpolicy.RestrictedIP(net.ParseIP("192.168.1.1")))
+	assert.True(t, netpolicy.RestrictedIP(net.ParseIP("224.0.0.1")))
+	assert.True(t, netpolicy.RestrictedIP(net.ParseIP("ff02::1")))
+	assert.False(t, netpolicy.RestrictedIP(net.ParseIP("93.184.216.34")))
 }
 
 func TestCustomLoggerMethods(t *testing.T) {

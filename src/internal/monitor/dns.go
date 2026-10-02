@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"context"
@@ -121,9 +121,31 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 	})
 }
 
-// queryDNS queries the given resolvers and returns parsed string results.
-// It bypasses the OS resolver completely and forces a direct UDP/TCP connection to the provided IP.
+// queryDNS retains two independent recursive observations when two global
+// resolvers are available. A custom/single resolver remains authoritative for
+// that configured check and is queried alone.
 func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) ([]string, error) {
+	if len(resolvers) < 2 {
+		return queryDNSOne(ctx, app, hostname, qtype, resolvers)
+	}
+	first, firstErr := queryDNSOne(ctx, app, hostname, qtype, resolvers[:1])
+	second, secondErr := queryDNSOne(ctx, app, hostname, qtype, resolvers[1:2])
+	if firstErr != nil || secondErr != nil {
+		return nil, fmt.Errorf(MsgErrIncompleteResolverEvidence, errors.Join(firstErr, secondErr))
+	}
+	slices.Sort(first)
+	first = slices.Compact(first)
+	slices.Sort(second)
+	second = slices.Compact(second)
+	if !slices.Equal(first, second) {
+		return nil, fmt.Errorf(MsgErrResolverDisagreementFor, hostname)
+	}
+	return first, nil
+}
+
+// queryDNSOne queries the supplied resolver set and returns parsed string results.
+// It bypasses the OS resolver completely and forces a direct UDP/TCP connection.
+func queryDNSOne(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) ([]string, error) {
 	r, err := queryDNSMsg(ctx, app, hostname, qtype, resolvers)
 	if err != nil {
 		return nil, err
@@ -141,7 +163,8 @@ func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16,
 			continue
 		}
 		owner := strings.ToLower(dns.Fqdn(ans.Header().Name))
-		if !allowedOwners[owner] || (qtype == dns.TypeCNAME && owner != queriedOwner) {
+		_, ownerAllowed := allowedOwners[owner]
+		if !ownerAllowed || (qtype == dns.TypeCNAME && owner != queriedOwner) {
 			continue
 		}
 		if value, matchesType := dnsAnswerText(ans, qtype); matchesType {
@@ -192,8 +215,8 @@ func canonicalCAARecordValue(record *dns.CAA) string {
 
 // dnsAnswerOwners follows CNAMEs in the answer section so only records for the
 // queried name or its bounded alias chain are accepted.
-func dnsAnswerOwners(answers []dns.RR, hostname string) map[string]bool {
-	owners := map[string]bool{strings.ToLower(dns.Fqdn(hostname)): true}
+func dnsAnswerOwners(answers []dns.RR, hostname string) stringSet {
+	owners := stringSet{strings.ToLower(dns.Fqdn(hostname)): {}}
 	for range MaxCNAMEAliasTraversals {
 		changed := false
 		for _, answer := range answers {
@@ -201,12 +224,15 @@ func dnsAnswerOwners(answers []dns.RR, hostname string) map[string]bool {
 				continue
 			}
 			alias, ok := answer.(*dns.CNAME)
-			if !ok || !owners[strings.ToLower(dns.Fqdn(alias.Hdr.Name))] {
+			if !ok {
+				continue
+			}
+			if _, allowed := owners[strings.ToLower(dns.Fqdn(alias.Hdr.Name))]; !allowed {
 				continue
 			}
 			target := strings.ToLower(dns.Fqdn(alias.Target))
-			if !owners[target] {
-				owners[target] = true
+			if _, exists := owners[target]; !exists {
+				owners[target] = struct{}{}
 				changed = true
 			}
 		}
@@ -390,7 +416,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 }
 
 func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn string, authenticatedKSKs ...*dns.DNSKEY) bool {
-	if app == nil || ResolveHTTPClient(app.HTTPClient) == nil {
+	if app == nil || ResolveHTTPClient(app.Clients.Public) == nil {
 		return false
 	}
 	u, err := url.Parse(endpoint)
@@ -402,7 +428,7 @@ func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn 
 	query.Set(ParamType, RecordTypeDNSKEY)
 	query.Set(ParamDO, ParamDOValue)
 	u.RawQuery = query.Encode()
-	resp, err := doHTTPWithRetry(ctx, NameOpDNSSECDoH, app.HTTPClient, true, func() (*http.Request, error) {
+	resp, err := doHTTPWithRetry(ctx, NameOpDNSSECDoH, app.Clients.Public, RetryHTTPTransient, func() (*http.Request, error) {
 		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if requestErr != nil {
 			return nil, requestErr
@@ -517,10 +543,34 @@ func EvaluateDNSSEC(target DomainConfig, res DNSSECResult) (CheckStatus, StateCo
 
 // FetchDNSSnapshot performs the DNS resolution and returns a snapshot
 func FetchDNSSnapshot(ctx context.Context, app *AppState, target DNSTask) DNSSnapshot {
-	foundRecords, err := resolveTarget(ctx, app, target)
+	resolvers := app.resolvers()
+	if target.CustomResolver != StrEmpty {
+		resolvers = []string{target.CustomResolver}
+	}
+	observationCount := 1
+	if target.CustomResolver == StrEmpty && len(resolvers) > 1 {
+		observationCount = 2
+	}
+	observations := make([]DNSObservation, 0, observationCount)
+	for _, resolver := range resolvers[:observationCount] {
+		records, err := resolveTargetWithResolvers(ctx, app, target, []string{resolver})
+		observations = append(observations, DNSObservation{Resolver: resolver, Records: records, Err: err})
+	}
+	foundRecords, err := observations[0].Records, observations[0].Err
+	if len(observations) == 2 {
+		switch {
+		case observations[0].Err != nil || observations[1].Err != nil:
+			err = fmt.Errorf(MsgErrIncompleteResolverEvidence, errors.Join(observations[0].Err, observations[1].Err))
+		case !slices.Equal(observations[0].Records, observations[1].Records):
+			err = fmt.Errorf(MsgErrResolverDisagreement, observations[0].Resolver, observations[1].Resolver)
+		default:
+			foundRecords = observations[0].Records
+		}
+	}
 	snap := DNSSnapshot{
-		Records: foundRecords,
-		Err:     err,
+		Records:      foundRecords,
+		Observations: observations,
+		Err:          err,
 	}
 	if err == nil && (target.Type == RecordTypeALIAS || target.Type == RecordTypeCNAME) && len(foundRecords) > 0 && net.ParseIP(foundRecords[0]) != nil {
 		resolvers := app.resolvers()
@@ -567,13 +617,38 @@ func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string
 	if target.CustomResolver != StrEmpty {
 		resolvers = []string{target.CustomResolver}
 	}
+	return resolveTargetWithResolvers(ctx, app, target, resolvers)
+}
+
+func dnsTypeForName(recordType string) (uint16, bool) {
+	switch recordType {
+	case RecordTypeA:
+		return dns.TypeA, true
+	case RecordTypeAAAA:
+		return dns.TypeAAAA, true
+	case RecordTypeCNAME:
+		return dns.TypeCNAME, true
+	case RecordTypeMX:
+		return dns.TypeMX, true
+	case RecordTypeTXT:
+		return dns.TypeTXT, true
+	case RecordTypeCAA:
+		return dns.TypeCAA, true
+	case RecordTypeNS:
+		return dns.TypeNS, true
+	default:
+		return 0, false
+	}
+}
+
+func resolveTargetWithResolvers(ctx context.Context, app *AppState, target DNSTask, resolvers []string) ([]string, error) {
 
 	var foundRecords []string
 	var err error
 
 	if target.Type == RecordTypeIP || target.Type == RecordTypeALIAS {
 		foundRecords, err = queryIPRecords(ctx, app, target.Hostname, resolvers)
-	} else if qtype, ok := DNSTypeMap[target.Type]; ok {
+	} else if qtype, ok := dnsTypeForName(target.Type); ok {
 		foundRecords, err = queryDNS(ctx, app, target.Hostname, qtype, resolvers)
 
 		// CNAME Flattening
@@ -604,6 +679,10 @@ func resolveTarget(ctx context.Context, app *AppState, target DNSTask) ([]string
 			slices.Sort(canonicalIPs)
 			foundRecords = canonicalIPs
 		}
+	}
+	if err == nil {
+		slices.Sort(foundRecords)
+		foundRecords = slices.Compact(foundRecords)
 	}
 
 	return foundRecords, err
@@ -780,7 +859,7 @@ func hasUsableDKIMKey(record string) bool {
 	if keyType != StrEmpty && keyType != DKIMKeyTypeRSA && keyType != DKIMKeyTypeEd25519 {
 		return false
 	}
-	key, exists := tags[DNSPolicyTagPublicKey]
+	key, exists := tags[DNSPolicyTagP]
 	if !exists || key == StrEmpty {
 		return false
 	}
@@ -798,7 +877,7 @@ func parseSemicolonTags(record string) (map[string]string, bool) {
 			rem = rem[idx+1:]
 		} else {
 			part = rem
-			rem = ""
+			rem = StrEmpty
 		}
 		if strings.TrimSpace(part) == StrEmpty {
 			continue
@@ -856,7 +935,7 @@ func hasValidDMARCPolicy(record string) bool {
 			return false
 		}
 	}
-	if !validPolicy(tags[DNSPolicyTagPublicKey]) {
+	if policy, exists := tags[DNSPolicyTagP]; exists && !validPolicy(policy) {
 		return false
 	}
 	for _, tag := range []string{StrSp, StrNp} {
@@ -864,7 +943,7 @@ func hasValidDMARCPolicy(record string) bool {
 			return false
 		}
 	}
-	if psd, ok := tags[StrPsd]; ok && !strings.EqualFold(psd, StrY) && !strings.EqualFold(psd, StrN2) && !strings.EqualFold(psd, StrU) {
+	if psd, ok := tags[StrPsd]; ok && !strings.EqualFold(psd, StrY) && !strings.EqualFold(psd, DMARCPSDNo) && !strings.EqualFold(psd, StrU) {
 		return false
 	}
 	return true
@@ -933,7 +1012,7 @@ func fetchDMARCPolicy(ctx context.Context, app *AppState, domain string) ([]stri
 					return []string{dmarcRecord}, nil
 				}
 				switch dmarcPSDValue(dmarcRecord) {
-				case StrN2:
+				case DMARCPSDNo:
 					return []string{dmarcRecord}, nil
 				case StrY:
 					if candidateRecord == StrEmpty || parentDomain(candidateDomain) != currentDomain {
@@ -1119,7 +1198,7 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 	var dmarcFound bool
 	if snap.DMARCErr != nil && !errors.Is(snap.DMARCErr, ErrNXDOMAIN) {
 		emailStatus = StatusFailed
-		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: StrDmarc2 + snap.DMARCErr.Error()})
+		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: StrDMARCDiagnosticPrefix + snap.DMARCErr.Error()})
 	} else {
 		dmarcCount := 0
 		for _, txt := range snap.DMARCRecords {
@@ -1202,6 +1281,7 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 		DKIMValid:    validDKIMs,
 		MX:           liveMXs,
 		Error:        strings.Join(errs, SymPipeSpaced),
+		Findings:     findingsFromConditions(emailStatus, conditions...),
 	}
 
 	// Return highest priority condition
@@ -1209,13 +1289,12 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 	if len(conditions) > 0 {
 		c := conditions[0]
 		if emailStatus == StatusFailed && snap.DMARCErr != nil && !errors.Is(snap.DMARCErr, ErrNXDOMAIN) {
-			c = StateCondition{Code: CodeDNSLookupFailed, Target: StrDmarc2 + snap.DMARCErr.Error()}
+			c = StateCondition{Code: CodeDNSLookupFailed, Target: StrDMARCDiagnosticPrefix + snap.DMARCErr.Error()}
 		}
 		finalCond = c
 	} else if emailStatus == StatusOK {
 		finalCond = StateCondition{Code: CodeEmailVerified}
 	}
-
 	return emailStatus, finalCond, state
 }
 
@@ -1341,6 +1420,9 @@ func findSOASerial(message *dns.Msg, domain string) (uint32, bool) {
 }
 
 func findSOAForDomain(message *dns.Msg, domain string) (*dns.SOA, bool) {
+	if message == nil {
+		return nil, false
+	}
 	owner := dns.Fqdn(domain)
 	for _, rr := range message.Answer {
 		if soa, ok := rr.(*dns.SOA); ok && soa.Hdr.Class == dns.ClassINET && strings.EqualFold(soa.Hdr.Name, owner) {
@@ -1383,14 +1465,14 @@ func FetchNSHealthSnapshots(ctx context.Context, app *AppState, target DomainCon
 	}
 
 	snapshots := make([]NSSnapshot, 0, len(target.Nameservers))
-	seen := make(map[string]bool)
+	seen := make(stringSet)
 	for _, nameserver := range target.Nameservers {
 		name := strings.TrimSpace(nameserver.Hostname)
 		key := strings.ToLower(strings.TrimSuffix(name, SymDot))
-		if key == StrEmpty || seen[key] {
+		if _, exists := seen[key]; key == StrEmpty || exists {
 			continue
 		}
-		seen[key] = true
+		seen[key] = struct{}{}
 		nameserver.Hostname = name
 		snapshots = append(snapshots, FetchNSSnapshot(ctx, app, nameserver, target))
 	}

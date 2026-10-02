@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"context"
@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -18,7 +17,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-// LoadConfig reads, unmarshals, normalizes, and validates the configuration file.
+// LoadConfig reads raw operator input and compiles an owned runtime configuration.
 func LoadConfig(ctx context.Context, path string) (AppConfig, error) {
 	return loadConfig(ctx, path, readConfigFile)
 }
@@ -46,29 +45,37 @@ func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte,
 		return AppConfig{}, WrapError(MsgErrFailedToReadConfig, err)
 	}
 
-	var rawCfg AppConfig
-	if err := jsonv2.Unmarshal(jsonBytes, &rawCfg); err != nil {
+	var config RawConfig
+	if err := jsonv2.Unmarshal(jsonBytes, &config); err != nil {
 		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
 	var removed removedConfigFields
 	if err := jsonv2.Unmarshal(jsonBytes, &removed); err != nil {
 		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
 	}
-	for i := range rawCfg.Domains {
+	for i := range config.Domains {
 		if i < len(removed.Domains) && removed.Domains[i].hasAny() {
-			return AppConfig{}, fmt.Errorf(MsgErrRemovedDomainConfig, rawCfg.Domains[i].Domain)
+			return AppConfig{}, fmt.Errorf(MsgErrRemovedDomainConfig, config.Domains[i].Domain)
 		}
 	}
 
-	applyConfigOverrides(&rawCfg)
-	if err := validateConfigEndpoints(&rawCfg); err != nil {
+	applyConfigOverrides(&config)
+	return compileRawConfig(config)
+}
+
+// compileRawConfig creates an independently owned runtime configuration before
+// applying defaults and normalization. The input remains isolated from all
+// mutations performed during compilation or later runtime use.
+func compileRawConfig(raw RawConfig) (AppConfig, error) {
+	cfg := cloneConfig(AppConfig(raw))
+	if err := validateConfigEndpoints(&cfg); err != nil {
 		return AppConfig{}, err
 	}
-	if err := normalizeConfiguredChecks(&rawCfg); err != nil {
+	if err := normalizeConfiguredChecks(&cfg); err != nil {
 		return AppConfig{}, err
 	}
-	applyLoopIntervalBounds(&rawCfg)
-	return rawCfg, nil
+	applyLoopIntervalBounds(&cfg)
+	return cfg, nil
 }
 
 func (r removedDomainFields) hasAny() bool {
@@ -78,70 +85,76 @@ func (r removedDomainFields) hasAny() bool {
 		r.ExpectedRegistrarID != nil || r.ExpectedRegistrarName != nil
 }
 
-func applyConfigOverrides(rawCfg *AppConfig) {
+func applyConfigOverrides(config *RawConfig) {
 	if p := strings.TrimSpace(os.Getenv(EnvPort)); p != StrEmpty {
-		rawCfg.Port = p
+		config.Port = p
 	}
 	if t := strings.TrimSpace(os.Getenv(EnvNtfyAuth)); t != StrEmpty {
-		if rawCfg.Notifications.Ntfy == nil {
-			rawCfg.Notifications.Ntfy = &NtfyConfig{}
+		if config.Notifications.Ntfy == nil {
+			config.Notifications.Ntfy = &NtfyConfig{}
 		}
-		rawCfg.Notifications.Ntfy.Auth = t
+		config.Notifications.Ntfy.Auth = t
 	}
 	if t := strings.TrimSpace(os.Getenv(EnvTelegramToken)); t != StrEmpty {
-		if rawCfg.Notifications.Telegram == nil {
-			rawCfg.Notifications.Telegram = &TelegramConfig{}
+		if config.Notifications.Telegram == nil {
+			config.Notifications.Telegram = &TelegramConfig{}
 		}
-		rawCfg.Notifications.Telegram.Token = t
+		config.Notifications.Telegram.Token = t
 	}
 	if id := strings.TrimSpace(os.Getenv(EnvTelegramChatID)); id != StrEmpty {
-		if rawCfg.Notifications.Telegram == nil {
-			rawCfg.Notifications.Telegram = &TelegramConfig{}
+		if config.Notifications.Telegram == nil {
+			config.Notifications.Telegram = &TelegramConfig{}
 		}
-		rawCfg.Notifications.Telegram.ChatID = id
+		config.Notifications.Telegram.ChatID = id
 	}
 	if u := strings.TrimSpace(os.Getenv(EnvDoHURL)); u != StrEmpty {
-		rawCfg.DoHURL = u
+		config.DoHURL = u
 	}
 }
 
-func validateConfigEndpoints(rawCfg *AppConfig) error {
-	if rawCfg.Port == StrEmpty {
-		rawCfg.Port = DefaultServerPort
+func validateConfigEndpoints(config *AppConfig) error {
+	if config.Port == StrEmpty {
+		config.Port = DefaultServerPort
 	}
-	if err := validateTCPPort(rawCfg.Port); err != nil {
+	if err := validateTCPPort(config.Port); err != nil {
 		return fmt.Errorf(MsgErrInvalidServerPort, err)
 	}
-	if len(rawCfg.Resolvers) == 0 {
-		rawCfg.Resolvers = DefaultResolvers()
+	if len(config.Resolvers) == 0 {
+		config.Resolvers = DefaultResolvers()
 	}
-	if len(rawCfg.Resolvers) > MaxResolversLimit {
-		return fmt.Errorf(MsgErrValidateConfiguredResolvers, len(rawCfg.Resolvers), MsgErrResolversExceedLimit)
+	if len(config.Resolvers) > MaxResolversLimit {
+		return fmt.Errorf(MsgErrValidateConfiguredResolvers, len(config.Resolvers), MsgErrResolversExceedLimit)
 	}
-	for _, endpoint := range rawCfg.Resolvers {
+	for _, endpoint := range config.Resolvers {
 		if err := validateResolverEndpoint(endpoint); err != nil {
 			return fmt.Errorf(MsgErrInvalidResolver, endpoint, err)
 		}
 	}
-	if rawCfg.DoHURL == StrEmpty {
-		rawCfg.DoHURL = DefaultDoHURL
+	if config.DoHURL == StrEmpty {
+		config.DoHURL = DefaultDoHURL
 	}
-	if err := validateHTTPURL(rawCfg.DoHURL); err != nil {
+	if err := validateHTTPURL(config.DoHURL); err != nil {
 		return fmt.Errorf(MsgErrInvalidDohURL, err)
 	}
-	return validateNotificationEndpoints(&rawCfg.Notifications)
+	return validateNotificationEndpoints(&config.Notifications)
 }
 
 func validateNotificationEndpoints(notifications *Notifications) error {
 	if notifications.Ntfy == nil {
-		return fmt.Errorf(MsgErrValidateNotificationsntfy, MsgErrNtfyURLRequired)
+		return fmt.Errorf(MsgErrValidateNotificationsNtfy, MsgErrNtfyURLRequired)
 	}
 	ntfy := notifications.Ntfy
 	if ntfy.URL == StrEmpty {
-		return fmt.Errorf(MsgErrValidateNotificationsntfy, MsgErrNtfyURLRequired)
+		return fmt.Errorf(MsgErrValidateNotificationsNtfy, MsgErrNtfyURLRequired)
 	}
 	if err := validateHTTPURL(ntfy.URL); err != nil {
 		return fmt.Errorf(MsgErrInvalidNtfyURL, err)
+	}
+	if ntfy.Auth != StrEmpty {
+		endpoint, err := url.Parse(ntfy.URL)
+		if err != nil || !strings.EqualFold(endpoint.Scheme, SchemeHTTPSName) {
+			return fmt.Errorf(MsgErrInvalidNtfyURL, errors.New(MsgErrAuthenticatedNtfyRequiresHTTPS))
+		}
 	}
 	if notifications.Telegram != nil {
 		telegram := notifications.Telegram
@@ -155,20 +168,20 @@ func validateNotificationEndpoints(notifications *Notifications) error {
 	return nil
 }
 
-func normalizeConfiguredChecks(rawCfg *AppConfig) error {
-	for _, task := range rawCfg.DNSRecords {
+func normalizeConfiguredChecks(config *AppConfig) error {
+	for _, task := range config.DNSRecords {
 		if strings.HasPrefix(strings.TrimSpace(task.Name), InternalCAATaskPrefix) {
 			return fmt.Errorf(MsgErrReservedDNSName, task.Name, InternalCAATaskPrefix)
 		}
 	}
-	seenDomains := make(map[string]bool, len(rawCfg.Domains))
-	seenDomainNames := make(map[string]bool, len(rawCfg.Domains))
-	for i := range rawCfg.Domains {
-		if err := normalizeDomainConfig(&rawCfg.Domains[i], i, seenDomains, seenDomainNames); err != nil {
+	seenDomains := make(stringSet, len(config.Domains))
+	seenDomainNames := make(stringSet, len(config.Domains))
+	for i := range config.Domains {
+		if err := normalizeDomainConfig(&config.Domains[i], i, seenDomains, seenDomainNames); err != nil {
 			return err
 		}
 
-		d := &rawCfg.Domains[i]
+		d := &config.Domains[i]
 		if d.CAA != nil {
 			var expected []string
 			if d.CAA.Issue != nil {
@@ -207,30 +220,30 @@ func normalizeConfiguredChecks(rawCfg *AppConfig) error {
 					Type:      RecordTypeCAA,
 					Expected:  expected,
 				}
-				rawCfg.DNSRecords = append(rawCfg.DNSRecords, task)
+				config.DNSRecords = append(config.DNSRecords, task)
 			}
 		}
 	}
 
-	seenDNSNames := make(map[string]bool, len(rawCfg.DNSRecords))
-	for i := range rawCfg.DNSRecords {
-		if err := normalizeDNSTask(&rawCfg.DNSRecords[i], i, seenDNSNames); err != nil {
+	seenDNSNames := make(stringSet, len(config.DNSRecords))
+	for i := range config.DNSRecords {
+		if err := normalizeDNSTask(&config.DNSRecords[i], i, seenDNSNames); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func applyLoopIntervalBounds(rawCfg *AppConfig) {
+func applyLoopIntervalBounds(config *AppConfig) {
 	switch {
-	case rawCfg.LoopIntervalDays == 0:
-		rawCfg.LoopIntervalDays = DefaultLoopIntervalDays
-	case rawCfg.LoopIntervalDays < MinLoopIntervalDays:
-		LogInfo(MsgLogLoopIntervalBelowMin, FieldConfigured, rawCfg.LoopIntervalDays)
-		rawCfg.LoopIntervalDays = MinLoopIntervalDays
-	case rawCfg.LoopIntervalDays > MaxLoopIntervalDays:
-		LogInfo(MsgLogLoopIntervalAboveMax, FieldConfigured, rawCfg.LoopIntervalDays)
-		rawCfg.LoopIntervalDays = MaxLoopIntervalDays
+	case config.LoopIntervalDays == 0:
+		config.LoopIntervalDays = DefaultLoopIntervalDays
+	case config.LoopIntervalDays < MinLoopIntervalDays:
+		LogInfo(MsgLogLoopIntervalBelowMin, FieldConfigured, config.LoopIntervalDays)
+		config.LoopIntervalDays = MinLoopIntervalDays
+	case config.LoopIntervalDays > MaxLoopIntervalDays:
+		LogInfo(MsgLogLoopIntervalAboveMax, FieldConfigured, config.LoopIntervalDays)
+		config.LoopIntervalDays = MaxLoopIntervalDays
 	}
 
 }
@@ -238,7 +251,7 @@ func applyLoopIntervalBounds(rawCfg *AppConfig) {
 func validateTCPPort(port string) error {
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf(MsgErrPortMustBeBetween1, port)
+		return fmt.Errorf(MsgErrPortOutOfRange, port)
 	}
 	return nil
 }
@@ -257,14 +270,14 @@ func validateResolverEndpoint(endpoint string) error {
 		var err error
 		host, port, err = net.SplitHostPort(endpoint)
 		if err != nil {
-			return fmt.Errorf(MsgErrExpectedAnIPAddressOr, err)
+			return fmt.Errorf(MsgErrExpectedIPAddressOrHostPort, err)
 		}
 		if err := validateTCPPort(port); err != nil {
 			return err
 		}
 	}
 	if net.ParseIP(host) == nil && (host == StrEmpty || strings.ContainsAny(host, SymInvalidURLChars)) {
-		return fmt.Errorf(MsgErrResolverEndpointHasAnInvalid, endpoint)
+		return fmt.Errorf(MsgErrResolverEndpointInvalidHost, endpoint)
 	}
 	return nil
 }
@@ -272,7 +285,7 @@ func validateResolverEndpoint(endpoint string) error {
 func validateHTTPURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u == nil || (u.Scheme != StrHTTP && u.Scheme != StrHTTPS) || u.Hostname() == StrEmpty || u.User != nil {
-		return errors.New(MsgErrExpectedAnHTTPSURLWith)
+		return errors.New(MsgErrExpectedHTTPURLWithHost)
 	}
 	if port := u.Port(); port != StrEmpty {
 		return validateTCPPort(port)
@@ -280,7 +293,7 @@ func validateHTTPURL(raw string) error {
 	return nil
 }
 
-func normalizeDomainConfig(domainCfg *DomainConfig, i int, seenDomains map[string]bool, seenDomainNames map[string]bool) error {
+func normalizeDomainConfig(domainCfg *DomainConfig, i int, seenDomains, seenDomainNames stringSet) error {
 	if err := normalizeDomainName(domainCfg, i, seenDomains); err != nil {
 		return err
 	}
@@ -328,7 +341,7 @@ func normalizeDomainCAA(domainCfg *DomainConfig) error {
 	return nil
 }
 
-func normalizeDomainName(domainCfg *DomainConfig, i int, seenDomains map[string]bool) error {
+func normalizeDomainName(domainCfg *DomainConfig, i int, seenDomains stringSet) error {
 	domainCfg.Domain = NormalizeDomainToASCIIText(domainCfg.Domain)
 	if domainCfg.Domain == StrEmpty {
 		return fmt.Errorf(MsgErrDomainEmptyDomain, i)
@@ -336,15 +349,15 @@ func normalizeDomainName(domainCfg *DomainConfig, i int, seenDomains map[string]
 	if !ReValidDomain.MatchString(domainCfg.Domain) || len(domainCfg.Domain) > 253 {
 		return fmt.Errorf(MsgErrInvalidMonitoredDomain, domainCfg.Domain)
 	}
-	if seenDomains[domainCfg.Domain] {
+	if _, exists := seenDomains[domainCfg.Domain]; exists {
 		return fmt.Errorf(MsgErrDuplicateDomain, strconv.Quote(domainCfg.Domain))
 	}
-	seenDomains[domainCfg.Domain] = true
+	seenDomains[domainCfg.Domain] = struct{}{}
 	return nil
 }
 
 func normalizeDomainNameservers(domainCfg *DomainConfig) error {
-	seen := make(map[string]bool, len(domainCfg.Nameservers))
+	seen := make(stringSet, len(domainCfg.Nameservers))
 	hasAnswering := false
 	for j := range domainCfg.Nameservers {
 		nameserver := &domainCfg.Nameservers[j]
@@ -355,10 +368,10 @@ func normalizeDomainNameservers(domainCfg *DomainConfig) error {
 		if !ReValidDomain.MatchString(nsClean) || len(nsClean) > 253 {
 			return fmt.Errorf(MsgErrDomainInvalidNameserver, domainCfg.Domain, strconv.Quote(nsClean))
 		}
-		if seen[nsClean] {
+		if _, exists := seen[nsClean]; exists {
 			return fmt.Errorf(MsgErrDomainDuplicateNameserver, domainCfg.Domain, nsClean)
 		}
-		seen[nsClean] = true
+		seen[nsClean] = struct{}{}
 		nameserver.Hostname = nsClean
 		hasAnswering = hasAnswering || !nameserver.Hidden
 	}
@@ -368,14 +381,14 @@ func normalizeDomainNameservers(domainCfg *DomainConfig) error {
 	return nil
 }
 
-func normalizeDomainMetadata(domainCfg *DomainConfig, seenDomainNames map[string]bool) error {
+func normalizeDomainMetadata(domainCfg *DomainConfig, seenDomainNames stringSet) error {
 	if domainCfg.Name == StrEmpty {
 		return fmt.Errorf(MsgErrDomainMissingName, domainCfg.Domain)
 	}
-	if seenDomainNames[domainCfg.Name] {
+	if _, exists := seenDomainNames[domainCfg.Name]; exists {
 		return fmt.Errorf(MsgErrDuplicateDomainName, strconv.Quote(domainCfg.Name))
 	}
-	seenDomainNames[domainCfg.Name] = true
+	seenDomainNames[domainCfg.Name] = struct{}{}
 
 	domainCfg.Registrar = strings.TrimSpace(domainCfg.Registrar)
 
@@ -427,7 +440,7 @@ func normalizeDomainEmail(domainCfg *DomainConfig) error {
 	return nil
 }
 
-func normalizeDNSTask(dnsRecord *DNSTask, i int, seenDNSNames map[string]bool) error {
+func normalizeDNSTask(dnsRecord *DNSTask, i int, seenDNSNames stringSet) error {
 	if err := normalizeDNSTaskIdentity(dnsRecord, i, seenDNSNames); err != nil {
 		return err
 	}
@@ -437,7 +450,7 @@ func normalizeDNSTask(dnsRecord *DNSTask, i int, seenDNSNames map[string]bool) e
 	return normalizeDNSTaskExpected(dnsRecord)
 }
 
-func normalizeDNSTaskIdentity(dnsRecord *DNSTask, i int, seenDNSNames map[string]bool) error {
+func normalizeDNSTaskIdentity(dnsRecord *DNSTask, i int, seenDNSNames stringSet) error {
 	dnsRecord.Hostname = NormalizeDomainToASCIIText(dnsRecord.Hostname)
 
 	if dnsRecord.Hostname == StrEmpty {
@@ -448,10 +461,10 @@ func normalizeDNSTaskIdentity(dnsRecord *DNSTask, i int, seenDNSNames map[string
 	if dnsRecord.Name == StrEmpty {
 		return fmt.Errorf(MsgErrDNSMissingName, dnsRecord.Hostname, dnsRecord.Type)
 	}
-	if seenDNSNames[dnsRecord.Name] {
+	if _, exists := seenDNSNames[dnsRecord.Name]; exists {
 		return fmt.Errorf(MsgErrDuplicateDNSName, strconv.Quote(dnsRecord.Name))
 	}
-	seenDNSNames[dnsRecord.Name] = true
+	seenDNSNames[dnsRecord.Name] = struct{}{}
 	return nil
 }
 
@@ -460,7 +473,7 @@ func validateDNSTaskOptions(dnsRecord *DNSTask) error {
 	if dnsRecord.Type == StrEmpty {
 		return fmt.Errorf(MsgErrDNSMissingType, dnsRecord.Hostname)
 	}
-	if _, known := DNSTypeMap[dnsRecord.Type]; !known && dnsRecord.Type != RecordTypeIP && dnsRecord.Type != RecordTypeALIAS {
+	if _, known := dnsTypeForName(dnsRecord.Type); !known && dnsRecord.Type != RecordTypeIP && dnsRecord.Type != RecordTypeALIAS {
 		return fmt.Errorf(MsgErrUnsupportedDNSRecordTypeFor, dnsRecord.Type, dnsRecord.Hostname)
 	}
 	dnsRecord.MatchType = strings.ToLower(strings.TrimSpace(dnsRecord.MatchType))
@@ -520,7 +533,7 @@ func normalizeExpectedDNSValue(record DNSTask, rawVal string) (string, error) {
 		}
 		caa, ok := rr.(*dns.CAA)
 		if !ok {
-			return StrEmpty, fmt.Errorf(MsgErrInvalidExpectedCAAValueFor2, rawVal, record.Hostname)
+			return StrEmpty, fmt.Errorf(MsgErrInvalidExpectedCAAValue, rawVal, record.Hostname)
 		}
 		return canonicalCAARecordValue(caa), nil
 	}
@@ -552,9 +565,9 @@ func normalizeExpectedIPValue(record DNSTask, rawVal string, parsedIP net.IP) (s
 	if parsedIP == nil {
 		switch record.Type {
 		case RecordTypeA:
-			return StrEmpty, fmt.Errorf(MsgErrExpectedNotValidIPv4, quotedName, record.Hostname, quotedValue)
+			return StrEmpty, fmt.Errorf(MsgErrExpectedInvalidIPv4, quotedName, record.Hostname, quotedValue)
 		case RecordTypeAAAA:
-			return StrEmpty, fmt.Errorf(MsgErrExpectedNotValidIPv6, quotedName, record.Hostname, quotedValue)
+			return StrEmpty, fmt.Errorf(MsgErrExpectedInvalidIPv6, quotedName, record.Hostname, quotedValue)
 		default:
 			return StrEmpty, fmt.Errorf(MsgErrExpectedNotValidIP, quotedName, record.Hostname, quotedValue)
 		}
@@ -575,9 +588,11 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 		return nil, fmt.Errorf(MsgErrInitializeApplication, err)
 	}
 	app := NewAppState(cfg)
-	app.HTTPClient = &http.Client{Timeout: DefaultHTTPTimeout}
-	app.Bootstrap = NewBootstrap(app.HTTPClient)
-	app.Pricing = NewPricingManager(app.HTTPClient)
+	app.Clients = OutboundClients{
+		Public: NewPublicHTTPClient(DefaultHTTPTimeout), Notification: NewNotificationHTTPClient(DefaultHTTPTimeout), RDAP: NewRDAPHTTPClient(DefaultHTTPTimeout),
+	}
+	app.Bootstrap = NewBootstrap(app.Clients.Public)
+	app.Pricing = NewPricingManager(app.Clients.Public)
 
 	var auth, ntfyURL string
 	if cfg.Notifications.Ntfy != nil {
@@ -595,7 +610,7 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 	}
 	if ntfyURL != StrEmpty || telegramToken != StrEmpty {
 		notifier := NewNotificationManager(ntfyURL, auth, telegramToken, telegramChatID)
-		notifier.HTTPClient = app.HTTPClient
+		notifier.HTTPClient = app.Clients.Notification
 		app.Notifier = notifier
 	}
 

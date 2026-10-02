@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,7 +27,7 @@ var indexHTML []byte
 
 func storePublishedState(app *AppState, body []byte) {
 	digest := sha256.Sum256(body)
-	app.publishedState.Store(&publishedState{body: body, etag: SymDoubleQuote + hex.EncodeToString(digest[:]) + SymDoubleQuote})
+	app.Published.store(&publishedState{body: body, etag: SymDoubleQuote + hex.EncodeToString(digest[:]) + SymDoubleQuote})
 }
 
 func securityHeadersMiddleware(next http.Handler) http.Handler {
@@ -51,7 +52,7 @@ func setupHTTPServer(app *AppState, port string) (*http.Server, <-chan error) {
 	mux.HandleFunc(RouteAPIState, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderContentType, MIMEApplicationJSON)
 		w.Header().Set(HeaderCacheControl, CacheControlNoCache)
-		if state := app.publishedState.Load(); state != nil {
+		if state := app.Published.load(); state != nil {
 			w.Header().Set(HeaderETag, state.etag)
 			if r.Header.Get(HeaderIfNoneMatch) == state.etag {
 				w.WriteHeader(http.StatusNotModified)
@@ -147,7 +148,7 @@ func gatherDNSEvidence(ctx context.Context, app *AppState, record DNSTask) (snap
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			LogError(MsgLogPanicDNSWorker, FieldRecord, record.Name, FieldPanic, recovered)
-			snapshot = DNSSnapshot{Err: fmt.Errorf(MsgErrInternalDNSCheckPanic, AnyToString(recovered))}
+			snapshot = DNSSnapshot{Err: errors.New(StrInternalDNSCheckPanic)}
 		}
 	}()
 	return FetchDNSSnapshot(ctx, app, record)
@@ -161,7 +162,7 @@ func evaluateDNSCheck(record DNSTask, snapshot DNSSnapshot) (result DNSResult) {
 			result.State = DNSState{
 				Hostname: record.Hostname, Name: record.Name, Type: record.Type,
 				Expected: slices.Clone(record.Expected), Status: StatusFailed,
-				Error:     fmt.Sprintf(MsgErrInternalDNSCheckPanic, AnyToString(r)),
+				Error:     StrInternalDNSCheckPanic,
 				Condition: StateCondition{Code: CodeDNSLookupFailed, Target: StrInternalDNSCheckPanic},
 			}
 		}
@@ -175,6 +176,7 @@ func evaluateDNSCheck(record DNSTask, snapshot DNSSnapshot) (result DNSResult) {
 		Hostname: record.Hostname, Name: record.Name, Type: record.Type,
 		Expected: slices.Clone(record.Expected), Status: status, Condition: cond,
 		Found: snapshot.Records, Error: errStr,
+		Findings: findingsFromConditions(status, cond),
 	}
 	return result
 }
@@ -217,19 +219,22 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 
 	if domain.isDelegatedZone() {
 		status, cond := EvaluateNSDelegation(domain, evidence.delegation)
-		state.RDAP[domain.Domain] = RDAPState{
+		delegationState := RDAPState{
 			Status:          status,
 			Condition:       cond,
 			AllowExpiry:     domain.AllowExpiry,
 			IsDelegatedZone: true,
 			Source:          SourceDNSDelegation,
 			Nameservers:     evidence.delegation.Nameservers,
+			Findings:        findingsFromConditions(status, cond),
 		}
+		state.RDAP[domain.Domain] = delegationState
 	}
 
 	dnssecStatus, dnssecCondition, dnssecResult := EvaluateDNSSEC(domain, evidence.dnssec)
 	dnssecResult.Status = dnssecStatus
 	dnssecResult.Condition = dnssecCondition
+	dnssecResult.Findings = findingsFromConditions(dnssecStatus, dnssecCondition)
 	if dnssecResult.Source != StrEmpty || dnssecResult.Error != StrEmpty || dnssecResult.Valid {
 		state.DNSSEC[domain.Domain] = dnssecResult
 	}
@@ -267,12 +272,14 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 			})
 		}
 
-		state.NSHealth[domain.Domain] = NSHealthResult{
+		nsState := NSHealthResult{
 			Valid:     status == StatusOK,
 			Status:    status,
 			Condition: nsCondition,
 			Servers:   servers,
+			Findings:  findingsFromConditions(status, nsCondition),
 		}
+		state.NSHealth[domain.Domain] = nsState
 	}
 }
 
@@ -313,8 +320,8 @@ func fastCheckSlot(position, dnsCount, domainCount int) (isDNS bool, checkIndex 
 	return false, position - dnsCount
 }
 
-func storePanicDomainResults(domain DomainConfig, state *CheckState, recovered any) {
-	message := fmt.Sprintf(MsgErrDomainCheckPanic, AnyToString(recovered))
+func storePanicDomainResults(domain DomainConfig, state *CheckState, _ any) {
+	message := StrInternalDomainCheckPanic
 	if current := state.Email[domain.Domain]; domain.Email != nil && current.Status == StatusUnknown {
 		provider := StrEmpty
 		if domain.Email != nil {
@@ -334,18 +341,18 @@ func storePanicDomainResults(domain DomainConfig, state *CheckState, recovered a
 	}
 }
 
-func gatherRDAPEvidence(ctx context.Context, app *AppState, domain DomainConfig, rdapHTTPClient *http.Client) (snapshot RDAPSnapshot) {
+func gatherRDAPEvidence(ctx context.Context, app *AppState, domain DomainConfig, rdapHTTPClient HTTPDoer) (snapshot RDAPSnapshot) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			LogError(MsgLogPanicRDAP, FieldDomain, domain.Domain, FieldPanic, recovered)
-			snapshot = RDAPSnapshot{Err: fmt.Errorf(MsgErrInternalRDAPCheckPanic, AnyToString(recovered))}
+			snapshot = RDAPSnapshot{Err: errors.New(StrInternalRDAPCheckPanic)}
 		}
 	}()
 	return FetchRDAPSnapshot(ctx, rdapHTTPClient, app, domain.Domain)
 }
 
 // gatherRateLimitedEvidence performs serial RDAP requests to respect registry limits.
-func gatherRateLimitedEvidence(ctx context.Context, app *AppState, domains []DomainConfig, active []int, rdapHTTPClient *http.Client, evidence *cycleEvidence) {
+func gatherRateLimitedEvidence(ctx context.Context, app *AppState, domains []DomainConfig, active []int, rdapHTTPClient HTTPDoer, evidence *cycleEvidence) {
 	for position, index := range active {
 		domain := domains[index]
 		if domain.isDelegatedZone() {
@@ -362,7 +369,7 @@ func evaluateRDAPCheck(domainConfig DomainConfig, snapshot RDAPSnapshot) (result
 			result = RDAPState{
 				Status:      StatusFailed,
 				AllowExpiry: domainConfig.AllowExpiry,
-				Error:       fmt.Sprintf(MsgErrInternalRDAPCheckPanic, AnyToString(r)),
+				Error:       StrInternalRDAPCheckPanic,
 				Condition:   StateCondition{Code: CodeRDAPHTTPError, Target: StrInternalRDAPCheckPanic},
 			}
 		}
@@ -380,13 +387,14 @@ func evaluateRDAPCheck(domainConfig DomainConfig, snapshot RDAPSnapshot) (result
 		DNSSEC:          snapshot.DNSSEC,
 		RenewalPrice:    domainConfig.RenewalPrice,
 		AllowExpiry:     domainConfig.AllowExpiry,
-		Unused:          domainConfig.AllowExpiry && status == StatusSkipped,
+		ExpiryConfirmed: domainConfig.AllowExpiry && status == StatusSkipped,
 		Source:          snapshot.Source,
 		ProtocolUsed:    snapshot.ProtocolUsed,
 		QueryDurationMs: snapshot.QueryDurationMs,
 		RegistryTier:    snapshot.RegistryTier,
 		RegistrarTier:   snapshot.RegistrarTier,
 		Discrepancies:   snapshot.Discrepancies,
+		Findings:        findingsFromConditions(status, cond),
 	}
 
 	if snapshot.Err != nil {
@@ -419,11 +427,11 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 			Condition: res.State.Condition,
 			Valid:     res.State.Status == StatusOK,
 			Error:     res.State.Error,
+			Findings:  slices.Clone(res.State.Findings),
 		}
-
-		expectedSet := make(map[string]bool)
+		expectedSet := make(stringSet)
 		for _, exp := range res.State.Expected {
-			expectedSet[exp] = true
+			expectedSet[exp] = struct{}{}
 		}
 
 		for _, rec := range res.State.Found {
@@ -441,7 +449,7 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 				}
 			}
 
-			if !caaRes.Valid && !expectedSet[rec] {
+			if _, expected := expectedSet[rec]; !caaRes.Valid && !expected {
 				if len(parts) == 3 {
 					caaRes.UnknownCAs = append(caaRes.UnknownCAs, strings.Trim(parts[2], SymDoubleQuote))
 				} else {
@@ -459,7 +467,7 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 	state.storeDNSResultValue(res)
 }
 
-func gatherCycleEvidence(ctx context.Context, app *AppState, cfg AppConfig, rdapHTTPClient *http.Client) (activeChecks, cycleEvidence) {
+func gatherCycleEvidence(ctx context.Context, app *AppState, cfg AppConfig, rdapHTTPClient HTTPDoer) (activeChecks, cycleEvidence) {
 	rdapActive := app.active.rdapDomains
 	evidence := cycleEvidence{
 		rdap: make([]RDAPSnapshot, len(rdapActive)),
@@ -494,13 +502,18 @@ func evaluateCycleEvidence(providers map[string]ProviderConfig, cfg AppConfig, a
 func runMonitoringCycle(
 	ctx context.Context,
 	app *AppState,
-	rdapHTTPClient *http.Client,
+	rdapHTTPClient HTTPDoer,
 	prevRDAPStatus map[string]CheckStatus,
 	prevDNSStatus map[string]CheckStatus,
 	prevEmailStatus map[string]CheckStatus,
 	prevConditions map[conditionKey]StateCondition,
 ) *CheckState {
-	cycleStart := time.Now()
+	clock := app.Clock
+	if clock == nil {
+		clock = systemClock{}
+	}
+	cycleStart := clock.Now()
+	cycleID := app.cycleSequence.Add(1)
 
 	loopDur := app.LoopDuration
 	if loopDur <= 0 {
@@ -510,7 +523,8 @@ func runMonitoringCycle(
 	cfg := app.configuration()
 	// Bound cycle timeout safely: scale with domain and DNS record counts so large portfolios
 	// have sufficient time for rate-limited RDAP requests and retries without hanging indefinitely.
-	minRequiredTimeout := time.Duration(len(app.active.rdapDomains))*15*time.Second + time.Duration(len(app.active.domains)+len(app.active.dnsRecords))*5*time.Second + 5*time.Minute
+	minRequiredTimeout := saturatingWorkDuration(len(app.active.rdapDomains), 15*time.Second, 5*time.Minute)
+	minRequiredTimeout = saturatingWorkDuration(len(app.active.domains)+len(app.active.dnsRecords), 5*time.Second, minRequiredTimeout)
 	cycleMaxTimeout := max(loopDur, minRequiredTimeout, 5*time.Minute)
 	cycleCtx, cycleCancel := context.WithTimeout(ctx, cycleMaxTimeout)
 	defer cycleCancel()
@@ -530,7 +544,29 @@ func runMonitoringCycle(
 
 	// RDAP selects the current dependent workload; final evaluation remains network-free.
 	active, evidence := gatherCycleEvidence(cycleCtx, app, cfg, rdapHTTPClient)
+	if cycleCtx.Err() != nil {
+		if ctx.Err() == nil {
+			publishCycleFailure(app, CycleMetadata{
+				ID: cycleID, Phase: CyclePhaseIdle, Outcome: CycleOutcomeFailed,
+				StartedAt:  cycleStart.UTC().Format(time.RFC3339),
+				FinishedAt: clock.Now().UTC().Format(time.RFC3339),
+				DurationMS: clock.Now().Sub(cycleStart).Milliseconds(),
+			})
+		}
+		return nil
+	}
 	loopState := evaluateCycleEvidence(app.EmailProviders, cfg, active, evidence)
+	if cycleCtx.Err() != nil {
+		if ctx.Err() == nil {
+			publishCycleFailure(app, CycleMetadata{
+				ID: cycleID, Phase: CyclePhaseIdle, Outcome: CycleOutcomeFailed,
+				StartedAt:  cycleStart.UTC().Format(time.RFC3339),
+				FinishedAt: clock.Now().UTC().Format(time.RFC3339),
+				DurationMS: clock.Now().Sub(cycleStart).Milliseconds(),
+			})
+		}
+		return nil
+	}
 
 	// 5. State transition logging
 	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, loopState.RDAP, func(s RDAPState) CheckStatus { return s.Status }, prevRDAPStatus)
@@ -541,10 +577,19 @@ func runMonitoringCycle(
 	processConditionsAndAlerts(app, loopState, cfg, active, prevConditions)
 
 	// 7. Update timestamps and pre-render atomic JSON cache
-	loopState.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+	finishedAt := clock.Now()
+	loopState.LastUpdated = finishedAt.UTC().Format(time.RFC3339)
+	loopState.Cycle = CycleMetadata{
+		ID: cycleID, Phase: CyclePhaseIdle, Outcome: CycleOutcomeSuccess,
+		StartedAt:     cycleStart.UTC().Format(time.RFC3339),
+		FinishedAt:    finishedAt.UTC().Format(time.RFC3339),
+		LastSuccessAt: finishedAt.UTC().Format(time.RFC3339),
+		DurationMS:    finishedAt.Sub(cycleStart).Milliseconds(),
+		Overrun:       finishedAt.Sub(cycleStart) > loopDur,
+	}
 	publishCycleState(app, loopState, loopDur)
 
-	cycleDuration := time.Since(cycleStart)
+	cycleDuration := clock.Now().Sub(cycleStart)
 	LogInfo(MsgLogMonitoringCycleCompleted,
 		FieldDurationMS, cycleDuration.Milliseconds(),
 		FieldDomainsChecked, len(active.rdapDomains),
@@ -552,6 +597,17 @@ func runMonitoringCycle(
 	)
 
 	return loopState
+}
+
+func saturatingWorkDuration(count int, perItem, base time.Duration) time.Duration {
+	if count <= 0 || perItem <= 0 {
+		return base
+	}
+	maxDuration := time.Duration(math.MaxInt64)
+	if count > int((maxDuration-base)/perItem) {
+		return maxDuration
+	}
+	return base + time.Duration(count)*perItem
 }
 
 func flushNotifier(ctx context.Context, notifier Notifier) {
@@ -577,13 +633,59 @@ func runNotificationWorker(ctx context.Context, notifier Notifier, wake <-chan s
 }
 
 func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) {
-	state.NextRefresh = time.Now().Add(loopDur).UTC().Format(time.RFC3339)
-	encoded, err := jsonv2.Marshal(state)
+	now := time.Now()
+	if app.Clock != nil {
+		now = app.Clock.Now()
+	}
+	state.NextRefresh = now.Add(loopDur).UTC().Format(time.RFC3339)
+	encoded, err := jsonv2.Marshal(toAPIState(state))
 	if err != nil {
 		LogWarn(MsgLogStateMarshalFailed, FieldError, err)
 		return
 	}
 	storePublishedState(app, encoded)
+}
+
+func sortedAPIChecks[T any](values map[string]T) []apiCheck[T] {
+	checks := make([]apiCheck[T], 0, len(values))
+	for _, id := range slices.Sorted(maps.Keys(values)) {
+		checks = append(checks, apiCheck[T]{ID: id, Result: values[id]})
+	}
+	return checks
+}
+
+func toAPIState(state *CheckState) apiState {
+	return apiState{
+		RDAP: sortedAPIChecks(state.RDAP), DNS: sortedAPIChecks(state.DNS), Email: sortedAPIChecks(state.Email),
+		DNSSEC: sortedAPIChecks(state.DNSSEC), NSHealth: sortedAPIChecks(state.NSHealth), CAA: sortedAPIChecks(state.CAA),
+		LastUpdated: state.LastUpdated, NextRefresh: state.NextRefresh, Cycle: state.Cycle,
+	}
+}
+
+func publishCycleFailure(app *AppState, attempt CycleMetadata) {
+	body, ok := app.PublishedJSON()
+	if !ok {
+		return
+	}
+	var state apiState
+	if err := jsonv2.Unmarshal(body, &state); err != nil {
+		LogWarn(MsgLogStateMarshalFailed, FieldError, err)
+		return
+	}
+	attempt.LastSuccessAt = state.Cycle.LastSuccessAt
+	state.Cycle = attempt
+	interval := app.LoopDuration
+	if interval <= 0 {
+		interval = DefaultLoopDurationFallback
+	}
+	now := time.Now()
+	if app.Clock != nil {
+		now = app.Clock.Now()
+	}
+	state.NextRefresh = now.Add(interval).UTC().Format(time.RFC3339)
+	if encoded, err := jsonv2.Marshal(&state); err == nil {
+		storePublishedState(app, encoded)
+	}
 }
 
 // newCycleState creates the maps owned by one monitoring cycle.
@@ -629,13 +731,13 @@ func newCycleState(cfg AppConfig, active activeChecks) *CheckState {
 }
 
 func suppressExpiredDomainChecks(cfg AppConfig, state *CheckState) {
-	var expired map[string]bool
+	var expired stringSet
 	for _, domain := range cfg.Domains {
-		if domain.AllowExpiry && state.RDAP[domain.Domain].Unused {
+		if domain.AllowExpiry && state.RDAP[domain.Domain].ExpiryConfirmed {
 			if expired == nil {
-				expired = make(map[string]bool)
+				expired = make(stringSet)
 			}
-			expired[NormalizeDomain(domain.Domain)] = true
+			expired[NormalizeDomain(domain.Domain)] = struct{}{}
 			delete(state.Email, domain.Domain)
 			delete(state.DNSSEC, domain.Domain)
 			delete(state.NSHealth, domain.Domain)
@@ -646,7 +748,7 @@ func suppressExpiredDomainChecks(cfg AppConfig, state *CheckState) {
 		return
 	}
 	for _, record := range cfg.DNSRecords {
-		if expired[configuredDomainOwner(record.Hostname, cfg.Domains)] {
+		if _, isExpired := expired[configuredDomainOwner(record.Hostname, cfg.Domains)]; isExpired {
 			delete(state.DNS, record.Name)
 		}
 	}
@@ -666,19 +768,19 @@ func configuredDomainOwner(hostname string, domains []DomainConfig) string {
 
 func activeChecksForCycle(app *AppState, cfg AppConfig) activeChecks {
 	active := app.active
-	if len(app.expiredDomains) == 0 {
+	if len(app.Runtime.ExpiredDomains) == 0 {
 		return active
 	}
 	active.domains = make([]int, 0, len(app.active.domains))
 	for _, index := range app.active.domains {
-		if !app.expiredDomains[cfg.Domains[index].Domain] {
+		if _, expired := app.Runtime.ExpiredDomains[cfg.Domains[index].Domain]; !expired {
 			active.domains = append(active.domains, index)
 		}
 	}
 	active.dnsRecords = make([]int, 0, len(app.active.dnsRecords))
 	for _, index := range app.active.dnsRecords {
 		owner := configuredDomainOwner(cfg.DNSRecords[index].Hostname, cfg.Domains)
-		if !app.expiredDomains[owner] {
+		if _, expired := app.Runtime.ExpiredDomains[owner]; !expired {
 			active.dnsRecords = append(active.dnsRecords, index)
 		}
 	}
@@ -688,18 +790,18 @@ func activeChecksForCycle(app *AppState, cfg AppConfig) activeChecks {
 func updateExpiredDomains(app *AppState, cfg AppConfig, state *CheckState) {
 	for _, domain := range cfg.Domains {
 		if !domain.AllowExpiry {
-			delete(app.expiredDomains, domain.Domain)
+			delete(app.Runtime.ExpiredDomains, domain.Domain)
 			continue
 		}
 		rdapState := state.RDAP[domain.Domain]
-		if rdapState.Unused {
-			app.expiredDomains[domain.Domain] = true
+		if rdapState.ExpiryConfirmed {
+			app.Runtime.ExpiredDomains[domain.Domain] = struct{}{}
 			continue
 		}
-		if app.expiredDomains[domain.Domain] && rdapState.Condition.Code == CodeRDAPHTTPError {
+		if _, expired := app.Runtime.ExpiredDomains[domain.Domain]; expired && rdapState.Condition.Code == CodeRDAPHTTPError {
 			continue
 		}
-		delete(app.expiredDomains, domain.Domain)
+		delete(app.Runtime.ExpiredDomains, domain.Domain)
 	}
 }
 
@@ -802,7 +904,7 @@ func appendConditionAlert(alerts []Alert, name, domain, check string, cond State
 	statusName, codeName := status.String(), cond.Code.String()
 	message := conditionAlertMessage(check, statusName, codeName, cond.Target, duration, false)
 	redacted := conditionAlertMessage(check, statusName, codeName, StrEmpty, duration, true)
-	return append(alerts, Alert{Message: message, Redacted: redacted, Priority: priority, Tag: TagSkull, Domain: domain, Name: name}), cond
+	return append(alerts, Alert{Message: message, Redacted: redacted, Priority: priority, Tag: TagSkull, Domain: domain, Name: name, Check: check}), cond
 }
 
 func conditionAlertMessage(check, status, code, target, duration string, redacted bool) string {
@@ -835,6 +937,7 @@ func collectDomainAlerts(alerts []Alert, state *CheckState, cfg DomainConfig, pr
 	}
 	if st, ok := state.Email[domain]; ok {
 		alerts, st.Condition = appendConditionAlert(alerts, name, domain, CheckTypeEmail, st.Condition, st.Status, suppress, prev)
+		alerts = appendAdditionalFindingAlerts(alerts, st.Findings, st.Condition, name, domain, CheckTypeEmail, st.Status, suppress)
 		state.Email[domain] = st
 	}
 	if st, ok := state.CAA[domain]; ok {
@@ -853,17 +956,35 @@ func collectDomainAlerts(alerts []Alert, state *CheckState, cfg DomainConfig, pr
 	return alerts
 }
 
+func appendAdditionalFindingAlerts(alerts []Alert, findings []Finding, primary StateCondition, name, domain, check string, status CheckStatus, suppress bool) []Alert {
+	if suppress || !alertableStatus(status) {
+		return alerts
+	}
+	priority := PriorityWarning
+	if status != StatusWarning {
+		priority = PriorityHigh
+	}
+	duration := formatDurationSince(primary.Since)
+	for _, finding := range findings {
+		if finding.Code == primary.Code && finding.Target == primary.Target {
+			continue
+		}
+		message := conditionAlertMessage(check, status.String(), finding.Code.String(), finding.Target, duration, false)
+		redacted := conditionAlertMessage(check, status.String(), finding.Code.String(), StrEmpty, duration, true)
+		alerts = append(alerts, Alert{Message: message, Redacted: redacted, Priority: priority, Tag: TagSkull, Domain: domain, Name: name, Check: check})
+	}
+	return alerts
+}
+
 func dispatchCycleAlerts(app *AppState, cycleAlerts []Alert) {
 	for _, alert := range cycleAlerts {
 		app.SafeDispatch(alert.Message, alert.Redacted, alert.Priority, alert.Tag, alert.Domain, alert.Name)
 	}
 }
 
-func main() {
-	os.Exit(mainExitCode())
-}
-
-func mainExitCode() int {
+// MainExitCode parses process configuration, runs the monitor, and returns the
+// exit code for the command package.
+func MainExitCode() int {
 	var configPath string
 	flag.StringVar(&configPath, FlagConfig, StrEmpty, FlagConfigUsage)
 	flag.StringVar(&configPath, FlagConfigShort, StrEmpty, FlagConfigShortUsage)
@@ -886,17 +1007,20 @@ func run(parent context.Context, configPath string) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	rawCfg, err := LoadConfig(ctx, configPath)
+	config, err := LoadConfig(ctx, configPath)
 	if err != nil {
 		return fmt.Errorf(MsgErrLoadConfiguration, err)
 	}
 
-	app, err := InitializeApp(ctx, rawCfg)
+	app, err := InitializeApp(ctx, config)
 	if err != nil {
 		return fmt.Errorf(MsgErrInitializeApplication, err)
 	}
 
-	rdapHTTPClient := NewRDAPHTTPClient(10 * time.Second)
+	rdapHTTPClient := app.Clients.RDAP
+	if rdapHTTPClient == nil {
+		rdapHTTPClient = NewRDAPHTTPClient(DefaultHTTPTimeout)
+	}
 	LogInfof(MsgLogStartup, len(app.configuration().Domains), len(app.configuration().DNSRecords))
 	app.PublishInitialState()
 
@@ -925,12 +1049,20 @@ func run(parent context.Context, configPath string) error {
 			default:
 			}
 
-			timer := time.NewTimer(app.LoopDuration)
+			interval := app.LoopDuration
+			if interval <= 0 {
+				interval = DefaultLoopDurationFallback
+			}
+			clock := app.Clock
+			if clock == nil {
+				clock = systemClock{}
+			}
+			timer := clock.NewTimer(interval)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return
-			case <-timer.C:
+			case <-timer.C():
 			}
 		}
 	}()
@@ -945,7 +1077,7 @@ func run(parent context.Context, configPath string) error {
 		runErr = fmt.Errorf(MsgErrHTTPServerStopped, sErr)
 	case <-engineDone:
 		LogError(MsgLogMonitoringEngineStopped)
-		runErr = fmt.Errorf(MsgErr2, NameOpMonitoringEngine, MsgErrMonitoringEngineExited)
+		runErr = fmt.Errorf(MsgErrOperationDetail, NameOpMonitoringEngine, MsgErrMonitoringEngineExited)
 	}
 
 	// Trigger cancellation for engines
@@ -968,7 +1100,7 @@ func run(parent context.Context, configPath string) error {
 		engineStopped = true
 	case <-time.After(5 * time.Second):
 		LogWarn(MsgLogMonitoringEngineTimeout)
-		runErr = errors.Join(runErr, fmt.Errorf(MsgErr2, NameOpMonitoringEngine, MsgErrMonitoringEngineShutdownTimeout))
+		runErr = errors.Join(runErr, fmt.Errorf(MsgErrOperationDetail, NameOpMonitoringEngine, MsgErrMonitoringEngineShutdownTimeout))
 	}
 	if engineStopped {
 		close(notificationWake)
@@ -981,6 +1113,7 @@ func run(parent context.Context, configPath string) error {
 		notificationCancel()
 		LogWarn(MsgLogNotificationWorkerTimeout)
 	}
+	app.Clients.CloseIdleConnections()
 
 	LogInfo(MsgLogShutdownComplete)
 	return runErr
@@ -990,6 +1123,7 @@ func run(parent context.Context, configPath string) error {
 func (a *AppState) PublishInitialState() {
 	cfg := a.configuration()
 	initialState := newCycleState(cfg, activeChecks{dnsRecords: a.active.dnsRecords})
+	initialState.Cycle = CycleMetadata{Phase: CyclePhaseInitializing}
 	for _, index := range a.active.dnsRecords {
 		dnsRecord := cfg.DNSRecords[index]
 		initialState.DNS[dnsRecord.Name] = DNSState{
@@ -998,8 +1132,8 @@ func (a *AppState) PublishInitialState() {
 			Status: StatusPending,
 		}
 	}
-	if b, err := jsonv2.Marshal(initialState); err == nil {
-		storePublishedState(a, b)
+	if encoded, err := jsonv2.Marshal(toAPIState(initialState)); err == nil {
+		storePublishedState(a, encoded)
 	}
 
 }

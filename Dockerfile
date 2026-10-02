@@ -1,29 +1,18 @@
-# Stage 1: Base builder environment
+# Stage 1: Build a static binary for the target platform.
 FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS base
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY src/ ./src/
-
-# Stage 2: Compile and compress the static binary
-FROM base AS builder
 ARG TARGETOS
 ARG TARGETARCH
-# Install UPX for extreme binary compression
-RUN apk add --no-cache upx
-# Build a fully static, stripped binary with trimmed paths
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -a -tags netgo -ldflags="-w -s -extldflags '-static'" -o domain-monitor ./src
-# Compress the binary
-RUN upx -9 domain-monitor
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o domain-monitor ./src/cmd/domain-monitor
 
-
-# Stage 3: Ultra-Minimal Production Image (Distroless)
+# Stage 2: Minimal non-root runtime image.
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /app
-COPY --from=builder /app/domain-monitor /app/domain-monitor
+COPY --from=base /app/domain-monitor /app/domain-monitor
 
-
-# Use the nonroot user for security
 USER 65532:65532
 
 EXPOSE 8080

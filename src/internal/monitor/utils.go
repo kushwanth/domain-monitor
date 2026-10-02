@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"context"
@@ -212,18 +212,34 @@ func transientNetworkError(err error) bool {
 	return errors.As(err, &networkError)
 }
 
-func doHTTPWithRetry(ctx context.Context, operation string, client HTTPDoer, retryTransport bool, requestFn func() (*http.Request, error)) (*http.Response, error) {
+func doHTTPRequest(client HTTPDoer, request *http.Request) (*http.Response, error) {
+	client = ResolveHTTPClient(client)
+	if client == nil {
+		return nil, ErrHTTPClientNil
+	}
+	response, err := client.Do(request)
+	if err == nil && response == nil {
+		return nil, ErrEmptyHTTPResponse
+	}
+	return response, err
+}
+
+func doHTTPWithRetry(ctx context.Context, operation string, client HTTPDoer, policy HTTPRetryPolicy, requestFn func() (*http.Request, error)) (*http.Response, error) {
+	client = ResolveHTTPClient(client)
+	if client == nil {
+		return nil, ErrHTTPClientNil
+	}
 	return retryWithBackoff(ctx, operation, HTTPRetryBaseDelay, func(attempt int) (*http.Response, bool, time.Duration, error) {
 		request, err := requestFn()
 		if err != nil {
 			return nil, false, 0, err
 		}
-		response, err := client.Do(request)
+		response, err := doHTTPRequest(client, request)
 		if err != nil {
 			if response != nil {
 				DrainAndClose(response.Body, MaxBodyDrainSize)
 			}
-			return nil, retryTransport && transientNetworkError(err), 0, err
+			return nil, policy == RetryHTTPTransient && transientNetworkError(err), 0, err
 		}
 		if !retryableHTTPStatus(response.StatusCode) || attempt == MaxNetworkAttempts {
 			return response, false, 0, nil
@@ -243,7 +259,7 @@ func DrainAndClose(rc io.ReadCloser, maxBytes int64) {
 		return
 	}
 	if maxBytes <= 0 {
-		maxBytes = 4096
+		maxBytes = MaxBodyDrainSize
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(rc, maxBytes))
 	_ = rc.Close()
@@ -275,28 +291,6 @@ func NormalizeStatusToken(s string) string {
 		}
 		return unicode.ToLower(r)
 	}, s)
-}
-
-// IsRestrictedIP reports whether ip is a private, loopback, link-local, multicast,
-// unspecified, or CGNAT IP address, suitable for SSRF and rebinding prevention.
-func IsRestrictedIP(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
-		return true
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		// RFC 6598: Carrier Grade NAT (100.64.0.0/10)
-		if ip4[0] == 100 && (ip4[1]&0xc0) == 64 {
-			return true
-		}
-		// RFC 1122: "This network" (0.0.0.0/8)
-		if ip4[0] == 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // --- 6. Standardized Logging Utilities with Localized Timezone (No k=v syntax, No Source) ---
