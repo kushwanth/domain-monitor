@@ -245,6 +245,7 @@ const (
 	PublicIDTypeIANA    = "iana"
 )
 
+// StatusUnknown and the following values enumerate check lifecycle outcomes.
 const (
 	StatusUnknown CheckStatus = iota
 	StatusPending
@@ -256,6 +257,7 @@ const (
 	StatusSkipped
 )
 
+// PriorityDefault and the following values enumerate notification priorities.
 const (
 	PriorityDefault AlertPriority = iota
 	PriorityWarning
@@ -267,6 +269,7 @@ var checkStatusNames = [...]string{"", "pending", "ok", "failed", "mismatch", "w
 var alertPriorityNames = [...]string{"default", "warning", "high", "urgent"}
 var findingSeverityNames = [...]string{"info", "warning", "error"}
 
+// CyclePhaseIdle and the following values name monitoring-cycle phases and outcomes.
 const (
 	CyclePhaseIdle         = "idle"
 	CyclePhaseInitializing = "initializing"
@@ -274,10 +277,11 @@ const (
 	CycleOutcomeSuccess    = "success"
 )
 
+// CodeNone and the following values are stable published evaluator result codes.
 const (
 	CodeNone ResultCode = iota
 
-	// RDAP / WHOIS
+	// CodeRDAPSuccess begins the RDAP and WHOIS result-code group.
 	CodeRDAPSuccess
 	CodeWHOISSuccess
 	CodeDomainNotFound
@@ -295,7 +299,7 @@ const (
 	CodeRDAPTransferUnlocked
 	CodeRDAPSuspended
 
-	// NS Health
+	// CodeNSSyncVerified begins the nameserver-health result-code group.
 	CodeNSSyncVerified
 	CodeNSUnreachable
 	CodeNSNotAuthoritative
@@ -306,7 +310,7 @@ const (
 	CodeUnauthorizedNS
 	CodeNSHiddenExposed
 
-	// DNS Records
+	// CodeDNSMatchVerified begins the DNS-record result-code group.
 	CodeDNSMatchVerified
 	CodeDNSMismatch
 	CodeDNSLookupFailed
@@ -314,7 +318,7 @@ const (
 	CodeDNSPrefixMismatch
 	CodeDNSSubstringMismatch
 
-	// Email Security
+	// CodeEmailVerified begins the email-security result-code group.
 	CodeEmailVerified
 	CodeEmailMissingMX
 	CodeEmailUnauthorizedMX
@@ -330,7 +334,7 @@ const (
 	CodeDMARCLookupFailed
 	CodeDKIMLookupFailed
 
-	// DNSSEC
+	// CodeDNSSECVerified begins the DNSSEC result-code group.
 	CodeDNSSECVerified
 	CodeDNSSECNetworkError
 	CodeDNSSECDisabled
@@ -340,24 +344,24 @@ const (
 	CodeDNSSECRRSIGFailed
 	CodeDNSSECChainBroken
 
-	// CAA
+	// CodeCAAVerified begins the CAA result-code group.
 	CodeCAAVerified
 	CodeCAAQueryFailed
 	CodeCAAMissingDenyAll
 	CodeCAAUnexpectedIssuer
 	CodeCAAMissingIssuer
 
-	// Reserved legacy CT codes preserve published numeric values.
+	// CodeCTLogsVerified begins reserved legacy CT codes that preserve published numeric values.
 	CodeCTLogsVerified
 	CodeCTLogsRateLimited
 	CodeCTLogsHTTPError
 	CodeCTPersistenceFailed
 	CodeCTCoverageIncomplete
 
-	// App-level
+	// CodeCheckTimeout begins the application-level result-code group.
 	CodeCheckTimeout
 	CodeCheckPanic
-	// Append new codes here to preserve existing numeric values in published state.
+	// CodeEmailInvalidNullMX is appended here to preserve existing numeric values in published state.
 	CodeEmailInvalidNullMX
 )
 
@@ -436,6 +440,9 @@ var resultCodeNames = [...]string{
 	CodeCAAUnexpectedIssuer: "caaUnexpectedIssuer",
 	CodeCAAMissingIssuer:    "caaMissingIssuer",
 
+	CodeCTLogsVerified:       "ctLogsVerified",
+	CodeCTLogsRateLimited:    "ctLogsRateLimited",
+	CodeCTLogsHTTPError:      "ctLogsHttpError",
 	CodeCTPersistenceFailed:  "ctPersistenceFailed",
 	CodeCTCoverageIncomplete: "ctCoverageIncomplete",
 
@@ -634,15 +641,16 @@ var (
 	ReValidDomain    = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 	ValidDomainRegex = ReValidDomain
 
-	ReWHOISReferral  = regexp.MustCompile(`(?im)^[ \t]*(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)[ \t]*:[ \t]*(?:whois:\/\/)?([a-zA-Z0-9.-]+)(?::43)?[ \t]*$`)
-	ReWHOISExpiry    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\]?)\s*[:\]]\s*([^\r\n]+)`)
-	ReWHOISCreated   = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Creation Date|Created on|Created|Registration Date|created|registered|created-date|Registered Date|Connected Date)\]?)\s*[:\]]\s*([^\r\n]+)`)
-	ReWHOISUpdated   = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Updated Date|Last Updated Date|Last Modified|changed|modified|updated-date|Last Update)\]?)\s*[:\]]\s*([^\r\n]+)`)
-	ReWHOISRegistrar = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registrar Name|Sponsoring Registrar Organization|Sponsoring Registrar|registrar-name|Registrar|Organization|sponsoring-registrar|registrar)\]?)\s*[:\]]\s*([^\r\n]+)`)
-	ReWHOISIANAID    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registrar IANA ID|Sponsoring Registrar IANA ID|IANA ID|Registrar IANA ID Number)\]?)\s*[:\]]\s*([0-9]+)`)
-	ReWHOISNS        = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Name Server|nameserver|nserver|DNS|Name Server Name)\]?)\s*[:\]]\s*([a-zA-Z0-9.-]+)`)
-	ReWHOISStatus    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Domain Status|Status|state|Domain State|Registration status)\]?)\s*[:\]]\s*([^\r\n]+)`)
-	ReWHOISDNSSEC    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:DNSSEC|dnssec)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISReferral     = regexp.MustCompile(`(?im)^[ \t]*(?:Registrar WHOIS Server|Whois Server|ReferralServer|Registrar Whois|referral|whois)[ \t]*:[ \t]*(?:whois:\/\/)?([a-zA-Z0-9.-]+)(?::43)?[ \t]*$`)
+	ReWHOISExpiry       = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|Expires on|Expires|paid-till|validity|Renewal Date|Record expires on|Domain Expiration Date|valid-date|Registry Expiration|Registry Expiry|expire|renewal-date)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISCreated      = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Creation Date|Created on|Created|Registration Date|created|registered|created-date|Registered Date|Connected Date)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISUpdated      = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Updated Date|Last Updated Date|Last Modified|changed|modified|updated-date|Last Update)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISRegistrar    = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registrar Name|Sponsoring Registrar Organization|Sponsoring Registrar|registrar-name|Registrar|Organization|sponsoring-registrar|registrar)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISIANAID       = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Registrar IANA ID|Sponsoring Registrar IANA ID|IANA ID|Registrar IANA ID Number)\]?)\s*[:\]]\s*([0-9]+)`)
+	ReWHOISNS           = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Name Server|nameserver|nserver|DNS|Name Server Name)\]?)\s*[:\]]\s*([a-zA-Z0-9.-]+)`)
+	ReWHOISStatus       = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:Domain Status|Status|state|Domain State|Registration status)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReWHOISDNSSEC       = regexp.MustCompile(`(?m)^(?i)\s*(?:\[?(?:DNSSEC|dnssec)\]?)\s*[:\]]\s*([^\r\n]+)`)
+	ReJSONDomainPointer = regexp.MustCompile(`within "/domains/([0-9]+)(.*?)"`)
 )
 
 // Stealth RDAP Seeds for ccTLDs not yet published in IANA bootstrap
@@ -971,6 +979,9 @@ const (
 	MsgErrBootstrapDecodeError               = "bootstrap decode error"
 	MsgErrFailedToReadConfig                 = "failed to read config file"
 	MsgErrJSONUnmarshalFailed                = "json unmarshal failed"
+	MsgErrEnrichedJSONUnmarshalFailed        = "json unmarshal failed in %s: %w"
+	MsgErrDomainIndexContext                 = "domain at index %d"
+	MsgErrDomainNameContext                  = "domain %q"
 	MsgErrResolversExceedLimit               = "configured resolvers exceed maximum limit of 9"
 	MsgErrDomainEmptyDomain                  = "domain entry at index %d has an empty domain"
 	MsgErrDuplicateDomain                    = "duplicate domain %s; each domain entry must be unique"
@@ -979,7 +990,6 @@ const (
 	MsgErrDomainDuplicateNameserver          = "domain %s has duplicate nameserver %s"
 	MsgErrDomainNeedsAnsweringNameserver     = "domain %s must configure at least one non-hidden nameserver"
 	MsgErrDomainInvalidRootZone              = "domain %s has invalid root zone %s"
-	MsgErrRemovedDomainConfig                = "domain %s uses removed configuration fields; update it to the current domain schema"
 	MsgErrDomainMissingName                  = "domain %s is missing a mandatory 'name' field"
 	MsgErrDuplicateDomainName                = "duplicate domain name %s; each domain must have a unique name"
 	MsgErrMailProviderAndMXMutuallyExclusive = "domain %s has both email.provider and email.mx_records set; these are mutually exclusive"
@@ -1060,18 +1070,8 @@ var registryDateLayouts = [...]string{
 	"20060102",
 }
 
-// Auto-generated error and log constants
+// Error and log constants.
 const (
-	MsgErrIPv6ResolverTimeout            = "IPv6 resolver timeout"
-	MsgErrResolverTimeout                = "resolver timeout"
-	MsgErrMockDohError                   = "mock doh error"
-	MsgErrMockDNSSECError                = "mock DNSSEC error"
-	MsgErrResolutionFailed               = "resolution failed"
-	MsgErrMockError                      = "mock error"
-	MsgErrResolverErrorCNAMELoopDetected = "resolver error: CNAME loop detected"
-	MsgErrTemporaryDNSFailure            = "temporary DNS failure"
-	MsgErrDNSTimeout                     = "DNS timeout"
-
 	MsgErrQueryDNSForOnTruncated        = "query DNS for %s on %s: truncated UDP answer and TCP resolver is not configured"
 	MsgErrQueryDNSForOnTCP              = "query DNS for %s on %s: TCP answer is truncated"
 	MsgErrExpectedOneMXRecordWith       = "%w: expected one MX record with preference 0 and the root exchange"
@@ -1081,7 +1081,6 @@ const (
 	MsgErrNameserverAddressReturnedANil = "nameserver address %s returned a nil SOA response"
 	MsgErrNilDnskeyResponseFor          = "nil DNSKEY response for %s"
 	MsgErr                              = "%s: %w"
-	MsgErrResolverUnavailable           = "resolver unavailable"
 
 	MsgErrLoadConfiguration     = "load configuration: %w"
 	MsgErrInitializeApplication = "initialize application: %w"
@@ -1089,17 +1088,6 @@ const (
 	MsgErrOperationDetail       = "%s: %s"
 	MsgErrShutDownHTTPServer    = "shut down HTTP server: %w"
 
-	MsgErrRootCause                   = "root cause"
-	MsgErrCustomError                 = "custom error"
-	MsgLogTestErrorMessage            = "Test error message"
-	MsgLogTestWarnMessage             = "Test warn message"
-	MsgLogTestInfoMessage             = "Test info message"
-	MsgLogSampleLocalizedMessage      = "Sample localized message"
-	MsgLogTestInfof                   = "Test infof %s"
-	MsgLogTestErrorf                  = "Test errorf %s"
-	MsgLogTestWarnf                   = "Test warnf %d"
-	MsgLogTestDebugMessage            = "Test debug message"
-	MsgLogTestDebugf                  = "Test debugf %s"
 	MsgErrInvalidServerPort           = "invalid server port: %w"
 	MsgErrValidateConfiguredResolvers = "validate configured resolvers (%d): %s"
 	MsgErrInvalidResolver             = "invalid resolver %q: %w"
@@ -1162,13 +1150,6 @@ const (
 	MsgErrUnknownCheckStatus                   = "unknown check status %q"
 	MsgErrInvalidAlertPriority                 = "invalid alert priority %d"
 	MsgErrUnknownAlertPriority                 = "unknown alert priority %q"
-	MsgErrMockHTTPError                        = "mock http error"
-	MsgErrWHOISServerNotFound                  = "WHOIS server not found"
-	MsgErrRDAPUnavailable                      = "RDAP unavailable"
-	MsgErrFirstAddressUnavailable              = "first address unavailable"
-	MsgErrConnectionRefused                    = "connection refused"
-	MsgErrWHOISShouldNotBeQueried              = "WHOIS should not be queried"
-	MsgErrMockRDAPRateLimitError               = "mock rdap rate limit error"
 )
 
 // Auto-generated String Literals

@@ -577,18 +577,14 @@ func TestConfigRejectsMalformedDomainEndpoints(t *testing.T) {
 	}
 }
 
-func TestConfig_RejectsRemovedDomainFields(t *testing.T) {
+func TestConfigMigratesV3DomainFields(t *testing.T) {
 	t.Parallel()
 
 	for _, field := range []string{
-		`"expected_ns":["ns1.example.com"]`,
-		`"secondary_ns":["ns2.example.com"]`,
-		`"verify_ns_health":false`,
 		`"check_email_security":false`,
 		`"mail_provider":"google"`,
 		`"mx_records":["mail.example.com"]`,
 		`"dkim_selectors":["default"]`,
-		`"is_delegated_zone":false`,
 		`"unused":false`,
 		`"expected_registrar_id":"292"`,
 		`"expected_registrar_name":"example"`,
@@ -597,7 +593,101 @@ func TestConfig_RejectsRemovedDomainFields(t *testing.T) {
 		body := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example",` + field + `}]}`
 		require.NoError(t, os.WriteFile(path, []byte(body), 0600))
 		_, err := LoadConfig(context.Background(), path)
-		require.ErrorContains(t, err, "removed configuration fields")
+		require.NoError(t, err)
+	}
+}
+
+func TestConfigRejectsUnsafeV3Fields(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{name: "data directory", body: `{"data_dir":"state","notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}}}`},
+		{name: "skip SSL", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records":[{"hostname":"example.com","name":"example","type":"A","expected":["192.0.2.1"],"skip_ssl":true}]}`},
+		{name: "expected nameservers", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","expected_ns":["ns1.example.com"]}]}`},
+		{name: "secondary nameservers", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","secondary_ns":["ns2.example.com"]}]}`},
+		{name: "NS health toggle", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","verify_ns_health":false}]}`},
+		{name: "delegation marker", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","is_delegated_zone":true}]}`},
+		{name: "CT monitoring", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","monitor_ct_logs":true}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
+				return []byte(tc.body), nil
+			})
+			require.ErrorContains(t, err, "cannot be migrated safely")
+		})
+	}
+}
+
+func TestConfigMigratesV3Values(t *testing.T) {
+	t.Parallel()
+
+	body := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","check_email_security":true,"mail_provider":"google","dkim_selectors":["default"],"expected_registrar_id":"292","unused":true}]}`
+	cfg, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) { return []byte(body), nil })
+	require.NoError(t, err)
+	require.Len(t, cfg.Domains, 1)
+	require.NotNil(t, cfg.Domains[0].Email)
+	assert.Equal(t, "google", cfg.Domains[0].Email.Provider)
+	assert.Equal(t, []string{"default"}, cfg.Domains[0].Email.DKIMSelectors)
+	assert.Equal(t, "292", cfg.Domains[0].Registrar)
+	assert.True(t, cfg.Domains[0].AllowExpiry)
+}
+
+func TestConfigMigrationPreservesDisabledLegacyEmail(t *testing.T) {
+	t.Parallel()
+
+	body := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","check_email_security":false,"mail_provider":"google","dkim_selectors":["default"]}]}`
+	cfg, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) { return []byte(body), nil })
+	require.NoError(t, err)
+	require.Len(t, cfg.Domains, 1)
+	assert.Nil(t, cfg.Domains[0].Email)
+}
+
+func TestConfigMigrationRejectsAmbiguousRegistrar(t *testing.T) {
+	t.Parallel()
+
+	body := `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","expected_registrar_id":"292","expected_registrar_name":"Example Registrar"}]}`
+	_, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) { return []byte(body), nil })
+	require.ErrorContains(t, err, "select one current")
+}
+
+func TestMigrateV3ConfigDefensiveParsing(t *testing.T) {
+	t.Parallel()
+
+	unchanged := []byte(`{"notifications":{}}`)
+	got, err := migrateV3Config(unchanged)
+	require.NoError(t, err)
+	assert.Equal(t, unchanged, got)
+
+	for _, body := range []string{
+		`{`,
+		`{"domains":{}}`,
+		`{"dns_records":{}}`,
+		`{"domains":[{"domain":false,"unused":true}]}`,
+		`{"domains":[{"domain":"example.com","check_email_security":"yes"}]}`,
+	} {
+		_, err := migrateV3Config([]byte(body))
+		require.Error(t, err, body)
+	}
+}
+
+func TestConfigRejectsUnknownMembersAtEveryLevel(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{
+		`{"unknown":true,"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}}}`,
+		`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic","unknown":true}}}`,
+		`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","unknown":true}]}`,
+		`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","email":{"unknown":true}}]}`,
+		`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"example","caa":{"unknown":[]}}]}`,
+		`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"dns_records":[{"hostname":"example.com","name":"example","type":"A","expected":["192.0.2.1"],"unknown":true}]}`,
+	} {
+		_, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
+			return []byte(body), nil
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unknown")
 	}
 }
 
@@ -1084,15 +1174,19 @@ func TestNormalizeExpectedDNSValue_CAA(t *testing.T) {
 	assert.Equal(t, `0 issue "letsencrypt.org"`, val)
 	_, err = normalizeExpectedDNSValue(DNSTask{Type: RecordTypeCAA, Hostname: "example.com"}, `invalid caa`)
 	assert.ErrorContains(t, err, "invalid expected CAA value")
+
+	val, err = normalizeExpectedDNSValue(DNSTask{Type: RecordTypeCAA, Hostname: "example.com"}, `0 ISSUE "LETSENCRYPT.ORG; account=AbC123"`)
+	require.NoError(t, err)
+	assert.Equal(t, `0 issue "letsencrypt.org; account=AbC123"`, val)
 }
 
-func TestLoadConfigRejectsUnpersistableCTDomain(t *testing.T) {
+func TestLoadConfigRejectsRemovedCTFieldBeforeDomainValidation(t *testing.T) {
 	for _, domain := range []string{"bad/name.example", "bad..example", "-bad.example"} {
 		t.Run(domain, func(t *testing.T) {
 			_, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
 				return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"` + domain + `","name":"CT target","monitor_ct_logs":true}]}`), nil
 			})
-			require.Error(t, err)
+			require.ErrorContains(t, err, "cannot be migrated safely")
 		})
 	}
 }

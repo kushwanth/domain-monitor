@@ -918,7 +918,7 @@ func TestFollowRegistrarRDAPLinks(t *testing.T) {
 
 	links := []string{registrarServer.URL + "/domain/example.com"}
 
-	relDomain := followRegistrarRDAPLinks(context.Background(), "example.com", links, registrarServer.Client(), &AppState{RDAPURLAllowed: func(string) bool { return true }})
+	relDomain := followRegistrarRDAPLinks(context.Background(), "example.com", links, registrarServer.Client(), func(string) bool { return true }, nil)
 	if relDomain == nil {
 		t.Fatalf("Expected non-nil relDomain from registrar RDAP server")
 	}
@@ -967,7 +967,7 @@ func TestFollowRegistrarRDAPLinksSkipsWrongDomain(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
 	}}
 	links := []string{"https://rdap.example/domain/first", "https://rdap.example/domain/second"}
-	response := followRegistrarRDAPLinks(context.Background(), "example.com", links, client, &AppState{RDAPURLAllowed: func(string) bool { return true }})
+	response := followRegistrarRDAPLinks(context.Background(), "example.com", links, client, func(string) bool { return true }, nil)
 	require.NotNil(t, response)
 	assert.Equal(t, "example.com", response.LDHName)
 	assert.Equal(t, []string{"/domain/first", "/domain/second"}, requested)
@@ -1498,7 +1498,7 @@ func TestFollowRegistrarRDAPLinks_SSRFProtection(t *testing.T) {
 		}
 	}
 
-	res := followRegistrarRDAPLinks(context.Background(), "example.com", unsafeLinks, nil, nil)
+	res := followRegistrarRDAPLinks(context.Background(), "example.com", unsafeLinks, nil, nil, nil)
 	if res != nil {
 		t.Errorf("Expected nil response when all referral links are unsafe SSRF targets")
 	}
@@ -1529,7 +1529,7 @@ func TestFollowRegistrarRDAPLinks_QueryParamReferral(t *testing.T) {
 
 	// Referral URL with query parameter and base path
 	links := []string{server.URL + "/rdap_service?apiKey=secret123"}
-	res := followRegistrarRDAPLinks(context.Background(), "example.com", links, server.Client(), &AppState{RDAPURLAllowed: func(string) bool { return true }})
+	res := followRegistrarRDAPLinks(context.Background(), "example.com", links, server.Client(), func(string) bool { return true }, nil)
 
 	if res == nil {
 		t.Fatalf("Expected non-nil response from referral server")
@@ -1549,7 +1549,7 @@ func TestFollowRegistrarRDAPLinksRejectsWrongDomain(t *testing.T) {
 		_, _ = w.Write([]byte(`{"objectClassName":"domain","ldhName":"other.example.com"}`))
 	}))
 	defer server.Close()
-	result := followRegistrarRDAPLinks(context.Background(), "example.com", []string{server.URL + "/domain/example.com"}, server.Client(), &AppState{RDAPURLAllowed: func(string) bool { return true }})
+	result := followRegistrarRDAPLinks(context.Background(), "example.com", []string{server.URL + "/domain/example.com"}, server.Client(), func(string) bool { return true }, nil)
 	assert.Nil(t, result)
 }
 
@@ -1592,6 +1592,24 @@ func TestNewRDAPHTTPClient_BlocksInsecureRedirects(t *testing.T) {
 	if dialErr == nil || !strings.Contains(dialErr.Error(), "connection to restricted IP blocked (SSRF)") {
 		t.Errorf("Expected dial-time SSRF blocked error, got: %v", dialErr)
 	}
+}
+
+func TestNewPublicHTTPClientBlocksRestrictedDestinations(t *testing.T) {
+	client := NewPublicHTTPClient(2 * time.Second)
+	require.NotNil(t, client.CheckRedirect)
+
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1/private", nil)
+	require.NoError(t, err)
+	assert.Error(t, client.CheckRedirect(request, []*http.Request{{}}))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	request, err = http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Do(request)
+	require.ErrorIs(t, err, ErrRestrictedIP)
 }
 
 func TestNilSafety_LookupGuards(t *testing.T) {

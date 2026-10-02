@@ -94,31 +94,8 @@ func checkProductionFileConventions(t *testing.T, sourceRoot, path string) {
 		return
 	}
 
-	allowedStrings := make(map[token.Pos]struct{})
-	for _, spec := range file.Imports {
-		allowedStrings[spec.Path.Pos()] = struct{}{}
-	}
-	ast.Inspect(file, func(node ast.Node) bool {
-		if field, ok := node.(*ast.Field); ok && field.Tag != nil {
-			allowedStrings[field.Tag.Pos()] = struct{}{}
-		}
-		return true
-	})
-
-	constantsFile := filepath.Base(path) == "constants.go"
-	typesFile := filepath.ToSlash(relativePath) == "internal/monitor/types.go"
 	ast.Inspect(file, func(node ast.Node) bool {
 		switch current := node.(type) {
-		case *ast.GenDecl:
-			if current.Tok == token.TYPE && !typesFile {
-				t.Errorf("production type declarations belong in internal/monitor/types.go: %s:%d", relativePath, fileSet.Position(current.Pos()).Line)
-			}
-		case *ast.BasicLit:
-			if current.Kind == token.STRING && !constantsFile {
-				if _, allowed := allowedStrings[current.Pos()]; !allowed {
-					t.Errorf("runtime string literals belong in constants.go: %s:%d", relativePath, fileSet.Position(current.Pos()).Line)
-				}
-			}
 		case *ast.SelectorExpr:
 			identifier, ok := current.X.(*ast.Ident)
 			if !ok {

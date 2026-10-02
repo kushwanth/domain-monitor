@@ -447,6 +447,45 @@ func TestStateEnumWireCompatibility(t *testing.T) {
 	require.Error(t, err, "invalid statuses must still fail encoding")
 }
 
+func TestStateEnumAndStringListErrorContracts(t *testing.T) {
+	t.Parallel()
+
+	statusText, err := StatusWarning.MarshalText()
+	require.NoError(t, err)
+	assert.Equal(t, "warning", string(statusText))
+	assert.Empty(t, CheckStatus(255).String())
+	_, err = CheckStatus(255).MarshalText()
+	require.Error(t, err)
+	var status CheckStatus
+	require.Error(t, status.UnmarshalJSON([]byte(`{`)))
+	require.Error(t, status.UnmarshalJSON([]byte(`"unknown"`)))
+
+	var code ResultCode
+	require.Error(t, code.UnmarshalJSON([]byte(`{`)))
+	require.Error(t, code.UnmarshalJSON([]byte(`"unknown"`)))
+	_, err = jsonv2.Marshal(ResultCode(255))
+	require.Error(t, err)
+
+	assert.Empty(t, FindingSeverity(255).String())
+	_, err = jsonv2.Marshal(FindingSeverity(255))
+	require.Error(t, err)
+	var severity FindingSeverity
+	require.Error(t, severity.UnmarshalJSON([]byte(`{`)))
+	require.Error(t, severity.UnmarshalJSON([]byte(`"unknown"`)))
+	require.NoError(t, severity.UnmarshalJSON([]byte(`"warning"`)))
+	assert.Equal(t, FindingWarning, severity)
+
+	for _, input := range []string{"", "null"} {
+		list := StringList{"existing"}
+		require.NoError(t, list.UnmarshalJSON([]byte(input)))
+		assert.Nil(t, list)
+	}
+	for _, input := range []string{`"`, `[`} {
+		var list StringList
+		require.Error(t, list.UnmarshalJSON([]byte(input)))
+	}
+}
+
 func TestRuntimeViewsAvoidAllocations(t *testing.T) {
 	app := NewAppState(AppConfig{Resolvers: []string{"1.1.1.1"}})
 	var cfg AppConfig

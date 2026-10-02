@@ -19,6 +19,7 @@ import (
 
 	whoisparser "github.com/likexian/whois-parser"
 	"github.com/miekg/dns"
+	"golang.org/x/time/rate"
 )
 
 // queryWHOISWithContext owns IANA discovery and the one TCP query it selects.
@@ -1047,12 +1048,12 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain string) (RDAPSnapshot, error) {
 	start := time.Now()
 	asciiDomain := NormalizeDomainToASCIIText(domain)
-	urls, err := rdapServersFor(ctx, app, asciiDomain)
+	urls, err := rdapServersFor(ctx, app.Bootstrap, asciiDomain)
 	if err != nil {
 		return RDAPSnapshot{}, err
 	}
 
-	httpClient = resolveRDAPClient(httpClient, app)
+	httpClient = resolveRDAPClient(httpClient, app.Clients.RDAP)
 	if httpClient == nil {
 		return RDAPSnapshot{}, fmt.Errorf(MsgErrRDAPHTTPClientNotConfigured, asciiDomain)
 	}
@@ -1061,7 +1062,7 @@ func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain s
 	for _, rawBaseURL := range urls {
 		baseURL := strings.TrimRight(rawBaseURL, SymSlash)
 		reqURL := baseURL + PathRDAPDomain + asciiDomain
-		if !rdapURLAllowed(app, reqURL) {
+		if !rdapURLAllowed(app.RDAPURLAllowed, reqURL) {
 			continue
 		}
 		safeURLs = append(safeURLs, baseURL)
@@ -1119,7 +1120,7 @@ func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain s
 		// registry response is authoritative and must never trigger WHOIS.
 		if registryTier.Expiration == StrEmpty || registryTier.Registrar == StrEmpty {
 			referralLinks := collectRDAPReferralLinks(domainInfo, baseURL)
-			if relDomain := followRegistrarRDAPLinks(ctx, asciiDomain, referralLinks, httpClient, app); relDomain != nil {
+			if relDomain := followRegistrarRDAPLinks(ctx, asciiDomain, referralLinks, httpClient, app.RDAPURLAllowed, app.RDAPLimiter); relDomain != nil {
 				registrarTier = extractRDAPDomainTier(relDomain, SourceRegistrarRDAP, SourceReferral)
 			}
 		}
@@ -1132,25 +1133,22 @@ func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain s
 	})
 }
 
-func rdapServersFor(ctx context.Context, app *AppState, domain string) ([]string, error) {
-	if app == nil || app.Bootstrap == nil {
+func rdapServersFor(ctx context.Context, bootstrap *Bootstrap, domain string) ([]string, error) {
+	if bootstrap == nil {
 		return nil, fmt.Errorf(MsgErrRDAPBootstrapIsUnavailableFor, domain)
 	}
-	servers, err := app.Bootstrap.ServersFor(ctx, domain)
+	servers, err := bootstrap.ServersFor(ctx, domain)
 	if err != nil {
 		return nil, WrapError(MsgErrNoRDAPServer, err)
 	}
 	return servers, nil
 }
 
-func resolveRDAPClient(client HTTPDoer, app *AppState) HTTPDoer {
+func resolveRDAPClient(client HTTPDoer, fallback HTTPDoer) HTTPDoer {
 	if client != nil {
 		return client
 	}
-	if app != nil {
-		return app.Clients.RDAP
-	}
-	return nil
+	return fallback
 }
 
 func readRDAPDomainResponse(response *http.Response) (*RDAPDomainResponse, error) {
@@ -1222,9 +1220,9 @@ func IsSafeRDAPURL(rawURL string) bool {
 	return true
 }
 
-func rdapURLAllowed(app *AppState, target string) bool {
-	if app != nil && app.RDAPURLAllowed != nil {
-		return app.RDAPURLAllowed(target)
+func rdapURLAllowed(allowFn func(string) bool, target string) bool {
+	if allowFn != nil {
+		return allowFn(target)
 	}
 	return IsSafeRDAPURL(target)
 }
@@ -1246,8 +1244,8 @@ func isSafeWHOISServer(server string) bool {
 	return ReValidDomain.MatchString(host)
 }
 
-func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client HTTPDoer, policyApp *AppState) *RDAPDomainResponse {
-	httpClient := resolveRDAPClient(client, policyApp)
+func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string, client HTTPDoer, allowFn func(string) bool, limiter *rate.Limiter) *RDAPDomainResponse {
+	httpClient := resolveRDAPClient(client, nil)
 	if httpClient == nil {
 		return nil
 	}
@@ -1258,7 +1256,7 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 		if targetURL == StrEmpty {
 			continue
 		}
-		if !rdapURLAllowed(policyApp, targetURL) {
+		if !rdapURLAllowed(allowFn, targetURL) {
 			LogWarn(MsgLogSkippingUnsafeRDAP, FieldDomain, domain, FieldURL, netpolicy.SanitizeURL(targetURL))
 			continue
 		}
@@ -1277,8 +1275,8 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 		}
 		relReq.Header.Set(HeaderAccept, AcceptRDAP)
 		relReq.Header.Set(HeaderUserAgent, DefaultUserAgent)
-		if policyApp != nil && policyApp.RDAPLimiter != nil {
-			if err := policyApp.RDAPLimiter.Wait(ctx); err != nil {
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
 				return nil, false, 0, err
 			}
 		}

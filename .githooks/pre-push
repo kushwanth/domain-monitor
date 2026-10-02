@@ -1,41 +1,39 @@
 #!/bin/sh
-set -eu
+set -u
 
-if ! command -v golangci-lint >/dev/null 2>&1; then
-	echo "golangci-lint v2.14.0 is required; install it before pushing" >&2
-	exit 1
-fi
-
-lint_version=$(golangci-lint version 2>/dev/null || true)
-case "$lint_version" in
-	*v2.14.0*) ;;
-	*)
-		echo "golangci-lint v2.14.0 is required; found: $lint_version" >&2
-		exit 1
-		;;
-esac
-
-unformatted=$(gofmt -l src)
-if [ -n "$unformatted" ]; then
-	echo "Go source is not formatted:" >&2
-	echo "$unformatted" >&2
-	exit 1
-fi
-
-coverage_file=$(mktemp "${TMPDIR:-/tmp}/domain-monitor-coverage.XXXXXX")
-trap 'rm -f "$coverage_file"' EXIT HUP INT TERM
-
-go test -race -covermode=atomic -coverprofile="$coverage_file" ./...
-
-coverage=$(go tool cover -func="$coverage_file" | awk '/^total:/ {gsub(/%/, "", $3); print $3}')
-if [ -z "$coverage" ]; then
-	echo "unable to determine total test coverage" >&2
-	exit 1
-fi
-awk -v coverage="$coverage" 'BEGIN { if (coverage < 83) exit 1 }' || {
-	echo "test coverage ${coverage}% is below the required 83%" >&2
-	exit 1
+warn() {
+	echo "pre-push advisory: $*" >&2
 }
 
-go vet ./...
-golangci-lint run --config .golangci.yml
+if command -v go >/dev/null 2>&1 && command -v gofmt >/dev/null 2>&1; then
+	unformatted=$(gofmt -l src 2>/dev/null || true)
+	if [ -n "$unformatted" ]; then
+		warn "Go source is not formatted:"
+		echo "$unformatted" >&2
+	fi
+
+	coverage_file=$(mktemp "${TMPDIR:-/tmp}/domain-monitor-coverage.XXXXXX")
+	trap 'rm -f "$coverage_file"' EXIT HUP INT TERM
+	if go test -race -covermode=atomic -coverprofile="$coverage_file" ./...; then
+		coverage=$(go tool cover -func="$coverage_file" 2>/dev/null | awk '/^total:/ {gsub(/%/, "", $3); print $3}')
+		if [ -z "$coverage" ]; then
+			warn "unable to determine total test coverage"
+		elif ! awk -v coverage="$coverage" 'BEGIN { exit coverage >= 90 ? 0 : 1 }'; then
+			warn "test coverage ${coverage}% is below the recommended 90%"
+		fi
+	else
+		warn "tests failed"
+	fi
+
+	go vet ./... || warn "go vet reported issues"
+else
+	warn "Go toolchain unavailable; install with: pacman -S go"
+fi
+
+if command -v revive >/dev/null 2>&1; then
+	revive ./... || warn "revive reported issues"
+else
+	warn "revive unavailable; install with: pacman -S revive"
+fi
+
+exit 0

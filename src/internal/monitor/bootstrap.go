@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"syscall"
@@ -43,26 +44,8 @@ func RDAPTLSConfig() *tls.Config {
 func NewRDAPHTTPClient(timeout time.Duration) *http.Client {
 	transport := &http.Transport{
 		// Direct-only: proxy resolution would bypass the dialed-IP policy.
-		Proxy: nil,
-		DialContext: (&net.Dialer{
-			Timeout:   timeout,
-			KeepAlive: DefaultTCPKeepAlive,
-			Control: func(_, address string, _ syscall.RawConn) error {
-				host, _, err := net.SplitHostPort(address)
-				if err != nil {
-					host = address
-				}
-				if strings.Contains(host, SymPercent) {
-					return WrapError(host, ErrRestrictedIP)
-				}
-				if ip := net.ParseIP(host); ip != nil {
-					if netpolicy.RestrictedIP(ip) {
-						return WrapError(host, ErrRestrictedIP)
-					}
-				}
-				return nil
-			},
-		}).DialContext,
+		Proxy:                 nil,
+		DialContext:           restrictedPublicDialer(timeout).DialContext,
 		TLSClientConfig:       RDAPTLSConfig(),
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
@@ -92,7 +75,58 @@ func NewPublicHTTPClient(timeout time.Duration) *http.Client {
 	transport.MaxIdleConnsPerHost = 4
 	transport.ResponseHeaderTimeout = timeout
 	transport.TLSHandshakeTimeout = timeout
-	return &http.Client{Transport: transport, Timeout: timeout}
+	transport.DialContext = restrictedPublicDialer(timeout).DialContext
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= MaxRedirects {
+				return errors.New(MsgErrStoppedAfterRedirects)
+			}
+			if !isSafePublicURL(req.URL) {
+				return fmt.Errorf(MsgErrInsecureRedirectURL, req.URL.String())
+			}
+			return nil
+		},
+	}
+}
+
+func restrictedPublicDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: DefaultTCPKeepAlive,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				host = address
+			}
+			if strings.Contains(host, SymPercent) {
+				return WrapError(host, ErrRestrictedIP)
+			}
+			if ip := net.ParseIP(host); ip != nil && netpolicy.RestrictedIP(ip) {
+				return WrapError(host, ErrRestrictedIP)
+			}
+			return nil
+		},
+	}
+}
+
+func isSafePublicURL(u *url.URL) bool {
+	if u == nil || u.User != nil || u.Hostname() == StrEmpty {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != SchemeHTTPSName && scheme != StrHTTP {
+		return false
+	}
+	host := strings.TrimRight(strings.ToLower(u.Hostname()), SymDot)
+	if host == StrLocalhost || strings.Contains(host, SymPercent) || strings.HasSuffix(host, StrLocal) || strings.HasSuffix(host, StrInternal) {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !netpolicy.RestrictedIP(ip)
+	}
+	return true
 }
 
 // NewNotificationHTTPClient permits operator-selected private ntfy endpoints

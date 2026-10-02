@@ -4,7 +4,7 @@ After=network-online.target
 
 [Container]
 # Replace with your actual GitHub username and repository name
-Image=ghcr.io/your-github-username/your-repo-name:latest
+Image=ghcr.io/your-github-username/your-repo-name@sha256:REPLACE_WITH_RELEASE_DIGEST
 
 # Add your auth tokens using Secrets here to avoid hardcoding them in config.json
 # Create them using: podman secret create <secret-name> <file-with-secret>
@@ -12,8 +12,8 @@ Image=ghcr.io/your-github-username/your-repo-name:latest
 # Secret=telegram-token,type=env,target=TELEGRAM_TOKEN
 # Environment=TELEGRAM_CHAT_ID=your_telegram_chat_id
 
-# Automatically pull the latest image on systemd daemon-reload or boot
-AutoUpdate=registry
+# Use the immutable digest published for the reviewed release. Upgrade only by
+# replacing this digest after reviewing release notes and configuration changes.
 
 # Tell the Go app where to find configuration
 Environment=CONFIG_PATH=/app/config.json

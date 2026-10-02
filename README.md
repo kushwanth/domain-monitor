@@ -1,7 +1,6 @@
 # Domain & DNS Security Monitor
 
-> **Disclaimer: LLM Contribution**
-> This project was developed and refactored with the assistance of a Large Language Model (LLM).
+> **This project was developed and refactored with the assistance of a LLMs**
 
 A self-hosted Go daemon that monitors domain registrations, DNS records, CAA policies, and published email security records.
 
@@ -146,26 +145,38 @@ files are read once; changes require a restart.
 | `allow_expiry` | bool | No | Allows the domain to expire without expiry alerts and keeps it in the separate Allowed to Expire dashboard section. The daemon continues gathering, displaying, and validating it normally until RDAP confirms expiration or absence, then suppresses its dependent checks and alerts. RDAP continues so re-registration reactivates the other checks. |
 | `suppress_alerts` | bool | No | Mutes notification alerts for this domain. |
 
+Email-security monitoring validates DNS publication posture: MX expectations,
+SPF record presence and multiplicity, DMARC policy discovery, and configured
+DKIM selector key usability. It is not an SMTP message authenticator: it does
+not evaluate an individual sender IP against SPF mechanisms, validate message
+signatures, determine identifier alignment, or generate DMARC reports.
+
 When `nameservers` is non-empty, every entry is queried directly for authoritative
 SOA and optional DNSKEY evidence. Non-hidden entries must appear in public
 delegation; hidden entries must not. Public delegation containing an unconfigured
 server also fails validation. At least one non-hidden server is required, and
 hostnames must be unique. A differing SOA serial is reported as a synchronization
 mismatch because the monitor does not infer primary/secondary roles or perform
-zone transfers. Omit `nameservers` to disable expected-delegation and direct
+zone transfers. When `dnssec` is enabled, every queried authoritative server must
+return an authoritative, non-empty DNSKEY set and all sets must agree. Omit
+`nameservers` to disable expected-delegation and direct
 nameserver-health validation.
 
-The former `expected_ns`, `secondary_ns`, `verify_ns_health`,
-`check_email_security`, `mail_provider`, `mx_records`, `dkim_selectors`,
-`is_delegated_zone`, `unused`, `expected_registrar_id`, and
-`expected_registrar_name` fields are no longer supported; startup rejects
-configurations that still contain them.
+Unknown configuration members are rejected at every nesting level. Equivalent
+v3 email, registrar, and `unused` settings are migrated to the current schema.
+Fields whose behavior cannot be preserved safely—top-level `data_dir`, domain
+`expected_ns`, `secondary_ns`, `verify_ns_health`, `is_delegated_zone`, and
+`monitor_ct_logs`, plus DNS-record `skip_ssl`—stop startup with an actionable
+upgrade error. Replace them deliberately using the current schema rather than
+silently losing monitoring coverage.
 
 CAA tag lists distinguish omission from explicit denial. For example,
 `"caa": {"issue": ["ca.example"], "issuewild": []}` expects the configured issuer
 and `0 issuewild ";"`. Omitted or null tags are unconstrained. An empty CAA
 object adds no check. Only tags included in the policy constrain matching;
 other observed tags remain visible without causing a mismatch.
+Issuer domain names are compared case-insensitively; issuer-defined parameter
+values retain their original case.
 
 ### DNS Record Options (`dns_records[]`)
 
@@ -235,8 +246,13 @@ docker run -d \
   -p 8080:8080 \
   -v /path/to/your/config.json:/app/config.json:ro \
   -e CONFIG_PATH=/app/config.json \
-  ghcr.io/your-github-username/your-repo-name:latest
+  ghcr.io/your-github-username/your-repo-name@sha256:REPLACE_WITH_RELEASE_DIGEST
 ```
+
+Replace `REPLACE_WITH_RELEASE_DIGEST` with the 64-character digest of the
+reviewed release image. Using an immutable digest prevents an unattended image
+update from changing runtime behavior or requiring an unreviewed configuration
+migration.
 
 To add custom email providers, mount their directory read-only at `/app/data/email_providers`. Bundled presets are used when this directory is absent.
 
@@ -287,9 +303,11 @@ Enable the tracked pre-push hook once per clone:
 git config core.hooksPath .githooks
 ```
 
-Before every push, `.githooks/pre-push` checks formatting, runs race tests with
-the 83% coverage floor, runs `go vet`, and applies `.golangci.yml`. Install
-`golangci-lint` v2.14.0 locally. The scheduler owns an injectable clock/timer
+Before every push, `.githooks/pre-push` runs formatting, race tests, the
+recommended 90% coverage check, `go vet`, and `revive` as best-effort advisory
+checks; it never blocks a push. On Arch Linux, install its tools with
+`pacman -S go revive`. Release CI remains the strict enforcement boundary and
+applies the complete pinned `.golangci.yml` suite. The scheduler owns an injectable clock/timer
 seam for deterministic lifecycle tests; protocol clients and caches still use
 wall-clock time internally.
 

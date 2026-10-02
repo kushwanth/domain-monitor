@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"embed"
+	jsonv1 "encoding/json"
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -45,22 +46,160 @@ func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte,
 		return AppConfig{}, WrapError(MsgErrFailedToReadConfig, err)
 	}
 
+	var looseConfig RawConfig
+	if err := jsonv2.Unmarshal(jsonBytes, &looseConfig); err != nil {
+		return AppConfig{}, enrichJSONError(err, &looseConfig)
+	}
+	jsonBytes, err = migrateV3Config(jsonBytes)
+	if err != nil {
+		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
+	}
+
 	var config RawConfig
-	if err := jsonv2.Unmarshal(jsonBytes, &config); err != nil {
-		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
-	}
-	var removed removedConfigFields
-	if err := jsonv2.Unmarshal(jsonBytes, &removed); err != nil {
-		return AppConfig{}, WrapError(MsgErrJSONUnmarshalFailed, err)
-	}
-	for i := range config.Domains {
-		if i < len(removed.Domains) && removed.Domains[i].hasAny() {
-			return AppConfig{}, fmt.Errorf(MsgErrRemovedDomainConfig, config.Domains[i].Domain)
-		}
+	if err := jsonv2.Unmarshal(jsonBytes, &config, jsonv2.RejectUnknownMembers(true)); err != nil {
+		return AppConfig{}, enrichJSONError(err, &looseConfig)
 	}
 
 	applyConfigOverrides(&config)
 	return compileRawConfig(config)
+}
+
+func migrateV3Config(data []byte) ([]byte, error) {
+	var root map[string]jsonv1.RawMessage
+	if err := jsonv1.Unmarshal(data, &root); err != nil {
+		return nil, err
+	}
+	if _, exists := root["data_dir"]; exists {
+		return nil, fmt.Errorf("legacy configuration field %q cannot be migrated safely; remove it after reviewing the v4 upgrade notes", "data_dir")
+	}
+	changed := false
+	if rawDomains, ok := root["domains"]; ok {
+		var domains []map[string]jsonv1.RawMessage
+		if err := jsonv1.Unmarshal(rawDomains, &domains); err != nil {
+			return nil, err
+		}
+		for _, domain := range domains {
+			domainChanged, err := migrateV3Domain(domain)
+			if err != nil {
+				return nil, err
+			}
+			changed = domainChanged || changed
+		}
+		if changed {
+			encoded, err := jsonv1.Marshal(domains)
+			if err != nil {
+				return nil, err
+			}
+			root["domains"] = encoded
+		}
+	}
+	if rawRecords, ok := root["dns_records"]; ok {
+		var records []map[string]jsonv1.RawMessage
+		if err := jsonv1.Unmarshal(rawRecords, &records); err != nil {
+			return nil, err
+		}
+		for index, record := range records {
+			if _, exists := record["skip_ssl"]; exists {
+				return nil, fmt.Errorf("dns record at index %d uses legacy field %q, which cannot be migrated safely; remove it after reviewing the v4 upgrade notes", index, "skip_ssl")
+			}
+		}
+		if changed {
+			encoded, err := jsonv1.Marshal(records)
+			if err != nil {
+				return nil, err
+			}
+			root["dns_records"] = encoded
+		}
+	}
+	if !changed {
+		return data, nil
+	}
+	return jsonv1.Marshal(root)
+}
+
+func migrateV3Domain(domain map[string]jsonv1.RawMessage) (bool, error) {
+	changed := false
+	var domainName string
+	if rawDomain, exists := domain["domain"]; exists {
+		if err := jsonv1.Unmarshal(rawDomain, &domainName); err != nil {
+			return false, err
+		}
+	}
+	for _, key := range []string{"expected_ns", "secondary_ns", "verify_ns_health", "is_delegated_zone", "monitor_ct_logs"} {
+		if _, exists := domain[key]; exists {
+			return false, fmt.Errorf("domain %q uses legacy field %q, which cannot be migrated safely; replace it with the current v4 schema", domainName, key)
+		}
+	}
+	if _, exists := domain["email"]; !exists {
+		email := make(map[string]jsonv1.RawMessage)
+		for legacy, current := range map[string]string{"mail_provider": "provider", "mx_records": "mx_records", "dkim_selectors": "dkim_selectors"} {
+			if raw, ok := domain[legacy]; ok {
+				email[current] = raw
+			}
+		}
+		var enabled bool
+		if raw, ok := domain["check_email_security"]; ok {
+			if err := jsonv1.Unmarshal(raw, &enabled); err != nil {
+				return false, err
+			}
+		}
+		if enabled {
+			encoded, err := jsonv1.Marshal(email)
+			if err != nil {
+				return false, err
+			}
+			domain["email"] = encoded
+			changed = true
+		}
+	}
+	if _, exists := domain["registrar"]; !exists {
+		registrarID, hasID := domain["expected_registrar_id"]
+		registrarName, hasName := domain["expected_registrar_name"]
+		if hasID && hasName {
+			return false, fmt.Errorf("domain %q configures both legacy registrar fields; select one current %q value", domainName, "registrar")
+		}
+		if hasID {
+			domain["registrar"] = registrarID
+			changed = true
+		} else if hasName {
+			domain["registrar"] = registrarName
+			changed = true
+		}
+	}
+	if _, exists := domain["allow_expiry"]; !exists {
+		if raw, ok := domain["unused"]; ok {
+			domain["allow_expiry"] = raw
+			changed = true
+		}
+	}
+	for _, key := range []string{"check_email_security", "mail_provider", "mx_records", "dkim_selectors", "unused", "expected_registrar_id", "expected_registrar_name"} {
+		changed = deleteJSONField(domain, key) || changed
+	}
+	return changed, nil
+}
+
+func deleteJSONField(object map[string]jsonv1.RawMessage, key string) bool {
+	if _, exists := object[key]; !exists {
+		return false
+	}
+	delete(object, key)
+	return true
+}
+
+func enrichJSONError(err error, config *RawConfig) error {
+	errMsg := err.Error()
+	match := ReJSONDomainPointer.FindStringSubmatch(errMsg)
+	if match != nil {
+		idx, _ := strconv.Atoi(match[1])
+		domainContext := fmt.Sprintf(MsgErrDomainIndexContext, idx)
+		if config != nil && idx >= 0 && idx < len(config.Domains) {
+			if name := config.Domains[idx].Domain; name != StrEmpty {
+				domainContext = fmt.Sprintf(MsgErrDomainNameContext, name)
+			}
+		}
+		return fmt.Errorf(MsgErrEnrichedJSONUnmarshalFailed, domainContext, err)
+	}
+	return WrapError(MsgErrJSONUnmarshalFailed, err)
 }
 
 // compileRawConfig creates an independently owned runtime configuration before
@@ -76,13 +215,6 @@ func compileRawConfig(raw RawConfig) (AppConfig, error) {
 	}
 	applyLoopIntervalBounds(&cfg)
 	return cfg, nil
-}
-
-func (r removedDomainFields) hasAny() bool {
-	return r.ExpectedNS != nil || r.SecondaryNS != nil || r.VerifyNSHealth != nil ||
-		r.CheckEmailSecurity != nil || r.MailProvider != nil || r.MXRecords != nil ||
-		r.DKIMSelectors != nil || r.IsDelegatedZone != nil || r.Unused != nil ||
-		r.ExpectedRegistrarID != nil || r.ExpectedRegistrarName != nil
 }
 
 func applyConfigOverrides(config *RawConfig) {
@@ -317,7 +449,7 @@ func normalizeDomainCAA(domainCfg *DomainConfig) error {
 			}
 			var res []string
 			for _, item := range list {
-				val := strings.ToLower(strings.TrimSpace(item))
+				val := canonicalCAAIssueValue(item)
 				if val != StrEmpty && val != SymSemicolon && val != StrNone {
 					res = append(res, val)
 				}

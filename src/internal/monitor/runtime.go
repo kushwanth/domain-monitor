@@ -475,9 +475,9 @@ func gatherCycleEvidence(ctx context.Context, app *AppState, cfg AppConfig, rdap
 	gatherRateLimitedEvidence(ctx, app, cfg.Domains, rdapActive, rdapHTTPClient, &evidence)
 	rdapState := newCycleState(cfg, activeChecks{rdapDomains: rdapActive})
 	evaluateRateLimitedEvidence(cfg.Domains, rdapActive, evidence, rdapState)
-	updateExpiredDomains(app, cfg, rdapState)
+	evidence.expiredDomains = nextExpiredDomains(app.Runtime.ExpiredDomains, cfg, rdapState)
 
-	active := activeChecksForCycle(app, cfg)
+	active := activeChecksForCycleWithExpired(app, cfg, evidence.expiredDomains)
 	evidence.dns = make([]DNSSnapshot, len(active.dnsRecords))
 	evidence.domains = make([]domainEvidence, len(active.domains))
 	gatherFastEvidence(ctx, app, cfg, active, &evidence)
@@ -587,7 +587,10 @@ func runMonitoringCycle(
 		DurationMS:    finishedAt.Sub(cycleStart).Milliseconds(),
 		Overrun:       finishedAt.Sub(cycleStart) > loopDur,
 	}
-	publishCycleState(app, loopState, loopDur)
+	if !publishCycleState(app, loopState, loopDur) {
+		return nil
+	}
+	app.Runtime.ExpiredDomains = evidence.expiredDomains
 
 	cycleDuration := clock.Now().Sub(cycleStart)
 	LogInfo(MsgLogMonitoringCycleCompleted,
@@ -632,7 +635,7 @@ func runNotificationWorker(ctx context.Context, notifier Notifier, wake <-chan s
 	}
 }
 
-func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) {
+func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) bool {
 	now := time.Now()
 	if app.Clock != nil {
 		now = app.Clock.Now()
@@ -641,9 +644,10 @@ func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) 
 	encoded, err := jsonv2.Marshal(toAPIState(state))
 	if err != nil {
 		LogWarn(MsgLogStateMarshalFailed, FieldError, err)
-		return
+		return false
 	}
 	storePublishedState(app, encoded)
+	return true
 }
 
 func sortedAPIChecks[T any](values map[string]T) []apiCheck[T] {
@@ -767,20 +771,24 @@ func configuredDomainOwner(hostname string, domains []DomainConfig) string {
 }
 
 func activeChecksForCycle(app *AppState, cfg AppConfig) activeChecks {
+	return activeChecksForCycleWithExpired(app, cfg, app.Runtime.ExpiredDomains)
+}
+
+func activeChecksForCycleWithExpired(app *AppState, cfg AppConfig, expiredDomains stringSet) activeChecks {
 	active := app.active
-	if len(app.Runtime.ExpiredDomains) == 0 {
+	if len(expiredDomains) == 0 {
 		return active
 	}
 	active.domains = make([]int, 0, len(app.active.domains))
 	for _, index := range app.active.domains {
-		if _, expired := app.Runtime.ExpiredDomains[cfg.Domains[index].Domain]; !expired {
+		if _, expired := expiredDomains[cfg.Domains[index].Domain]; !expired {
 			active.domains = append(active.domains, index)
 		}
 	}
 	active.dnsRecords = make([]int, 0, len(app.active.dnsRecords))
 	for _, index := range app.active.dnsRecords {
 		owner := configuredDomainOwner(cfg.DNSRecords[index].Hostname, cfg.Domains)
-		if _, expired := app.Runtime.ExpiredDomains[owner]; !expired {
+		if _, expired := expiredDomains[owner]; !expired {
 			active.dnsRecords = append(active.dnsRecords, index)
 		}
 	}
@@ -788,21 +796,30 @@ func activeChecksForCycle(app *AppState, cfg AppConfig) activeChecks {
 }
 
 func updateExpiredDomains(app *AppState, cfg AppConfig, state *CheckState) {
+	app.Runtime.ExpiredDomains = nextExpiredDomains(app.Runtime.ExpiredDomains, cfg, state)
+}
+
+func nextExpiredDomains(current stringSet, cfg AppConfig, state *CheckState) stringSet {
+	expiredDomains := maps.Clone(current)
+	if expiredDomains == nil {
+		expiredDomains = make(stringSet)
+	}
 	for _, domain := range cfg.Domains {
 		if !domain.AllowExpiry {
-			delete(app.Runtime.ExpiredDomains, domain.Domain)
+			delete(expiredDomains, domain.Domain)
 			continue
 		}
 		rdapState := state.RDAP[domain.Domain]
 		if rdapState.ExpiryConfirmed {
-			app.Runtime.ExpiredDomains[domain.Domain] = struct{}{}
+			expiredDomains[domain.Domain] = struct{}{}
 			continue
 		}
-		if _, expired := app.Runtime.ExpiredDomains[domain.Domain]; expired && rdapState.Condition.Code == CodeRDAPHTTPError {
+		if _, expired := expiredDomains[domain.Domain]; expired && rdapState.Condition.Code == CodeRDAPHTTPError {
 			continue
 		}
-		delete(app.Runtime.ExpiredDomains, domain.Domain)
+		delete(expiredDomains, domain.Domain)
 	}
+	return expiredDomains
 }
 
 func applyConditionSince(cond StateCondition, key conditionKey, prev map[conditionKey]StateCondition) StateCondition {

@@ -99,6 +99,7 @@ type StateCondition struct {
 // FindingSeverity is evaluator severity and is not a provider priority.
 type FindingSeverity uint8
 
+// FindingInfo and the following values enumerate evaluator finding severity.
 const (
 	FindingInfo FindingSeverity = iota
 	FindingWarning
@@ -112,6 +113,7 @@ func (s FindingSeverity) String() string {
 	return StrEmpty
 }
 
+// MarshalJSONTo writes the finding severity as its stable JSON name.
 func (s FindingSeverity) MarshalJSONTo(enc *jsontext.Encoder) error {
 	if s.String() == StrEmpty {
 		return fmt.Errorf(MsgErrInvalidFindingSeverity, s)
@@ -119,6 +121,7 @@ func (s FindingSeverity) MarshalJSONTo(enc *jsontext.Encoder) error {
 	return enc.WriteToken(jsontext.String(s.String()))
 }
 
+// UnmarshalJSON reads a stable finding-severity JSON name.
 func (s *FindingSeverity) UnmarshalJSON(data []byte) error {
 	var name string
 	if err := jsonv2.Unmarshal(data, &name); err != nil {
@@ -325,26 +328,6 @@ type AppConfig struct {
 	DNSRecords []DNSTask      `json:"dns_records"`
 }
 
-// removedConfigFields detects obsolete per-domain fields so they cannot be silently ignored.
-type removedConfigFields struct {
-	Domains []removedDomainFields `json:"domains"`
-}
-
-// removedDomainFields contains unsupported per-domain configuration keys.
-type removedDomainFields struct {
-	ExpectedNS            *[]string `json:"expected_ns"`
-	SecondaryNS           *[]string `json:"secondary_ns"`
-	VerifyNSHealth        *bool     `json:"verify_ns_health"`
-	CheckEmailSecurity    *bool     `json:"check_email_security"`
-	MailProvider          *string   `json:"mail_provider"`
-	MXRecords             *[]string `json:"mx_records"`
-	DKIMSelectors         *[]string `json:"dkim_selectors"`
-	IsDelegatedZone       *bool     `json:"is_delegated_zone"`
-	Unused                *bool     `json:"unused"`
-	ExpectedRegistrarID   *string   `json:"expected_registrar_id"`
-	ExpectedRegistrarName *string   `json:"expected_registrar_name"`
-}
-
 // DomainConfig defines expected registration, DNS, and email evidence for a domain.
 type DomainConfig struct {
 	Domain               string             `json:"domain"`
@@ -419,6 +402,7 @@ type HTTPDoer interface {
 // be retried. HTTP temporary status responses are always handled consistently.
 type HTTPRetryPolicy uint8
 
+// RetryHTTPStatusOnly and the following values declare HTTP retry behavior.
 const (
 	RetryHTTPStatusOnly HTTPRetryPolicy = iota
 	RetryHTTPTransient
@@ -440,6 +424,7 @@ type Timer interface {
 	Stop() bool
 }
 
+// Clock supplies scheduler time and timer creation for production and tests.
 type Clock interface {
 	Now() time.Time
 	NewTimer(time.Duration) Timer
@@ -493,6 +478,7 @@ type OutboundClients struct {
 	RDAP         HTTPDoer
 }
 
+// CloseIdleConnections closes pooled connections on clients that support it.
 func (c OutboundClients) CloseIdleConnections() {
 	for _, client := range []HTTPDoer{c.Public, c.Notification, c.RDAP} {
 		if closer, ok := client.(interface{ CloseIdleConnections() }); ok {
@@ -980,11 +966,12 @@ type domainEvidence struct {
 
 // cycleEvidence owns every network result until pure evaluation begins.
 type cycleEvidence struct {
-	dns        []DNSSnapshot
-	domains    []domainEvidence
-	rdap       []RDAPSnapshot
-	pricing    *pricingCatalog
-	pricingErr error
+	dns            []DNSSnapshot
+	domains        []domainEvidence
+	rdap           []RDAPSnapshot
+	pricing        *pricingCatalog
+	pricingErr     error
+	expiredDomains stringSet
 }
 
 // 4. Notification Models & Interfaces

@@ -137,7 +137,7 @@ func TestEvaluateCycleEvidencePerformsNoNetworkRequests(t *testing.T) {
 			email:      EmailSnapshot{MXRecords: []string{"mail.example.com"}, SPFRecords: []string{"v=spf1 -all"}, DMARCRecords: []string{"v=DMARC1; p=reject"}},
 			delegation: NSDelegationSnapshot{Nameservers: []string{"ns1.example.com"}},
 			dnssec:     DNSSECResult{Source: DNSSECSourceLocalDoH, Valid: true, HasDS: true, HasDNSKEY: true, DSMatchesDNSKEY: true, RRSIGValid: true, ChainIntact: true},
-			nsHealth:   []NSSnapshot{{Nameserver: "ns1.example.com", Authoritative: true, HasSOA: true}},
+			nsHealth:   []NSSnapshot{{Nameserver: "ns1.example.com", Authoritative: true, HasSOA: true, HasDNSKEY: true, DNSKEYs: []string{"257-3-13-key"}}},
 		}},
 		rdap: make([]RDAPSnapshot, 1),
 	}
@@ -241,6 +241,24 @@ func TestExpiredDomainRemainsSuppressedWhenRDAPIsUnavailable(t *testing.T) {
 
 	_, expired := app.Runtime.ExpiredDomains["example.com"]
 	assert.True(t, expired)
+}
+
+func TestNextExpiredDomainsDoesNotMutateCommittedState(t *testing.T) {
+	t.Parallel()
+
+	cfg := AppConfig{Domains: []DomainConfig{{Domain: "example.com", AllowExpiry: true}}}
+	committed := stringSet{"example.com": {}}
+	state := newCycleState(cfg, activeChecks{rdapDomains: []int{0}})
+	state.RDAP["example.com"] = RDAPState{Status: StatusOK}
+
+	next := nextExpiredDomains(committed, cfg, state)
+	assert.Contains(t, committed, "example.com")
+	assert.NotContains(t, next, "example.com")
+}
+
+func TestMainExitCodeReportsConfigurationFailure(t *testing.T) {
+	t.Setenv(EnvConfigPath, filepath.Join(t.TempDir(), "missing-config.json"))
+	assert.Equal(t, 1, MainExitCode())
 }
 
 func TestConfiguredDomainOwnerUsesMostSpecificDomain(t *testing.T) {

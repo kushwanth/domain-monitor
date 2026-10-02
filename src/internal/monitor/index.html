@@ -951,6 +951,7 @@
       } else {
         currentFilter = filter;
       }
+	  currentPage = 1;
       if (currentView === 'domains') {
         renderDomains();
       } else if (currentView === 'dns') {
@@ -1055,7 +1056,7 @@
       const amountText = (total, unknown) => unknown > 0 ? `${total.toFixed(2)} (partial; ${unknown} unknown)` : total.toFixed(2);
       document.getElementById('total-renewal-cost').textContent = amountText(annualTotal, annualUnknown);
       document.getElementById('next-year-renewal-cost').textContent = amountText(nextYearTotal, nextYearUnknown);
-      
+
       const container = document.getElementById('renewal-pricing');
       if (container) {
         container.classList.toggle('hidden', annualTotal <= 0 && annualUnknown <= 0);

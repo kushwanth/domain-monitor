@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -802,6 +803,43 @@ func TestQueryDNSMsg_NXDOMAIN_ErrorsIs(t *testing.T) {
 	}
 }
 
+func TestQueryDNSRequiresUnanimousNXDOMAIN(t *testing.T) {
+	t.Parallel()
+
+	app := NewAppState(AppConfig{})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		if strings.HasPrefix(address, "192.0.2.1") {
+			response.SetRcode(query, dns.RcodeNameError)
+			return response, 0, nil
+		}
+		response.SetReply(query)
+		response.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET},
+			A:   net.ParseIP("192.0.2.10"),
+		}}
+		return response, 0, nil
+	}}
+
+	_, err := queryDNS(context.Background(), app, "example.com", dns.TypeA, []string{"192.0.2.1", "192.0.2.2"})
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNXDOMAIN)
+}
+
+func TestEvaluateDNSExplicitEmptyAcceptsNXDOMAIN(t *testing.T) {
+	t.Parallel()
+
+	status, condition := EvaluateDNS(
+		DNSTask{Expected: StringList{}},
+		DNSSnapshot{Err: fmt.Errorf("lookup: %w", ErrNXDOMAIN)},
+	)
+	assert.Equal(t, StatusOK, status)
+	assert.Equal(t, CodeDNSMatchVerified, condition.Code)
+
+	status, _ = EvaluateDNS(DNSTask{}, DNSSnapshot{Err: ErrNXDOMAIN})
+	assert.Equal(t, StatusFailed, status)
+}
+
 func TestQueryDNSMsg_QuestionEchoValidation(t *testing.T) {
 	t.Parallel()
 
@@ -989,7 +1027,7 @@ func evaluateNSHealthForTest(ctx context.Context, app *AppState, target DomainCo
 		return NSHealthResult{}
 	}
 	snapshots := FetchNSHealthSnapshots(ctx, app, target)
-	status, _ := EvaluateNSHealth(target, snapshots)
+	status, condition := EvaluateNSHealth(target, snapshots)
 	var servers []NSHealthServerResult
 	for _, srvSnap := range snapshots {
 		errStr := ""
@@ -1009,8 +1047,9 @@ func evaluateNSHealthForTest(ctx context.Context, app *AppState, target DomainCo
 		})
 	}
 	return NSHealthResult{
-		Valid:   status == StatusOK,
-		Servers: servers,
+		Valid:     status == StatusOK,
+		Condition: condition,
+		Servers:   servers,
 	}
 }
 
@@ -1085,8 +1124,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		}
 	})
 
-	// 2. Happy Path: Unsigned zone (neither primary nor secondary has DNSKEY)
-	t.Run("HappyPathUnsignedZone", func(t *testing.T) {
+	// 2. A DNSSEC-enabled zone must publish DNSKEYs on every authoritative server.
+	t.Run("DNSSECEnabledWithoutDNSKEY", func(t *testing.T) {
 		pAddr, pClose := startMockNSWithKeys(2026090101, true, nil)
 		defer pClose()
 		sAddr, sClose := startMockNSWithKeys(2026090101, true, nil)
@@ -1101,9 +1140,8 @@ func TestEvaluateNSHealth(t *testing.T) {
 		}
 		res := evaluateNSHealthForTest(context.Background(), app, target)
 
-		if !res.Valid {
-			t.Fatalf("Expected valid NSHealth for unsigned zone without DNSKEY")
-		}
+		assert.False(t, res.Valid)
+		assert.Equal(t, CodeNSDNSKEYMismatch, res.Condition.Code)
 	})
 
 	// 3. DNSKEY Mismatch (Secondary generates its own keys / smart secondary) -> REJECTED
@@ -1972,12 +2010,15 @@ func TestHasUsableDKIMKey(t *testing.T) {
 	rsaDER, err := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
 	require.NoError(t, err)
 	rsaPKCS1DER := x509.MarshalPKCS1PublicKey(&rsaKey.PublicKey)
+	weakRSAKey := rsa.PublicKey{N: new(big.Int).Rsh(new(big.Int).Set(rsaKey.N), 512), E: rsaKey.E}
+	weakRSADER := x509.MarshalPKCS1PublicKey(&weakRSAKey)
 	for _, tt := range []struct {
 		record string
 		usable bool
 	}{
 		{"v=DKIM1; k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaPKCS1DER), true},
 		{"v=DKIM1; k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaDER), true},
+		{"v=DKIM1; k=rsa; p=" + base64.StdEncoding.EncodeToString(weakRSADER), false},
 		{"v=DKIM1; k=ed25519; p=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", true},
 		{"v=dkim1; k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaPKCS1DER), false},
 		{"k=rsa; p=" + base64.StdEncoding.EncodeToString(rsaPKCS1DER) + "; v=DKIM1", false},
@@ -2019,7 +2060,7 @@ func TestHasValidDMARCPolicy(t *testing.T) {
 		{"v=DMARC1; p=none", true},
 		{"v=DMARC1; p=reject; sp=quarantine; np=none; psd=n", true},
 		{"v = DMARC1; p=reject; psd=u", true},
-		{"v=DMARC1", true},
+		{"v=DMARC1", false},
 		{"v=dmarc1; p=reject", false},
 		{"v=DMARC1; p=invalid", false},
 		{"v=DMARC1; p=reject; sp=invalid", false},
@@ -2044,7 +2085,7 @@ func TestDMARCTreeWalkSelectsOrganizationalPolicy(t *testing.T) {
 			var policies []string
 			switch name {
 			case "_dmarc.a.mail.example.com.":
-				policies = []string{"v=DMARC1; p=none", "v=DMARC1; p=reject"}
+				policies = nil
 			case "_dmarc.mail.example.com.":
 				policies = []string{"v=DMARC1; p=quarantine"}
 			case "_dmarc.example.com.":
@@ -2061,6 +2102,137 @@ func TestDMARCTreeWalkSelectsOrganizationalPolicy(t *testing.T) {
 	require.NoError(t, snapshot.DMARCErr)
 	assert.Equal(t, []string{"_dmarc.a.mail.example.com.", "_dmarc.mail.example.com.", "_dmarc.example.com.", "_dmarc.com."}, dmarcQueries)
 	assert.Equal(t, []string{"v=DMARC1; p=reject"}, snapshot.DMARCRecords)
+}
+
+func TestDMARCTreeWalkBoundarySelection(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		records  map[string][]string
+		expected string
+	}{
+		{
+			name: "organizational PSD boundary",
+			records: map[string][]string{
+				"_dmarc.example.com": {"v=DMARC1; p=quarantine"},
+				"_dmarc.com":         {"v=DMARC1; p=reject; psd=y"},
+			},
+			expected: "v=DMARC1; p=quarantine",
+		},
+		{
+			name: "PSD fallback",
+			records: map[string][]string{
+				"_dmarc.com": {"v=DMARC1; p=reject; psd=y"},
+			},
+			expected: "v=DMARC1; p=reject; psd=y",
+		},
+		{
+			name: "explicit organizational boundary",
+			records: map[string][]string{
+				"_dmarc.example.com": {"v=DMARC1; p=reject; psd=n"},
+			},
+			expected: "v=DMARC1; p=reject; psd=n",
+		},
+		{
+			name: "duplicate node discarded",
+			records: map[string][]string{
+				"_dmarc.a.example.com": {"v=DMARC1; p=none", "v=DMARC1; p=reject"},
+				"_dmarc.example.com":   {"v=DMARC1; p=quarantine"},
+			},
+			expected: "v=DMARC1; p=quarantine",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			records, err := fetchDMARCPolicy("a.example.com", func(name string) ([]string, error) {
+				return tc.records[strings.TrimSuffix(name, ".")], nil
+			})
+			require.NoError(t, err)
+			require.Equal(t, []string{tc.expected}, records)
+		})
+	}
+}
+
+func TestSPFVersionIsCaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	for _, record := range []string{"v=spf1 -all", "V=SPF1 -all", "v=SpF1"} {
+		status, _, state := EvaluateEmailSecurity(
+			DomainConfig{Email: &EmailConfig{}},
+			EmailSnapshot{MXRecords: []string{"mail.example.com"}, SPFRecords: []string{record}, DMARCRecords: []string{"v=DMARC1; p=reject"}},
+			nil,
+		)
+		assert.Equal(t, StatusOK, status, record)
+		assert.True(t, state.SPF, record)
+	}
+}
+
+func TestSPFVersionRequiresExactRecordBoundary(t *testing.T) {
+	t.Parallel()
+
+	for _, record := range []string{" v=spf1 -all", "\tv=spf1 -all", "v=spf1\t-all", "v=spf10 -all", "note=v=spf1"} {
+		assert.False(t, isSPFPolicyRecord(record), record)
+	}
+	for _, record := range []string{"v=spf1", "v=spf1 -all", "V=SPF1  -all"} {
+		assert.True(t, isSPFPolicyRecord(record), record)
+	}
+}
+
+func TestResolveNSAddressesOutcomes(t *testing.T) {
+	t.Parallel()
+
+	appWithAnswers := func(a, aaaa []string, aErr, aaaaErr error) *AppState {
+		app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.53"}})
+		app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+			qtype := query.Question[0].Qtype
+			if qtype == dns.TypeA && aErr != nil {
+				return nil, 0, aErr
+			}
+			if qtype == dns.TypeAAAA && aaaaErr != nil {
+				return nil, 0, aaaaErr
+			}
+			response := new(dns.Msg)
+			response.SetReply(query)
+			for _, value := range a {
+				if qtype == dns.TypeA {
+					response.Answer = append(response.Answer, &dns.A{Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET}, A: net.ParseIP(value)})
+				}
+			}
+			for _, value := range aaaa {
+				if qtype == dns.TypeAAAA {
+					response.Answer = append(response.Answer, &dns.AAAA{Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET}, AAAA: net.ParseIP(value)})
+				}
+			}
+			return response, 0, nil
+		}}
+		return app
+	}
+
+	addresses, partial, err := resolveNSAddresses(context.Background(), appWithAnswers(nil, nil, nil, nil), "192.0.2.10")
+	require.NoError(t, err)
+	require.NoError(t, partial)
+	assert.Equal(t, []string{"192.0.2.10:53"}, addresses)
+
+	addresses, partial, err = resolveNSAddresses(context.Background(), appWithAnswers([]string{"192.0.2.11"}, []string{"2001:db8::11"}, nil, nil), "ns.example.com:5353")
+	require.NoError(t, err)
+	require.NoError(t, partial)
+	assert.Equal(t, []string{"192.0.2.11:5353", "[2001:db8::11]:5353"}, addresses)
+
+	temporary := errors.New("temporary address lookup failure")
+	addresses, partial, err = resolveNSAddresses(context.Background(), appWithAnswers([]string{"192.0.2.12"}, nil, nil, temporary), "ns.example.com")
+	require.NoError(t, err)
+	require.ErrorIs(t, partial, temporary)
+	assert.Equal(t, []string{"192.0.2.12:53"}, addresses)
+
+	addresses, partial, err = resolveNSAddresses(context.Background(), appWithAnswers(nil, nil, nil, nil), "empty.example.com")
+	assert.Empty(t, addresses)
+	require.NoError(t, partial)
+	require.ErrorContains(t, err, "no IP records")
+
+	addresses, partial, err = resolveNSAddresses(context.Background(), appWithAnswers(nil, nil, temporary, temporary), "failed.example.com")
+	assert.Empty(t, addresses)
+	require.ErrorIs(t, partial, temporary)
+	require.ErrorIs(t, err, temporary)
 }
 
 func TestMalformedDMARCDoesNotInheritParentPolicy(t *testing.T) {
@@ -2170,16 +2342,23 @@ func TestLiveNullMX(t *testing.T) {
 		t.Fatalf("monitor did not preserve the public null MX: records=%v error=%v", snapshot.MXRecords, snapshot.MXErr)
 	}
 }
+
 func TestCanonicalCAARecordValue(t *testing.T) {
-	record, err := dns.NewRR(`example.com. 300 IN CAA 0 issue "letsencrypt.org"`)
-	require.NoError(t, err)
-	caa, ok := record.(*dns.CAA)
-	require.True(t, ok)
-	val := canonicalCAARecordValue(caa)
-	assert.Equal(t, `0 issue "letsencrypt.org"`, val)
-	val2, ok := dnsAnswerText(caa, dns.TypeCAA)
-	assert.True(t, ok)
-	assert.Equal(t, `0 issue "letsencrypt.org"`, val2)
+	for _, tc := range []struct {
+		record, expected string
+	}{
+		{record: `example.com. 300 IN CAA 0 issue "letsencrypt.org"`, expected: `0 issue "letsencrypt.org"`},
+		{record: `example.com. 300 IN CAA 0 ISSUE "LETSENCRYPT.ORG; account=AbC123"`, expected: `0 issue "letsencrypt.org; account=AbC123"`},
+	} {
+		record, err := dns.NewRR(tc.record)
+		require.NoError(t, err)
+		caa, ok := record.(*dns.CAA)
+		require.True(t, ok)
+		assert.Equal(t, tc.expected, canonicalCAARecordValue(caa))
+		value, ok := dnsAnswerText(caa, dns.TypeCAA)
+		assert.True(t, ok)
+		assert.Equal(t, tc.expected, value)
+	}
 }
 
 func TestSOALookupPreservesErrorCause(t *testing.T) {
