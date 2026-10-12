@@ -353,6 +353,10 @@
       background-color: var(--error);
     }
 
+    .status-dot.unavailable {
+      background-color: var(--text-muted);
+    }
+
     .domain-chevron {
       grid-column: 2;
       grid-row: 1;
@@ -959,7 +963,7 @@
       }
     }
 
-    function renderStats(total, healthy, issues, unused) {
+    function renderStats(total, healthy, issues, unused, unavailable = 0) {
       const healthyLabel = currentView === 'dns' ? 'Matched' : 'Healthy';
       const issuesLabel = currentView === 'dns' ? 'Not Matched' : 'Issues';
       document.getElementById('view-stats').innerHTML = `
@@ -974,6 +978,10 @@
         <div class="stat-box ${currentFilter === 'issues' ? 'active' : ''} ${issues > 0 ? 'alert-error' : ''}" onclick="toggleFilter('issues')">
           <span class="stat-label">${issuesLabel}</span>
           <span class="stat-value"><span class="status-dot error"></span>${issues}</span>
+        </div>
+        <div class="stat-box ${currentFilter === 'unavailable' ? 'active' : ''}" onclick="toggleFilter('unavailable')">
+          <span class="stat-label">Unavailable</span>
+          <span class="stat-value"><span class="status-dot unavailable"></span>${unavailable}</span>
         </div>
         ${currentView === 'domains' ? `
         <div class="stat-box ${currentFilter === 'unused' ? 'active' : ''}" onclick="toggleFilter('unused')">
@@ -1186,9 +1194,12 @@
     }
 
     function aggregateDomainStatus(states) {
-      const statuses = states.map(state => state && (state.status || (state.valid === false ? 'failed' : undefined))).filter(Boolean);
+      const unavailable = states.some(state => state && (state.unavailable || state.network_error));
+      const statuses = states.filter(state => state && !state.unavailable && !state.network_error)
+        .map(state => state.status || (state.valid === false ? 'failed' : undefined)).filter(Boolean);
       if (statuses.some(status => ['failed', 'mismatch', 'hijacked'].includes(status))) return 'error';
       if (statuses.some(status => status === 'warning')) return 'warning';
+      if (unavailable) return 'unavailable';
       if (statuses.length === 0 || statuses.some(status => status === 'pending')) return 'unknown';
       return 'ok';
     }
@@ -1243,6 +1254,7 @@
       let healthyCount = 0;
       let issueCount = 0;
       let unusedCount = 0;
+      let unavailableCount = 0;
 
       const domainDataList = [];
       const sortedDomains = Array.from(allDomains).sort((a, b) => a.localeCompare(b));
@@ -1259,10 +1271,12 @@
         if (!rdapState.expiry_confirmed && (!rdapState.status || checkStates.some(state => state && state.status === 'pending') || statusClass === 'unknown')) {
           continue;
         }
-        const group = (rdapState.allow_expiry || rdapState.expiry_confirmed) ? 'unused' : (statusClass === 'error' || statusClass === 'warning' ? 'issues' : 'healthy');
+        const group = (rdapState.allow_expiry || rdapState.expiry_confirmed) ? 'unused' :
+          (statusClass === 'error' || statusClass === 'warning' ? 'issues' : statusClass === 'unavailable' ? 'unavailable' : 'healthy');
 
         if (group === 'unused') unusedCount++;
         else if (group === 'issues') issueCount++;
+        else if (group === 'unavailable') unavailableCount++;
         else healthyCount++;
 
         domainDataList.push({
@@ -1284,7 +1298,7 @@
         filteredDomains = filteredDomains.filter(item => item.group === currentFilter);
       }
 
-      const groupOrder = { healthy: 0, issues: 1, unused: 2 };
+      const groupOrder = { healthy: 0, issues: 1, unavailable: 2, unused: 3 };
       filteredDomains.sort((a, b) => groupOrder[a.group] - groupOrder[b.group] || a.domain.localeCompare(b.domain));
 
       const totalFiltered = filteredDomains.length;
@@ -1297,13 +1311,13 @@
             <p class="empty-state-copy">${domainDataList.length === 0 ? 'Domains will appear when their checks finish.' : 'No domains match the current search or filter criteria.'}</p>
           </div>
         `;
-        renderStats(healthyCount + issueCount + unusedCount, healthyCount, issueCount, unusedCount);
+        renderStats(healthyCount + issueCount + unavailableCount + unusedCount, healthyCount, issueCount, unusedCount, unavailableCount);
         return;
       }
 
       const startIndex = (currentPage - 1) * itemsPerPage;
       const paginatedDomains = filteredDomains.slice(startIndex, startIndex + itemsPerPage);
-      const groupedCards = { healthy: [], issues: [], unused: [] };
+      const groupedCards = { healthy: [], issues: [], unavailable: [], unused: [] };
 
       for (const item of paginatedDomains) {
         const domain = item.domain;
@@ -1337,7 +1351,9 @@
           }
 
           let emailStatusClass = 'text-success';
-          if (emailState.status === 'failed' || emailState.status === 'hijacked') {
+          if (emailState.unavailable) {
+            emailStatusClass = 'text-muted';
+          } else if (emailState.status === 'failed' || emailState.status === 'hijacked') {
             emailStatusClass = 'text-error';
           } else if (emailState.status === 'warning' || emailState.status === 'mismatch') {
             emailStatusClass = 'text-warning';
@@ -1346,7 +1362,7 @@
           emailHtml = `
             <div class="detail-panel">
               <h3>Email Security</h3>
-              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value ${emailStatusClass}">${formatTitleCase(emailState.status)}</div></div>
+              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value ${emailStatusClass}">${emailState.unavailable ? 'Check Unavailable' : formatTitleCase(emailState.status)}</div></div>
               <div class="detail-row"><div class="detail-label">SPF:</div><div class="detail-value">${emailState.spf ? 'Configured' : 'Missing'}</div></div>
               <div class="detail-row"><div class="detail-label">DMARC:</div><div class="detail-value">${emailState.dmarc ? 'Configured' : 'Missing'}</div></div>
               <div class="detail-row"><div class="detail-label">DKIM:</div><div class="detail-value">${dkimDisplay}</div></div>
@@ -1377,7 +1393,7 @@
                 <h3>Delegated Zone</h3>
                 <div class="detail-row"><div class="detail-label">Renewal Price:</div><div class="detail-value">${renewalPrice}</div></div>
                 <div class="detail-row"><div class="detail-label">Nameservers:</div><div class="detail-value text-lowercase">${ns}</div></div>
-                <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value">Monitored</div></div>
+                <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value">${rdapState.unavailable ? 'Check Unavailable' : 'Monitored'}</div></div>
               </div>`;
           } else {
             let regDisplay = escapeHTML(rdapState.registrar) || 'None reported';
@@ -1408,7 +1424,7 @@
           dnssecHtml = `
             <div class="detail-panel">
               <h3>DNSSEC Validation</h3>
-              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value ${dnssecState.valid ? 'text-success' : 'text-error'}">${dnssecState.valid ? 'Valid' : 'Invalid'}</div></div>
+              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value ${dnssecState.network_error ? 'text-muted' : dnssecState.valid ? 'text-success' : 'text-error'}">${dnssecState.network_error ? 'Check Unavailable' : dnssecState.valid ? 'Valid' : 'Invalid'}</div></div>
               <div class="detail-row"><div class="detail-label">Tier 1 (Local):</div><div class="detail-value">${dnssecState.ds_matches_dnskey && dnssecState.rrsig_valid ? 'Pass' : 'Fail'}</div></div>
               <div class="detail-row"><div class="detail-label">Tier 2 (DoH):</div><div class="detail-value">${dnssecState.chain_intact ? 'Pass' : (dnssecState.source === 'local_only' ? 'N/A' : 'Fail')}</div></div>
               ${!dnssecState.valid && dnssecState.error ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value text-error">${escapeHTML(dnssecState.error)}</div></div>` : ''}
@@ -1421,7 +1437,7 @@
           caaHtml = `
             <div class="detail-panel">
               <h3>CAA Records</h3>
-              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value ${caaState.valid ? 'text-success' : 'text-error'}">${caaState.valid ? 'Valid' : 'Invalid'}</div></div>
+              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value ${caaState.unavailable ? 'text-muted' : caaState.valid ? 'text-success' : 'text-error'}">${caaState.unavailable ? 'Check Unavailable' : caaState.valid ? 'Valid' : 'Invalid'}</div></div>
               <div class="detail-row"><div class="detail-label">Issue:</div><div class="detail-value">${(caaState.issue || []).map(formatCAAValue).join(', ') || 'None'}</div></div>
               <div class="detail-row"><div class="detail-label">IssueWild:</div><div class="detail-value">${(caaState.issuewild || []).map(formatCAAValue).join(', ') || 'None'}</div></div>
               <div class="detail-row"><div class="detail-label">IssueMail:</div><div class="detail-value">${(caaState.issuemail || []).map(formatCAAValue).join(', ') || 'None'}</div></div>
@@ -1433,17 +1449,19 @@
         let nsHealthHtml = '';
         if (nsHealthState && nsHealthState.servers) {
           const isNSPending = !nsHealthState.servers || nsHealthState.servers.length === 0;
-          const statusText = isNSPending ? 'Pending' : (nsHealthState.valid ? 'In Sync' : 'Issues Detected');
-          const statusClass = isNSPending ? 'text-warning' : (nsHealthState.valid ? 'text-success' : 'text-error');
+          const statusText = isNSPending ? 'Pending' : nsHealthState.unavailable ? 'Check Unavailable' : (nsHealthState.valid ? 'In Sync' : 'Issues Detected');
+          const statusClass = isNSPending ? 'text-warning' : nsHealthState.unavailable ? 'text-muted' : (nsHealthState.valid ? 'text-success' : 'text-error');
           const serverCount = nsHealthState.servers ? nsHealthState.servers.length : 0;
           const hiddenServerCount = nsHealthState.servers ? nsHealthState.servers.filter(server => server.hidden).length : 0;
           const answeringServerCount = serverCount - hiddenServerCount;
+          const nsError = nsHealthState.servers.find(server => server.error)?.error;
           nsHealthHtml = `
             <div class="detail-panel">
               <h3>Nameserver Health</h3>
               <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value emphasis ${statusClass}">${statusText}</div></div>
               <div class="detail-row"><div class="detail-label">Configured NS checked:</div><div class="detail-value">${isNSPending ? 'Query Pending' : serverCount}</div></div>
               ${isNSPending ? '' : `<div class="detail-row"><div class="detail-label">Answering / Hidden:</div><div class="detail-value">${answeringServerCount} / ${hiddenServerCount}</div></div>`}
+              ${nsHealthState.unavailable && nsError ? `<div class="detail-row"><div class="detail-label">Error:</div><div class="detail-value text-muted">${escapeHTML(nsError)}</div></div>` : ''}
               ${rdapState.source ? `<div class="detail-row"><div class="detail-label">Lookup Source:</div><div class="detail-value text-uppercase lookup-source">${escapeHTML(rdapState.source)}</div></div>` : ''}
             </div>
           `;
@@ -1463,6 +1481,7 @@
           <summary class="domain-header domain-header-domains">
             <div class="domain-header-left">
               <div class="domain-title text-lowercase">${escapeHTML(domain)}</div>
+              ${item.group === 'unavailable' ? '<span class="text-muted">Check Unavailable</span>' : ''}
               ${expiry ? `<span class="domain-expiry ${expiry.className}">${expiry.text}</span>` : ''}
             </div>
             ${chevronHtml}
@@ -1482,7 +1501,7 @@
         groupedCards[item.group].push(card);
       } // end of for loop
 
-      for (const [group, heading] of [['healthy', 'Healthy Domains'], ['issues', 'Domains with Issues'], ['unused', 'Allowed to Expire']]) {
+      for (const [group, heading] of [['healthy', 'Healthy Domains'], ['issues', 'Domains with Issues'], ['unavailable', 'Checks Unavailable'], ['unused', 'Allowed to Expire']]) {
         if (groupedCards[group].length === 0) continue;
         const section = document.createElement('section');
         section.className = 'domain-group';
@@ -1495,7 +1514,7 @@
       }
 
       if (currentView === 'domains') {
-        renderStats(healthyCount + issueCount + unusedCount, healthyCount, issueCount, unusedCount);
+        renderStats(healthyCount + issueCount + unavailableCount + unusedCount, healthyCount, issueCount, unusedCount, unavailableCount);
       }
     }
 
@@ -1529,13 +1548,16 @@
       let issueCount = 0;
 
       const dnsDataList = [];
+      let unavailableCount = 0;
       for (const key of dnsKeys) {
         const state = dnsChecks[key] || {};
         const matched = state.status === 'ok' || state.status === 'ok_flattened';
         const notMatched = ['failed', 'api_error', 'mismatch', 'warning'].includes(state.status);
+        const unavailable = state.unavailable && notMatched;
         if (!matched && !notMatched) continue;
-        const group = matched ? 'matched' : 'unmatched';
+        const group = unavailable ? 'unavailable' : matched ? 'matched' : 'unmatched';
         if (matched) healthyCount++;
+        else if (unavailable) unavailableCount++;
         else issueCount++;
 
         let statusClass = 'ok';
@@ -1547,7 +1569,10 @@
         const expectedUl = (state.expected && state.expected.length > 0) ? `<ul class="data-list"><li>${state.expected.map(escapeHTML).join('</li><li>')}</li></ul>` : 'N/A';
         const found = (state.found && state.found.length > 0) ? `<ul class="data-list"><li>${state.found.map(escapeHTML).join('</li><li>')}</li></ul>` : 'None';
 
-        if (state.status === 'failed' || state.status === 'api_error') {
+        if (unavailable) {
+          statusClass = 'unknown';
+          statusText = 'Check Unavailable';
+        } else if (state.status === 'failed' || state.status === 'api_error') {
           statusClass = 'error';
           statusText = 'Issue Detected';
         } else if (state.status === 'mismatch' || state.status === 'warning') {
@@ -1584,9 +1609,12 @@
         filteredDNS = filteredDNS.filter(item => item.group === 'matched');
       } else if (currentFilter === 'issues') {
         filteredDNS = filteredDNS.filter(item => item.group === 'unmatched');
+      } else if (currentFilter === 'unavailable') {
+        filteredDNS = filteredDNS.filter(item => item.group === 'unavailable');
       }
 
-      filteredDNS.sort((a, b) => (a.group === b.group ? a.key.localeCompare(b.key) : a.group === 'matched' ? -1 : 1));
+      const dnsGroupOrder = { matched: 0, unmatched: 1, unavailable: 2 };
+      filteredDNS.sort((a, b) => dnsGroupOrder[a.group] - dnsGroupOrder[b.group] || a.key.localeCompare(b.key));
 
       const totalFiltered = filteredDNS.length;
       renderPagination(totalFiltered);
@@ -1598,13 +1626,13 @@
             <p class="empty-state-copy">${dnsDataList.length === 0 ? 'DNS records will appear when their checks finish.' : 'No DNS records match the current search or filter criteria.'}</p>
           </div>
         `;
-        renderStats(healthyCount + issueCount, healthyCount, issueCount, 0);
+        renderStats(healthyCount + issueCount + unavailableCount, healthyCount, issueCount, 0, unavailableCount);
         return;
       }
 
       const startIndex = (currentPage - 1) * itemsPerPage;
       const paginatedDNS = filteredDNS.slice(startIndex, startIndex + itemsPerPage);
-      const groupedCards = { matched: [], unmatched: [] };
+      const groupedCards = { matched: [], unmatched: [], unavailable: [] };
 
       for (const item of paginatedDNS) {
         const key = item.key;
@@ -1654,7 +1682,7 @@
         groupedCards[item.group].push(card);
       }
 
-      for (const [group, heading] of [['matched', 'Matched DNS Records'], ['unmatched', 'DNS Records Not Matched']]) {
+      for (const [group, heading] of [['matched', 'Matched DNS Records'], ['unmatched', 'DNS Records Not Matched'], ['unavailable', 'Checks Unavailable']]) {
         if (groupedCards[group].length === 0) continue;
         const section = document.createElement('section');
         section.className = 'domain-group';
@@ -1667,7 +1695,7 @@
       }
 
       if (currentView === 'dns') {
-        renderStats(healthyCount + issueCount, healthyCount, issueCount, 0);
+        renderStats(healthyCount + issueCount + unavailableCount, healthyCount, issueCount, 0, unavailableCount);
       }
     }
 

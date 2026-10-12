@@ -2,7 +2,7 @@
 
 A small, self-hosted monitor for the domains and DNS records you look after.
 It runs as a single Go process, serves its own dashboard, and sends concise
-alerts through ntfy or Telegram.
+alerts through ntfy or Telegram when configured.
 
 > **Development note:** This project has been developed and refactored with
 > LLM assistance. Changes are reviewed against the documented behavior and
@@ -34,9 +34,9 @@ scope, standards, and release assurance, see
   cached public TLD price catalog, with manual overrides for premium domains.
 
 The embedded dashboard provides light and dark themes, while each completed
-cycle can send one bounded, deterministically ordered report. Network failures,
-resolver disagreement, and incomplete evidence remain visible instead of being
-silently treated as healthy.
+cycle can send one bounded, deterministically ordered report. Inconclusive
+lookup failures appear under Unavailable, while confirmed domain findings stay
+under Issues. Resolver disagreement and incomplete evidence remain visible.
 
 ## Quick start
 
@@ -105,7 +105,7 @@ Changes require a restart.
 | `email_providers_dir` | string | `./data/email_providers` | Optional startup directory of provider JSON files, overriding bundled presets by filename. A missing default directory uses bundled presets; an explicitly configured missing directory, malformed definition, or unknown configured provider fails startup. |
 | `resolvers` | array | `["1.1.1.1"...]` | Global DNS resolver IPs. Checks compare the first two observations when available; additional entries remain available to protocol-specific failover paths. |
 | `doh_url` | string | `"https://dns.google/resolve"` | Trusted upstream JSON DoH validator used to corroborate local DNSSEC evidence; this daemon is not an independent root-to-zone validator. |
-| `notifications` | object | Required | Must contain `ntfy.url`, a valid HTTP(S) URL. Authenticated ntfy requires HTTPS. Optional Telegram is enabled only when both `token` and `chat_id` are nonempty. Cross-origin notification redirects are rejected. |
+| `notifications` | object | Optional | Omit it to disable external delivery. Configure `ntfy.url` with a valid HTTP(S) URL, `telegram` with both `token` and `chat_id`, or both. Empty or incomplete provider settings are disabled. Authenticated ntfy requires HTTPS. Cross-origin notification redirects are rejected. |
 
 RDAP and public-metadata clients connect directly so proxy resolution cannot bypass destination policy. The operator-selected notification client may use environment proxy settings; credentials are never followed across origins.
 
@@ -120,7 +120,8 @@ The worker pool is capped at 32. Transient HTTP failures use bounded retries
 with backoff and `Retry-After` support, while DNS and WHOIS use their own small
 retry budgets. Resolver disagreement and partial results are reported as such.
 Notifications are assembled after publication, ordered by severity, and sent
-independently to each configured provider.
+independently to each configured provider. Without a configured provider,
+findings remain visible in the dashboard and logs.
 
 All state is kept in memory. A restart rebuilds condition ages, caches, and the
 latest results; failed notification deliveries are not persisted. This keeps
@@ -220,9 +221,9 @@ container deployments:
 
 The daemon provides an embedded web UI and JSON API:
 
-- **`GET /`:** Dashboard grouping domains into Healthy, Issues, and Allowed to
-  Expire, with separate matched and unmatched DNS records. Domain cards show
-  expiry and renewal details.
+- **`GET /`:** Dashboard grouping domains into Healthy, Issues, Unavailable,
+  and Allowed to Expire, with separate matched, unmatched, and unavailable DNS
+  records. Domain cards show expiry and renewal details.
 - **`GET /health`:** HTTP 200 liveness probe (`{"status":"ok"}`).
 - **`GET /api/state`:** Latest coherent JSON snapshot. Pending checks are
   published at startup, failed attempts retain prior evidence, and ETag support

@@ -106,6 +106,14 @@ func TestHTTPRetryPolicy(t *testing.T) {
 	assert.ErrorIs(t, err, ErrHTTPClientNil)
 }
 
+func TestTransientNetworkErrorRetriesRequestTimeoutWithLiveCycle(t *testing.T) {
+	assert.True(t, transientNetworkError(context.Background(), context.DeadlineExceeded))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.False(t, transientNetworkError(ctx, context.DeadlineExceeded))
+	assert.False(t, transientNetworkError(context.Background(), context.Canceled))
+}
+
 func TestNormalizeDomain(t *testing.T) {
 	t.Parallel()
 

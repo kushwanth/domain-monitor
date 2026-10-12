@@ -371,15 +371,16 @@ type CAAConfig struct {
 
 // CAAResult contains the evaluated CAA records and their condition.
 type CAAResult struct {
-	Status     CheckStatus    `json:"status"`
-	Condition  StateCondition `json:"condition,omitzero"`
-	Valid      bool           `json:"valid"`
-	Issue      []string       `json:"issue,omitempty"`
-	IssueWild  []string       `json:"issuewild,omitempty"`
-	IssueMail  []string       `json:"issuemail,omitempty"`
-	UnknownCAs []string       `json:"unknown_cas,omitempty"`
-	Error      string         `json:"error,omitempty"`
-	Findings   []Finding      `json:"findings,omitempty"`
+	Status      CheckStatus    `json:"status"`
+	Condition   StateCondition `json:"condition,omitzero"`
+	Valid       bool           `json:"valid"`
+	Unavailable bool           `json:"unavailable,omitempty"`
+	Issue       []string       `json:"issue,omitempty"`
+	IssueWild   []string       `json:"issuewild,omitempty"`
+	IssueMail   []string       `json:"issuemail,omitempty"`
+	UnknownCAs  []string       `json:"unknown_cas,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Findings    []Finding      `json:"findings,omitempty"`
 }
 
 // DNSTask defines a DNS record query and its expected values.
@@ -715,6 +716,7 @@ type DomainTierData struct {
 type RDAPState struct {
 	Status            CheckStatus     `json:"status"`
 	Condition         StateCondition  `json:"condition,omitzero"`
+	Unavailable       bool            `json:"unavailable,omitempty"`
 	Registrar         string          `json:"registrar,omitempty"`
 	RegistrarIANAID   string          `json:"registrar_iana_id,omitempty"`
 	RegistrarMismatch bool            `json:"registrar_mismatch,omitempty"`
@@ -739,15 +741,16 @@ type RDAPState struct {
 
 // DNSState stores expected and observed DNS records with their verdict.
 type DNSState struct {
-	Hostname  string         `json:"hostname"`
-	Name      string         `json:"name"`
-	Type      string         `json:"type"`
-	Expected  []string       `json:"expected"`
-	Status    CheckStatus    `json:"status"`
-	Condition StateCondition `json:"condition,omitzero"`
-	Found     []string       `json:"found,omitempty"`
-	Error     string         `json:"error,omitempty"`
-	Findings  []Finding      `json:"findings,omitempty"`
+	Hostname    string         `json:"hostname"`
+	Name        string         `json:"name"`
+	Type        string         `json:"type"`
+	Expected    []string       `json:"expected"`
+	Status      CheckStatus    `json:"status"`
+	Condition   StateCondition `json:"condition,omitzero"`
+	Unavailable bool           `json:"unavailable,omitempty"`
+	Found       []string       `json:"found,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Findings    []Finding      `json:"findings,omitempty"`
 }
 
 // EmailState stores evaluated MX, SPF, DMARC, and DKIM publication evidence.
@@ -755,6 +758,7 @@ type EmailState struct {
 	Provider     string         `json:"provider,omitempty"`
 	Status       CheckStatus    `json:"status"`
 	Condition    StateCondition `json:"condition,omitzero"`
+	Unavailable  bool           `json:"unavailable,omitempty"`
 	SPF          bool           `json:"spf,omitempty"`
 	DMARC        bool           `json:"dmarc,omitempty"`
 	DKIMExpected bool           `json:"dkim_expected,omitempty"`
@@ -798,11 +802,12 @@ type NSHealthServerResult struct {
 
 // NSHealthResult stores the aggregated authoritative nameserver health for a domain.
 type NSHealthResult struct {
-	Valid     bool                   `json:"valid"`
-	Status    CheckStatus            `json:"status"`
-	Condition StateCondition         `json:"condition,omitzero"`
-	Servers   []NSHealthServerResult `json:"servers"`
-	Findings  []Finding              `json:"findings,omitempty"`
+	Valid       bool                   `json:"valid"`
+	Status      CheckStatus            `json:"status"`
+	Condition   StateCondition         `json:"condition,omitzero"`
+	Unavailable bool                   `json:"unavailable,omitempty"`
+	Servers     []NSHealthServerResult `json:"servers"`
+	Findings    []Finding              `json:"findings,omitempty"`
 }
 
 // CycleMetadata is compact RAM-only scheduling and publication metadata.
@@ -909,17 +914,18 @@ type NSDelegationSnapshot struct {
 
 // NSSnapshot holds raw data fetched from a single authoritative nameserver.
 type NSSnapshot struct {
-	Nameserver    string
-	Hidden        bool
-	Authoritative bool
-	HasSOA        bool
-	SOASerial     uint32
-	HasDNSKEY     bool
-	DNSKEYs       []string
-	DNSKEYErr     error
-	PartialError  error
-	Unreachable   bool
-	Err           error
+	Nameserver               string
+	Hidden                   bool
+	Authoritative            bool
+	HasSOA                   bool
+	SOASerial                uint32
+	HasDNSKEY                bool
+	DNSKEYs                  []string
+	DNSKEYErr                error
+	PartialError             error
+	AddressLookupUnavailable bool
+	Unreachable              bool
+	Err                      error
 }
 
 // DNSSnapshot holds raw DNS query results for a single record check.

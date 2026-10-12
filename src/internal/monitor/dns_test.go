@@ -1018,6 +1018,80 @@ func TestFetchDNSSnapshotReducesResolverObservations(t *testing.T) {
 	require.Equal(t, "192.0.2.1", snapshot.Observations[0].Resolver)
 }
 
+func TestQueryDNSUsesSpareResolverAfterFailedObservation(t *testing.T) {
+	app := NewAppState(AppConfig{})
+	var queried []string
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+		queried = append(queried, address)
+		if strings.HasPrefix(address, "192.0.2.1:") {
+			return nil, 0, context.DeadlineExceeded
+		}
+		response := new(dns.Msg).SetReply(query)
+		record, err := dns.NewRR("example.com. 60 IN A 192.0.2.10")
+		require.NoError(t, err)
+		response.Answer = []dns.RR{record}
+		return response, 0, nil
+	}}
+
+	got, err := queryDNS(context.Background(), app, "example.com", dns.TypeA,
+		[]string{"192.0.2.1", "192.0.2.2", "192.0.2.3"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.0.2.10"}, got)
+	assert.Equal(t, []string{"192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53"}, queried)
+}
+
+func TestFetchDNSSnapshotUsesSpareResolverWithoutHidingIncompleteEvidence(t *testing.T) {
+	app := NewAppState(AppConfig{Resolvers: []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"}})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+		if strings.HasPrefix(address, "192.0.2.1:") {
+			return nil, 0, context.DeadlineExceeded
+		}
+		response := new(dns.Msg).SetReply(query)
+		record, err := dns.NewRR("example.com. 60 IN A 192.0.2.10")
+		require.NoError(t, err)
+		response.Answer = []dns.RR{record}
+		return response, 0, nil
+	}}
+	target := DNSTask{Hostname: "example.com", Name: "web", Type: RecordTypeA, Expected: []string{"192.0.2.10"}}
+	snapshot := FetchDNSSnapshot(context.Background(), app, target)
+	require.NoError(t, snapshot.Err)
+	assert.Len(t, snapshot.Observations, 3)
+	assert.Equal(t, []string{"192.0.2.10"}, snapshot.Records)
+
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+		if strings.HasPrefix(address, "192.0.2.1:") {
+			return new(dns.Msg).SetRcode(query, dns.RcodeNameError), 0, nil
+		}
+		return nil, 0, context.DeadlineExceeded
+	}}
+	target.Expected = StringList{}
+	snapshot = FetchDNSSnapshot(context.Background(), app, target)
+	require.Error(t, snapshot.Err)
+	assert.NotErrorIs(t, snapshot.Err, ErrNXDOMAIN)
+}
+
+func TestDNSObservationsRequireDistinctResolverEndpoints(t *testing.T) {
+	var queried []string
+	lookup := func(resolver string) ([]string, error) {
+		queried = append(queried, resolver)
+		return []string{"192.0.2.10"}, nil
+	}
+	attempts, selected := collectDNSObservations([]string{"192.0.2.1", "192.0.2.1:53", "192.0.2.2"}, 2, lookup)
+	assert.Len(t, attempts, 2)
+	assert.Len(t, selected, 2)
+	assert.Equal(t, []string{"192.0.2.1", "192.0.2.2"}, queried)
+
+	attempts, selected = collectDNSObservations([]string{"192.0.2.1", "192.0.2.1:53"}, 2, lookup)
+	assert.Len(t, attempts, 1)
+	assert.Len(t, selected, 1)
+	app := NewAppState(AppConfig{})
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		return new(dns.Msg).SetReply(query), 0, nil
+	}}
+	_, err := queryDNS(context.Background(), app, "example.com", dns.TypeA, []string{"192.0.2.1", "192.0.2.1:53"})
+	require.ErrorContains(t, err, "fewer than two distinct resolver observations")
+}
+
 // Create a cycle between loop.example. and alias.example.
 
 // For CAA or other types, return empty Answer (NODATA)

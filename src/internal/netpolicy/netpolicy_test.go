@@ -6,13 +6,15 @@ import (
 )
 
 func TestRestrictedIP(t *testing.T) {
-	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "100.64.0.1", "224.0.0.1", "::1"} {
+	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "100.64.0.1", "0.1.2.3", "224.0.0.1", "::1", "fe80::1", "ff02::1"} {
 		if !RestrictedIP(net.ParseIP(raw)) {
 			t.Fatalf("%s must be restricted", raw)
 		}
 	}
-	if RestrictedIP(net.ParseIP("93.184.216.34")) {
-		t.Fatal("public address must remain allowed")
+	for _, ip := range []net.IP{nil, net.ParseIP("93.184.216.34"), net.ParseIP("2001:4860:4860::8888")} {
+		if RestrictedIP(ip) {
+			t.Fatalf("%v must remain allowed", ip)
+		}
 	}
 }
 

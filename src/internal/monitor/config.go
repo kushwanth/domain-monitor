@@ -65,6 +65,10 @@ func loadConfig(ctx context.Context, path string, readFile func(string) ([]byte,
 }
 
 func migrateV3Config(data []byte) ([]byte, error) {
+	return migrateV3ConfigWithMarshal(data, jsonv1.Marshal)
+}
+
+func migrateV3ConfigWithMarshal(data []byte, marshal func(any) ([]byte, error)) ([]byte, error) {
 	var root map[string]jsonv1.RawMessage
 	if err := jsonv1.Unmarshal(data, &root); err != nil {
 		return nil, err
@@ -86,7 +90,7 @@ func migrateV3Config(data []byte) ([]byte, error) {
 			changed = domainChanged || changed
 		}
 		if changed {
-			encoded, err := jsonv1.Marshal(domains)
+			encoded, err := marshal(domains)
 			if err != nil {
 				return nil, err
 			}
@@ -104,7 +108,7 @@ func migrateV3Config(data []byte) ([]byte, error) {
 			}
 		}
 		if changed {
-			encoded, err := jsonv1.Marshal(records)
+			encoded, err := marshal(records)
 			if err != nil {
 				return nil, err
 			}
@@ -114,7 +118,7 @@ func migrateV3Config(data []byte) ([]byte, error) {
 	if !changed {
 		return data, nil
 	}
-	return jsonv1.Marshal(root)
+	return marshal(root)
 }
 
 func migrateV3Domain(domain map[string]jsonv1.RawMessage) (bool, error) {
@@ -272,20 +276,21 @@ func validateConfigEndpoints(config *AppConfig) error {
 }
 
 func validateNotificationEndpoints(notifications *Notifications) error {
-	if notifications.Ntfy == nil {
-		return fmt.Errorf(MsgErrValidateNotificationsNtfy, MsgErrNtfyURLRequired)
-	}
-	ntfy := notifications.Ntfy
-	if ntfy.URL == StrEmpty {
-		return fmt.Errorf(MsgErrValidateNotificationsNtfy, MsgErrNtfyURLRequired)
-	}
-	if err := validateHTTPURL(ntfy.URL); err != nil {
-		return fmt.Errorf(MsgErrInvalidNtfyURL, err)
-	}
-	if ntfy.Auth != StrEmpty {
-		endpoint, err := url.Parse(ntfy.URL)
-		if err != nil || !strings.EqualFold(endpoint.Scheme, SchemeHTTPSName) {
-			return fmt.Errorf(MsgErrInvalidNtfyURL, errors.New(MsgErrAuthenticatedNtfyRequiresHTTPS))
+	if notifications.Ntfy != nil {
+		ntfy := notifications.Ntfy
+		ntfy.URL = strings.TrimSpace(ntfy.URL)
+		if ntfy.URL == StrEmpty {
+			notifications.Ntfy = nil
+		} else {
+			if err := validateHTTPURL(ntfy.URL); err != nil {
+				return fmt.Errorf(MsgErrInvalidNtfyURL, err)
+			}
+			if ntfy.Auth != StrEmpty {
+				endpoint, err := url.Parse(ntfy.URL)
+				if err != nil || !strings.EqualFold(endpoint.Scheme, SchemeHTTPSName) {
+					return fmt.Errorf(MsgErrInvalidNtfyURL, errors.New(MsgErrAuthenticatedNtfyRequiresHTTPS))
+				}
+			}
 		}
 	}
 	if notifications.Telegram != nil {
@@ -444,9 +449,6 @@ func normalizeDomainConfig(domainCfg *DomainConfig, i int, seenDomains, seenDoma
 func normalizeDomainCAA(domainCfg *DomainConfig) error {
 	if domainCfg.CAA != nil {
 		normalizeCAAList := func(list []string) []string {
-			if list == nil {
-				return nil
-			}
 			var res []string
 			for _, item := range list {
 				val := canonicalCAAIssueValue(item)
@@ -663,11 +665,7 @@ func normalizeExpectedDNSValue(record DNSTask, rawVal string) (string, error) {
 		if err != nil {
 			return StrEmpty, fmt.Errorf(MsgErrInvalidExpectedCAAValueFor, rawVal, record.Hostname, err)
 		}
-		caa, ok := rr.(*dns.CAA)
-		if !ok {
-			return StrEmpty, fmt.Errorf(MsgErrInvalidExpectedCAAValue, rawVal, record.Hostname)
-		}
-		return canonicalCAARecordValue(caa), nil
+		return canonicalCAARecordValue(rr.(*dns.CAA)), nil
 	}
 	cleanVal := strings.TrimSuffix(strings.TrimSpace(rawVal), SymDot)
 	if cleanVal == StrEmpty {
@@ -740,7 +738,7 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 		telegramToken = cfg.Notifications.Telegram.Token
 		telegramChatID = cfg.Notifications.Telegram.ChatID
 	}
-	if ntfyURL != StrEmpty || telegramToken != StrEmpty {
+	if ntfyURL != StrEmpty || (telegramToken != StrEmpty && telegramChatID != StrEmpty) {
 		notifier := NewNotificationManager(ntfyURL, auth, telegramToken, telegramChatID)
 		notifier.HTTPClient = app.Clients.Notification
 		app.Notifier = notifier
@@ -766,7 +764,11 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 var emailProvidersFS embed.FS
 
 func loadEmailProviders(directory string) (map[string]ProviderConfig, error) {
-	builtin, err := fs.Sub(emailProvidersFS, DefaultEmailProvidersDir)
+	return loadEmailProvidersFromFS(directory, emailProvidersFS)
+}
+
+func loadEmailProvidersFromFS(directory string, embedded fs.FS) (map[string]ProviderConfig, error) {
+	builtin, err := fs.Sub(embedded, DefaultEmailProvidersDir)
 	if err != nil {
 		return nil, fmt.Errorf(MsgErrOpenEmbeddedEmailProviders, err)
 	}

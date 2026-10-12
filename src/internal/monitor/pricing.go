@@ -126,10 +126,6 @@ func extractTLD(domain string) string {
 	if ps != StrEmpty {
 		return ps
 	}
-	idx := strings.LastIndexByte(domain, '.')
-	if idx != -1 && idx < len(domain)-1 {
-		return domain[idx+1:]
-	}
 	return domain
 }
 

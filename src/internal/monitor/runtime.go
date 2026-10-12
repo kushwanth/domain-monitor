@@ -155,6 +155,10 @@ func gatherDNSEvidence(ctx context.Context, app *AppState, record DNSTask) (snap
 }
 
 func evaluateDNSCheck(record DNSTask, snapshot DNSSnapshot) (result DNSResult) {
+	return evaluateDNSCheckWith(record, snapshot, EvaluateDNS)
+}
+
+func evaluateDNSCheckWith(record DNSTask, snapshot DNSSnapshot, evaluate func(DNSTask, DNSSnapshot) (CheckStatus, StateCondition)) (result DNSResult) {
 	result.Name = record.Name
 	defer func() {
 		if r := recover(); r != nil {
@@ -167,7 +171,7 @@ func evaluateDNSCheck(record DNSTask, snapshot DNSSnapshot) (result DNSResult) {
 			}
 		}
 	}()
-	status, cond := EvaluateDNS(record, snapshot)
+	status, cond := evaluate(record, snapshot)
 	errStr := StrEmpty
 	if !cond.IsZero() && cond.Code != CodeDNSMatchVerified {
 		errStr = cond.Target
@@ -175,7 +179,8 @@ func evaluateDNSCheck(record DNSTask, snapshot DNSSnapshot) (result DNSResult) {
 	result.State = DNSState{
 		Hostname: record.Hostname, Name: record.Name, Type: record.Type,
 		Expected: slices.Clone(record.Expected), Status: status, Condition: cond,
-		Found: snapshot.Records, Error: errStr,
+		Unavailable: snapshot.Err != nil && !errors.Is(snapshot.Err, ErrNXDOMAIN),
+		Found:       snapshot.Records, Error: errStr,
 		Findings: findingsFromConditions(status, cond),
 	}
 	return result
@@ -200,6 +205,10 @@ func gatherDomainEvidence(ctx context.Context, app *AppState, domain DomainConfi
 }
 
 func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain DomainConfig, evidence domainEvidence, state *CheckState) {
+	evaluateFastDomainChecksWithEmail(providers, domain, evidence, state, EvaluateEmailSecurity)
+}
+
+func evaluateFastDomainChecksWithEmail(providers map[string]ProviderConfig, domain DomainConfig, evidence domainEvidence, state *CheckState, evaluate func(DomainConfig, EmailSnapshot, map[string]ProviderConfig) (CheckStatus, StateCondition, EmailState)) {
 	if evidence.panicText != StrEmpty {
 		storePanicDomainResults(domain, state, evidence.panicText)
 		return
@@ -211,8 +220,22 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 		}
 	}()
 
-	_, cond, emailState := EvaluateEmailSecurity(domain, evidence.email, providers)
+	_, cond, emailState := evaluate(domain, evidence.email, providers)
 	emailState.Condition = cond
+	// Only classify an email lookup as inconclusive when no definitive policy
+	// finding was produced alongside the lookup failure.
+	if (emailState.Status == StatusFailed || emailState.Status == StatusWarning) &&
+		!errors.Is(evidence.email.MXErr, ErrNXDOMAIN) &&
+		!errors.Is(evidence.email.SPFErr, ErrNXDOMAIN) &&
+		!errors.Is(evidence.email.DMARCErr, ErrNXDOMAIN) {
+		emailState.Unavailable = len(emailState.Findings) > 0
+		for _, finding := range emailState.Findings {
+			if finding.Code != CodeDNSLookupFailed {
+				emailState.Unavailable = false
+				break
+			}
+		}
+	}
 	if emailState.Status != StatusUnknown {
 		state.Email[domain.Domain] = emailState
 	}
@@ -222,6 +245,7 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 		delegationState := RDAPState{
 			Status:          status,
 			Condition:       cond,
+			Unavailable:     evidence.delegation.Err != nil && !errors.Is(evidence.delegation.Err, ErrNXDOMAIN),
 			AllowExpiry:     domain.AllowExpiry,
 			IsDelegatedZone: true,
 			Source:          SourceDNSDelegation,
@@ -244,10 +268,28 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 
 		servers := make([]NSHealthServerResult, 0, len(evidence.nsHealth))
 		var dnskeyBaseline []string
+		var soaBaseline uint32
+		hasSOABaseline := false
+		addressLookupUnavailable := false
+		confirmedNSIssue := false
 		for _, serverSnapshot := range evidence.nsHealth {
+			if serverSnapshot.AddressLookupUnavailable {
+				addressLookupUnavailable = true
+			}
+			if (!serverSnapshot.AddressLookupUnavailable && (serverSnapshot.Unreachable || serverSnapshot.PartialError != nil)) ||
+				(!serverSnapshot.Unreachable && (!serverSnapshot.Authoritative || !serverSnapshot.HasSOA)) ||
+				(domain.DNSSEC && (serverSnapshot.DNSKEYErr != nil || !serverSnapshot.HasDNSKEY)) {
+				confirmedNSIssue = true
+			}
 			if serverSnapshot.Authoritative && serverSnapshot.HasSOA {
-				dnskeyBaseline = serverSnapshot.DNSKEYs
-				break
+				if !hasSOABaseline {
+					soaBaseline = serverSnapshot.SOASerial
+					dnskeyBaseline = serverSnapshot.DNSKEYs
+					hasSOABaseline = true
+				} else if serverSnapshot.SOASerial != soaBaseline ||
+					(domain.DNSSEC && !slices.Equal(dnskeyBaseline, serverSnapshot.DNSKEYs)) {
+					confirmedNSIssue = true
+				}
 			}
 		}
 		for _, serverSnapshot := range evidence.nsHealth {
@@ -273,11 +315,12 @@ func evaluateFastDomainChecks(providers map[string]ProviderConfig, domain Domain
 		}
 
 		nsState := NSHealthResult{
-			Valid:     status == StatusOK,
-			Status:    status,
-			Condition: nsCondition,
-			Servers:   servers,
-			Findings:  findingsFromConditions(status, nsCondition),
+			Valid:       status == StatusOK,
+			Status:      status,
+			Condition:   nsCondition,
+			Unavailable: status != StatusOK && addressLookupUnavailable && !confirmedNSIssue,
+			Servers:     servers,
+			Findings:    findingsFromConditions(status, nsCondition),
 		}
 		state.NSHealth[domain.Domain] = nsState
 	}
@@ -363,6 +406,10 @@ func gatherRateLimitedEvidence(ctx context.Context, app *AppState, domains []Dom
 }
 
 func evaluateRDAPCheck(domainConfig DomainConfig, snapshot RDAPSnapshot) (result RDAPState) {
+	return evaluateRDAPCheckWith(domainConfig, snapshot, EvaluateRDAP)
+}
+
+func evaluateRDAPCheckWith(domainConfig DomainConfig, snapshot RDAPSnapshot, evaluate func(DomainConfig, RDAPSnapshot) (CheckStatus, StateCondition)) (result RDAPState) {
 	defer func() {
 		if r := recover(); r != nil {
 			LogError(MsgLogPanicRDAP, FieldDomain, domainConfig.Domain, FieldPanic, r)
@@ -374,11 +421,12 @@ func evaluateRDAPCheck(domainConfig DomainConfig, snapshot RDAPSnapshot) (result
 			}
 		}
 	}()
-	status, cond := EvaluateRDAP(domainConfig, snapshot)
+	status, cond := evaluate(domainConfig, snapshot)
 
 	rdapState := RDAPState{
 		Status:          status,
 		Condition:       cond,
+		Unavailable:     snapshot.Err != nil && !errors.Is(snapshot.Err, ErrDomainNotFound) && !errors.Is(snapshot.Err, ErrRDAPNotFound),
 		Registrar:       snapshot.Registrar,
 		RegistrarIANAID: snapshot.RegistrarIANAID,
 		Expiration:      snapshot.Expiration,
@@ -423,11 +471,12 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 		domainName := strings.TrimPrefix(res.Name, InternalCAATaskPrefix)
 
 		caaRes := CAAResult{
-			Status:    res.State.Status,
-			Condition: res.State.Condition,
-			Valid:     res.State.Status == StatusOK,
-			Error:     res.State.Error,
-			Findings:  slices.Clone(res.State.Findings),
+			Status:      res.State.Status,
+			Condition:   res.State.Condition,
+			Valid:       res.State.Status == StatusOK,
+			Unavailable: res.State.Unavailable,
+			Error:       res.State.Error,
+			Findings:    slices.Clone(res.State.Findings),
 		}
 		expectedSet := make(stringSet)
 		for _, exp := range res.State.Expected {
@@ -508,6 +557,27 @@ func runMonitoringCycle(
 	prevEmailStatus map[string]CheckStatus,
 	prevConditions map[conditionKey]StateCondition,
 ) *CheckState {
+	return runMonitoringCycleWithHooks(ctx, app, rdapHTTPClient, prevRDAPStatus, prevDNSStatus, prevEmailStatus, prevConditions, cycleHooks{
+		gather: gatherCycleEvidence, evaluate: evaluateCycleEvidence,
+	})
+}
+
+type cycleHooks struct {
+	gather   func(context.Context, *AppState, AppConfig, HTTPDoer) (activeChecks, cycleEvidence)
+	evaluate func(map[string]ProviderConfig, AppConfig, activeChecks, cycleEvidence) *CheckState
+	timeout  time.Duration
+}
+
+func runMonitoringCycleWithHooks(
+	ctx context.Context,
+	app *AppState,
+	rdapHTTPClient HTTPDoer,
+	prevRDAPStatus map[string]CheckStatus,
+	prevDNSStatus map[string]CheckStatus,
+	prevEmailStatus map[string]CheckStatus,
+	prevConditions map[conditionKey]StateCondition,
+	hooks cycleHooks,
+) *CheckState {
 	clock := app.Clock
 	if clock == nil {
 		clock = systemClock{}
@@ -526,6 +596,9 @@ func runMonitoringCycle(
 	minRequiredTimeout := saturatingWorkDuration(len(app.active.rdapDomains), 15*time.Second, 5*time.Minute)
 	minRequiredTimeout = saturatingWorkDuration(len(app.active.domains)+len(app.active.dnsRecords), 5*time.Second, minRequiredTimeout)
 	cycleMaxTimeout := max(loopDur, minRequiredTimeout, 5*time.Minute)
+	if hooks.timeout > 0 {
+		cycleMaxTimeout = hooks.timeout
+	}
 	cycleCtx, cycleCancel := context.WithTimeout(ctx, cycleMaxTimeout)
 	defer cycleCancel()
 
@@ -543,7 +616,7 @@ func runMonitoringCycle(
 	}
 
 	// RDAP selects the current dependent workload; final evaluation remains network-free.
-	active, evidence := gatherCycleEvidence(cycleCtx, app, cfg, rdapHTTPClient)
+	active, evidence := hooks.gather(cycleCtx, app, cfg, rdapHTTPClient)
 	if cycleCtx.Err() != nil {
 		if ctx.Err() == nil {
 			publishCycleFailure(app, CycleMetadata{
@@ -555,7 +628,7 @@ func runMonitoringCycle(
 		}
 		return nil
 	}
-	loopState := evaluateCycleEvidence(app.EmailProviders, cfg, active, evidence)
+	loopState := hooks.evaluate(app.EmailProviders, cfg, active, evidence)
 	if cycleCtx.Err() != nil {
 		if ctx.Err() == nil {
 			publishCycleFailure(app, CycleMetadata{
@@ -1013,6 +1086,10 @@ func MainExitCode() int {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	return mainExitCode(ctx, configPath)
+}
+
+func mainExitCode(ctx context.Context, configPath string) int {
 	if err := run(ctx, configPath); err != nil {
 		LogError(MsgLogApplicationFailed, FieldError, err)
 		return 1
@@ -1021,6 +1098,25 @@ func MainExitCode() int {
 }
 
 func run(parent context.Context, configPath string) error {
+	return runWithInitialize(parent, configPath, InitializeApp)
+}
+
+func runWithInitialize(parent context.Context, configPath string, initialize func(context.Context, AppConfig) (*AppState, error)) error {
+	return runWithLifecycleHooks(parent, configPath, initialize, lifecycleHooks{
+		setup: setupHTTPServer, cycle: runMonitoringCycle,
+		shutdownTimeout: ShutdownTimeout, engineWait: 5 * time.Second, notificationWait: 5 * time.Second,
+	})
+}
+
+type lifecycleHooks struct {
+	setup            func(*AppState, string) (*http.Server, <-chan error)
+	cycle            func(context.Context, *AppState, HTTPDoer, map[string]CheckStatus, map[string]CheckStatus, map[string]CheckStatus, map[conditionKey]StateCondition) *CheckState
+	shutdownTimeout  time.Duration
+	engineWait       time.Duration
+	notificationWait time.Duration
+}
+
+func runWithLifecycleHooks(parent context.Context, configPath string, initialize func(context.Context, AppConfig) (*AppState, error), hooks lifecycleHooks) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -1029,7 +1125,7 @@ func run(parent context.Context, configPath string) error {
 		return fmt.Errorf(MsgErrLoadConfiguration, err)
 	}
 
-	app, err := InitializeApp(ctx, config)
+	app, err := initialize(ctx, config)
 	if err != nil {
 		return fmt.Errorf(MsgErrInitializeApplication, err)
 	}
@@ -1041,7 +1137,7 @@ func run(parent context.Context, configPath string) error {
 	LogInfof(MsgLogStartup, len(app.configuration().Domains), len(app.configuration().DNSRecords))
 	app.PublishInitialState()
 
-	server, serverErrChan := setupHTTPServer(app, app.configuration().Port)
+	server, serverErrChan := hooks.setup(app, app.configuration().Port)
 	notificationCtx, notificationCancel := context.WithCancel(context.Background())
 	defer notificationCancel()
 	notificationWake := make(chan struct{}, 1)
@@ -1060,7 +1156,7 @@ func run(parent context.Context, configPath string) error {
 		prevConditions := make(map[conditionKey]StateCondition)
 
 		for {
-			_ = runMonitoringCycle(ctx, app, rdapHTTPClient, prevRDAPStatus, prevDNSStatus, prevEmailStatus, prevConditions)
+			_ = hooks.cycle(ctx, app, rdapHTTPClient, prevRDAPStatus, prevDNSStatus, prevEmailStatus, prevConditions)
 			select {
 			case notificationWake <- struct{}{}:
 			default:
@@ -1101,7 +1197,7 @@ func run(parent context.Context, configPath string) error {
 	cancel()
 
 	// Shutdown HTTP Server
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), ShutdownTimeout)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), hooks.shutdownTimeout)
 	defer shutdownCancel()
 	if server != nil {
 		if err := server.Shutdown(shutdownCtx); err != nil {
@@ -1115,7 +1211,7 @@ func run(parent context.Context, configPath string) error {
 	select {
 	case <-engineDone:
 		engineStopped = true
-	case <-time.After(5 * time.Second):
+	case <-time.After(hooks.engineWait):
 		LogWarn(MsgLogMonitoringEngineTimeout)
 		runErr = errors.Join(runErr, fmt.Errorf(MsgErrOperationDetail, NameOpMonitoringEngine, MsgErrMonitoringEngineShutdownTimeout))
 	}
@@ -1126,7 +1222,7 @@ func run(parent context.Context, configPath string) error {
 	}
 	select {
 	case <-notificationDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(hooks.notificationWait):
 		notificationCancel()
 		LogWarn(MsgLogNotificationWorkerTimeout)
 	}

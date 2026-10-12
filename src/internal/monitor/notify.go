@@ -46,7 +46,7 @@ func truncateAlertBytes(message string, limit int) string {
 func (nm *NotificationManager) Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string) {
 	alert := Alert{Message: message, Redacted: redacted, Priority: priority, Tag: tag, Domain: domain, Name: name}
 	logQueuedAlert(alert)
-	if nm.NtfyURL == StrEmpty && nm.TelegramToken == StrEmpty {
+	if nm.NtfyURL == StrEmpty && (nm.TelegramToken == StrEmpty || nm.TelegramChatID == StrEmpty) {
 		return
 	}
 	nm.mu.Lock()
@@ -91,7 +91,7 @@ func (nm *NotificationManager) FlushContext(parent context.Context) {
 		nm.sendNtfyBatchContext(ctx, report)
 		cancel()
 	}
-	if nm.TelegramToken != StrEmpty && parent.Err() == nil {
+	if nm.TelegramToken != StrEmpty && nm.TelegramChatID != StrEmpty && parent.Err() == nil {
 		ctx, cancel := context.WithTimeout(parent, DefaultHTTPTimeout)
 		nm.sendTelegramBatchContext(ctx, report)
 		cancel()
@@ -228,9 +228,13 @@ func formatNtfyMessage(alert Alert) string {
 }
 
 func (nm *NotificationManager) sendTelegramBatchContext(ctx context.Context, alert Alert) bool {
+	return nm.sendTelegramBatchContextLimit(ctx, alert, MaxProviderMessageBytes)
+}
+
+func (nm *NotificationManager) sendTelegramBatchContextLimit(ctx context.Context, alert Alert, maxBytes int) bool {
 	defer RecoverAndLogPanic(NameTelegramProvider)
 	text := formatTelegramMessage(alert)
-	if len(text) > MaxProviderMessageBytes {
+	if len(text) > maxBytes {
 		LogWarn(MsgLogTelegramPayloadTooLarge, FieldBytes, len(text))
 		return false
 	}

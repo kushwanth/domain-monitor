@@ -402,6 +402,7 @@ func TestInitializeApp_ResolverResilience(t *testing.T) {
 		wantNotifier  bool
 	}{
 		{name: "none"},
+		{name: "incomplete telegram", notifications: Notifications{Telegram: &TelegramConfig{Token: "token"}}},
 		{name: "ntfy", notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}}, wantNotifier: true},
 		{name: "telegram", notifications: Notifications{Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, wantNotifier: true},
 	} {
@@ -980,7 +981,7 @@ func TestEndpointAndProviderValidation(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsIncompleteNotifications(t *testing.T) {
+func TestLoadConfigRejectsInvalidEndpoints(t *testing.T) {
 	t.Setenv(EnvPort, "")
 	t.Setenv(EnvTelegramToken, "")
 	t.Setenv(EnvTelegramChatID, "")
@@ -990,7 +991,7 @@ func TestLoadConfigRejectsIncompleteNotifications(t *testing.T) {
 		body string
 	}{
 		{"bad port", `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"port":"0"}`},
-		{"ntfy without URL", `{"notifications":{"ntfy":{"auth":"token"}}}`},
+		{"invalid ntfy URL", `{"notifications":{"ntfy":{"url":"ftp://ntfy.invalid/topic"}}}`},
 		{"bad DoH URL", `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"doh_url":"ftp://dns.example.com"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1002,14 +1003,14 @@ func TestLoadConfigRejectsIncompleteNotifications(t *testing.T) {
 	}
 }
 
-func TestRequiredNtfyAndOptionalTelegram(t *testing.T) {
+func TestOptionalNtfyAndTelegram(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		notifications Notifications
 		wantError     bool
 	}{
-		{"missing ntfy", Notifications{}, true},
-		{"telegram only", Notifications{Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, true},
+		{"missing ntfy", Notifications{}, false},
+		{"telegram only", Notifications{Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, false},
 		{"ntfy only", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}}, false},
 		{"both", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, false},
 		{"incomplete telegram", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token"}}, false},
@@ -1156,6 +1157,53 @@ func TestOptionalTelegramDoesNotBlockNtfyStartup(t *testing.T) {
 			require.True(t, ok)
 			assert.Equal(t, "https://ntfy.invalid/topic", notifier.NtfyURL)
 			assert.Equal(t, tc.wantTelegram, notifier.TelegramToken != "" && notifier.TelegramChatID != "")
+		})
+	}
+}
+
+func TestOptionalNotificationProvidersLoadAndInitialize(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, ntfyAuthEnv, tokenEnv, chatEnv string
+		wantNtfy, wantTelegram                     bool
+		wantErr                                    string
+	}{
+		{name: "omitted", body: `{}`},
+		{name: "empty object", body: `{"notifications":{}}`},
+		{name: "empty ntfy", body: `{"notifications":{"ntfy":{}}}`},
+		{name: "whitespace ntfy", body: `{"notifications":{"ntfy":{"url":"  "}}}`},
+		{name: "ntfy auth only", body: `{}`, ntfyAuthEnv: "secret"},
+		{name: "partial telegram", body: `{"notifications":{"telegram":{"token":"token"}}}`},
+		{name: "telegram only", body: `{"notifications":{"telegram":{"token":"token","chat_id":"chat"}}}`, wantTelegram: true},
+		{name: "telegram from environment", body: `{}`, tokenEnv: "token", chatEnv: "chat", wantTelegram: true},
+		{name: "telegram config and environment", body: `{"notifications":{"telegram":{"token":"token"}}}`, chatEnv: "chat", wantTelegram: true},
+		{name: "ntfy only", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}}}`, wantNtfy: true},
+		{name: "both", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"},"telegram":{"token":"token","chat_id":"chat"}}}`, wantNtfy: true, wantTelegram: true},
+		{name: "invalid ntfy URL", body: `{"notifications":{"ntfy":{"url":"not-a-url"}}}`, wantErr: "invalid ntfy"},
+		{name: "authenticated HTTP ntfy", body: `{"notifications":{"ntfy":{"url":"http://ntfy.invalid/topic","auth":"secret"}}}`, wantErr: "authenticated ntfy requires HTTPS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(EnvNtfyAuth, tc.ntfyAuthEnv)
+			t.Setenv(EnvTelegramToken, tc.tokenEnv)
+			t.Setenv(EnvTelegramChatID, tc.chatEnv)
+			cfg, err := loadConfig(context.Background(), "unused", func(string) ([]byte, error) {
+				return []byte(tc.body), nil
+			})
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantNtfy, cfg.Notifications.Ntfy != nil)
+			assert.Equal(t, tc.wantTelegram, cfg.Notifications.Telegram != nil)
+
+			app, err := InitializeApp(context.Background(), cfg)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantNtfy || tc.wantTelegram, app.Notifier != nil)
+			if app.Notifier != nil {
+				notifier := app.Notifier.(*NotificationManager)
+				assert.Equal(t, tc.wantNtfy, notifier.NtfyURL != "")
+				assert.Equal(t, tc.wantTelegram, notifier.TelegramToken != "" && notifier.TelegramChatID != "")
+			}
 		})
 	}
 }

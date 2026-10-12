@@ -155,7 +155,7 @@ func retryBackoff(attempt int, base time.Duration) time.Duration {
 
 func retryWithBackoff[T any](ctx context.Context, operation string, baseDelay time.Duration, attemptFn func(int) (T, bool, time.Duration, error)) (T, error) {
 	var zero T
-	for attempt := 1; attempt <= MaxNetworkAttempts; attempt++ {
+	for attempt := 1; ; attempt++ {
 		value, retry, serverDelay, err := attemptFn(attempt)
 		if !retry || attempt == MaxNetworkAttempts {
 			return value, err
@@ -182,7 +182,6 @@ func retryWithBackoff[T any](ctx context.Context, operation string, baseDelay ti
 		case <-timer.C:
 		}
 	}
-	return zero, ctx.Err()
 }
 
 func retryableHTTPStatus(status int) bool {
@@ -204,9 +203,13 @@ func responseRetryAfter(response *http.Response, now time.Time) time.Duration {
 	return 0
 }
 
-func transientNetworkError(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+func transientNetworkError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false
+	}
+	// A client or per-query timeout is retryable while the enclosing cycle is live.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	var networkError net.Error
 	return errors.As(err, &networkError)
@@ -239,7 +242,7 @@ func doHTTPWithRetry(ctx context.Context, operation string, client HTTPDoer, pol
 			if response != nil {
 				DrainAndClose(response.Body, MaxBodyDrainSize)
 			}
-			return nil, policy == RetryHTTPTransient && transientNetworkError(err), 0, err
+			return nil, policy == RetryHTTPTransient && transientNetworkError(ctx, err), 0, err
 		}
 		if !retryableHTTPStatus(response.StatusCode) || attempt == MaxNetworkAttempts {
 			return response, false, 0, nil

@@ -152,7 +152,11 @@ func NewNotificationHTTPClient(timeout time.Duration) *http.Client {
 }
 
 func cloneDefaultTransport() *http.Transport {
-	transport, ok := http.DefaultTransport.(*http.Transport)
+	return cloneTransport(http.DefaultTransport)
+}
+
+func cloneTransport(source http.RoundTripper) *http.Transport {
+	transport, ok := source.(*http.Transport)
 	if !ok || transport == nil {
 		return &http.Transport{}
 	}

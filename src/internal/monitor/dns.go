@@ -122,14 +122,21 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 }
 
 // queryDNS retains two independent recursive observations when two global
-// resolvers are available. A custom/single resolver remains authoritative for
-// that configured check and is queried alone.
+// resolvers are available. Failed observations can use additional configured
+// resolvers, but a result still requires two distinct successful observations.
+// A custom/single resolver remains authoritative and is queried alone.
 func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) ([]string, error) {
 	if len(resolvers) < 2 {
 		return queryDNSOne(ctx, app, hostname, qtype, resolvers)
 	}
-	first, firstErr := queryDNSOne(ctx, app, hostname, qtype, resolvers[:1])
-	second, secondErr := queryDNSOne(ctx, app, hostname, qtype, resolvers[1:2])
+	observations, selected := collectDNSObservations(resolvers, 2, func(resolver string) ([]string, error) {
+		return queryDNSOne(ctx, app, hostname, qtype, []string{resolver})
+	})
+	if len(selected) < 2 {
+		return nil, fmt.Errorf(MsgErrIncompleteResolverEvidence, incompleteResolverCause(observationErrors(observations)...))
+	}
+	first, second := selected[0].Records, selected[1].Records
+	firstErr, secondErr := selected[0].Err, selected[1].Err
 	if firstErr != nil || secondErr != nil {
 		if errors.Is(firstErr, ErrNXDOMAIN) && errors.Is(secondErr, ErrNXDOMAIN) {
 			return nil, errors.Join(firstErr, secondErr)
@@ -146,12 +153,51 @@ func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16,
 	return first, nil
 }
 
+// collectDNSObservations retains failed attempts for diagnostics and selects
+// only usable, distinct resolver observations for comparison.
+func collectDNSObservations(resolvers []string, needed int, lookup func(string) ([]string, error)) ([]DNSObservation, []DNSObservation) {
+	observations := make([]DNSObservation, 0, min(len(resolvers), MaxNetworkAttempts))
+	selected := make([]DNSObservation, 0, needed)
+	seen := make(stringSet, len(resolvers))
+	for _, resolver := range resolvers {
+		endpoint := strings.ToLower(DefaultPort(resolver, DefaultDNSPort))
+		if _, exists := seen[endpoint]; exists {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		if len(observations) == MaxNetworkAttempts {
+			break
+		}
+		records, err := lookup(resolver)
+		observation := DNSObservation{Resolver: resolver, Records: records, Err: err}
+		observations = append(observations, observation)
+		if err == nil || errors.Is(err, ErrNXDOMAIN) {
+			selected = append(selected, observation)
+			if len(selected) == needed {
+				break
+			}
+		}
+	}
+	return observations, selected
+}
+
+func observationErrors(observations []DNSObservation) []error {
+	errs := make([]error, 0, len(observations))
+	for _, observation := range observations {
+		errs = append(errs, observation.Err)
+	}
+	return errs
+}
+
 // incompleteResolverCause preserves actionable resolver failures without
 // allowing one resolver's NXDOMAIN to masquerade as unanimous absence.
-func incompleteResolverCause(firstErr, secondErr error) error {
-	joined := errors.Join(firstErr, secondErr)
+func incompleteResolverCause(observationErrors ...error) error {
+	joined := errors.Join(observationErrors...)
+	if joined == nil {
+		return errors.New("fewer than two distinct resolver observations")
+	}
 	var actionable []error
-	for _, err := range []error{firstErr, secondErr} {
+	for _, err := range observationErrors {
 		if err != nil && !errors.Is(err, ErrNXDOMAIN) {
 			actionable = append(actionable, err)
 		}
@@ -165,7 +211,11 @@ func incompleteResolverCause(firstErr, secondErr error) error {
 // queryDNSOne queries the supplied resolver set and returns parsed string results.
 // It bypasses the OS resolver completely and forces a direct UDP/TCP connection.
 func queryDNSOne(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) ([]string, error) {
-	r, err := queryDNSMsg(ctx, app, hostname, qtype, resolvers)
+	return queryDNSOneWithQuery(ctx, app, hostname, qtype, resolvers, queryDNSMsg)
+}
+
+func queryDNSOneWithQuery(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string, query func(context.Context, *AppState, string, uint16, []string) (*dns.Msg, error)) ([]string, error) {
+	r, err := query(ctx, app, hostname, qtype, resolvers)
 	if err != nil {
 		return nil, err
 	}
@@ -304,6 +354,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	dsResp, err := queryDNSMsg(ctx, app, domain, dns.TypeDS, resolvers)
 	if err != nil {
 		res.Valid = false
+		res.NetworkError = !errors.Is(err, ErrNXDOMAIN)
 		res.Error = fmt.Sprintf(MsgErrDSQueryFailed, err.Error())
 		return res
 	}
@@ -322,6 +373,7 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	keyResp, err := queryDNSMsg(ctx, app, domain, dns.TypeDNSKEY, resolvers)
 	if err != nil {
 		res.Valid = false
+		res.NetworkError = !errors.Is(err, ErrNXDOMAIN)
 		res.Error = fmt.Sprintf(MsgErrDNSKEYQueryFailed, err.Error())
 		return res
 	}
@@ -417,7 +469,10 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	} else {
 		res.Source = DNSSECSourceLocalOnly
 	}
+	return finalizeDNSSECResult(res)
+}
 
+func finalizeDNSSECResult(res DNSSECResult) DNSSECResult {
 	switch {
 	case res.HasDS && res.HasDNSKEY && res.DSMatchesDNSKEY && res.RRSIGValid:
 		switch {
@@ -449,6 +504,24 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 }
 
 func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn string, authenticatedKSKs ...*dns.DNSKEY) bool {
+	return verifyDNSSECDoHWith(ctx, app, endpoint, domain, fqdn, dnssecDoHDependencies{
+		newRequest: func(ctx context.Context, rawURL string) (*http.Request, error) {
+			return http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		},
+		fetch: func(ctx context.Context, client HTTPDoer, requestFn func() (*http.Request, error)) (*http.Response, error) {
+			return doHTTPWithRetry(ctx, NameOpDNSSECDoH, client, RetryHTTPTransient, requestFn)
+		},
+		parseRR: dns.NewRR,
+	}, authenticatedKSKs...)
+}
+
+type dnssecDoHDependencies struct {
+	newRequest func(context.Context, string) (*http.Request, error)
+	fetch      func(context.Context, HTTPDoer, func() (*http.Request, error)) (*http.Response, error)
+	parseRR    func(string) (dns.RR, error)
+}
+
+func verifyDNSSECDoHWith(ctx context.Context, app *AppState, endpoint, domain, fqdn string, dependencies dnssecDoHDependencies, authenticatedKSKs ...*dns.DNSKEY) bool {
 	if app == nil || ResolveHTTPClient(app.Clients.Public) == nil {
 		return false
 	}
@@ -461,8 +534,8 @@ func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn 
 	query.Set(ParamType, RecordTypeDNSKEY)
 	query.Set(ParamDO, ParamDOValue)
 	u.RawQuery = query.Encode()
-	resp, err := doHTTPWithRetry(ctx, NameOpDNSSECDoH, app.Clients.Public, RetryHTTPTransient, func() (*http.Request, error) {
-		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	resp, err := dependencies.fetch(ctx, app.Clients.Public, func() (*http.Request, error) {
+		req, requestErr := dependencies.newRequest(ctx, u.String())
 		if requestErr != nil {
 			return nil, requestErr
 		}
@@ -501,7 +574,7 @@ func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn 
 		if answer.Type != int(dns.TypeDNSKEY) || !strings.EqualFold(dns.Fqdn(answer.Name), fqdn) {
 			continue
 		}
-		rr, err := dns.NewRR(fmt.Sprintf(StrS0InDnskey, answer.Name, answer.Data))
+		rr, err := dependencies.parseRR(fmt.Sprintf(StrS0InDnskey, answer.Name, answer.Data))
 		if err != nil {
 			continue
 		}
@@ -584,24 +657,25 @@ func FetchDNSSnapshot(ctx context.Context, app *AppState, target DNSTask) DNSSna
 	if target.CustomResolver == StrEmpty && len(resolvers) > 1 {
 		observationCount = 2
 	}
-	observations := make([]DNSObservation, 0, observationCount)
-	for _, resolver := range resolvers[:observationCount] {
-		records, err := resolveTargetWithResolvers(ctx, app, target, []string{resolver})
-		observations = append(observations, DNSObservation{Resolver: resolver, Records: records, Err: err})
-	}
+	observations, selected := collectDNSObservations(resolvers, observationCount, func(resolver string) ([]string, error) {
+		return resolveTargetWithResolvers(ctx, app, target, []string{resolver})
+	})
 	foundRecords, err := observations[0].Records, observations[0].Err
-	if len(observations) == 2 {
+	if observationCount == 2 && len(selected) < 2 {
+		err = fmt.Errorf(MsgErrIncompleteResolverEvidence, incompleteResolverCause(observationErrors(observations)...))
+	} else if len(selected) == 2 {
 		switch {
-		case observations[0].Err != nil || observations[1].Err != nil:
-			if errors.Is(observations[0].Err, ErrNXDOMAIN) && errors.Is(observations[1].Err, ErrNXDOMAIN) {
-				err = errors.Join(observations[0].Err, observations[1].Err)
+		case selected[0].Err != nil || selected[1].Err != nil:
+			if errors.Is(selected[0].Err, ErrNXDOMAIN) && errors.Is(selected[1].Err, ErrNXDOMAIN) {
+				err = errors.Join(selected[0].Err, selected[1].Err)
 			} else {
-				err = fmt.Errorf(MsgErrIncompleteResolverEvidence, incompleteResolverCause(observations[0].Err, observations[1].Err))
+				err = fmt.Errorf(MsgErrIncompleteResolverEvidence, incompleteResolverCause(selected[0].Err, selected[1].Err))
 			}
-		case !slices.Equal(observations[0].Records, observations[1].Records):
-			err = fmt.Errorf(MsgErrResolverDisagreement, observations[0].Resolver, observations[1].Resolver)
+		case !slices.Equal(selected[0].Records, selected[1].Records):
+			err = fmt.Errorf(MsgErrResolverDisagreement, selected[0].Resolver, selected[1].Resolver)
 		default:
-			foundRecords = observations[0].Records
+			foundRecords = selected[0].Records
+			err = nil
 		}
 	}
 	snap := DNSSnapshot{
@@ -1377,6 +1451,7 @@ func FetchNSSnapshot(ctx context.Context, app *AppState, nameserver NameserverCo
 	srv := NSSnapshot{Nameserver: nameserver.Hostname, Hidden: nameserver.Hidden}
 	addresses, partial, err := resolveNSAddresses(ctx, app, nameserver.Hostname)
 	srv.PartialError = partial
+	srv.AddressLookupUnavailable = partial != nil && !errors.Is(partial, ErrNXDOMAIN)
 	if err != nil {
 		srv.Err, srv.Unreachable = err, true
 		return srv
@@ -1409,7 +1484,11 @@ func FetchNSSnapshot(ctx context.Context, app *AppState, nameserver NameserverCo
 }
 
 func resolveNSAddresses(ctx context.Context, app *AppState, name string) ([]string, error, error) {
-	host, port, err := net.SplitHostPort(DefaultPort(name, DefaultDNSPort))
+	return resolveNSAddressesWithPort(ctx, app, name, DefaultPort)
+}
+
+func resolveNSAddressesWithPort(ctx context.Context, app *AppState, name string, defaultPort func(string, string) string) ([]string, error, error) {
+	host, port, err := net.SplitHostPort(defaultPort(name, DefaultDNSPort))
 	if err != nil {
 		return nil, nil, WrapError(fmt.Sprintf(MsgErrInvalidNSAddress, name), err)
 	}
@@ -1435,11 +1514,15 @@ func resolveNSAddresses(ctx context.Context, app *AppState, name string) ([]stri
 }
 
 func selectNSSOA(ctx context.Context, app *AppState, domain string, addresses []string) (*dns.Msg, string, error) {
+	return selectNSSOAWithQuery(ctx, app, domain, addresses, queryDNSMsgWithRD)
+}
+
+func selectNSSOAWithQuery(ctx context.Context, app *AppState, domain string, addresses []string, query func(context.Context, *AppState, string, uint16, []string, bool) (*dns.Msg, error)) (*dns.Msg, string, error) {
 	var firstResponse *dns.Msg
 	var firstAddress string
 	var partial error
 	for _, address := range addresses[:min(len(addresses), MaxNetworkAttempts)] {
-		response, err := queryDNSMsgWithRD(ctx, app, domain, dns.TypeSOA, []string{address}, false)
+		response, err := query(ctx, app, domain, dns.TypeSOA, []string{address}, false)
 		if err == nil && response != nil {
 			if firstResponse == nil {
 				firstResponse, firstAddress = response, address
@@ -1490,7 +1573,11 @@ func findSOAForDomain(message *dns.Msg, domain string) (*dns.SOA, bool) {
 }
 
 func fetchNSDNSKEY(ctx context.Context, app *AppState, domain, address string, srv *NSSnapshot) {
-	message, err := queryDNSMsgWithRD(ctx, app, domain, dns.TypeDNSKEY, []string{address}, false)
+	fetchNSDNSKEYWithQuery(ctx, app, domain, address, srv, queryDNSMsgWithRD)
+}
+
+func fetchNSDNSKEYWithQuery(ctx context.Context, app *AppState, domain, address string, srv *NSSnapshot, query func(context.Context, *AppState, string, uint16, []string, bool) (*dns.Msg, error)) {
+	message, err := query(ctx, app, domain, dns.TypeDNSKEY, []string{address}, false)
 	if err != nil || message == nil {
 		if err == nil {
 			err = fmt.Errorf(MsgErrNilDnskeyResponseFor, domain)

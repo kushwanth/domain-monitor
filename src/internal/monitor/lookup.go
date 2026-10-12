@@ -646,12 +646,16 @@ func extractRDAPDomainTier(domainInfo *RDAPDomainResponse, source string, server
 
 // extractWHOISTier extracts a DomainTierData from raw WHOIS output.
 func extractWHOISTier(raw string, source string, server string) *DomainTierData {
+	return extractWHOISTierWithParser(raw, source, server, whoisparser.Parse)
+}
+
+func extractWHOISTierWithParser(raw string, source string, server string, parse func(string) (whoisparser.WhoisInfo, error)) *DomainTierData {
 	tier := &DomainTierData{
 		Source: source,
 		Server: server,
 	}
 
-	parsed, parseErr := whoisparser.Parse(raw)
+	parsed, parseErr := parse(raw)
 	if parseErr == nil && parsed.Registrar != nil && parsed.Registrar.Name != StrEmpty {
 		tier.Registrar = parsed.Registrar.Name
 		tier.IANAID = parsed.Registrar.ID
@@ -661,31 +665,19 @@ func extractWHOISTier(raw string, source string, server string) *DomainTierData 
 		if parsed.Domain.ExpirationDateInTime != nil {
 			tier.Expiration = parsed.Domain.ExpirationDateInTime.UTC().Format(time.RFC3339)
 		} else if parsed.Domain.ExpirationDate != StrEmpty {
-			if _, norm, err := parseFlexibleDate(parsed.Domain.ExpirationDate); err == nil {
-				tier.Expiration = norm
-			} else {
-				tier.Expiration = parsed.Domain.ExpirationDate
-			}
+			tier.Expiration = normalizedWHOISDate(parsed.Domain.ExpirationDate)
 		}
 
 		if parsed.Domain.CreatedDateInTime != nil {
 			tier.Created = parsed.Domain.CreatedDateInTime.UTC().Format(time.RFC3339)
 		} else if parsed.Domain.CreatedDate != StrEmpty {
-			if _, norm, err := parseFlexibleDate(parsed.Domain.CreatedDate); err == nil {
-				tier.Created = norm
-			} else {
-				tier.Created = parsed.Domain.CreatedDate
-			}
+			tier.Created = normalizedWHOISDate(parsed.Domain.CreatedDate)
 		}
 
 		if parsed.Domain.UpdatedDateInTime != nil {
 			tier.Updated = parsed.Domain.UpdatedDateInTime.UTC().Format(time.RFC3339)
 		} else if parsed.Domain.UpdatedDate != StrEmpty {
-			if _, norm, err := parseFlexibleDate(parsed.Domain.UpdatedDate); err == nil {
-				tier.Updated = norm
-			} else {
-				tier.Updated = parsed.Domain.UpdatedDate
-			}
+			tier.Updated = normalizedWHOISDate(parsed.Domain.UpdatedDate)
 		}
 
 		tier.DomainStatus = NormalizeDomainStatuses(parsed.Domain.Status)
@@ -791,6 +783,13 @@ func extractWHOISTier(raw string, source string, server string) *DomainTierData 
 		}
 	}
 	return tier
+}
+
+func normalizedWHOISDate(value string) string {
+	if _, normalized, err := parseFlexibleDate(value); err == nil {
+		return normalized
+	}
+	return value
 }
 
 func isWHOISDNSSECSigned(value string) bool {
@@ -1092,7 +1091,7 @@ func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain s
 			if resp != nil {
 				DrainAndClose(resp.Body, MaxBodyDrainSize)
 			}
-			return RDAPSnapshot{}, transientNetworkError(err), 0, err
+			return RDAPSnapshot{}, transientNetworkError(ctx, err), 0, err
 		}
 		if retryableHTTPStatus(resp.StatusCode) && attempt < MaxNetworkAttempts {
 			delay := responseRetryAfter(resp, time.Now())
@@ -1286,7 +1285,7 @@ func followRegistrarRDAPLinks(ctx context.Context, domain string, links []string
 			if relResp != nil {
 				DrainAndClose(relResp.Body, MaxBodyDrainSize)
 			}
-			return nil, transientNetworkError(err), 0, err
+			return nil, transientNetworkError(ctx, err), 0, err
 		}
 		if relResp.StatusCode != http.StatusOK {
 			delay := responseRetryAfter(relResp, time.Now())
@@ -1402,7 +1401,7 @@ func queryWHOISWithRetry(ctx context.Context, app *AppState, domain, server, ope
 
 		if queryErr != nil && attemptResult == StrEmpty {
 			wrapped := WrapError(MsgErrWHOISQueryFailed, queryErr)
-			return StrEmpty, transientNetworkError(queryErr), 0, wrapped
+			return StrEmpty, transientNetworkError(ctx, queryErr), 0, wrapped
 		}
 
 		if !isWHOISRateLimited(attemptResult, queryErr) {

@@ -265,6 +265,38 @@ func TestPricingCatalogRefreshKeepsExistingReadersStable(t *testing.T) {
 	assert.Equal(t, int32(2), requests.Load())
 }
 
+func TestPricingCatalogConcurrentRefreshUsesOnlyAcceptablyStaleData(t *testing.T) {
+	manager := NewPricingManager(&MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"tlds":[{"tld":"com","renewal":24}]}`))}, nil
+	}})
+	old := &pricingCatalog{prices: map[string]float64{"com": 12}, fetchedAt: time.Now().Add(-2 * PricingCacheTTL)}
+	manager.catalog = old
+	manager.fetchMu.Lock()
+	got, err := manager.cachedCatalog(context.Background())
+	require.NoError(t, err)
+	require.Same(t, old, got, "readers should use an acceptably stale snapshot during refresh")
+	manager.fetchMu.Unlock()
+
+	manager.catalog = &pricingCatalog{prices: old.prices, fetchedAt: time.Now().Add(-PricingMaxStaleAge - time.Hour)}
+	manager.fetchMu.Lock()
+	type result struct {
+		catalog *pricingCatalog
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		catalog, err := manager.cachedCatalog(context.Background())
+		done <- result{catalog: catalog, err: err}
+	}()
+	manager.fetchMu.Unlock()
+	res := <-done
+	require.NoError(t, res.err)
+	require.NotSame(t, old, res.catalog)
+	price, ok := res.catalog.price("com")
+	require.True(t, ok)
+	require.Equal(t, float64(24), price)
+}
+
 func BenchmarkPricingCatalogRead(b *testing.B) {
 	prices := make(map[string]float64, 2000)
 	for i := range 2000 {

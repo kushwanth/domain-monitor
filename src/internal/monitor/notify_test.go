@@ -66,6 +66,12 @@ func TestNotificationManager(t *testing.T) {
 	}
 }
 
+func TestNotificationManagerSkipsIncompleteTelegram(t *testing.T) {
+	nm := NewNotificationManager("", "", "token", "")
+	nm.Dispatch("alert", "redacted", PriorityHigh, "", "example.com", "Example")
+	require.Empty(t, nm.takeAlertBatch())
+}
+
 func TestNotificationManager_PriorityLogging(t *testing.T) {
 	t.Parallel()
 
@@ -296,19 +302,64 @@ func TestNotificationFormattingAndPayloadLimits(t *testing.T) {
 	}
 }
 
+func TestNotificationSortsEqualPriorityByCheckAndDomain(t *testing.T) {
+	alerts := []Alert{
+		{Priority: PriorityHigh, Check: "z", Domain: "z.example", Name: "z"},
+		{Priority: PriorityHigh, Check: "a", Domain: "z.example", Name: "z"},
+		{Priority: PriorityHigh, Check: "a", Domain: "a.example", Name: "z"},
+		{Priority: PriorityHigh, Check: "a", Domain: "a.example", Name: "a"},
+	}
+	sortAlerts(alerts)
+	require.Equal(t, []string{"a", "z", "z", "z"}, []string{alerts[0].Name, alerts[1].Name, alerts[2].Name, alerts[3].Name})
+	require.Equal(t, []string{"a.example", "a.example", "z.example", "z.example"}, []string{alerts[0].Domain, alerts[1].Domain, alerts[2].Domain, alerts[3].Domain})
+}
+
+func TestTelegramRejectsInvalidUTF8ChatID(t *testing.T) {
+	nm := NewNotificationManager("", "", "token", string([]byte{0xff}))
+	nm.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		t.Fatal("invalid payload must not be sent")
+		return nil, nil
+	}}
+	if nm.sendTelegramBatchContext(context.Background(), Alert{Message: "alert"}) {
+		t.Fatal("invalid UTF-8 payload was accepted")
+	}
+}
+
+func TestTelegramRejectsPayloadOverConfiguredByteLimit(t *testing.T) {
+	nm := NewNotificationManager("", "", "token", "chat")
+	nm.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
+		t.Fatal("oversized payload must not be sent")
+		return nil, nil
+	}}
+	if nm.sendTelegramBatchContextLimit(context.Background(), Alert{Message: "alert"}, 8) {
+		t.Fatal("oversized payload was accepted")
+	}
+}
+
+func TestTelegramRedactsDomainInMessage(t *testing.T) {
+	message := formatTelegramMessage(Alert{Message: "example.com changed", Domain: "example.com", Name: "Example"})
+	require.NotContains(t, message, "example.com")
+	require.Contains(t, message, "Example changed")
+	message = formatTelegramMessage(Alert{Message: "example.com changed", Domain: "example.com"})
+	require.NotContains(t, message, "example.com")
+	require.Contains(t, message, RedactedDomainPlaceholder)
+}
+
 func TestNotificationFlushPriorityAndIndependentAttempts(t *testing.T) {
 	for range 2 {
 		nm := NewNotificationManager("https://ntfy.invalid/topic", "", "token", "chat")
 		var previous context.Context
+		var previousHost string
 		var attempts []string
 		nm.HTTPClient = &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
-			if previous != nil && previous.Err() == nil {
-				t.Error("previous attempt context was not canceled before next delivery")
+			if previous != nil && previousHost != req.URL.Host && previous.Err() == nil {
+				t.Error("previous provider context was not canceled before next delivery")
 			}
 			if req.Context().Err() != nil {
 				t.Error("previous failure canceled a subsequent attempt")
 			}
 			previous = req.Context()
+			previousHost = req.URL.Host
 			if req.URL.Host == "ntfy.invalid" {
 				body, err := io.ReadAll(req.Body)
 				if err != nil {
@@ -324,7 +375,11 @@ func TestNotificationFlushPriorityAndIndependentAttempts(t *testing.T) {
 			nm.Dispatch(alert.Message, "", alert.Priority, "", "", "")
 		}
 		nm.FlushContext(context.Background())
-		want := []string{"urgent\ncritical\ncritical second\nwarning", "telegram"}
+		want := make([]string, MaxNetworkAttempts+1)
+		for index := range MaxNetworkAttempts {
+			want[index] = "urgent\ncritical\ncritical second\nwarning"
+		}
+		want[MaxNetworkAttempts] = "telegram"
 		if !slices.Equal(attempts, want) {
 			t.Errorf("delivery order = %v, want %v", attempts, want)
 		}

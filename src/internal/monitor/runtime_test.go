@@ -30,6 +30,37 @@ func executeFastChecksForTest(ctx context.Context, app *AppState, cfg AppConfig,
 	evaluateFastEvidence(app.EmailProviders, cfg, active, evidence, state)
 }
 
+func TestLookupAvailabilityDistinguishesNetworkFailureFromDomainFinding(t *testing.T) {
+	record := DNSTask{Hostname: "example.com", Name: "web", Type: RecordTypeA, Expected: []string{"192.0.2.10"}}
+	failed := evaluateDNSCheck(record, DNSSnapshot{Err: context.DeadlineExceeded})
+	assert.Equal(t, StatusFailed, failed.State.Status)
+	assert.True(t, failed.State.Unavailable)
+
+	notFound := evaluateDNSCheck(record, DNSSnapshot{Err: ErrNXDOMAIN})
+	assert.Equal(t, StatusFailed, notFound.State.Status)
+	assert.False(t, notFound.State.Unavailable)
+
+	rdapUnavailable := evaluateRDAPCheck(DomainConfig{Domain: "example.com"}, RDAPSnapshot{Err: context.DeadlineExceeded})
+	assert.True(t, rdapUnavailable.Unavailable)
+	rdapNotFound := evaluateRDAPCheck(DomainConfig{Domain: "example.com"}, RDAPSnapshot{Err: ErrDomainNotFound})
+	assert.False(t, rdapNotFound.Unavailable)
+}
+
+func TestNameserverAddressLookupOutageIsUnavailable(t *testing.T) {
+	domain := DomainConfig{Domain: "example.com", Nameservers: []NameserverConfig{{Hostname: "ns1.example.com"}, {Hostname: "ns2.example.com"}}}
+	state := &CheckState{NSHealth: make(map[string]NSHealthResult)}
+	evidence := domainEvidence{nsHealth: []NSSnapshot{
+		{Nameserver: "ns1.example.com", Unreachable: true, AddressLookupUnavailable: true, PartialError: context.DeadlineExceeded},
+		{Nameserver: "ns2.example.com", Authoritative: true, HasSOA: true, SOASerial: 10},
+	}}
+	evaluateFastDomainChecks(nil, domain, evidence, state)
+	assert.True(t, state.NSHealth[domain.Domain].Unavailable)
+
+	evidence.nsHealth[0].AddressLookupUnavailable = false
+	evaluateFastDomainChecks(nil, domain, evidence, state)
+	assert.False(t, state.NSHealth[domain.Domain].Unavailable)
+}
+
 func executeRateLimitedChecksForTest(ctx context.Context, app *AppState, domains []DomainConfig, active []int, client *http.Client, state *CheckState) {
 	evidence := cycleEvidence{rdap: make([]RDAPSnapshot, len(active))}
 	gatherRateLimitedEvidence(ctx, app, domains, active, client, &evidence)
