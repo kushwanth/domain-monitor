@@ -441,11 +441,11 @@ func TestWHOISStatusNormalizesAliasesAndInvalidFragments(t *testing.T) {
 	require.Empty(t, normalizeEPPStatus("()"))
 	require.Equal(t, "unknownExtension", normalizeEPPStatus("https://example.com/epp#unknownExtension"))
 	require.Equal(t, "https://example.com/epp#bad/path", normalizeEPPStatus("https://example.com/epp#bad/path"))
-	require.True(t, isTransferLocked([]string{StrTransferlock}))
+	require.True(t, isTransferLocked([]string{EPPTokenTransferLock}))
 	for generic, specific := range map[string]string{
-		StrUpdateprohibited: StrServerupdateprohibited,
-		StrRenewprohibited:  StrServerrenewprohibited,
-		StrHold:             StrServerhold,
+		EPPTokenUpdateProhibited: EPPTokenServerUpdateProhibited,
+		EPPTokenRenewProhibited:  EPPTokenServerRenewProhibited,
+		StrHold:                  EPPTokenServerHold,
 	} {
 		result := NormalizeDomainStatuses([]string{generic, specific})
 		require.Len(t, result, 1)

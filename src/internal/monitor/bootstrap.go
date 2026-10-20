@@ -306,7 +306,7 @@ func (b *Bootstrap) fetch(ctx context.Context) error {
 func bootstrapServices(registry dnsRegistry) map[string][]string {
 	services := make(map[string][]string)
 	for _, serviceEntry := range registry.Services {
-		if len(serviceEntry) < 2 {
+		if len(serviceEntry) < BootstrapServiceEntryFields {
 			continue
 		}
 		var validURLs []string

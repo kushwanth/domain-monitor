@@ -1,5 +1,5 @@
 # Stage 1: Build a static binary for the target platform.
-FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS base
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS base
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

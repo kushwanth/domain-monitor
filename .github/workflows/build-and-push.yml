@@ -2,15 +2,50 @@ name: CI/CD
 run-name: ${{ github.event.head_commit.message || github.ref_name }}
 on:
   push:
+    branches: [ main ]
     tags: [ 'v*.*.*' ]
+  pull_request:
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
+  quality:
+    name: Go quality checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Format
+        run: test -z "$(gofmt -l src)"
+      - name: Test with race detection and coverage reporting
+        run: go test -race -cover ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Diff hygiene
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            git diff --check "$(git merge-base HEAD origin/main)" HEAD
+          else
+            git show --format= --check HEAD
+          fi
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+
   build-and-push:
     name: Build Container Image
     if: github.ref_type == 'tag'
+    needs: quality
     runs-on: ubuntu-latest
     permissions:
       contents: read

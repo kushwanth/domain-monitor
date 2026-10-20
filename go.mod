@@ -1,6 +1,6 @@
 module domain_monitor
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/likexian/gokit v0.25.16 // indirect

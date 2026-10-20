@@ -12,6 +12,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1200,7 +1201,8 @@ func TestOptionalNotificationProvidersLoadAndInitialize(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantNtfy || tc.wantTelegram, app.Notifier != nil)
 			if app.Notifier != nil {
-				notifier := app.Notifier.(*NotificationManager)
+				notifier, ok := app.Notifier.(*NotificationManager)
+				require.True(t, ok)
 				assert.Equal(t, tc.wantNtfy, notifier.NtfyURL != "")
 				assert.Equal(t, tc.wantTelegram, notifier.TelegramToken != "" && notifier.TelegramChatID != "")
 			}
@@ -1226,6 +1228,14 @@ func TestNormalizeExpectedDNSValue_CAA(t *testing.T) {
 	val, err = normalizeExpectedDNSValue(DNSTask{Type: RecordTypeCAA, Hostname: "example.com"}, `0 ISSUE "LETSENCRYPT.ORG; account=AbC123"`)
 	require.NoError(t, err)
 	assert.Equal(t, `0 issue "letsencrypt.org; account=AbC123"`, val)
+}
+
+func TestNormalizeExpectedCAAValueRejectsUnexpectedRecordType(t *testing.T) {
+	value, err := normalizeExpectedCAAValue(`0 issue "example.com"`, "example.com", func(string) (dns.RR, error) {
+		return &dns.A{}, nil
+	})
+	require.Empty(t, value)
+	require.ErrorContains(t, err, "unexpected DNS record type")
 }
 
 func TestLoadConfigRejectsRemovedCTFieldBeforeDomainValidation(t *testing.T) {

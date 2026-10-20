@@ -98,6 +98,37 @@ func BenchmarkCycleAssemblyAndPublication(b *testing.B) {
 	}
 }
 
+// BenchmarkConfiguredCycleAssemblyAndPublication measures the sample 5-domain,
+// 8-record workload without network time.
+func BenchmarkConfiguredCycleAssemblyAndPublication(b *testing.B) {
+	domains, rdapResults, emailResults, dnsResults := benchmarkCycleFixture(8)
+	domains = domains[:5]
+	rdapResults = rdapResults[:5]
+	emailResults = emailResults[:5]
+	dnsTasks := make([]DNSTask, len(dnsResults))
+	for i := range dnsTasks {
+		dnsTasks[i].Name = dnsResults[i].Name
+	}
+	cfg := AppConfig{Domains: domains, DNSRecords: dnsTasks}
+	active := activeChecks{domains: benchmarkIndexes(len(domains)), dnsRecords: benchmarkIndexes(len(dnsTasks))}
+	app := NewAppState(AppConfig{})
+	b.ReportAllocs()
+	for b.Loop() {
+		state := newCycleState(cfg, active)
+		benchmarkStoreDNSResults(state, dnsResults)
+		for index, domain := range domains {
+			state.RDAP[domain.Domain] = rdapResults[index]
+			state.Email[domain.Domain] = emailResults[index]
+		}
+		publishCycleState(app, state, time.Hour)
+		benchmarkCycleState = state
+	}
+	if encoded, ok := app.PublishedJSON(); ok {
+		benchmarkPublishedState = encoded
+		b.ReportMetric(float64(len(encoded)), "json_bytes")
+	}
+}
+
 func BenchmarkDNSContainsMatching(b *testing.B) {
 	found := make([]string, 8)
 	expected := make([]string, 8)

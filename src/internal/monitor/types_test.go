@@ -93,9 +93,35 @@ func checkProductionFileConventions(t *testing.T, sourceRoot, path string) {
 		t.Errorf("resolve source path %s: %v", path, err)
 		return
 	}
+	base := filepath.Base(path)
+	for _, declaration := range file.Decls {
+		group, ok := declaration.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		if group.Tok == token.TYPE && base != "types.go" {
+			t.Errorf("type declaration belongs in types.go: %s:%d", relativePath, fileSet.Position(group.Pos()).Line)
+		}
+		if group.Tok == token.CONST && base != "constants.go" {
+			t.Errorf("constant declaration belongs in constants.go: %s:%d", relativePath, fileSet.Position(group.Pos()).Line)
+		}
+	}
+
+	allowedStrings := make(map[token.Pos]bool, len(file.Imports))
+	for _, spec := range file.Imports {
+		allowedStrings[spec.Path.Pos()] = true
+	}
 
 	ast.Inspect(file, func(node ast.Node) bool {
 		switch current := node.(type) {
+		case *ast.Field:
+			if current.Tag != nil {
+				allowedStrings[current.Tag.Pos()] = true
+			}
+		case *ast.BasicLit:
+			if current.Kind == token.STRING && base != "constants.go" && !allowedStrings[current.Pos()] {
+				t.Errorf("production string belongs in constants.go: %s:%d", relativePath, fileSet.Position(current.Pos()).Line)
+			}
 		case *ast.SelectorExpr:
 			identifier, ok := current.X.(*ast.Ident)
 			if !ok {

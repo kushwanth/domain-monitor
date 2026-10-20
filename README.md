@@ -317,6 +317,26 @@ executable entry point, `src/internal/monitor` owns daemon behavior and embedded
 assets, and `src/internal/netpolicy` owns reusable outbound-target policy.
 Maintained project documentation lives under `docs`.
 
+Production Go string values and constants belong in each owning package's
+`constants.go`; types belong in its `types.go`. Go import paths and struct tags
+must remain literals, and tests may use local fixtures. The existing Go AST
+convention test checks these placement rules. Use `PascalCase` for
+exported names, `camelCase` for private names, and Go initialisms such as `DNS`,
+`RDAP`, `ID`, and `URL`. New exported APIs need Go doc comments. New functions
+must stay below the `.golangci.yml` complexity limit of 30; meaningful numeric
+limits must have named constants, as checked by `mnd`. Production functions
+currently have no complexity exceptions. Static protocol tables and registry
+seed data remain grouped in `constants.go` as data literals.
+
+Keep startup configuration read-only after initialization. Workers write only
+their indexed result slots; the cycle builder owns result maps and publishes one
+complete JSON body and ETag atomically. Copy mutable values when returning them
+to callers, bound workers and retained queues, and use mutexes for shared caches.
+Commit alert history and delivery only after a cycle snapshot is published.
+Before changing concurrency or storage, trace ownership and measure the
+configured workload. Source design and data ownership still require code review;
+the formatter, linter, race detector, and coverage gate cannot prove them.
+
 The test suite uses injected clients, local HTTP/DNS fixtures, and a committed
 synthetic WHOIS corpus.
 
@@ -326,17 +346,23 @@ Enable the tracked pre-push hook once per clone:
 git config core.hooksPath .githooks
 ```
 
-Before every push, `.githooks/pre-push` runs formatting, race tests, the
-recommended 90% coverage check, `go vet`, and `revive` as best-effort advisory
-checks; it never blocks a push. On Arch Linux, install its tools with
-`pacman -S go revive`. Release CI remains the strict enforcement boundary and
-applies the complete pinned `.golangci.yml` suite. The scheduler owns an
-injectable clock/timer seam for deterministic lifecycle tests; protocol clients
-and caches still use wall-clock time internally.
+Before every push, `.githooks/pre-push` runs formatting, race tests with coverage
+reporting, `go vet`, and `revive` as best-effort advisory checks; it never blocks
+a push. On Arch Linux, install its tools with `pacman -S go revive`. Run
+`go test -race -cover ./...` locally; coverage is diagnostic, not a release
+percentage target. The thin command entry point calls `os.Exit`, so ordinary
+package tests report no command-package coverage. CI runs the same test command
+on pull requests, `main`, and release tags, alongside formatting, vet, diff
+hygiene, and the pinned `.golangci.yml` lint suite. The
+scheduler owns an injectable clock/timer seam for deterministic lifecycle tests;
+protocol clients and caches still use wall-clock time internally.
 
-Dashboard delivery, API integration, and embedded assets use deterministic
-non-browser tests. Review interactive and visual behavior manually when changing
-the dashboard.
+Configuration through cycle evaluation, API publication, and alert delivery is
+also exercised by a service-flow test. A whole-daemon test starts the scheduler,
+HTTP server, and notification worker from a config file against injected local
+fixtures, then verifies the API, health and dashboard routes, alert delivery,
+and clean shutdown. Review interactive and visual behavior manually when
+changing the dashboard.
 
 Live tests are colocated with their protocol tests and skip unless explicitly
 enabled: `DOMAIN_MONITOR_LIVE=1 go test ./src/internal/monitor -run '^TestLive' -count=1`.
@@ -348,5 +374,5 @@ For parser fuzzing, run `go test -fuzz=FuzzFlexibleDateParsing -fuzztime=30s ./s
 ### Release checks
 
 The local pre-push hook is intentionally advisory. Release tags run the strict
-race, coverage, vet, formatting, diff-hygiene, and lint gates before the
+race, vet, formatting, diff-hygiene, and lint gates before the
 multi-platform container is published.

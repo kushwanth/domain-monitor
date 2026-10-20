@@ -99,13 +99,6 @@ type StateCondition struct {
 // FindingSeverity is evaluator severity and is not a provider priority.
 type FindingSeverity uint8
 
-// FindingInfo and the following values enumerate evaluator finding severity.
-const (
-	FindingInfo FindingSeverity = iota
-	FindingWarning
-	FindingError
-)
-
 func (s FindingSeverity) String() string {
 	if int(s) < len(findingSeverityNames) {
 		return findingSeverityNames[s]
@@ -402,12 +395,6 @@ type HTTPDoer interface {
 // HTTPRetryPolicy declares whether ambiguous transient transport failures may
 // be retried. HTTP temporary status responses are always handled consistently.
 type HTTPRetryPolicy uint8
-
-// RetryHTTPStatusOnly and the following values declare HTTP retry behavior.
-const (
-	RetryHTTPStatusOnly HTTPRetryPolicy = iota
-	RetryHTTPTransient
-)
 
 // Resolver defines an interface for executing DNS queries, allowing for mocking in tests.
 type Resolver interface {
@@ -1091,4 +1078,27 @@ type ConsoleHandler struct {
 	w     io.Writer
 	mu    *sync.Mutex
 	attrs []string
+}
+
+// cycleHooks supplies deterministic cycle dependencies in tests.
+type cycleHooks struct {
+	gather   func(context.Context, *AppState, AppConfig, HTTPDoer) (activeChecks, cycleEvidence)
+	evaluate func(map[string]ProviderConfig, AppConfig, activeChecks, cycleEvidence) *CheckState
+	timeout  time.Duration
+}
+
+// lifecycleHooks supplies deterministic daemon lifecycle dependencies in tests.
+type lifecycleHooks struct {
+	setup            func(*AppState, string) (*http.Server, <-chan error)
+	cycle            func(context.Context, *AppState, HTTPDoer, map[string]CheckStatus, map[string]CheckStatus, map[string]CheckStatus, map[conditionKey]StateCondition) *CheckState
+	shutdownTimeout  time.Duration
+	engineWait       time.Duration
+	notificationWait time.Duration
+}
+
+// dnssecDoHDependencies contains the DNSSEC lookup's injectable operations.
+type dnssecDoHDependencies struct {
+	newRequest func(context.Context, string) (*http.Request, error)
+	fetch      func(context.Context, HTTPDoer, func() (*http.Request, error)) (*http.Response, error)
+	parseRR    func(string) (dns.RR, error)
 }

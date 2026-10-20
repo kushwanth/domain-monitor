@@ -62,7 +62,9 @@ func TestHTTPServerReportsOccupiedPortAndUsesDefaultPort(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer func() { _ = listener.Close() }()
-	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	address, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	port := strconv.Itoa(address.Port)
 	_, failure := setupHTTPServer(&AppState{}, port)
 	select {
 	case err := <-failure:
@@ -133,7 +135,9 @@ func TestMonitoringCycleRecordsEmailAndRejectsUnencodableState(t *testing.T) {
 func TestMainAndRunInitializationPaths(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	address, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	port := strconv.Itoa(address.Port)
 	require.NoError(t, listener.Close())
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"port":"`+port+`","domains":[],"dns_records":[]}`), 0600))
@@ -168,7 +172,9 @@ func (panicClock) NewTimer(time.Duration) Timer { panic("unexpected timer") }
 func TestRunReportsServerAndEngineFailure(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	address, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	port := strconv.Itoa(address.Port)
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"port":"`+port+`","domains":[],"dns_records":[]}`), 0600))
 	err = runWithInitialize(context.Background(), configPath, func(_ context.Context, cfg AppConfig) (*AppState, error) {
@@ -234,9 +240,10 @@ func (clock *coverageClock) NewTimer(time.Duration) Timer {
 	index := clock.created
 	clock.mu.Unlock()
 	channel := make(chan time.Time, 1)
-	if index == 1 {
+	switch index {
+	case 1:
 		go func() { <-clock.started; channel <- time.Now() }()
-	} else if index == 2 {
+	case 2:
 		channel <- time.Now()
 	}
 	return coverageTimer{channel: channel}
@@ -257,7 +264,9 @@ func (notifier *blockingCoverageNotifier) FlushContext(context.Context) {
 func TestRunCoalescesNotificationWakeupsAndTimesOutBlockedWorker(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	address, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	port := strconv.Itoa(address.Port)
 	require.NoError(t, listener.Close())
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"port":"`+port+`","domains":[],"dns_records":[]}`), 0600))
@@ -291,7 +300,9 @@ func TestRunCoalescesNotificationWakeupsAndTimesOutBlockedWorker(t *testing.T) {
 func TestRunCancelsNotificationWorkerAfterEngineTimeout(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	address, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	port := strconv.Itoa(address.Port)
 	require.NoError(t, listener.Close())
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"port":"`+port+`","domains":[],"dns_records":[]}`), 0600))

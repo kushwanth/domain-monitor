@@ -23,6 +23,8 @@ func TestDNSMatchersHandleLargeSetsAndMultipleExpectations(t *testing.T) {
 		wantMatch bool
 		wantCode  ResultCode
 	}{
+		{MatchPrefix, StringList{}, []string{"anything"}, true, CodeDNSMatchVerified},
+		{MatchContains, StringList{}, []string{"anything"}, true, CodeDNSMatchVerified},
 		{MatchPrefix, StringList{"alpha", "beta"}, []string{" ALPHABET ", "BETAMAX"}, true, CodeDNSMatchVerified},
 		{MatchPrefix, StringList{"alpha", "missing"}, []string{"alphabet", "beta"}, false, CodeDNSPrefixMismatch},
 		{MatchPrefix, StringList{"alpha", "beta"}, []string{"alpha", "beta", "c", "d", "e", "f", "g", "h", "i"}, true, CodeDNSMatchVerified},
@@ -156,7 +158,7 @@ func TestDNSRejectsNonzeroPreferenceNullMX(t *testing.T) {
 }
 
 func TestDNSRejectsMixedNullMXAndSERVFAIL(t *testing.T) {
-	app := &AppState{DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, address string) (*dns.Msg, time.Duration, error) {
+	app := &AppState{DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 		response := new(dns.Msg)
 		response.SetReply(query)
 		if query.Question[0].Qtype == dns.TypeMX {
@@ -393,7 +395,9 @@ func TestDNSSECRejectsCryptographicallyValidExpiredSignature(t *testing.T) {
 	ds := key.ToDS(dns.SHA256)
 	require.NotNil(t, ds)
 	signature := &dns.RRSIG{Hdr: dns.RR_Header{Ttl: 60}, Algorithm: dns.ED25519, KeyTag: key.KeyTag(), SignerName: "example.com.", Inception: uint32(time.Now().Add(-2 * time.Hour).Unix()), Expiration: uint32(time.Now().Add(-time.Hour).Unix())}
-	require.NoError(t, signature.Sign(private.(ed25519.PrivateKey), []dns.RR{key}))
+	privateKey, ok := private.(ed25519.PrivateKey)
+	require.True(t, ok)
+	require.NoError(t, signature.Sign(privateKey, []dns.RR{key}))
 	app := &AppState{DNSClient: &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 		response := new(dns.Msg)
 		response.SetReply(query)
@@ -407,6 +411,37 @@ func TestDNSSECRejectsCryptographicallyValidExpiredSignature(t *testing.T) {
 	result := validateDNSSEC(context.Background(), app, "example.com", []string{"192.0.2.53"}, "")
 	require.False(t, result.RRSIGValid)
 	require.Equal(t, MsgErrRRSIGExpiredOrNotYetValid, result.Error)
+}
+
+func TestDNSKEYSignatureVerifierRejectsUnrelatedAndInvalidSignatures(t *testing.T) {
+	key := &dns.DNSKEY{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 60}, Flags: 257, Protocol: 3, Algorithm: dns.ED25519}
+	private, err := key.Generate(256)
+	require.NoError(t, err)
+	privateKey, ok := private.(ed25519.PrivateKey)
+	require.True(t, ok)
+	signature := &dns.RRSIG{Hdr: dns.RR_Header{Ttl: 60}, Algorithm: dns.ED25519, KeyTag: key.KeyTag(), SignerName: "example.com.", Inception: uint32(time.Now().Add(-time.Hour).Unix()), Expiration: uint32(time.Now().Add(time.Hour).Unix())}
+	require.NoError(t, signature.Sign(privateKey, []dns.RR{key}))
+
+	wrongSigner := *signature
+	wrongSigner.SignerName = "other.example."
+	wrongKey := &dns.DNSKEY{Algorithm: dns.RSASHA256}
+	invalidSignature := *signature
+	invalidSignature.Signature = "invalid-base64"
+	for _, tc := range []struct {
+		name       string
+		signatures []*dns.RRSIG
+		keys       []*dns.DNSKEY
+	}{
+		{"wrong signer", []*dns.RRSIG{&wrongSigner}, []*dns.DNSKEY{key}},
+		{"wrong key", []*dns.RRSIG{signature}, []*dns.DNSKEY{wrongKey}},
+		{"invalid signature", []*dns.RRSIG{&invalidSignature}, []*dns.DNSKEY{key}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var result DNSSECResult
+			verifyDNSKEYSignatures("example.com.", tc.signatures, []dns.RR{key}, tc.keys, &result)
+			require.False(t, result.RRSIGValid)
+		})
+	}
 }
 
 func TestRawDNSClientRetriesTruncatedUDPOverTCP(t *testing.T) {
@@ -515,6 +550,26 @@ func TestEmailEvaluationPreservesDistinctPolicyFailures(t *testing.T) {
 			require.Equal(t, tc.wantCode, condition.Code)
 			require.NotEmpty(t, state.Findings)
 		})
+	}
+}
+
+func TestEmailEvaluationSelectsStableDKIMError(t *testing.T) {
+	target := DomainConfig{Domain: "example.com", Email: &EmailConfig{DKIMSelectors: []string{"alpha", "zeta"}}}
+	snapshot := EmailSnapshot{
+		MXRecords:    []string{"mail.example.com"},
+		SPFRecords:   []string{"v=spf1 -all"},
+		DMARCRecords: []string{"v=DMARC1; p=reject"},
+		DKIMErrs: map[string]error{
+			"zeta":  errors.New("zeta lookup failed"),
+			"alpha": errors.New("alpha lookup failed"),
+		},
+	}
+	for range 100 {
+		status, condition, state := EvaluateEmailSecurity(target, snapshot, nil)
+		require.Equal(t, StatusWarning, status)
+		require.Equal(t, CodeDNSLookupFailed, condition.Code)
+		require.Equal(t, "DKIM: alpha lookup failed", condition.Target)
+		require.Contains(t, state.Error, "alpha lookup failed")
 	}
 }
 

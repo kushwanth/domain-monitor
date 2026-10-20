@@ -7,6 +7,52 @@ import (
 	"time"
 )
 
+// FindingInfo and the following values enumerate evaluator finding severity.
+const (
+	FindingInfo FindingSeverity = iota
+	FindingWarning
+	FindingError
+)
+
+// RetryHTTPStatusOnly and the following values declare HTTP retry behavior.
+const (
+	RetryHTTPStatusOnly HTTPRetryPolicy = iota
+	RetryHTTPTransient
+)
+
+// Configuration migration keys and diagnostics are part of the v3 wire schema.
+const (
+	ConfigKeyDataDir                  = "data_dir"
+	ConfigKeyDomains                  = "domains"
+	ConfigKeyDNSRecords               = "dns_records"
+	ConfigKeySkipSSL                  = "skip_ssl"
+	ConfigKeyDomain                   = "domain"
+	ConfigKeyExpectedNS               = "expected_ns"
+	ConfigKeySecondaryNS              = "secondary_ns"
+	ConfigKeyVerifyNSHealth           = "verify_ns_health"
+	ConfigKeyIsDelegatedZone          = "is_delegated_zone"
+	ConfigKeyMonitorCTLogs            = "monitor_ct_logs"
+	ConfigKeyEmail                    = "email"
+	ConfigKeyMailProvider             = "mail_provider"
+	ConfigKeyProvider                 = "provider"
+	ConfigKeyMXRecords                = "mx_records"
+	ConfigKeyDKIMSelectors            = "dkim_selectors"
+	ConfigKeyCheckEmailSecurity       = "check_email_security"
+	ConfigKeyRegistrar                = "registrar"
+	ConfigKeyExpectedRegistrarID      = "expected_registrar_id"
+	ConfigKeyExpectedRegistrarName    = "expected_registrar_name"
+	ConfigKeyAllowExpiry              = "allow_expiry"
+	ConfigKeyUnused                   = "unused"
+	MsgErrUnsafeLegacyField           = "legacy configuration field %q cannot be migrated safely; remove it after reviewing the v4 upgrade notes"
+	MsgErrUnsafeLegacyDNSRecordField  = "dns record at index %d uses legacy field %q, which cannot be migrated safely; remove it after reviewing the v4 upgrade notes"
+	MsgErrUnsafeLegacyDomainField     = "domain %q uses legacy field %q, which cannot be migrated safely; replace it with the current v4 schema"
+	MsgErrLegacyRegistrarConflict     = "domain %q configures both legacy registrar fields; select one current %q value"
+	MsgErrUnexpectedDNSRecordType     = "unexpected DNS record type %T"
+	MsgErrInsufficientDNSObservations = "fewer than two distinct resolver observations"
+	MsgErrWrappedResolverObservations = "%s: %w"
+	LifecycleWorkerWait               = 5 * time.Second
+)
+
 // System & Default Paths and Files
 const (
 	DefaultConfigFile        = "config.json"
@@ -76,6 +122,21 @@ const (
 	MaxFindingsPerCheck               = 16
 	AlertTruncationNotice             = " [truncated; see local state]"
 	HoursPerDay                       = 24
+	MinRecursiveResolverObservations  = 2
+	CAARecordFieldCount               = 3
+	MinDKIMRSABits                    = 1024
+	MaxDMARCDiscoveryLabels           = 8
+	DMARCDiscoveryTargetLabels        = 7
+	RDAPCriticalExpiryDays            = 7
+	WHOISCloneResponseThreshold       = 64 << 10
+	BootstrapServiceEntryFields       = 2
+	VCardArrayMinFields               = 2
+	FastCheckPairSize                 = 2
+	InlineDNSMatchRecords             = 8
+	RetryJitterDivisor                = 4
+	CycleRDAPBudgetPerDomain          = 15 * time.Second
+	CycleOtherBudgetPerCheck          = 5 * time.Second
+	MinCycleTimeBudget                = 5 * time.Minute
 )
 
 // Environment Variable Keys
@@ -90,7 +151,9 @@ const (
 
 // HTTP Constants
 const (
-	DotSweepAPIEndpoint = "https://dotsweep.com/tlds"
+	DotSweepAPIEndpoint    = "https://dotsweep.com/tlds"
+	RDAPIdentityDigitalURL = "https://rdap.identitydigital.services/rdap/"
+	RDAPGoogleRegistryURL  = "https://rdap.nic.google/"
 )
 
 // HTTP Headers & Media Types
@@ -215,7 +278,7 @@ const (
 	ProtocolTCP         = "tcp"
 	WHOISDNSSECSigned   = "signed"
 	WHOISDNSSECYes      = "yes"
-	WHOISDNSSECActive   = "active"
+	WHOISDNSSECActive   = StrActive
 	WHOISDNSSECTrue     = "true"
 )
 
@@ -265,9 +328,9 @@ const (
 	PriorityUrgent
 )
 
-var checkStatusNames = [...]string{"", "pending", "ok", "failed", "mismatch", "warning", "hijacked", "skipped"}
-var alertPriorityNames = [...]string{"default", "warning", "high", "urgent"}
-var findingSeverityNames = [...]string{"info", "warning", "error"}
+var checkStatusNames = [...]string{"", "pending", "ok", "failed", "mismatch", StrWarning, "hijacked", "skipped"}
+var alertPriorityNames = [...]string{"default", StrWarning, "high", "urgent"}
+var findingSeverityNames = [...]string{"info", StrWarning, "error"}
 
 // CyclePhaseIdle and the following values name monitoring-cycle phases and outcomes.
 const (
@@ -379,7 +442,7 @@ var resultCodeNames = [...]string{
 	CodeEPPClientHold:         "clientHold",
 	CodeEPPPendingDelete:      "pendingDelete",
 	CodeEPPRedemptionPeriod:   "redemptionPeriod",
-	CodeEPPInactive:           "inactive",
+	CodeEPPInactive:           StrInactive,
 	CodeRDAPExpired:           "rdapExpired",
 	CodeRDAPExpiringSoon:      "rdapExpiringSoon",
 	CodeRDAPExpiryUnavailable: "rdapExpiryUnavailable",
@@ -451,27 +514,49 @@ var resultCodeNames = [...]string{
 	CodeCheckPanic:   "checkPanic",
 }
 
+// Messages for distinct sentinel errors.
+const (
+	MsgErrDNSResolution          = "dns resolution failed"
+	MsgErrNXDOMAIN               = "no such host (NXDOMAIN)"
+	MsgErrSERVFAIL               = "server failure (SERVFAIL)"
+	MsgErrRDAPNotFound           = "RDAP domain not found (404)"
+	MsgErrRDAPRateLimited        = "RDAP rate limited (429)"
+	MsgErrWHOISRateLimited       = "whois rate limited (429)"
+	MsgErrDomainNotFound         = "domain not found in whois (404)"
+	MsgErrNoResolvers            = "no resolvers configured"
+	MsgErrEmptyDNSResponse       = "empty dns response"
+	MsgErrEmptyHTTPResponse      = "empty HTTP response"
+	MsgErrHTTPClientNil          = "HTTP client is nil"
+	MsgErrInvalidNullMX          = "invalid null MX record"
+	MsgErrReadLimitExceeded      = "read limit exceeded"
+	MsgErrRestrictedIP           = "connection to restricted IP blocked (SSRF)"
+	MsgErrBootstrapClientNil     = "bootstrap client is nil"
+	MsgErrNoRDAPServerFound      = "no rdap server found"
+	MsgErrEmptyDate              = "empty date string"
+	MsgErrEmptyBootstrapRegistry = "empty bootstrap registry"
+)
+
 // System Errors
 var (
-	ErrDNSResolution     = errors.New("dns resolution failed")
-	ErrNXDOMAIN          = errors.New("no such host (NXDOMAIN)")
-	ErrSERVFAIL          = errors.New("server failure (SERVFAIL)")
-	ErrRDAPNotFound      = errors.New("RDAP domain not found (404)")
-	ErrRDAPRateLimited   = errors.New("RDAP rate limited (429)")
-	ErrWHOISRateLimited  = errors.New("whois rate limited (429)")
-	ErrDomainNotFound    = errors.New("domain not found in whois (404)")
-	ErrNoResolvers       = errors.New("no resolvers configured")
-	ErrEmptyDNSResponse  = errors.New("empty dns response")
-	ErrEmptyHTTPResponse = errors.New("empty HTTP response")
-	ErrHTTPClientNil     = errors.New("HTTP client is nil")
-	ErrInvalidNullMX     = errors.New("invalid null MX record")
-	ErrReadLimitExceeded = errors.New("read limit exceeded")
+	ErrDNSResolution     = errors.New(MsgErrDNSResolution)
+	ErrNXDOMAIN          = errors.New(MsgErrNXDOMAIN)
+	ErrSERVFAIL          = errors.New(MsgErrSERVFAIL)
+	ErrRDAPNotFound      = errors.New(MsgErrRDAPNotFound)
+	ErrRDAPRateLimited   = errors.New(MsgErrRDAPRateLimited)
+	ErrWHOISRateLimited  = errors.New(MsgErrWHOISRateLimited)
+	ErrDomainNotFound    = errors.New(MsgErrDomainNotFound)
+	ErrNoResolvers       = errors.New(MsgErrNoResolvers)
+	ErrEmptyDNSResponse  = errors.New(MsgErrEmptyDNSResponse)
+	ErrEmptyHTTPResponse = errors.New(MsgErrEmptyHTTPResponse)
+	ErrHTTPClientNil     = errors.New(MsgErrHTTPClientNil)
+	ErrInvalidNullMX     = errors.New(MsgErrInvalidNullMX)
+	ErrReadLimitExceeded = errors.New(MsgErrReadLimitExceeded)
 
-	ErrRestrictedIP           = errors.New("connection to restricted IP blocked (SSRF)")
-	ErrBootstrapClientNil     = errors.New("bootstrap client is nil")
-	ErrNoRDAPServer           = errors.New("no rdap server found")
-	ErrEmptyDate              = errors.New("empty date string")
-	ErrEmptyBootstrapRegistry = errors.New("empty bootstrap registry")
+	ErrRestrictedIP           = errors.New(MsgErrRestrictedIP)
+	ErrBootstrapClientNil     = errors.New(MsgErrBootstrapClientNil)
+	ErrNoRDAPServer           = errors.New(MsgErrNoRDAPServerFound)
+	ErrEmptyDate              = errors.New(MsgErrEmptyDate)
+	ErrEmptyBootstrapRegistry = errors.New(MsgErrEmptyBootstrapRegistry)
 )
 
 // Compact domain statuses from RFC 5731, RGP (RFC 3915), and generic RDAP evidence.
@@ -504,77 +589,126 @@ const (
 	EPPHold
 )
 
+// Named EPP and RDAP status tokens used by the code and canonical-name tables.
+const (
+	EPPStatusAddPeriod                = "addPeriod"
+	EPPStatusAutoRenewPeriod          = "autoRenewPeriod"
+	EPPStatusClientDeleteProhibited   = "clientDeleteProhibited"
+	EPPStatusClientHold               = "clientHold"
+	EPPStatusClientRenewProhibited    = "clientRenewProhibited"
+	EPPStatusClientTransferProhibited = "clientTransferProhibited"
+	EPPStatusClientUpdateProhibited   = "clientUpdateProhibited"
+	EPPStatusDeleteProhibited         = "deleteProhibited"
+	EPPStatusNotAssociated            = "notAssociated"
+	EPPStatusPendingCreate            = "pendingCreate"
+	EPPStatusPendingDelete            = "pendingDelete"
+	EPPStatusPendingRenew             = "pendingRenew"
+	EPPStatusPendingRestore           = "pendingRestore"
+	EPPStatusPendingTransfer          = "pendingTransfer"
+	EPPStatusPendingUpdate            = "pendingUpdate"
+	EPPStatusRedemptionPeriod         = "redemptionPeriod"
+	EPPStatusRenewPeriod              = "renewPeriod"
+	EPPStatusRenewProhibited          = "renewProhibited"
+	EPPStatusServerDeleteProhibited   = "serverDeleteProhibited"
+	EPPStatusServerHold               = "serverHold"
+	EPPStatusServerRenewProhibited    = "serverRenewProhibited"
+	EPPStatusServerTransferProhibited = "serverTransferProhibited"
+	EPPStatusServerUpdateProhibited   = "serverUpdateProhibited"
+	EPPStatusTransferPeriod           = "transferPeriod"
+	EPPStatusTransferProhibited       = "transferProhibited"
+	EPPStatusUpdateProhibited         = "updateProhibited"
+	EPPTokenAddPeriod                 = "addperiod"
+	EPPTokenAssociated                = "associated"
+	EPPTokenAutoRenewPeriod           = "autorenewperiod"
+	EPPTokenConnected                 = "connected"
+	EPPTokenNotAssociated             = "notassociated"
+	EPPTokenOK                        = "ok"
+	EPPTokenPendingCreate             = "pendingcreate"
+	EPPTokenPendingDelete             = "pendingdelete"
+	EPPTokenPendingRenew              = "pendingrenew"
+	EPPTokenPendingRestore            = "pendingrestore"
+	EPPTokenPendingTransfer           = "pendingtransfer"
+	EPPTokenPendingUpdate             = "pendingupdate"
+	EPPTokenRedemptionPeriod          = "redemptionperiod"
+	EPPTokenRenewPeriod               = "renewperiod"
+	EPPTokenTransferPeriod            = "transferperiod"
+	EPPTokenValidated                 = "validated"
+)
+
 var eppCodeKeys = [...]string{
-	EPPUnknown:                  "",
-	EPPOK:                       "ok",
-	EPPInactive:                 "inactive",
-	EPPClientHold:               "clienthold",
-	EPPServerHold:               "serverhold",
-	EPPClientTransferProhibited: "clienttransferprohibited",
-	EPPServerTransferProhibited: "servertransferprohibited",
-	EPPClientDeleteProhibited:   "clientdeleteprohibited",
-	EPPServerDeleteProhibited:   "serverdeleteprohibited",
-	EPPClientUpdateProhibited:   "clientupdateprohibited",
-	EPPServerUpdateProhibited:   "serverupdateprohibited",
-	EPPClientRenewProhibited:    "clientrenewprohibited",
-	EPPServerRenewProhibited:    "serverrenewprohibited",
-	EPPPendingCreate:            "pendingcreate",
-	EPPPendingDelete:            "pendingdelete",
-	EPPPendingRenew:             "pendingrenew",
-	EPPPendingTransfer:          "pendingtransfer",
-	EPPPendingUpdate:            "pendingupdate",
-	EPPRedemptionPeriod:         "redemptionperiod",
-	EPPPendingRestore:           "pendingrestore",
-	EPPAddPeriod:                "addperiod",
-	EPPAutoRenewPeriod:          "autorenewperiod",
-	EPPRenewPeriod:              "renewperiod",
-	EPPTransferPeriod:           "transferperiod",
-	EPPTransferProhibited:       "transferprohibited",
-	EPPHold:                     "hold",
+	EPPUnknown:                  StrEmpty,
+	EPPOK:                       EPPTokenOK,
+	EPPInactive:                 StrInactive,
+	EPPClientHold:               EPPTokenClientHold,
+	EPPServerHold:               EPPTokenServerHold,
+	EPPClientTransferProhibited: EPPTokenClientTransferProhibited,
+	EPPServerTransferProhibited: EPPTokenServerTransferProhibited,
+	EPPClientDeleteProhibited:   EPPTokenClientDeleteProhibited,
+	EPPServerDeleteProhibited:   EPPTokenServerDeleteProhibited,
+	EPPClientUpdateProhibited:   EPPTokenClientUpdateProhibited,
+	EPPServerUpdateProhibited:   EPPTokenServerUpdateProhibited,
+	EPPClientRenewProhibited:    EPPTokenClientRenewProhibited,
+	EPPServerRenewProhibited:    EPPTokenServerRenewProhibited,
+	EPPPendingCreate:            EPPTokenPendingCreate,
+	EPPPendingDelete:            EPPTokenPendingDelete,
+	EPPPendingRenew:             EPPTokenPendingRenew,
+	EPPPendingTransfer:          EPPTokenPendingTransfer,
+	EPPPendingUpdate:            EPPTokenPendingUpdate,
+	EPPRedemptionPeriod:         EPPTokenRedemptionPeriod,
+	EPPPendingRestore:           EPPTokenPendingRestore,
+	EPPAddPeriod:                EPPTokenAddPeriod,
+	EPPAutoRenewPeriod:          EPPTokenAutoRenewPeriod,
+	EPPRenewPeriod:              EPPTokenRenewPeriod,
+	EPPTransferPeriod:           EPPTokenTransferPeriod,
+	EPPTransferProhibited:       EPPTokenTransferProhibited,
+	EPPHold:                     StrHold,
 }
 
 // eppStatusMap maps raw or formatted EPP/RDAP tokens to canonical camelCase strings.
 var eppStatusMap = map[string]string{
-	"clienttransferprohibited": "clientTransferProhibited",
-	"servertransferprohibited": "serverTransferProhibited",
-	"transferprohibited":       "transferProhibited",
-	"clientupdateprohibited":   "clientUpdateProhibited",
-	"serverupdateprohibited":   "serverUpdateProhibited",
-	"updateprohibited":         "updateProhibited",
-	"clientdeleteprohibited":   "clientDeleteProhibited",
-	"serverdeleteprohibited":   "serverDeleteProhibited",
-	"deleteprohibited":         "deleteProhibited",
-	"clientrenewprohibited":    "clientRenewProhibited",
-	"serverrenewprohibited":    "serverRenewProhibited",
-	"renewprohibited":          "renewProhibited",
-	"clienthold":               "clientHold",
-	"serverhold":               "serverHold",
-	"hold":                     "hold",
-	"pendingcreate":            "pendingCreate",
-	"pendingdelete":            "pendingDelete",
-	"pendingrenew":             "pendingRenew",
-	"pendingrestore":           "pendingRestore",
-	"pendingtransfer":          "pendingTransfer",
-	"pendingupdate":            "pendingUpdate",
-	"redemptionperiod":         "redemptionPeriod",
-	"addperiod":                "addPeriod",
-	"autorenewperiod":          "autoRenewPeriod",
-	"renewperiod":              "renewPeriod",
-	"transferperiod":           "transferPeriod",
-	"inactive":                 "inactive",
-	"active":                   "active",
-	"ok":                       "ok",
-	"validated":                "validated",
-	"associated":               "associated",
-	"notassociated":            "notAssociated",
-	"connected":                "active",
+	EPPTokenClientTransferProhibited: EPPStatusClientTransferProhibited,
+	EPPTokenServerTransferProhibited: EPPStatusServerTransferProhibited,
+	EPPTokenTransferProhibited:       EPPStatusTransferProhibited,
+	EPPTokenClientUpdateProhibited:   EPPStatusClientUpdateProhibited,
+	EPPTokenServerUpdateProhibited:   EPPStatusServerUpdateProhibited,
+	EPPTokenUpdateProhibited:         EPPStatusUpdateProhibited,
+	EPPTokenClientDeleteProhibited:   EPPStatusClientDeleteProhibited,
+	EPPTokenServerDeleteProhibited:   EPPStatusServerDeleteProhibited,
+	EPPTokenDeleteProhibited:         EPPStatusDeleteProhibited,
+	EPPTokenClientRenewProhibited:    EPPStatusClientRenewProhibited,
+	EPPTokenServerRenewProhibited:    EPPStatusServerRenewProhibited,
+	EPPTokenRenewProhibited:          EPPStatusRenewProhibited,
+	EPPTokenClientHold:               EPPStatusClientHold,
+	EPPTokenServerHold:               EPPStatusServerHold,
+	StrHold:                          StrHold,
+	EPPTokenPendingCreate:            EPPStatusPendingCreate,
+	EPPTokenPendingDelete:            EPPStatusPendingDelete,
+	EPPTokenPendingRenew:             EPPStatusPendingRenew,
+	EPPTokenPendingRestore:           EPPStatusPendingRestore,
+	EPPTokenPendingTransfer:          EPPStatusPendingTransfer,
+	EPPTokenPendingUpdate:            EPPStatusPendingUpdate,
+	EPPTokenRedemptionPeriod:         EPPStatusRedemptionPeriod,
+	EPPTokenAddPeriod:                EPPStatusAddPeriod,
+	EPPTokenAutoRenewPeriod:          EPPStatusAutoRenewPeriod,
+	EPPTokenRenewPeriod:              EPPStatusRenewPeriod,
+	EPPTokenTransferPeriod:           EPPStatusTransferPeriod,
+	StrInactive:                      StrInactive,
+	StrActive:                        StrActive,
+	EPPTokenOK:                       EPPTokenOK,
+	EPPTokenValidated:                EPPTokenValidated,
+	EPPTokenAssociated:               EPPTokenAssociated,
+	EPPTokenNotAssociated:            EPPStatusNotAssociated,
+	EPPTokenConnected:                StrActive,
 }
+
+// TimezoneOffsetUTC is the zero offset used by UTC, GMT, and Z WHOIS timestamps.
+const TimezoneOffsetUTC = " +0000"
 
 // timezoneOffsets maps common global registrar and WHOIS timezone abbreviations to ISO numeric offsets.
 var timezoneOffsets = map[string]string{
-	" UTC":  " +0000",
-	" GMT":  " +0000",
-	" Z":    " +0000",
+	" UTC":  TimezoneOffsetUTC,
+	" GMT":  TimezoneOffsetUTC,
+	" Z":    TimezoneOffsetUTC,
 	" EDT":  " -0400",
 	" EST":  " -0500",
 	" CDT":  " -0500",
@@ -655,41 +789,41 @@ var (
 
 // Stealth RDAP Seeds for ccTLDs not yet published in IANA bootstrap
 var stealthSeeds = map[string][]string{
-	"ac":               {"https://rdap.identitydigital.services/rdap/"},
+	"ac":               {RDAPIdentityDigitalURL},
 	"af":               {"https://whois.nic.af/"},
-	"ag":               {"https://rdap.identitydigital.services/rdap/"},
+	"ag":               {RDAPIdentityDigitalURL},
 	"ai":               {"https://rdap.nic.ai/"},
 	"am":               {"https://rdap.amnic.net/"},
-	"app":              {"https://rdap.nic.google/"},
+	"app":              {RDAPGoogleRegistryURL},
 	"arpa":             {"https://rdap.iana.org/"},
 	"aw":               {"https://rdap.nic.aw/"},
 	"bh":               {"https://rdap.centralnic.com/bh/"},
 	"bw":               {"https://rdap.nic.net.bw/"},
-	"bz":               {"https://rdap.identitydigital.services/rdap/"},
+	"bz":               {RDAPIdentityDigitalURL},
 	"ca":               {"https://rdap.ca.fury.ca/rdap/"},
 	"ch":               {"https://rdap.nic.ch/"},
 	"ci":               {"https://rdap.nic.ci/"},
 	"co":               {"https://rdap.registry.co/co/"},
 	"de":               {"https://rdap.denic.de/"},
-	"dev":              {"https://rdap.nic.google/"},
+	"dev":              {RDAPGoogleRegistryURL},
 	"dm":               {"https://rdap.dmdomains.dm/rdap/"},
 	"eu":               {"https://rdap.eurid.eu/"},
 	"fr":               {"https://rdap.nic.fr/"},
 	"ga":               {"https://rdap.nic.ga/"},
-	"gi":               {"https://rdap.identitydigital.services/rdap/"},
+	"gi":               {RDAPIdentityDigitalURL},
 	"gl":               {"https://rdap.centralnic.com/gl/"},
 	"in":               {"https://rdap.registry.in/"},
-	"io":               {"https://rdap.identitydigital.services/rdap/"},
+	"io":               {RDAPIdentityDigitalURL},
 	"iq":               {"https://rdap.reg.iq/rdap/"},
 	"is":               {"https://rdap.isnic.is/rdap/"},
 	"it":               {"https://rdap.nic.it/"},
 	"jp":               {"https://rdap.jprs.jp/"},
 	"ki":               {"https://rdap.coccaregistry.org/"},
 	"kz":               {"https://rdap.nic.kz/"},
-	"lc":               {"https://rdap.identitydigital.services/rdap/"},
+	"lc":               {RDAPIdentityDigitalURL},
 	"li":               {"https://rdap.nic.li/"},
-	"me":               {"https://rdap.identitydigital.services/rdap/"},
-	"mn":               {"https://rdap.identitydigital.services/rdap/"},
+	"me":               {RDAPIdentityDigitalURL},
+	"mn":               {RDAPIdentityDigitalURL},
 	"mr":               {"https://rdap.nic.mr/"},
 	"mx":               {"https://rdap.nic.mx/"},
 	"my":               {"https://rdap.mynic.my/rdap/"},
@@ -698,14 +832,14 @@ var stealthSeeds = map[string][]string{
 	"nu":               {"https://rdap.iis.nu/"},
 	"nz":               {"https://rdap.internetnz.nz/"},
 	"om":               {"https://rdap.registry.om/"},
-	"page":             {"https://rdap.nic.google/"},
+	"page":             {RDAPGoogleRegistryURL},
 	"pl":               {"https://rdap.dns.pl/"},
-	"pr":               {"https://rdap.identitydigital.services/rdap/"},
+	"pr":               {RDAPIdentityDigitalURL},
 	"ru":               {"https://cctld.ru/tci-ripn-rdap/"},
 	"sb":               {"https://rdap.nic.sb/"},
-	"sc":               {"https://rdap.identitydigital.services/rdap/"},
+	"sc":               {RDAPIdentityDigitalURL},
 	"se":               {"https://rdap.iis.se/"},
-	"sh":               {"https://rdap.identitydigital.services/rdap/"},
+	"sh":               {RDAPIdentityDigitalURL},
 	"sk":               {"https://rdap.sk-nic.sk/sk/"},
 	"so":               {"https://rdap.nic.so/"},
 	"td":               {"https://rdap.nic.td/"},
@@ -714,7 +848,7 @@ var stealthSeeds = map[string][]string{
 	"uk":               {"https://rdap.nominet.uk/"},
 	"us":               {"https://rdap.nic.us/"},
 	"uz":               {"https://rdap.cctld.uz/"},
-	"vc":               {"https://rdap.identitydigital.services/rdap/"},
+	"vc":               {RDAPIdentityDigitalURL},
 	"ve":               {"https://rdap.nic.ve/rdap/"},
 	"vu":               {"https://rdap.dnrs.vu/"},
 	"ws":               {"https://rdap.website.ws/"},
@@ -1152,21 +1286,21 @@ const (
 
 // Auto-generated String Literals
 const (
-	DateLayoutCompact           = "2006-01-02"
-	StrAutoRenewGracePeriod     = "Auto-Renew Grace Period discrepancy: Registry expiration ("
-	StrCacheAge                 = "cache_age"
-	StrClientdeleteprohibited   = "clientdeleteprohibited"
-	StrClienthold               = "clienthold"
-	StrClientrenewprohibited    = "clientrenewprohibited"
-	StrClienttransferprohibited = "clienttransferprohibited"
-	StrClientupdateprohibited   = "clientupdateprohibited"
-	StrConnectionRefused        = "connection refused"
-	StrCreated                  = "created"
+	DateLayoutCompact                = "2006-01-02"
+	StrAutoRenewGracePeriod          = "Auto-Renew Grace Period discrepancy: Registry expiration ("
+	StrCacheAge                      = "cache_age"
+	EPPTokenClientDeleteProhibited   = "clientdeleteprohibited"
+	EPPTokenClientHold               = "clienthold"
+	EPPTokenClientRenewProhibited    = "clientrenewprohibited"
+	EPPTokenClientTransferProhibited = "clienttransferprohibited"
+	EPPTokenClientUpdateProhibited   = "clientupdateprohibited"
+	StrConnectionRefused             = "connection refused"
+	StrCreated                       = "created"
 
 	StrDSQ                                = "%d %s %q"
 	StrDate                               = "date"
 	StrDelegationReturnedNoNameservers    = "delegation returned no nameservers"
-	StrDeleteprohibited                   = "deleteprohibited"
+	EPPTokenDeleteProhibited              = "deleteprohibited"
 	StrDKIM                               = "DKIM: "
 	StrDMARC                              = "_dmarc."
 	StrDMARCDiagnosticPrefix              = "DMARC: "
@@ -1178,6 +1312,9 @@ const (
 	StrExpiration                         = "expiration"
 	StrExpire                             = "expire"
 	StrHold                               = "hold"
+	StrActive                             = "active"
+	StrInactive                           = "inactive"
+	StrWarning                            = "warning"
 	StrHTTP                               = "http"
 	StrHTTPS                              = "https"
 	StrIOTimeout                          = "i/o timeout"
@@ -1206,7 +1343,7 @@ const (
 	StrOr                                 = " OR "
 	StrPanic                              = "panic"
 	StrPriority                           = "priority"
-	StrProhibittransfer                   = "prohibittransfer"
+	EPPTokenProhibitTransfer              = "prohibittransfer"
 	StrPsd                                = "psd"
 	StrQueryFailed                        = "query failed"
 	StrQuota                              = "quota"
@@ -1214,13 +1351,13 @@ const (
 	StrRegistrarConfiguration             = "] != Registrar configuration ["
 	StrRegistrarIANA                      = "Registrar (IANA "
 	StrRegistration                       = "registration"
-	StrRenewprohibited                    = "renewprohibited"
+	EPPTokenRenewProhibited               = "renewprohibited"
 	StrS0InDnskey                         = "%s 0 IN DNSKEY %s"
-	StrServerdeleteprohibited             = "serverdeleteprohibited"
-	StrServerhold                         = "serverhold"
-	StrServerrenewprohibited              = "serverrenewprohibited"
-	StrServertransferprohibited           = "servertransferprohibited"
-	StrServerupdateprohibited             = "serverupdateprohibited"
+	EPPTokenServerDeleteProhibited        = "serverdeleteprohibited"
+	EPPTokenServerHold                    = "serverhold"
+	EPPTokenServerRenewProhibited         = "serverrenewprohibited"
+	EPPTokenServerTransferProhibited      = "servertransferprohibited"
+	EPPTokenServerUpdateProhibited        = "serverupdateprohibited"
 	StrSp                                 = "sp"
 	StrSPF                                = "SPF: "
 	SymParenOpen                          = "("
@@ -1246,10 +1383,10 @@ const (
 	StrTerminationSignal                  = "termination signal"
 	StrTooMany                            = "too many"
 	StrU                                  = "u"
-	StrTransferlock                       = "transferlock"
-	StrTransferprohibited                 = "transferprohibited"
+	EPPTokenTransferLock                  = "transferlock"
+	EPPTokenTransferProhibited            = "transferprohibited"
 	StrUpdated                            = "updated"
-	StrUpdateprohibited                   = "updateprohibited"
+	EPPTokenUpdateProhibited              = "updateprohibited"
 	StrValid                              = "valid"
 	StrVsRegistrarExpiration              = ") vs Registrar expiration ("
 	StrY                                  = "y"

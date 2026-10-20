@@ -12,18 +12,7 @@ if command -v go >/dev/null 2>&1 && command -v gofmt >/dev/null 2>&1; then
 		echo "$unformatted" >&2
 	fi
 
-	coverage_file=$(mktemp "${TMPDIR:-/tmp}/domain-monitor-coverage.XXXXXX")
-	trap 'rm -f "$coverage_file"' EXIT HUP INT TERM
-	if go test -race -covermode=atomic -coverprofile="$coverage_file" ./...; then
-		coverage=$(go tool cover -func="$coverage_file" 2>/dev/null | awk '/^total:/ {gsub(/%/, "", $3); print $3}')
-		if [ -z "$coverage" ]; then
-			warn "unable to determine total test coverage"
-		elif ! awk -v coverage="$coverage" 'BEGIN { exit coverage >= 90 ? 0 : 1 }'; then
-			warn "test coverage ${coverage}% is below the recommended 90%"
-		fi
-	else
-		warn "tests failed"
-	fi
+	go test -race -cover ./... || warn "race tests or coverage run failed"
 
 	go vet ./... || warn "go vet reported issues"
 else

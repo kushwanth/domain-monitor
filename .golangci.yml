@@ -7,6 +7,8 @@ linters:
     - staticcheck
     - gosec
     - gocyclo
+    - goconst
+    - mnd
     - govet
     - gocritic
     - ineffassign
@@ -32,15 +34,10 @@ linters:
           msg: use the project logging utilities
   exclusions:
     rules:
-      # These existing protocol evaluators require focused refactors and regression tests.
-      # New production functions remain subject to the complexity limit above.
-      - path: src/internal/monitor/(dns|lookup)\.go
-        linters:
-          - gocyclo
-        text: 'func `(validateDNSSEC|validateRecordsWithReason|EvaluateEmailSecurity|extractWHOISTier|synthesizeTierData|EvaluateRDAP)`'
       - path: _test\.go
         linters:
           - gocyclo
+          - goconst
           - gosec
       - path: src/internal/monitor/utils\.go
         linters:

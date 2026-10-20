@@ -518,7 +518,8 @@ func TestProcessConditionsAndAlerts_AllChecksAndSuppression(t *testing.T) {
 			state.DNSSEC[domain] = DNSSECResult{Status: StatusFailed, Condition: StateCondition{Code: CodeDNSSECNetworkError}}
 			state.NSHealth[domain] = NSHealthResult{Status: StatusWarning, Condition: StateCondition{Code: CodeNSUnreachable}}
 			prev := make(map[conditionKey]StateCondition)
-			processConditionsAndAlerts(app, state, AppConfig{Domains: []DomainConfig{{Domain: domain, Name: "Example", SuppressAlerts: tc.suppress}}}, activeChecks{domains: []int{0}}, prev)
+			alerts := prepareConditionsAndAlerts(state, AppConfig{Domains: []DomainConfig{{Domain: domain, Name: "Example", SuppressAlerts: tc.suppress}}}, activeChecks{domains: []int{0}}, prev)
+			dispatchCycleAlerts(app, alerts)
 			assert.Len(t, notifier.alerts, tc.wantAlerts)
 			assert.Len(t, prev, 4)
 			assert.False(t, state.RDAP[domain].Condition.Since.IsZero())
@@ -546,7 +547,7 @@ func TestProcessConditionsDropsHistoryForSuppressedChecks(t *testing.T) {
 		DNSRecords: []DNSTask{{Name: "allowed A", Hostname: "www.example.com", Type: RecordTypeA}},
 	}
 
-	processConditionsAndAlerts(&AppState{}, state, cfg, activeChecks{}, prev)
+	prepareConditionsAndAlerts(state, cfg, activeChecks{}, prev)
 
 	assert.Empty(t, prev)
 }
@@ -832,6 +833,47 @@ func TestPublicationFailureKeepsLastSnapshot(t *testing.T) {
 	assert.Equal(t, original, current)
 }
 
+func TestPublicationFailureDoesNotCommitAlertsOrConditionHistory(t *testing.T) {
+	domain := "example.com"
+	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: domain, Name: "Example"}}})
+	app.PublishInitialState()
+	baseline, ok := app.PublishedJSON()
+	require.True(t, ok)
+	notifier := newRecordingNotifier()
+	app.Notifier = notifier
+	previousStatuses := make(map[string]CheckStatus)
+	previousConditions := make(map[conditionKey]StateCondition)
+	validPrice := false
+	hooks := cycleHooks{
+		gather: func(context.Context, *AppState, AppConfig, HTTPDoer) (activeChecks, cycleEvidence) {
+			return activeChecks{domains: []int{0}}, cycleEvidence{}
+		},
+		evaluate: func(_ map[string]ProviderConfig, cfg AppConfig, active activeChecks, _ cycleEvidence) *CheckState {
+			state := newCycleState(cfg, active)
+			price := math.NaN()
+			if validPrice {
+				price = 1
+			}
+			state.RDAP[domain] = RDAPState{Status: StatusFailed, Condition: StateCondition{Code: CodeRDAPHTTPError}, RenewalPrice: price}
+			return state
+		},
+	}
+
+	require.Nil(t, runMonitoringCycleWithHooks(context.Background(), app, nil, previousStatuses, nil, nil, previousConditions, hooks))
+	current, ok := app.PublishedJSON()
+	require.True(t, ok)
+	assert.Equal(t, baseline, current)
+	assert.Empty(t, notifier.alerts)
+	assert.Empty(t, previousStatuses)
+	assert.Empty(t, previousConditions)
+
+	validPrice = true
+	require.NotNil(t, runMonitoringCycleWithHooks(context.Background(), app, nil, previousStatuses, nil, nil, previousConditions, hooks))
+	assert.NotEmpty(t, notifier.alerts)
+	assert.NotEmpty(t, previousStatuses)
+	assert.NotEmpty(t, previousConditions)
+}
+
 func TestFailedAttemptRetainsEvidenceAndUpdatesMetadata(t *testing.T) {
 	app := NewAppState(AppConfig{Domains: []DomainConfig{{Domain: "example.com"}}})
 	state := newTestCheckState()
@@ -937,5 +979,206 @@ func TestCAATaskMatchingScopes(t *testing.T) {
 				assert.Equal(t, tc.want, state.DNS["CAA"].Status)
 			}
 		})
+	}
+}
+
+func TestServiceFlowConfigCycleAPIAndAlertDelivery(t *testing.T) {
+	config, err := loadConfig(context.Background(), "memory.json", func(string) ([]byte, error) {
+		return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"Example","registrar":"RDAP Registrar","renewal_price":12}],"dns_records":[{"hostname":"example.com","name":"web","type":"A","expected":["192.0.2.1"]}]}`), nil
+	})
+	require.NoError(t, err)
+	app, err := InitializeApp(context.Background(), config)
+	require.NoError(t, err)
+	app.Bootstrap = &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()}
+	app.RDAPURLAllowed = func(string) bool { return true }
+	app.RDAPLimiter = nil
+	app.WHOISClient = &MockWHOISClient{MockQuery: func(context.Context, string, string) (string, error) {
+		t.Fatal("complete RDAP result must not fall back to WHOIS")
+		return "", nil
+	}}
+	rdapClient := &MockHTTPClient{MockDo: func(request *http.Request) (*http.Response, error) {
+		require.Equal(t, "https://rdap.example/domain/example.com", request.URL.String())
+		body := `{"objectClassName":"domain","ldhName":"example.com","events":[{"eventAction":"expiration","eventDate":"2030-01-01T00:00:00Z"}],"entities":[{"roles":["registrar"],"vcardArray":["vcard",[["fn",{},"text","RDAP Registrar"]]]}]}`
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}}
+	record, err := dns.NewRR("example.com. IN A 192.0.2.2")
+	require.NoError(t, err)
+	app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+		response := new(dns.Msg)
+		response.SetReply(query)
+		response.Answer = []dns.RR{dns.Copy(record)}
+		return response, 0, nil
+	}}
+	notifier, ok := app.Notifier.(*NotificationManager)
+	require.True(t, ok)
+	var delivered []string
+	notifier.HTTPClient = &MockHTTPClient{MockDo: func(request *http.Request) (*http.Response, error) {
+		body, readErr := io.ReadAll(request.Body)
+		require.NoError(t, readErr)
+		delivered = append(delivered, string(body))
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}}
+	app.PublishInitialState()
+	server, _ := setupHTTPServer(app, "0")
+	t.Cleanup(func() { require.NoError(t, server.Close()) })
+	apiPath := strings.TrimPrefix(RouteAPIState, "GET ")
+	readAPI := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, apiPath, nil))
+		return response
+	}
+
+	initial := readAPI()
+	require.Equal(t, http.StatusOK, initial.Code)
+	initialState := decodePublishedState(t, initial.Body.Bytes())
+	require.Equal(t, StatusPending, initialState.DNS["web"].Status)
+	require.Equal(t, StatusPending, initialState.RDAP["example.com"].Status)
+
+	for cycle := range 2 {
+		state := runMonitoringCycle(context.Background(), app, rdapClient, nil, nil, nil, nil)
+		require.NotNil(t, state)
+		response := readAPI()
+		require.Equal(t, http.StatusOK, response.Code)
+		published := decodePublishedState(t, response.Body.Bytes())
+		require.Equal(t, StatusMismatch, published.DNS["web"].Status)
+		require.Equal(t, StatusOK, published.RDAP["example.com"].Status)
+		require.Equal(t, "RDAP Registrar", published.RDAP["example.com"].Registrar)
+		if cycle == 0 {
+			require.NotEqual(t, initial.Header().Get(HeaderETag), response.Header().Get(HeaderETag))
+		}
+		flushNotifier(context.Background(), notifier)
+		require.Len(t, delivered, cycle+1)
+		require.Contains(t, delivered[cycle], "web")
+	}
+}
+
+func TestDaemonLifecycleServesChecksAndDeliversAlert(t *testing.T) {
+	for _, variable := range []string{EnvPort, EnvNtfyAuth, EnvTelegramToken, EnvTelegramChatID, EnvDoHURL} {
+		t.Setenv(variable, "")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	port := strconv.Itoa(address.Port)
+	require.NoError(t, listener.Close())
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	configJSON := fmt.Sprintf(`{"port":%q,"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}},"domains":[{"domain":"example.com","name":"Example","registrar":"RDAP Registrar","renewal_price":12}],"dns_records":[{"hostname":"example.com","name":"web","type":"A","expected":["192.0.2.1"]}]}`, port)
+	require.NoError(t, os.WriteFile(configPath, []byte(configJSON), 0600))
+	record, err := dns.NewRR("example.com. IN A 192.0.2.2")
+	require.NoError(t, err)
+	delivered := make(chan string, 1)
+	runContext, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	stopped := false
+	t.Cleanup(func() {
+		cancel()
+		if stopped {
+			return
+		}
+		select {
+		case runErr := <-done:
+			require.NoError(t, runErr)
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not shut down")
+		}
+	})
+	go func() {
+		done <- runWithInitialize(runContext, configPath, func(ctx context.Context, cfg AppConfig) (*AppState, error) {
+			app, initErr := InitializeApp(ctx, cfg)
+			if initErr != nil {
+				return nil, initErr
+			}
+			app.Bootstrap = &Bootstrap{services: map[string][]string{"com": {"https://rdap.example/"}}, fetchedAt: time.Now()}
+			app.RDAPURLAllowed = func(string) bool { return true }
+			app.RDAPLimiter = nil
+			app.Clients.RDAP = &MockHTTPClient{MockDo: func(request *http.Request) (*http.Response, error) {
+				if request.URL.String() != "https://rdap.example/domain/example.com" {
+					return nil, fmt.Errorf("unexpected RDAP URL: %s", request.URL)
+				}
+				body := `{"objectClassName":"domain","ldhName":"example.com","events":[{"eventAction":"expiration","eventDate":"2030-01-01T00:00:00Z"}],"entities":[{"roles":["registrar"],"vcardArray":["vcard",[["fn",{},"text","RDAP Registrar"]]]}]}`
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+			}}
+			app.WHOISClient = &MockWHOISClient{MockQuery: func(context.Context, string, string) (string, error) {
+				return "", errors.New("unexpected WHOIS fallback")
+			}}
+			app.DNSClient = &MockDNSResolver{MockExchangeContext: func(_ context.Context, query *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+				response := new(dns.Msg)
+				response.SetReply(query)
+				response.Answer = []dns.RR{dns.Copy(record)}
+				return response, 0, nil
+			}}
+			notifier, ok := app.Notifier.(*NotificationManager)
+			if !ok {
+				return nil, errors.New("notification manager was not initialized")
+			}
+			notifier.HTTPClient = &MockHTTPClient{MockDo: func(request *http.Request) (*http.Response, error) {
+				body, readErr := io.ReadAll(request.Body)
+				if readErr != nil {
+					return nil, readErr
+				}
+				select {
+				case delivered <- string(body):
+				default:
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}}
+			return app, nil
+		})
+	}()
+
+	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{Proxy: nil}}
+	t.Cleanup(client.CloseIdleConnections)
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("daemon did not publish checks")
+		default:
+		}
+		response, requestErr := client.Get("http://127.0.0.1:" + port + "/api/state")
+		if requestErr == nil {
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			require.NoError(t, readErr)
+			if response.StatusCode == http.StatusOK && response.Header.Get(HeaderETag) != "" {
+				published := decodePublishedState(t, body)
+				if published.DNS["web"].Status == StatusMismatch {
+					require.Equal(t, StatusOK, published.RDAP["example.com"].Status)
+					require.Equal(t, "RDAP Registrar", published.RDAP["example.com"].Registrar)
+					break
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	health, err := client.Get("http://127.0.0.1:" + port + "/health")
+	require.NoError(t, err)
+	healthBody, err := io.ReadAll(health.Body)
+	require.NoError(t, err)
+	require.NoError(t, health.Body.Close())
+	require.Equal(t, http.StatusOK, health.StatusCode)
+	require.JSONEq(t, JSONResponseStatusOK, string(healthBody))
+	dashboard, err := client.Get("http://127.0.0.1:" + port + "/")
+	require.NoError(t, err)
+	dashboardBody, err := io.ReadAll(dashboard.Body)
+	require.NoError(t, err)
+	require.NoError(t, dashboard.Body.Close())
+	require.Equal(t, http.StatusOK, dashboard.StatusCode)
+	require.Contains(t, string(dashboardBody), "<title>Domain Monitor</title>")
+	select {
+	case report := <-delivered:
+		require.Contains(t, report, "web")
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not deliver the alert")
+	}
+	cancel()
+	select {
+	case runErr := <-done:
+		stopped = true
+		require.NoError(t, runErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not shut down")
 	}
 }

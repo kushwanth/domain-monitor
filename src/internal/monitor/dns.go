@@ -126,13 +126,13 @@ func queryDNSMsgWithRD(ctx context.Context, app *AppState, hostname string, qtyp
 // resolvers, but a result still requires two distinct successful observations.
 // A custom/single resolver remains authoritative and is queried alone.
 func queryDNS(ctx context.Context, app *AppState, hostname string, qtype uint16, resolvers []string) ([]string, error) {
-	if len(resolvers) < 2 {
+	if len(resolvers) < MinRecursiveResolverObservations {
 		return queryDNSOne(ctx, app, hostname, qtype, resolvers)
 	}
-	observations, selected := collectDNSObservations(resolvers, 2, func(resolver string) ([]string, error) {
+	observations, selected := collectDNSObservations(resolvers, MinRecursiveResolverObservations, func(resolver string) ([]string, error) {
 		return queryDNSOne(ctx, app, hostname, qtype, []string{resolver})
 	})
-	if len(selected) < 2 {
+	if len(selected) < MinRecursiveResolverObservations {
 		return nil, fmt.Errorf(MsgErrIncompleteResolverEvidence, incompleteResolverCause(observationErrors(observations)...))
 	}
 	first, second := selected[0].Records, selected[1].Records
@@ -194,7 +194,7 @@ func observationErrors(observations []DNSObservation) []error {
 func incompleteResolverCause(observationErrors ...error) error {
 	joined := errors.Join(observationErrors...)
 	if joined == nil {
-		return errors.New("fewer than two distinct resolver observations")
+		return errors.New(MsgErrInsufficientDNSObservations)
 	}
 	var actionable []error
 	for _, err := range observationErrors {
@@ -205,7 +205,7 @@ func incompleteResolverCause(observationErrors ...error) error {
 	if len(actionable) == 0 {
 		return errors.New(joined.Error())
 	}
-	return fmt.Errorf("%s: %w", joined.Error(), errors.Join(actionable...))
+	return fmt.Errorf(MsgErrWrappedResolverObservations, joined.Error(), errors.Join(actionable...))
 }
 
 // queryDNSOne queries the supplied resolver set and returns parsed string results.
@@ -408,60 +408,19 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 	}
 
 	// 3. Match DS to DNSKEY and record authenticated KSKs (RFC 4035 Section 5.2)
-	var authenticatedKSKs []*dns.DNSKEY
-	for _, key := range dnskeyRecords {
-		for _, ds := range dsRecords {
-			if key.KeyTag() == ds.KeyTag && key.Algorithm == ds.Algorithm {
-				computedDS := key.ToDS(ds.DigestType)
-				if computedDS != nil && strings.EqualFold(computedDS.Digest, ds.Digest) {
-					res.DSMatchesDNSKEY = true
-					authenticatedKSKs = append(authenticatedKSKs, key)
-					break
-				}
-			}
-		}
-	}
+	authenticatedKSKs := matchDSDNSKEY(dsRecords, dnskeyRecords)
+	res.DSMatchesDNSKEY = len(authenticatedKSKs) > 0
 
 	if len(dsRecords) > 0 && len(dnskeyRecords) > 0 && !res.DSMatchesDNSKEY {
 		res.Error = MsgErrDSRecordDoesNotMatchDNSKEY
 	}
 
 	// 4. Validate dns.RRSIG covering DNSKEY RRset using DS-authenticated KSK (RFC 4035 Section 5.3)
-	if len(rrsigRecords) > 0 && len(rrset) > 0 {
-
-		keysToVerify := authenticatedKSKs
-		if len(keysToVerify) == 0 && len(dsRecords) == 0 {
-			keysToVerify = dnskeyRecords // Fallback for unsigned delegation or trust anchor testing
-		}
-
-		for _, sig := range rrsigRecords {
-			if strings.EqualFold(sig.SignerName, fqdn) {
-				for _, key := range keysToVerify {
-					if key.KeyTag() == sig.KeyTag && key.Algorithm == sig.Algorithm {
-						err := sig.Verify(key, rrset)
-						if err == nil {
-							now := time.Now().Unix()
-							inception := int64(sig.Inception)
-							expiration := int64(sig.Expiration)
-							if (inception <= now+DNSSECClockSkew) && (now <= expiration+DNSSECClockSkew) {
-								res.RRSIGValid = true
-								res.Error = StrEmpty // Clear any stale error from previous iteration
-								expiryStr := dns.TimeToString(sig.Expiration)
-								if et, parseErr := time.Parse(LayoutCompactDateTime, expiryStr); parseErr == nil {
-									res.RRSIGExpiry = et.UTC().Format(time.RFC3339)
-								}
-								break
-							}
-							res.Error = MsgErrRRSIGExpiredOrNotYetValid
-						}
-					}
-				}
-				if res.RRSIGValid {
-					break
-				}
-			}
-		}
+	keysToVerify := authenticatedKSKs
+	if len(keysToVerify) == 0 && len(dsRecords) == 0 {
+		keysToVerify = dnskeyRecords // Fallback for unsigned delegation or trust anchor testing
 	}
+	verifyDNSKEYSignatures(fqdn, rrsigRecords, rrset, keysToVerify, &res)
 
 	// Tier 2: a trusted DoH AD response is required for a verified chain.
 	if dohURLTemplate != StrEmpty && verifyDNSSECDoH(ctx, app, dohURLTemplate, domain, fqdn, authenticatedKSKs...) {
@@ -470,6 +429,55 @@ func validateDNSSEC(ctx context.Context, app *AppState, domain string, resolvers
 		res.Source = DNSSECSourceLocalOnly
 	}
 	return finalizeDNSSECResult(res)
+}
+
+func matchDSDNSKEY(dsRecords []*dns.DS, keys []*dns.DNSKEY) []*dns.DNSKEY {
+	var authenticated []*dns.DNSKEY
+	for _, key := range keys {
+		for _, ds := range dsRecords {
+			if key.KeyTag() != ds.KeyTag || key.Algorithm != ds.Algorithm {
+				continue
+			}
+			computedDS := key.ToDS(ds.DigestType)
+			if computedDS != nil && strings.EqualFold(computedDS.Digest, ds.Digest) {
+				authenticated = append(authenticated, key)
+				break
+			}
+		}
+	}
+	return authenticated
+}
+
+func verifyDNSKEYSignatures(fqdn string, signatures []*dns.RRSIG, rrset []dns.RR, keys []*dns.DNSKEY, result *DNSSECResult) {
+	if len(signatures) == 0 || len(rrset) == 0 {
+		return
+	}
+	for _, signature := range signatures {
+		if !strings.EqualFold(signature.SignerName, fqdn) {
+			continue
+		}
+		for _, key := range keys {
+			if key.KeyTag() != signature.KeyTag || key.Algorithm != signature.Algorithm {
+				continue
+			}
+			if err := signature.Verify(key, rrset); err != nil {
+				continue
+			}
+			now := time.Now().Unix()
+			inception := int64(signature.Inception)
+			expiration := int64(signature.Expiration)
+			if inception <= now+DNSSECClockSkew && now <= expiration+DNSSECClockSkew {
+				result.RRSIGValid = true
+				result.Error = StrEmpty // Clear any stale error from previous iteration.
+				expiryText := dns.TimeToString(signature.Expiration)
+				if expiry, err := time.Parse(LayoutCompactDateTime, expiryText); err == nil {
+					result.RRSIGExpiry = expiry.UTC().Format(time.RFC3339)
+				}
+				return
+			}
+			result.Error = MsgErrRRSIGExpiredOrNotYetValid
+		}
+	}
 }
 
 func finalizeDNSSECResult(res DNSSECResult) DNSSECResult {
@@ -513,12 +521,6 @@ func verifyDNSSECDoH(ctx context.Context, app *AppState, endpoint, domain, fqdn 
 		},
 		parseRR: dns.NewRR,
 	}, authenticatedKSKs...)
-}
-
-type dnssecDoHDependencies struct {
-	newRequest func(context.Context, string) (*http.Request, error)
-	fetch      func(context.Context, HTTPDoer, func() (*http.Request, error)) (*http.Response, error)
-	parseRR    func(string) (dns.RR, error)
 }
 
 func verifyDNSSECDoHWith(ctx context.Context, app *AppState, endpoint, domain, fqdn string, dependencies dnssecDoHDependencies, authenticatedKSKs ...*dns.DNSKEY) bool {
@@ -655,15 +657,15 @@ func FetchDNSSnapshot(ctx context.Context, app *AppState, target DNSTask) DNSSna
 	}
 	observationCount := 1
 	if target.CustomResolver == StrEmpty && len(resolvers) > 1 {
-		observationCount = 2
+		observationCount = MinRecursiveResolverObservations
 	}
 	observations, selected := collectDNSObservations(resolvers, observationCount, func(resolver string) ([]string, error) {
 		return resolveTargetWithResolvers(ctx, app, target, []string{resolver})
 	})
 	foundRecords, err := observations[0].Records, observations[0].Err
-	if observationCount == 2 && len(selected) < 2 {
+	if observationCount == MinRecursiveResolverObservations && len(selected) < MinRecursiveResolverObservations {
 		err = fmt.Errorf(MsgErrIncompleteResolverEvidence, incompleteResolverCause(observationErrors(observations)...))
-	} else if len(selected) == 2 {
+	} else if len(selected) == MinRecursiveResolverObservations {
 		switch {
 		case selected[0].Err != nil || selected[1].Err != nil:
 			if errors.Is(selected[0].Err, ErrNXDOMAIN) && errors.Is(selected[1].Err, ErrNXDOMAIN) {
@@ -816,84 +818,9 @@ func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, str
 
 	switch matchType {
 	case MatchPrefix:
-		allMatch := true
-		var mismatchReasons []string
-		var inlineFound [8]string
-		var lowerFound []string
-		if len(target.Expected) > 1 {
-			if len(foundRecords) <= len(inlineFound) {
-				lowerFound = inlineFound[:len(foundRecords)]
-			} else {
-				lowerFound = make([]string, len(foundRecords))
-			}
-			for i, found := range foundRecords {
-				lowerFound[i] = strings.ToLower(strings.TrimSpace(found))
-			}
-		}
-		for _, expected := range target.Expected {
-			matched := false
-			normalizedExpected := strings.ToLower(strings.TrimSpace(expected))
-			for i, found := range foundRecords {
-				var value string
-				if lowerFound != nil {
-					value = lowerFound[i]
-				} else {
-					value = strings.ToLower(strings.TrimSpace(found))
-				}
-				if strings.HasPrefix(value, normalizedExpected) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				allMatch = false
-				mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonPrefixNotFound, expected, strings.Join(foundRecords, SymCommaSpace)))
-			}
-		}
-		if !allMatch {
-			return false, strings.Join(mismatchReasons, SymSemicolonSpace), CodeDNSPrefixMismatch
-		}
-		return true, StrEmpty, CodeDNSMatchVerified
-
+		return validateTextRecords(target.Expected, foundRecords, true)
 	case MatchContains:
-		allMatch := true
-		var mismatchReasons []string
-		var inlineFound [8]string
-		var lowerFound []string
-		if len(target.Expected) > 1 {
-			if len(foundRecords) <= len(inlineFound) {
-				lowerFound = inlineFound[:len(foundRecords)]
-			} else {
-				lowerFound = make([]string, len(foundRecords))
-			}
-			for i, found := range foundRecords {
-				lowerFound[i] = strings.ToLower(found)
-			}
-		}
-		for _, expected := range target.Expected {
-			matched := false
-			normalizedExpected := strings.ToLower(expected)
-			for i, found := range foundRecords {
-				var value string
-				if lowerFound != nil {
-					value = lowerFound[i]
-				} else {
-					value = strings.ToLower(found)
-				}
-				if strings.Contains(value, normalizedExpected) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				allMatch = false
-				mismatchReasons = append(mismatchReasons, fmt.Sprintf(MsgReasonSubstringNotFound, expected, strings.Join(foundRecords, SymCommaSpace)))
-			}
-		}
-		if !allMatch {
-			return false, strings.Join(mismatchReasons, SymSemicolonSpace), CodeDNSSubstringMismatch
-		}
-		return true, StrEmpty, CodeDNSMatchVerified
+		return validateTextRecords(target.Expected, foundRecords, false)
 
 	case MatchAnyOf:
 		matched := false
@@ -943,15 +870,78 @@ func validateRecordsWithReason(target DNSTask, foundRecords []string) (bool, str
 	}
 }
 
+// validateTextRecords applies the configured text matching mode to every expected value.
+func validateTextRecords(expectedRecords, foundRecords []string, prefix bool) (bool, string, ResultCode) {
+	if len(expectedRecords) == 0 {
+		return true, StrEmpty, CodeDNSMatchVerified
+	}
+
+	var inlineFound [InlineDNSMatchRecords]string
+	var normalizedFound []string
+	if len(expectedRecords) > 1 {
+		if len(foundRecords) <= len(inlineFound) {
+			normalizedFound = inlineFound[:len(foundRecords)]
+		} else {
+			normalizedFound = make([]string, len(foundRecords))
+		}
+		for index, found := range foundRecords {
+			if prefix {
+				found = strings.TrimSpace(found)
+			}
+			normalizedFound[index] = strings.ToLower(found)
+		}
+	}
+
+	reasonFormat, mismatchCode := MsgReasonSubstringNotFound, CodeDNSSubstringMismatch
+	if prefix {
+		reasonFormat, mismatchCode = MsgReasonPrefixNotFound, CodeDNSPrefixMismatch
+	}
+	var reasons []string
+	var foundSummary string
+	for _, expected := range expectedRecords {
+		comparison := expected
+		if prefix {
+			comparison = strings.TrimSpace(comparison)
+		}
+		comparison = strings.ToLower(comparison)
+		matched := false
+		for index, found := range foundRecords {
+			value := found
+			if normalizedFound != nil {
+				value = normalizedFound[index]
+			} else {
+				if prefix {
+					value = strings.TrimSpace(value)
+				}
+				value = strings.ToLower(value)
+			}
+			if (prefix && strings.HasPrefix(value, comparison)) || (!prefix && strings.Contains(value, comparison)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			if reasons == nil {
+				foundSummary = strings.Join(foundRecords, SymCommaSpace)
+			}
+			reasons = append(reasons, fmt.Sprintf(reasonFormat, expected, foundSummary))
+		}
+	}
+	if len(reasons) > 0 {
+		return false, strings.Join(reasons, SymSemicolonSpace), mismatchCode
+	}
+	return true, StrEmpty, CodeDNSMatchVerified
+}
+
 // caaTagIsUnconstrained reports whether a well-formed record uses an omitted policy tag.
 func caaTagIsUnconstrained(record string, expected []string) bool {
-	parts := strings.SplitN(record, SymSpace, 3)
-	if len(parts) != 3 {
+	parts := strings.SplitN(record, SymSpace, CAARecordFieldCount)
+	if len(parts) != CAARecordFieldCount {
 		return false
 	}
 	for _, value := range expected {
-		expectedParts := strings.SplitN(value, SymSpace, 3)
-		if len(expectedParts) == 3 && strings.EqualFold(expectedParts[1], parts[1]) {
+		expectedParts := strings.SplitN(value, SymSpace, CAARecordFieldCount)
+		if len(expectedParts) == CAARecordFieldCount && strings.EqualFold(expectedParts[1], parts[1]) {
 			return false
 		}
 	}
@@ -1022,7 +1012,7 @@ func validDKIMPublicKey(keyType, key string) bool {
 		return len(decoded) == ed25519.PublicKeySize
 	}
 	if parsed, parseErr := x509.ParsePKCS1PublicKey(decoded); parseErr == nil && parsed != nil {
-		return parsed.N.BitLen() >= 1024
+		return parsed.N.BitLen() >= MinDKIMRSABits
 	}
 	// Accept SubjectPublicKeyInfo as a compatibility extension because it is
 	// commonly published even though RFC 6376 specifies PKCS#1 RSAPublicKey.
@@ -1031,7 +1021,7 @@ func validDKIMPublicKey(keyType, key string) bool {
 		return false
 	}
 	rsaKey, ok := parsed.(*rsa.PublicKey)
-	return ok && rsaKey.N.BitLen() >= 1024
+	return ok && rsaKey.N.BitLen() >= MinDKIMRSABits
 }
 
 func hasValidDMARCPolicy(record string) bool {
@@ -1149,8 +1139,8 @@ func fetchDMARCPolicy(domain string, queryFn func(string) ([]string, error)) ([]
 		}
 		if queryCount == 0 {
 			labelCount := 1 + strings.Count(currentDomain, SymDot)
-			if labelCount > 8 {
-				for range labelCount - 7 {
+			if labelCount > MaxDMARCDiscoveryLabels {
+				for range labelCount - DMARCDiscoveryTargetLabels {
 					currentDomain = parentDomain(currentDomain)
 				}
 				continue
@@ -1232,140 +1222,31 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 	}
 	email := target.Email
 
-	var conditions []StateCondition
-	emailStatus := StatusOK
+	liveMXs, emailStatus, conditions := evaluateEmailMX(target, snap, providers)
 
-	// MX
-	var liveMXs []string
-	switch {
-	case errors.Is(snap.MXErr, ErrInvalidNullMX):
-		emailStatus = StatusMismatch
-		conditions = append(conditions, StateCondition{Code: CodeEmailInvalidNullMX, Target: snap.MXErr.Error()})
-	case snap.MXErr != nil:
-		emailStatus = StatusFailed
-		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: snap.MXErr.Error()})
-	case len(snap.MXRecords) == 0:
-		emailStatus = StatusFailed
-		conditions = append(conditions, StateCondition{Code: CodeEmailMissingMX})
-	default:
-		liveMXs = append(liveMXs, snap.MXRecords...)
-		if len(email.MXRecords) > 0 {
-			allMatch := true
-			for _, expected := range email.MXRecords {
-				if !slices.Contains(liveMXs, expected) {
-					allMatch = false
-					conditions = append(conditions, StateCondition{Code: CodeEmailMissingMX, Target: expected})
-				}
-			}
-			for _, found := range liveMXs {
-				if !slices.Contains(email.MXRecords, found) {
-					allMatch = false
-					conditions = append(conditions, StateCondition{Code: CodeEmailUnauthorizedMX, Target: found})
-				}
-			}
-			if !allMatch && emailStatus == StatusOK {
-				emailStatus = StatusMismatch
-			}
-		} else if email.Provider != StrEmpty {
-			var safe, known bool
-			if providers != nil {
-				if provider, ok := providers[email.Provider]; ok {
-					known = true
-					safe = isProviderMXSafeDynamic(liveMXs, provider)
-				}
-			}
-			if !known {
-				LogWarnf(MsgLogEmailUnknownProvider, email.Provider, target.Domain)
-			} else if !safe {
-				emailStatus = StatusHijacked
-				conditions = append(conditions, StateCondition{Code: CodeEmailHijackedMX, Target: strings.Join(liveMXs, SymCommaSpace)})
-			}
-		}
-	}
-
-	// SPF
-	var spfFound bool
-	if snap.SPFErr != nil {
+	spfFound, spfCondition := evaluateEmailSPF(snap)
+	if !spfCondition.IsZero() {
 		if emailStatus == StatusOK {
 			emailStatus = StatusWarning
 		}
-		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: StrSPF + snap.SPFErr.Error()})
-	} else {
-		spfCount := 0
-		for _, txt := range snap.SPFRecords {
-			if isSPFPolicyRecord(txt) {
-				spfCount++
-			}
-		}
-		switch {
-		case spfCount == 0:
-			if emailStatus == StatusOK {
-				emailStatus = StatusWarning
-			}
-			conditions = append(conditions, StateCondition{Code: CodeEmailMissingSPF})
-		case spfCount > 1:
-			if emailStatus == StatusOK {
-				emailStatus = StatusWarning
-			}
-			conditions = append(conditions, StateCondition{Code: CodeEmailMultipleSPF})
-		default:
-			spfFound = true
-		}
+		conditions = append(conditions, spfCondition)
 	}
 
-	// DMARC
-	var dmarcFound bool
-	if snap.DMARCErr != nil && !errors.Is(snap.DMARCErr, ErrNXDOMAIN) {
-		emailStatus = StatusFailed
-		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: StrDMARCDiagnosticPrefix + snap.DMARCErr.Error()})
-	} else {
-		dmarcCount := 0
-		for _, txt := range snap.DMARCRecords {
-			if hasValidDMARCPolicy(txt) {
-				dmarcCount++
-			}
+	dmarcFound, dmarcCondition, dmarcLookupFailed := evaluateEmailDMARC(snap)
+	if !dmarcCondition.IsZero() {
+		if dmarcLookupFailed {
+			emailStatus = StatusFailed
+		} else if emailStatus == StatusOK {
+			emailStatus = StatusWarning
 		}
-		if dmarcCount > 0 {
-			if dmarcCount > 1 {
-				if emailStatus == StatusOK {
-					emailStatus = StatusWarning
-				}
-				conditions = append(conditions, StateCondition{Code: CodeEmailMultipleDMARC})
-			} else {
-				dmarcFound = true
-			}
-		} else {
-			if emailStatus == StatusOK {
-				emailStatus = StatusWarning
-			}
-			conditions = append(conditions, StateCondition{Code: CodeEmailMissingDMARC})
-		}
+		conditions = append(conditions, dmarcCondition)
 	}
 
-	// DKIM
-	var validDKIMs []string
-	var missingDKIMs []string
-	var dkimNetworkErr error
-	for sel, err := range snap.DKIMErrs {
-		if err != nil {
-			dkimNetworkErr = err
-			missingDKIMs = append(missingDKIMs, sel)
-		}
-	}
-	for sel, found := range snap.DKIMResults {
-		if found {
-			validDKIMs = append(validDKIMs, sel)
-		} else {
-			missingDKIMs = append(missingDKIMs, sel)
-		}
-	}
-
+	validDKIMs, missingDKIMs, dkimNetworkErr := summarizeDKIM(snap)
 	hasDKIMExpected := len(email.DKIMSelectors) > 0
 	if len(providers[email.Provider].DKIMSelectors) > 0 {
 		hasDKIMExpected = true
 	}
-	slices.Sort(validDKIMs)
-	slices.Sort(missingDKIMs)
 	if hasDKIMExpected && (len(validDKIMs) == 0 || dkimNetworkErr != nil) {
 		if dkimNetworkErr != nil {
 			if emailStatus == StatusOK {
@@ -1415,6 +1296,116 @@ func EvaluateEmailSecurity(target DomainConfig, snap EmailSnapshot, providers ma
 		finalCond = StateCondition{Code: CodeEmailVerified}
 	}
 	return emailStatus, finalCond, state
+}
+
+func evaluateEmailMX(target DomainConfig, snap EmailSnapshot, providers map[string]ProviderConfig) ([]string, CheckStatus, []StateCondition) {
+	email := target.Email
+	var conditions []StateCondition
+	emailStatus := StatusOK
+	var liveMXs []string
+	switch {
+	case errors.Is(snap.MXErr, ErrInvalidNullMX):
+		emailStatus = StatusMismatch
+		conditions = append(conditions, StateCondition{Code: CodeEmailInvalidNullMX, Target: snap.MXErr.Error()})
+	case snap.MXErr != nil:
+		emailStatus = StatusFailed
+		conditions = append(conditions, StateCondition{Code: CodeDNSLookupFailed, Target: snap.MXErr.Error()})
+	case len(snap.MXRecords) == 0:
+		emailStatus = StatusFailed
+		conditions = append(conditions, StateCondition{Code: CodeEmailMissingMX})
+	default:
+		liveMXs = append(liveMXs, snap.MXRecords...)
+		if len(email.MXRecords) > 0 {
+			allMatch := true
+			for _, expected := range email.MXRecords {
+				if !slices.Contains(liveMXs, expected) {
+					allMatch = false
+					conditions = append(conditions, StateCondition{Code: CodeEmailMissingMX, Target: expected})
+				}
+			}
+			for _, found := range liveMXs {
+				if !slices.Contains(email.MXRecords, found) {
+					allMatch = false
+					conditions = append(conditions, StateCondition{Code: CodeEmailUnauthorizedMX, Target: found})
+				}
+			}
+			if !allMatch {
+				emailStatus = StatusMismatch
+			}
+		} else if email.Provider != StrEmpty {
+			if provider, known := providers[email.Provider]; !known {
+				LogWarnf(MsgLogEmailUnknownProvider, email.Provider, target.Domain)
+			} else if !isProviderMXSafeDynamic(liveMXs, provider) {
+				emailStatus = StatusHijacked
+				conditions = append(conditions, StateCondition{Code: CodeEmailHijackedMX, Target: strings.Join(liveMXs, SymCommaSpace)})
+			}
+		}
+	}
+
+	return liveMXs, emailStatus, conditions
+}
+
+func evaluateEmailSPF(snap EmailSnapshot) (bool, StateCondition) {
+	if snap.SPFErr != nil {
+		return false, StateCondition{Code: CodeDNSLookupFailed, Target: StrSPF + snap.SPFErr.Error()}
+	}
+	count := 0
+	for _, txt := range snap.SPFRecords {
+		if isSPFPolicyRecord(txt) {
+			count++
+		}
+	}
+	switch {
+	case count == 0:
+		return false, StateCondition{Code: CodeEmailMissingSPF}
+	case count > 1:
+		return false, StateCondition{Code: CodeEmailMultipleSPF}
+	default:
+		return true, StateCondition{}
+	}
+}
+
+func evaluateEmailDMARC(snap EmailSnapshot) (found bool, condition StateCondition, lookupFailed bool) {
+	if snap.DMARCErr != nil && !errors.Is(snap.DMARCErr, ErrNXDOMAIN) {
+		return false, StateCondition{Code: CodeDNSLookupFailed, Target: StrDMARCDiagnosticPrefix + snap.DMARCErr.Error()}, true
+	}
+	count := 0
+	for _, txt := range snap.DMARCRecords {
+		if hasValidDMARCPolicy(txt) {
+			count++
+		}
+	}
+	switch {
+	case count == 0:
+		return false, StateCondition{Code: CodeEmailMissingDMARC}, false
+	case count > 1:
+		return false, StateCondition{Code: CodeEmailMultipleDMARC}, false
+	default:
+		return true, StateCondition{}, false
+	}
+}
+
+func summarizeDKIM(snap EmailSnapshot) (validSelectors, missingSelectors []string, networkErr error) {
+	var errorSelector string
+	for selector, err := range snap.DKIMErrs {
+		if err != nil {
+			if networkErr == nil || selector < errorSelector {
+				networkErr = err
+				errorSelector = selector
+			}
+			missingSelectors = append(missingSelectors, selector)
+		}
+	}
+	for selector, found := range snap.DKIMResults {
+		if found {
+			validSelectors = append(validSelectors, selector)
+		} else {
+			missingSelectors = append(missingSelectors, selector)
+		}
+	}
+	slices.Sort(validSelectors)
+	slices.Sort(missingSelectors)
+	return validSelectors, missingSelectors, networkErr
 }
 
 func isSPFPolicyRecord(record string) bool {

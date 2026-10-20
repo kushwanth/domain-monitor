@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unique"
 
 	"domain_monitor/src/internal/netpolicy"
 
@@ -271,11 +270,11 @@ func normalizeEPPStatus(raw string) string {
 	// Map known multi-word, hyphenated, or camelCase EPP / RDAP status strings to canonical format
 	cleanKey := NormalizeStatusToken(s)
 	if canon, ok := eppStatusMap[cleanKey]; ok {
-		return unique.Make(canon).Value()
+		return canon
 	}
 
 	if len(nonURLFields) > 0 {
-		return unique.Make(s).Value()
+		return s
 	}
 
 	// A URL-only status may identify its token with an anchor (e.g., "https://icann.org/epp#clientTransferProhibited"
@@ -292,7 +291,7 @@ func normalizeEPPStatus(raw string) string {
 		}
 	}
 
-	return unique.Make(s).Value()
+	return s
 }
 
 // NormalizeDomainStatuses deduplicates and normalizes status strings.
@@ -316,39 +315,39 @@ func NormalizeDomainStatuses(statuses []string) []string {
 	for _, norm := range normalized {
 		key := strings.ToLower(norm)
 		switch key {
-		case StrTransferprohibited:
-			if _, client := seen[StrClienttransferprohibited]; client {
+		case EPPTokenTransferProhibited:
+			if _, client := seen[EPPTokenClientTransferProhibited]; client {
 				continue
 			}
-			if _, server := seen[StrServertransferprohibited]; server {
+			if _, server := seen[EPPTokenServerTransferProhibited]; server {
 				continue
 			}
-		case StrDeleteprohibited:
-			if _, client := seen[StrClientdeleteprohibited]; client {
+		case EPPTokenDeleteProhibited:
+			if _, client := seen[EPPTokenClientDeleteProhibited]; client {
 				continue
 			}
-			if _, server := seen[StrServerdeleteprohibited]; server {
+			if _, server := seen[EPPTokenServerDeleteProhibited]; server {
 				continue
 			}
-		case StrUpdateprohibited:
-			if _, client := seen[StrClientupdateprohibited]; client {
+		case EPPTokenUpdateProhibited:
+			if _, client := seen[EPPTokenClientUpdateProhibited]; client {
 				continue
 			}
-			if _, server := seen[StrServerupdateprohibited]; server {
+			if _, server := seen[EPPTokenServerUpdateProhibited]; server {
 				continue
 			}
-		case StrRenewprohibited:
-			if _, client := seen[StrClientrenewprohibited]; client {
+		case EPPTokenRenewProhibited:
+			if _, client := seen[EPPTokenClientRenewProhibited]; client {
 				continue
 			}
-			if _, server := seen[StrServerrenewprohibited]; server {
+			if _, server := seen[EPPTokenServerRenewProhibited]; server {
 				continue
 			}
 		case StrHold:
-			if _, client := seen[StrClienthold]; client {
+			if _, client := seen[EPPTokenClientHold]; client {
 				continue
 			}
-			if _, server := seen[StrServerhold]; server {
+			if _, server := seen[EPPTokenServerHold]; server {
 				continue
 			}
 		}
@@ -376,7 +375,7 @@ func isTransferLocked(statuses []string) bool {
 		}
 		// Preserve explicit registrar aliases, without matching arbitrary extension substrings.
 		key := NormalizeStatusToken(s)
-		if key == StrProhibittransfer || key == StrTransferlock {
+		if key == EPPTokenProhibitTransfer || key == EPPTokenTransferLock {
 			return true
 		}
 	}
@@ -452,7 +451,7 @@ func extractVCardText(val any) string {
 
 // extractVCardProperty finds a named property (e.g. "fn", "org") in a jCard vcardArray (RFC 7095).
 func extractVCardProperty(vcardArray []any, targetProp string) string {
-	if len(vcardArray) < 2 {
+	if len(vcardArray) < VCardArrayMinFields {
 		return StrEmpty
 	}
 	props, ok := vcardArray[1].([]any)
@@ -656,6 +655,13 @@ func extractWHOISTierWithParser(raw string, source string, server string, parse 
 	}
 
 	parsed, parseErr := parse(raw)
+	populateParsedWHOISTier(tier, parsed, parseErr)
+	populateWHOISTierFallback(tier, raw)
+	cloneWHOISTierStrings(tier, len(raw))
+	return tier
+}
+
+func populateParsedWHOISTier(tier *DomainTierData, parsed whoisparser.WhoisInfo, parseErr error) {
 	if parseErr == nil && parsed.Registrar != nil && parsed.Registrar.Name != StrEmpty {
 		tier.Registrar = parsed.Registrar.Name
 		tier.IANAID = parsed.Registrar.ID
@@ -689,7 +695,9 @@ func extractWHOISTierWithParser(raw string, source string, server string, parse 
 			}
 		}
 	}
+}
 
+func populateWHOISTierFallback(tier *DomainTierData, raw string) {
 	// Supplementary regex field extraction if missing
 	if tier.Expiration == StrEmpty {
 		if m := ReWHOISExpiry.FindStringSubmatch(raw); len(m) > 1 {
@@ -766,10 +774,12 @@ func extractWHOISTierWithParser(raw string, source string, server string, parse 
 			}
 		}
 	}
+}
 
+func cloneWHOISTierStrings(tier *DomainTierData, rawLen int) {
 	// A small extracted substring can otherwise keep an unusually large WHOIS
 	// response alive for the entire monitoring cycle.
-	if len(raw) > 64<<10 {
+	if rawLen > WHOISCloneResponseThreshold {
 		tier.Registrar = strings.Clone(tier.Registrar)
 		tier.IANAID = strings.Clone(tier.IANAID)
 		tier.Expiration = strings.Clone(tier.Expiration)
@@ -782,7 +792,6 @@ func extractWHOISTierWithParser(raw string, source string, server string, parse 
 			tier.DomainStatus[i] = strings.Clone(tier.DomainStatus[i])
 		}
 	}
-	return tier
 }
 
 func normalizedWHOISDate(value string) string {
@@ -840,36 +849,70 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RD
 	}
 
 	// 3. Synthesize Expiration & Check for Grace Period Discrepancies
+	var expirationDiscrepancy string
+	state.Expiration, expirationDiscrepancy = synthesizeTierExpiration(registry, registrar)
+	if expirationDiscrepancy != StrEmpty {
+		discrepancies = append(discrepancies, expirationDiscrepancy)
+	}
+
+	// 4. Synthesize Nameservers & Check for Desynchronization
+	var nameserverDiscrepancy string
+	state.Nameservers, nameserverDiscrepancy = synthesizeTierNameservers(registry, registrar)
+	if nameserverDiscrepancy != StrEmpty {
+		discrepancies = append(discrepancies, nameserverDiscrepancy)
+	}
+
+	// 5. Synthesize Domain Statuses (Union of Registry and Registrar holds/prohibitions)
+	var allStatuses []string
+	if registry != nil {
+		allStatuses = append(allStatuses, registry.DomainStatus...)
+	}
+	if registrar != nil {
+		allStatuses = append(allStatuses, registrar.DomainStatus...)
+	}
+	state.DomainStatus = NormalizeDomainStatuses(allStatuses)
+
+	// 6. Synthesize DNSSEC
+	if (registry != nil && registry.DNSSEC) || (registrar != nil && registrar.DNSSEC) {
+		state.DNSSEC = true
+	}
+
+	state.Discrepancies = discrepancies
+	return state, discrepancies
+}
+
+func synthesizeTierExpiration(registry, registrar *DomainTierData) (expiration, discrepancy string) {
 	switch {
 	case registry != nil && registry.Expiration != StrEmpty && registrar != nil && registrar.Expiration != StrEmpty:
 		regTime, _, errReg := parseFlexibleDate(registry.Expiration)
 		rarTime, _, errRar := parseFlexibleDate(registrar.Expiration)
 		if errReg == nil && errRar == nil {
-			deltaDays := math.Abs(regTime.Sub(rarTime).Hours() / 24)
+			deltaDays := math.Abs(regTime.Sub(rarTime).Hours() / HoursPerDay)
 			if deltaDays > AutoRenewGracePeriodThresholdDays {
-				disc := StrAutoRenewGracePeriod + regTime.Format(DateLayoutCompact) + StrVsRegistrarExpiration + rarTime.Format(DateLayoutCompact) + SymParenClose
-				discrepancies = append(discrepancies, disc)
+				discrepancy = StrAutoRenewGracePeriod + regTime.Format(DateLayoutCompact) + StrVsRegistrarExpiration + rarTime.Format(DateLayoutCompact) + SymParenClose
 			}
 			// Use the earlier date for alert evaluation to be conservative
 			if rarTime.Before(regTime) {
-				state.Expiration = registrar.Expiration
+				expiration = registrar.Expiration
 			} else {
-				state.Expiration = registry.Expiration
+				expiration = registry.Expiration
 			}
 		} else if errReg == nil {
-			state.Expiration = registry.Expiration
+			expiration = registry.Expiration
 		} else if errRar == nil {
-			state.Expiration = registrar.Expiration
+			expiration = registrar.Expiration
 		} else {
-			state.Expiration = registry.Expiration
+			expiration = registry.Expiration
 		}
 	case registry != nil && registry.Expiration != StrEmpty:
-		state.Expiration = registry.Expiration
+		expiration = registry.Expiration
 	case registrar != nil && registrar.Expiration != StrEmpty:
-		state.Expiration = registrar.Expiration
+		expiration = registrar.Expiration
 	}
+	return expiration, discrepancy
+}
 
-	// 4. Synthesize Nameservers & Check for Desynchronization
+func synthesizeTierNameservers(registry, registrar *DomainTierData) (nameservers []string, discrepancy string) {
 	if registry != nil && len(registry.Nameservers) > 0 && registrar != nil && len(registrar.Nameservers) > 0 {
 		regMap := make(stringSet)
 		for _, ns := range registry.Nameservers {
@@ -893,34 +936,16 @@ func synthesizeTierData(registry *DomainTierData, registrar *DomainTierData) (RD
 		}
 
 		if mismatch {
-			disc := StrNameserverDesyncRegistryDelegation + strings.Join(registry.Nameservers, SymCommaSpace) + StrRegistrarConfiguration + strings.Join(registrar.Nameservers, SymCommaSpace) + SymBracketClose
-			discrepancies = append(discrepancies, disc)
+			discrepancy = StrNameserverDesyncRegistryDelegation + strings.Join(registry.Nameservers, SymCommaSpace) + StrRegistrarConfiguration + strings.Join(registrar.Nameservers, SymCommaSpace) + SymBracketClose
 		}
 		// Registry delegation is authoritative for global DNS resolution
-		state.Nameservers = registry.Nameservers
+		nameservers = registry.Nameservers
 	} else if registry != nil && len(registry.Nameservers) > 0 {
-		state.Nameservers = registry.Nameservers
+		nameservers = registry.Nameservers
 	} else if registrar != nil && len(registrar.Nameservers) > 0 {
-		state.Nameservers = registrar.Nameservers
+		nameservers = registrar.Nameservers
 	}
-
-	// 5. Synthesize Domain Statuses (Union of Registry and Registrar holds/prohibitions)
-	var allStatuses []string
-	if registry != nil {
-		allStatuses = append(allStatuses, registry.DomainStatus...)
-	}
-	if registrar != nil {
-		allStatuses = append(allStatuses, registrar.DomainStatus...)
-	}
-	state.DomainStatus = NormalizeDomainStatuses(allStatuses)
-
-	// 6. Synthesize DNSSEC
-	if (registry != nil && registry.DNSSEC) || (registrar != nil && registrar.DNSSEC) {
-		state.DNSSEC = true
-	}
-
-	state.Discrepancies = discrepancies
-	return state, discrepancies
+	return nameservers, discrepancy
 }
 
 // FetchRDAPSnapshot fetches raw registry data via RDAP, falling back to WHOIS
@@ -965,26 +990,14 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 	}
 
 	if snapshot.Err != nil {
-		if errors.Is(snapshot.Err, ErrDomainNotFound) || errors.Is(snapshot.Err, ErrRDAPNotFound) {
-			if target.AllowExpiry {
-				return StatusSkipped, StateCondition{}
-			}
-			return StatusFailed, StateCondition{Code: CodeDomainNotFound}
-		}
-
-		errStr := snapshot.Err.Error()
-		if strings.Contains(errStr, StrConnectionRefused) || strings.Contains(errStr, StrIOTimeout) || strings.Contains(errStr, StrNoSuchHost) || strings.Contains(errStr, StrTemporaryFailure) || isWHOISRateLimited(errStr, snapshot.Err) || errors.Is(snapshot.Err, ErrWHOISRateLimited) {
-			return StatusWarning, StateCondition{Code: CodeRDAPHTTPError}
-		}
-
-		return StatusFailed, StateCondition{Code: CodeRDAPHTTPError}
+		return classifyRDAPError(snapshot.Err, target.AllowExpiry)
 	}
 
 	ct := ConditionTracker{Status: StatusOK}
 
 	// 1. Checks expiration
 	if t, _, err := parseFlexibleDate(snapshot.Expiration); err == nil {
-		days := time.Until(t).Hours() / 24
+		days := time.Until(t).Hours() / HoursPerDay
 		if days < 0 {
 			if target.AllowExpiry {
 				return StatusSkipped, StateCondition{}
@@ -992,7 +1005,7 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 			ct.Promote(StatusFailed, CodeRDAPExpired, StrEmpty)
 		} else if days <= DefaultRDAPExpiryWarningDays && !target.AllowExpiry {
 			priority := StatusWarning
-			if days <= 7 {
+			if days <= RDAPCriticalExpiryDays {
 				priority = StatusFailed
 			}
 			ct.Promote(priority, CodeRDAPExpiringSoon, StrEmpty)
@@ -1042,6 +1055,21 @@ func EvaluateRDAP(target DomainConfig, snapshot RDAPSnapshot) (CheckStatus, Stat
 		ct.Cond = StateCondition{Code: CodeRDAPSuccess}
 	}
 	return ct.Status, ct.Cond
+}
+
+func classifyRDAPError(err error, allowExpiry bool) (CheckStatus, StateCondition) {
+	if errors.Is(err, ErrDomainNotFound) || errors.Is(err, ErrRDAPNotFound) {
+		if allowExpiry {
+			return StatusSkipped, StateCondition{}
+		}
+		return StatusFailed, StateCondition{Code: CodeDomainNotFound}
+	}
+
+	errText := err.Error()
+	if strings.Contains(errText, StrConnectionRefused) || strings.Contains(errText, StrIOTimeout) || strings.Contains(errText, StrNoSuchHost) || strings.Contains(errText, StrTemporaryFailure) || isWHOISRateLimited(errText, err) || errors.Is(err, ErrWHOISRateLimited) {
+		return StatusWarning, StateCondition{Code: CodeRDAPHTTPError}
+	}
+	return StatusFailed, StateCondition{Code: CodeRDAPHTTPError}
 }
 
 func fetchRDAP(ctx context.Context, httpClient HTTPDoer, app *AppState, domain string) (RDAPSnapshot, error) {

@@ -73,11 +73,11 @@ func migrateV3ConfigWithMarshal(data []byte, marshal func(any) ([]byte, error)) 
 	if err := jsonv1.Unmarshal(data, &root); err != nil {
 		return nil, err
 	}
-	if _, exists := root["data_dir"]; exists {
-		return nil, fmt.Errorf("legacy configuration field %q cannot be migrated safely; remove it after reviewing the v4 upgrade notes", "data_dir")
+	if _, exists := root[ConfigKeyDataDir]; exists {
+		return nil, fmt.Errorf(MsgErrUnsafeLegacyField, ConfigKeyDataDir)
 	}
 	changed := false
-	if rawDomains, ok := root["domains"]; ok {
+	if rawDomains, ok := root[ConfigKeyDomains]; ok {
 		var domains []map[string]jsonv1.RawMessage
 		if err := jsonv1.Unmarshal(rawDomains, &domains); err != nil {
 			return nil, err
@@ -94,17 +94,17 @@ func migrateV3ConfigWithMarshal(data []byte, marshal func(any) ([]byte, error)) 
 			if err != nil {
 				return nil, err
 			}
-			root["domains"] = encoded
+			root[ConfigKeyDomains] = encoded
 		}
 	}
-	if rawRecords, ok := root["dns_records"]; ok {
+	if rawRecords, ok := root[ConfigKeyDNSRecords]; ok {
 		var records []map[string]jsonv1.RawMessage
 		if err := jsonv1.Unmarshal(rawRecords, &records); err != nil {
 			return nil, err
 		}
 		for index, record := range records {
-			if _, exists := record["skip_ssl"]; exists {
-				return nil, fmt.Errorf("dns record at index %d uses legacy field %q, which cannot be migrated safely; remove it after reviewing the v4 upgrade notes", index, "skip_ssl")
+			if _, exists := record[ConfigKeySkipSSL]; exists {
+				return nil, fmt.Errorf(MsgErrUnsafeLegacyDNSRecordField, index, ConfigKeySkipSSL)
 			}
 		}
 		if changed {
@@ -112,7 +112,7 @@ func migrateV3ConfigWithMarshal(data []byte, marshal func(any) ([]byte, error)) 
 			if err != nil {
 				return nil, err
 			}
-			root["dns_records"] = encoded
+			root[ConfigKeyDNSRecords] = encoded
 		}
 	}
 	if !changed {
@@ -124,25 +124,25 @@ func migrateV3ConfigWithMarshal(data []byte, marshal func(any) ([]byte, error)) 
 func migrateV3Domain(domain map[string]jsonv1.RawMessage) (bool, error) {
 	changed := false
 	var domainName string
-	if rawDomain, exists := domain["domain"]; exists {
+	if rawDomain, exists := domain[ConfigKeyDomain]; exists {
 		if err := jsonv1.Unmarshal(rawDomain, &domainName); err != nil {
 			return false, err
 		}
 	}
-	for _, key := range []string{"expected_ns", "secondary_ns", "verify_ns_health", "is_delegated_zone", "monitor_ct_logs"} {
+	for _, key := range []string{ConfigKeyExpectedNS, ConfigKeySecondaryNS, ConfigKeyVerifyNSHealth, ConfigKeyIsDelegatedZone, ConfigKeyMonitorCTLogs} {
 		if _, exists := domain[key]; exists {
-			return false, fmt.Errorf("domain %q uses legacy field %q, which cannot be migrated safely; replace it with the current v4 schema", domainName, key)
+			return false, fmt.Errorf(MsgErrUnsafeLegacyDomainField, domainName, key)
 		}
 	}
-	if _, exists := domain["email"]; !exists {
+	if _, exists := domain[ConfigKeyEmail]; !exists {
 		email := make(map[string]jsonv1.RawMessage)
-		for legacy, current := range map[string]string{"mail_provider": "provider", "mx_records": "mx_records", "dkim_selectors": "dkim_selectors"} {
+		for legacy, current := range map[string]string{ConfigKeyMailProvider: ConfigKeyProvider, ConfigKeyMXRecords: ConfigKeyMXRecords, ConfigKeyDKIMSelectors: ConfigKeyDKIMSelectors} {
 			if raw, ok := domain[legacy]; ok {
 				email[current] = raw
 			}
 		}
 		var enabled bool
-		if raw, ok := domain["check_email_security"]; ok {
+		if raw, ok := domain[ConfigKeyCheckEmailSecurity]; ok {
 			if err := jsonv1.Unmarshal(raw, &enabled); err != nil {
 				return false, err
 			}
@@ -152,31 +152,31 @@ func migrateV3Domain(domain map[string]jsonv1.RawMessage) (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			domain["email"] = encoded
+			domain[ConfigKeyEmail] = encoded
 			changed = true
 		}
 	}
-	if _, exists := domain["registrar"]; !exists {
-		registrarID, hasID := domain["expected_registrar_id"]
-		registrarName, hasName := domain["expected_registrar_name"]
+	if _, exists := domain[ConfigKeyRegistrar]; !exists {
+		registrarID, hasID := domain[ConfigKeyExpectedRegistrarID]
+		registrarName, hasName := domain[ConfigKeyExpectedRegistrarName]
 		if hasID && hasName {
-			return false, fmt.Errorf("domain %q configures both legacy registrar fields; select one current %q value", domainName, "registrar")
+			return false, fmt.Errorf(MsgErrLegacyRegistrarConflict, domainName, ConfigKeyRegistrar)
 		}
 		if hasID {
-			domain["registrar"] = registrarID
+			domain[ConfigKeyRegistrar] = registrarID
 			changed = true
 		} else if hasName {
-			domain["registrar"] = registrarName
+			domain[ConfigKeyRegistrar] = registrarName
 			changed = true
 		}
 	}
-	if _, exists := domain["allow_expiry"]; !exists {
-		if raw, ok := domain["unused"]; ok {
-			domain["allow_expiry"] = raw
+	if _, exists := domain[ConfigKeyAllowExpiry]; !exists {
+		if raw, ok := domain[ConfigKeyUnused]; ok {
+			domain[ConfigKeyAllowExpiry] = raw
 			changed = true
 		}
 	}
-	for _, key := range []string{"check_email_security", "mail_provider", "mx_records", "dkim_selectors", "unused", "expected_registrar_id", "expected_registrar_name"} {
+	for _, key := range []string{ConfigKeyCheckEmailSecurity, ConfigKeyMailProvider, ConfigKeyMXRecords, ConfigKeyDKIMSelectors, ConfigKeyUnused, ConfigKeyExpectedRegistrarID, ConfigKeyExpectedRegistrarName} {
 		changed = deleteJSONField(domain, key) || changed
 	}
 	return changed, nil
@@ -661,11 +661,7 @@ func normalizeExpectedDNSValue(record DNSTask, rawVal string) (string, error) {
 		if strings.TrimSpace(rawVal) == StrEmpty {
 			return StrEmpty, nil
 		}
-		rr, err := dns.NewRR(StrExample60InCAA + strings.TrimSpace(rawVal))
-		if err != nil {
-			return StrEmpty, fmt.Errorf(MsgErrInvalidExpectedCAAValueFor, rawVal, record.Hostname, err)
-		}
-		return canonicalCAARecordValue(rr.(*dns.CAA)), nil
+		return normalizeExpectedCAAValue(rawVal, record.Hostname, dns.NewRR)
 	}
 	cleanVal := strings.TrimSuffix(strings.TrimSpace(rawVal), SymDot)
 	if cleanVal == StrEmpty {
@@ -687,6 +683,18 @@ func normalizeExpectedDNSValue(record DNSTask, rawVal string) (string, error) {
 	default:
 		return NormalizeDomainToASCIIText(cleanVal), nil
 	}
+}
+
+func normalizeExpectedCAAValue(rawVal, hostname string, parse func(string) (dns.RR, error)) (string, error) {
+	rr, err := parse(StrExample60InCAA + strings.TrimSpace(rawVal))
+	if err != nil {
+		return StrEmpty, fmt.Errorf(MsgErrInvalidExpectedCAAValueFor, rawVal, hostname, err)
+	}
+	caa, ok := rr.(*dns.CAA)
+	if !ok {
+		return StrEmpty, fmt.Errorf(MsgErrInvalidExpectedCAAValueFor, rawVal, hostname, fmt.Errorf(MsgErrUnexpectedDNSRecordType, rr))
+	}
+	return canonicalCAARecordValue(caa), nil
 }
 
 func normalizeExpectedIPValue(record DNSTask, rawVal string, parsedIP net.IP) (string, error) {

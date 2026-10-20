@@ -146,7 +146,7 @@ func ResolveHTTPClient(client HTTPDoer) HTTPDoer {
 
 func retryBackoff(attempt int, base time.Duration) time.Duration {
 	delay := base << max(attempt-1, 0)
-	jitter := delay / 4
+	jitter := delay / RetryJitterDivisor
 	if jitter == 0 {
 		return delay
 	}

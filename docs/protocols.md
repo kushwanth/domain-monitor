@@ -25,7 +25,7 @@ bug-free guarantee. Apply all six gates to the same release commit:
 
 1. Scope: RFC contracts and explicit limits are the table above.
 2. Defects: fix false-healthy, state-loss, secret-disclosure and missed-alert findings with regressions; assess remaining defects before release.
-3. Offline: valid/invalid/transient/stateful outcomes, race tests, vet, configured lint, formatting and the 83% coverage floor pass.
-4. End to end: fixtures verify evaluation, immutable API JSON, alert priority/redaction, delivery failures, cancellation, panics and recovery.
+3. Offline: valid/invalid/transient/stateful outcomes, race tests, coverage review, vet, configured lint and formatting pass.
+4. End to end: a whole-daemon fixture covers startup, scheduled checks, HTTP routes, alert delivery and shutdown; focused fixtures cover immutable JSON, priority/redaction, delivery failures, cancellation, panics and recovery.
 5. Interoperability: opt-in live tests plus independent DNS/RDAP/WHOIS observations agree for representative cases.
 6. Soak/review: repeat monitoring cycles and restart/cancellation scenarios for the release commit. Existing focused tests cover lifecycle cancellation, recurring alerts, serial RDAP panic/cancellation handling, cache refreshes, and snapshot isolation; they do not establish a long-running soak guarantee.

@@ -262,17 +262,20 @@ func evaluateFastDomainChecksWithEmail(providers map[string]ProviderConfig, doma
 	if dnssecResult.Source != StrEmpty || dnssecResult.Error != StrEmpty || dnssecResult.Valid {
 		state.DNSSEC[domain.Domain] = dnssecResult
 	}
+	evaluateNSHealthResult(domain, evidence.nsHealth, state)
+}
 
+func evaluateNSHealthResult(domain DomainConfig, snapshots []NSSnapshot, state *CheckState) {
 	if len(domain.Nameservers) > 0 {
-		status, nsCondition := EvaluateNSHealth(domain, evidence.nsHealth)
+		status, nsCondition := EvaluateNSHealth(domain, snapshots)
 
-		servers := make([]NSHealthServerResult, 0, len(evidence.nsHealth))
+		servers := make([]NSHealthServerResult, 0, len(snapshots))
 		var dnskeyBaseline []string
 		var soaBaseline uint32
 		hasSOABaseline := false
 		addressLookupUnavailable := false
 		confirmedNSIssue := false
-		for _, serverSnapshot := range evidence.nsHealth {
+		for _, serverSnapshot := range snapshots {
 			if serverSnapshot.AddressLookupUnavailable {
 				addressLookupUnavailable = true
 			}
@@ -292,7 +295,7 @@ func evaluateFastDomainChecksWithEmail(providers map[string]ProviderConfig, doma
 				}
 			}
 		}
-		for _, serverSnapshot := range evidence.nsHealth {
+		for _, serverSnapshot := range snapshots {
 			errStr := StrEmpty
 			if combined := errors.Join(serverSnapshot.Err, serverSnapshot.PartialError, serverSnapshot.DNSKEYErr); combined != nil {
 				errStr = combined.Error()
@@ -354,8 +357,8 @@ func evaluateFastEvidence(providers map[string]ProviderConfig, cfg AppConfig, ac
 // remainder. This keeps domain checks from waiting behind a large DNS portfolio.
 func fastCheckSlot(position, dnsCount, domainCount int) (isDNS bool, checkIndex int) {
 	paired := min(dnsCount, domainCount)
-	if position < 2*paired {
-		return position%2 == 0, position / 2
+	if position < FastCheckPairSize*paired {
+		return position%FastCheckPairSize == 0, position / FastCheckPairSize
 	}
 	if dnsCount > domainCount {
 		return true, position - domainCount
@@ -484,8 +487,8 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 		}
 
 		for _, rec := range res.State.Found {
-			parts := strings.SplitN(rec, SymSpace, 3)
-			if len(parts) == 3 {
+			parts := strings.SplitN(rec, SymSpace, CAARecordFieldCount)
+			if len(parts) == CAARecordFieldCount {
 				tag := strings.ToLower(parts[1])
 				val := strings.Trim(parts[2], SymDoubleQuote)
 				switch tag {
@@ -499,7 +502,7 @@ func storeDNSResult(state *CheckState, res DNSResult) {
 			}
 
 			if _, expected := expectedSet[rec]; !caaRes.Valid && !expected {
-				if len(parts) == 3 {
+				if len(parts) == CAARecordFieldCount {
 					caaRes.UnknownCAs = append(caaRes.UnknownCAs, strings.Trim(parts[2], SymDoubleQuote))
 				} else {
 					caaRes.UnknownCAs = append(caaRes.UnknownCAs, rec)
@@ -562,12 +565,6 @@ func runMonitoringCycle(
 	})
 }
 
-type cycleHooks struct {
-	gather   func(context.Context, *AppState, AppConfig, HTTPDoer) (activeChecks, cycleEvidence)
-	evaluate func(map[string]ProviderConfig, AppConfig, activeChecks, cycleEvidence) *CheckState
-	timeout  time.Duration
-}
-
 func runMonitoringCycleWithHooks(
 	ctx context.Context,
 	app *AppState,
@@ -593,9 +590,9 @@ func runMonitoringCycleWithHooks(
 	cfg := app.configuration()
 	// Bound cycle timeout safely: scale with domain and DNS record counts so large portfolios
 	// have sufficient time for rate-limited RDAP requests and retries without hanging indefinitely.
-	minRequiredTimeout := saturatingWorkDuration(len(app.active.rdapDomains), 15*time.Second, 5*time.Minute)
-	minRequiredTimeout = saturatingWorkDuration(len(app.active.domains)+len(app.active.dnsRecords), 5*time.Second, minRequiredTimeout)
-	cycleMaxTimeout := max(loopDur, minRequiredTimeout, 5*time.Minute)
+	minRequiredTimeout := saturatingWorkDuration(len(app.active.rdapDomains), CycleRDAPBudgetPerDomain, MinCycleTimeBudget)
+	minRequiredTimeout = saturatingWorkDuration(len(app.active.domains)+len(app.active.dnsRecords), CycleOtherBudgetPerCheck, minRequiredTimeout)
+	cycleMaxTimeout := max(loopDur, minRequiredTimeout, MinCycleTimeBudget)
 	if hooks.timeout > 0 {
 		cycleMaxTimeout = hooks.timeout
 	}
@@ -641,13 +638,9 @@ func runMonitoringCycleWithHooks(
 		return nil
 	}
 
-	// 5. State transition logging
-	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, loopState.RDAP, func(s RDAPState) CheckStatus { return s.Status }, prevRDAPStatus)
-	logStateTransitions(CheckTypeDNS, TargetKeyRecord, loopState.DNS, func(s DNSState) CheckStatus { return s.Status }, prevDNSStatus)
-	logStateTransitions(CheckTypeEmail, TargetKeyDomain, loopState.Email, func(s EmailState) CheckStatus { return s.Status }, prevEmailStatus)
-
-	// 6. Track Since Timestamps and Dispatch Cycle Report
-	processConditionsAndAlerts(app, loopState, cfg, active, prevConditions)
+	// Stage condition history until the complete snapshot can be published.
+	nextConditions := maps.Clone(prevConditions)
+	cycleAlerts := prepareConditionsAndAlerts(loopState, cfg, active, nextConditions)
 
 	// 7. Update timestamps and pre-render atomic JSON cache
 	finishedAt := clock.Now()
@@ -663,7 +656,13 @@ func runMonitoringCycleWithHooks(
 	if !publishCycleState(app, loopState, loopDur) {
 		return nil
 	}
+	clear(prevConditions)
+	maps.Copy(prevConditions, nextConditions)
+	logStateTransitions(CheckTypeRDAP, TargetKeyDomain, loopState.RDAP, func(s RDAPState) CheckStatus { return s.Status }, prevRDAPStatus)
+	logStateTransitions(CheckTypeDNS, TargetKeyRecord, loopState.DNS, func(s DNSState) CheckStatus { return s.Status }, prevDNSStatus)
+	logStateTransitions(CheckTypeEmail, TargetKeyDomain, loopState.Email, func(s EmailState) CheckStatus { return s.Status }, prevEmailStatus)
 	app.Runtime.ExpiredDomains = evidence.expiredDomains
+	dispatchCycleAlerts(app, cycleAlerts)
 
 	cycleDuration := clock.Now().Sub(cycleStart)
 	LogInfo(MsgLogMonitoringCycleCompleted,
@@ -725,9 +724,12 @@ func publishCycleState(app *AppState, state *CheckState, loopDur time.Duration) 
 
 func sortedAPIChecks[T any](values map[string]T) []apiCheck[T] {
 	checks := make([]apiCheck[T], 0, len(values))
-	for _, id := range slices.Sorted(maps.Keys(values)) {
-		checks = append(checks, apiCheck[T]{ID: id, Result: values[id]})
+	for id, result := range values {
+		checks = append(checks, apiCheck[T]{ID: id, Result: result})
 	}
+	slices.SortFunc(checks, func(left, right apiCheck[T]) int {
+		return strings.Compare(left.ID, right.ID)
+	})
 	return checks
 }
 
@@ -918,7 +920,7 @@ func formatDurationSince(since time.Time) string {
 	return d.String()
 }
 
-func processConditionsAndAlerts(app *AppState, state *CheckState, cfg AppConfig, active activeChecks, prev map[conditionKey]StateCondition) {
+func prepareConditionsAndAlerts(state *CheckState, cfg AppConfig, active activeChecks, prev map[conditionKey]StateCondition) []Alert {
 	var cycleAlerts []Alert
 	for _, index := range active.domains {
 		cycleAlerts = collectDomainAlerts(cycleAlerts, state, cfg.Domains[index], prev)
@@ -932,7 +934,7 @@ func processConditionsAndAlerts(app *AppState, state *CheckState, cfg AppConfig,
 		}
 	}
 	pruneConditionHistory(state, prev)
-	dispatchCycleAlerts(app, cycleAlerts)
+	return cycleAlerts
 }
 
 func pruneConditionHistory(state *CheckState, prev map[conditionKey]StateCondition) {
@@ -1104,16 +1106,8 @@ func run(parent context.Context, configPath string) error {
 func runWithInitialize(parent context.Context, configPath string, initialize func(context.Context, AppConfig) (*AppState, error)) error {
 	return runWithLifecycleHooks(parent, configPath, initialize, lifecycleHooks{
 		setup: setupHTTPServer, cycle: runMonitoringCycle,
-		shutdownTimeout: ShutdownTimeout, engineWait: 5 * time.Second, notificationWait: 5 * time.Second,
+		shutdownTimeout: ShutdownTimeout, engineWait: LifecycleWorkerWait, notificationWait: LifecycleWorkerWait,
 	})
-}
-
-type lifecycleHooks struct {
-	setup            func(*AppState, string) (*http.Server, <-chan error)
-	cycle            func(context.Context, *AppState, HTTPDoer, map[string]CheckStatus, map[string]CheckStatus, map[string]CheckStatus, map[conditionKey]StateCondition) *CheckState
-	shutdownTimeout  time.Duration
-	engineWait       time.Duration
-	notificationWait time.Duration
 }
 
 func runWithLifecycleHooks(parent context.Context, configPath string, initialize func(context.Context, AppConfig) (*AppState, error), hooks lifecycleHooks) error {

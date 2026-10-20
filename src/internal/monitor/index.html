@@ -1113,6 +1113,14 @@
       }
     }
 
+    function decodeHash(value) {
+      try {
+        return decodeURIComponent(value);
+      } catch (e) {
+        return value;
+      }
+    }
+
     function initialize() {
       updateHeaderTimestamps();
       pollState();
@@ -1121,7 +1129,7 @@
       if (['domains', 'dns'].includes(hash)) {
         switchView(hash);
       } else if (hash.startsWith('dns:')) {
-        const target = decodeURIComponent(hash.substring(4)).toLowerCase();
+        const target = decodeHash(hash.substring(4)).toLowerCase();
         switchView('dns');
         setTimeout(() => {
           const card = document.querySelector(`details[data-search*="${CSS.escape(target)}"]`);
@@ -1143,7 +1151,7 @@
         if (['domains', 'dns'].includes(view) && currentView !== view) {
           switchView(view);
         } else if (view.startsWith('dns:')) {
-          const target = decodeURIComponent(view.substring(4)).toLowerCase();
+          const target = decodeHash(view.substring(4)).toLowerCase();
           switchView('dns');
           setTimeout(() => {
             const card = document.querySelector(`details[data-search*="${CSS.escape(target)}"]`);
@@ -1362,7 +1370,7 @@
           emailHtml = `
             <div class="detail-panel">
               <h3>Email Security</h3>
-              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value ${emailStatusClass}">${emailState.unavailable ? 'Check Unavailable' : formatTitleCase(emailState.status)}</div></div>
+              <div class="detail-row"><div class="detail-label">Status:</div><div class="detail-value ${emailStatusClass}">${emailState.unavailable ? 'Check Unavailable' : escapeHTML(formatTitleCase(emailState.status))}</div></div>
               <div class="detail-row"><div class="detail-label">SPF:</div><div class="detail-value">${emailState.spf ? 'Configured' : 'Missing'}</div></div>
               <div class="detail-row"><div class="detail-label">DMARC:</div><div class="detail-value">${emailState.dmarc ? 'Configured' : 'Missing'}</div></div>
               <div class="detail-row"><div class="detail-label">DKIM:</div><div class="detail-value">${dkimDisplay}</div></div>
@@ -1649,7 +1657,7 @@
         card.className = 'domain-card';
         card.setAttribute('data-search-id', key.toLowerCase());
         card.setAttribute('data-search', `${key.toLowerCase()} ${hostname.toLowerCase()} ${type.toLowerCase()} ${(state.name || '').toLowerCase()}`);
-        const decHash = decodeURIComponent(window.location.hash).toLowerCase();
+        const decHash = decodeHash(window.location.hash).toLowerCase();
         if (decHash === '#open:' + key.toLowerCase() || decHash === '#dns:' + key.toLowerCase() || decHash === '#dns:' + hostname.toLowerCase() || previouslyOpen.has(key.toLowerCase())) {
           card.open = true;
         }

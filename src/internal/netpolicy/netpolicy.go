@@ -16,7 +16,7 @@ func RestrictedIP(ip net.IP) bool {
 		return true
 	}
 	if ip4 := ip.To4(); ip4 != nil {
-		return ip4[0] == 0 || (ip4[0] == 100 && (ip4[1]&0xc0) == 64)
+		return ip4[0] == 0 || (ip4[0] == cgnatFirstOctet && (ip4[1]&cgnatSecondOctetMask) == cgnatSecondOctetValue)
 	}
 	return false
 }
