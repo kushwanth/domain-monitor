@@ -2,7 +2,7 @@
 
 A small, self-hosted monitor for the domains and DNS records you look after.
 It runs as a single Go process, serves its own dashboard, and sends concise
-alerts through ntfy or Telegram when configured.
+alerts through ntfy when configured.
 
 > **Development note:** This project has been developed and refactored with
 > LLM assistance. Changes are reviewed against the documented behavior and
@@ -105,7 +105,7 @@ Changes require a restart.
 | `email_providers_dir` | string | `./data/email_providers` | Optional startup directory of provider JSON files, overriding bundled presets by filename. A missing default directory uses bundled presets; an explicitly configured missing directory, malformed definition, or unknown configured provider fails startup. |
 | `resolvers` | array | `["1.1.1.1"...]` | Global DNS resolver IPs. Checks compare the first two observations when available; additional entries remain available to protocol-specific failover paths. |
 | `doh_url` | string | `"https://dns.google/resolve"` | Trusted upstream JSON DoH validator used to corroborate local DNSSEC evidence; this daemon is not an independent root-to-zone validator. |
-| `notifications` | object | Optional | Omit it to disable external delivery. Configure `ntfy.url` with a valid HTTP(S) URL, `telegram` with both `token` and `chat_id`, or both. Empty or incomplete provider settings are disabled. Authenticated ntfy requires HTTPS. Cross-origin notification redirects are rejected. |
+| `notifications` | object | Optional | Omit it to disable external delivery. Configure `ntfy.url` with a valid HTTP(S) URL. Empty or incomplete provider settings are disabled. Authenticated ntfy requires HTTPS. Cross-origin notification redirects are rejected. |
 
 RDAP and public-metadata clients connect directly so proxy resolution cannot bypass destination policy. The operator-selected notification client may use environment proxy settings; credentials are never followed across origins.
 
@@ -213,8 +213,6 @@ container deployments:
 | `CONFIG_PATH` | `"config.json"` | Path to the configuration file. |
 | `PORT` | `"8080"` | HTTP server listening port. |
 | `NTFY_AUTH` | Config value | Authorization header or token for ntfy. |
-| `TELEGRAM_TOKEN` | Config value | Telegram Bot API token. |
-| `TELEGRAM_CHAT_ID` | Config value | Telegram chat or channel ID. |
 | `DOH_URL` | `"https://dns.google/resolve"` | Upstream DNS-over-HTTPS endpoint. |
 
 ## Web dashboard and API

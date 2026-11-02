@@ -231,18 +231,6 @@ func applyConfigOverrides(config *RawConfig) {
 		}
 		config.Notifications.Ntfy.Auth = t
 	}
-	if t := strings.TrimSpace(os.Getenv(EnvTelegramToken)); t != StrEmpty {
-		if config.Notifications.Telegram == nil {
-			config.Notifications.Telegram = &TelegramConfig{}
-		}
-		config.Notifications.Telegram.Token = t
-	}
-	if id := strings.TrimSpace(os.Getenv(EnvTelegramChatID)); id != StrEmpty {
-		if config.Notifications.Telegram == nil {
-			config.Notifications.Telegram = &TelegramConfig{}
-		}
-		config.Notifications.Telegram.ChatID = id
-	}
 	if u := strings.TrimSpace(os.Getenv(EnvDoHURL)); u != StrEmpty {
 		config.DoHURL = u
 	}
@@ -291,15 +279,6 @@ func validateNotificationEndpoints(notifications *Notifications) error {
 					return fmt.Errorf(MsgErrInvalidNtfyURL, errors.New(MsgErrAuthenticatedNtfyRequiresHTTPS))
 				}
 			}
-		}
-	}
-	if notifications.Telegram != nil {
-		telegram := notifications.Telegram
-		telegram.Token = strings.TrimSpace(telegram.Token)
-		telegram.ChatID = strings.TrimSpace(telegram.ChatID)
-		if telegram.Token == StrEmpty || telegram.ChatID == StrEmpty {
-			LogWarn(MsgLogTelegramDisabled)
-			notifications.Telegram = nil
 		}
 	}
 	return nil
@@ -741,13 +720,8 @@ func InitializeApp(ctx context.Context, cfg AppConfig) (*AppState, error) {
 		auth = PrefixBearer + auth
 	}
 
-	var telegramToken, telegramChatID string
-	if cfg.Notifications.Telegram != nil {
-		telegramToken = cfg.Notifications.Telegram.Token
-		telegramChatID = cfg.Notifications.Telegram.ChatID
-	}
-	if ntfyURL != StrEmpty || (telegramToken != StrEmpty && telegramChatID != StrEmpty) {
-		notifier := NewNotificationManager(ntfyURL, auth, telegramToken, telegramChatID)
+	if ntfyURL != StrEmpty {
+		notifier := NewNotificationManager(ntfyURL, auth)
 		notifier.HTTPClient = app.Clients.Notification
 		app.Notifier = notifier
 	}

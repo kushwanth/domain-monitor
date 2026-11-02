@@ -50,7 +50,7 @@ func TestLoadConfigInjectedReader(t *testing.T) {
 }
 
 func TestRepositoryExampleConfigCompiles(t *testing.T) {
-	for _, environmentVariable := range []string{EnvPort, EnvNtfyAuth, EnvTelegramToken, EnvTelegramChatID, EnvDoHURL} {
+	for _, environmentVariable := range []string{EnvPort, EnvNtfyAuth, EnvDoHURL} {
 		t.Setenv(environmentVariable, StrEmpty)
 	}
 
@@ -282,19 +282,13 @@ func TestLoadConfig(t *testing.T) {
 				"domains": [{"domain": "example.com", "name": "Example"}]
 			}`,
 			envVars: map[string]string{
-				"PORT":             "8888",
-				"TELEGRAM_TOKEN":   "test-token",
-				"TELEGRAM_CHAT_ID": "12345",
-				"CTLOGS_API_KEY":   "ct-key-abc",
-				"DOH_URL":          "https://custom-doh.com/resolve",
+				"PORT":    "8888",
+				"DOH_URL": "https://custom-doh.com/resolve",
 			},
 			expectErr: false,
 			validate: func(t *testing.T, app *AppState) {
 				if app.Config().Port != "8888" {
 					t.Errorf("Expected port 8888 from env, got %s", app.Config().Port)
-				}
-				if app.Config().Notifications.Telegram == nil || app.Config().Notifications.Telegram.Token != "test-token" {
-					t.Errorf("Expected telegram token test-token, got %+v", app.Config().Notifications.Telegram)
 				}
 
 				if app.Config().DoHURL != "https://custom-doh.com/resolve" {
@@ -403,9 +397,7 @@ func TestInitializeApp_ResolverResilience(t *testing.T) {
 		wantNotifier  bool
 	}{
 		{name: "none"},
-		{name: "incomplete telegram", notifications: Notifications{Telegram: &TelegramConfig{Token: "token"}}},
 		{name: "ntfy", notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}}, wantNotifier: true},
-		{name: "telegram", notifications: Notifications{Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, wantNotifier: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := AppConfig{Resolvers: []string{"192.0.2.1:53", "192.0.2.2:53"}, Notifications: tc.notifications}
@@ -984,8 +976,6 @@ func TestEndpointAndProviderValidation(t *testing.T) {
 
 func TestLoadConfigRejectsInvalidEndpoints(t *testing.T) {
 	t.Setenv(EnvPort, "")
-	t.Setenv(EnvTelegramToken, "")
-	t.Setenv(EnvTelegramChatID, "")
 	t.Setenv(EnvDoHURL, "")
 	for _, tc := range []struct {
 		name string
@@ -1004,17 +994,14 @@ func TestLoadConfigRejectsInvalidEndpoints(t *testing.T) {
 	}
 }
 
-func TestOptionalNtfyAndTelegram(t *testing.T) {
+func TestOptionalNtfy(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		notifications Notifications
 		wantError     bool
 	}{
 		{"missing ntfy", Notifications{}, false},
-		{"telegram only", Notifications{Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, false},
 		{"ntfy only", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}}, false},
-		{"both", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}}, false},
-		{"incomplete telegram", Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token"}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateNotificationEndpoints(&tc.notifications)
@@ -1026,7 +1013,7 @@ func TestOptionalNtfyAndTelegram(t *testing.T) {
 func TestConfigSnapshotOwnsNestedData(t *testing.T) {
 	config := AppConfig{
 		Resolvers:     []string{"1.1.1.1"},
-		Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}, Telegram: &TelegramConfig{Token: "token", ChatID: "chat"}},
+		Notifications: Notifications{Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic"}},
 		Domains:       []DomainConfig{{Domain: "example.com", Nameservers: []NameserverConfig{{Hostname: "ns.example.com"}, {Hostname: "hidden.example.com", Hidden: true}}, Email: &EmailConfig{MXRecords: []string{"mail.example.com"}, DKIMSelectors: []string{"selector"}}}},
 		DNSRecords:    []DNSTask{{Expected: StringList{"192.0.2.1"}}},
 	}
@@ -1040,7 +1027,6 @@ func TestConfigSnapshotOwnsNestedData(t *testing.T) {
 
 		snapshot.DNSRecords[0].Expected[0] = "192.0.2.2"
 		snapshot.Notifications.Ntfy.URL = "https://changed.invalid"
-		snapshot.Notifications.Telegram.Token = "changed"
 	}
 	mutate(config)
 	assert.Equal(t, original, app.Config(), "startup input must not remain shared")
@@ -1057,8 +1043,7 @@ func TestCompileRawConfigOwnsNestedData(t *testing.T) {
 
 	raw := RawConfig{
 		Notifications: Notifications{
-			Ntfy:     &NtfyConfig{URL: "https://ntfy.invalid/topic", Auth: "secret"},
-			Telegram: &TelegramConfig{Token: "token", ChatID: "chat"},
+			Ntfy: &NtfyConfig{URL: "https://ntfy.invalid/topic", Auth: "secret"},
 		},
 		Resolvers: []string{"1.1.1.1", "8.8.8.8"},
 		Domains: []DomainConfig{{
@@ -1080,7 +1065,6 @@ func TestCompileRawConfigOwnsNestedData(t *testing.T) {
 	require.NoError(t, err)
 
 	raw.Notifications.Ntfy.URL = "https://changed.invalid/topic"
-	raw.Notifications.Telegram.Token = "changed"
 	raw.Resolvers[0] = "9.9.9.9"
 	raw.Domains[0].Nameservers[0].Hostname = "changed.example"
 	raw.Domains[0].Email.MXRecords[0] = "changed.example"
@@ -1089,7 +1073,6 @@ func TestCompileRawConfigOwnsNestedData(t *testing.T) {
 	raw.DNSRecords[0].Expected[0] = "192.0.2.2"
 
 	assert.Equal(t, "https://ntfy.invalid/topic", compiled.Notifications.Ntfy.URL)
-	assert.Equal(t, "token", compiled.Notifications.Telegram.Token)
 	assert.Equal(t, []string{"1.1.1.1", "8.8.8.8"}, compiled.Resolvers)
 	assert.Equal(t, "ns1.example.com", compiled.Domains[0].Nameservers[0].Hostname)
 	assert.Equal(t, []string{"mail.example.com"}, compiled.Domains[0].Email.MXRecords)
@@ -1128,64 +1111,23 @@ func TestAppStateOwnsCompiledConfig(t *testing.T) {
 	assert.Equal(t, StringList{"192.0.2.1"}, owned.DNSRecords[0].Expected)
 }
 
-func TestOptionalTelegramDoesNotBlockNtfyStartup(t *testing.T) {
-	for _, tc := range []struct {
-		name, telegram, tokenEnv, chatEnv string
-		wantTelegram                      bool
-	}{
-		{name: "omitted"},
-		{name: "empty object", telegram: `,"telegram":{}`},
-		{name: "token only", telegram: `,"telegram":{"token":"token"}`},
-		{name: "chat only", telegram: `,"telegram":{"chat_id":"chat"}`},
-		{name: "whitespace", telegram: `,"telegram":{"token":"  ","chat_id":"  "}`},
-		{name: "token environment only", tokenEnv: "token"},
-		{name: "chat environment only", chatEnv: "chat"},
-		{name: "both environment", tokenEnv: "token", chatEnv: "chat", wantTelegram: true},
-		{name: "config plus environment", telegram: `,"telegram":{"token":"token"}`, chatEnv: "chat", wantTelegram: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(EnvTelegramToken, tc.tokenEnv)
-			t.Setenv(EnvTelegramChatID, tc.chatEnv)
-			cfg, err := loadConfig(context.Background(), "unused", func(string) ([]byte, error) {
-				return []byte(`{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}` + tc.telegram + `}}`), nil
-			})
-			require.NoError(t, err)
-			assert.Equal(t, tc.wantTelegram, cfg.Notifications.Telegram != nil)
-			app, err := InitializeApp(context.Background(), cfg)
-			require.NoError(t, err)
-			require.IsType(t, &NotificationManager{}, app.Notifier)
-			notifier, ok := app.Notifier.(*NotificationManager)
-			require.True(t, ok)
-			assert.Equal(t, "https://ntfy.invalid/topic", notifier.NtfyURL)
-			assert.Equal(t, tc.wantTelegram, notifier.TelegramToken != "" && notifier.TelegramChatID != "")
-		})
-	}
-}
-
 func TestOptionalNotificationProvidersLoadAndInitialize(t *testing.T) {
 	for _, tc := range []struct {
-		name, body, ntfyAuthEnv, tokenEnv, chatEnv string
-		wantNtfy, wantTelegram                     bool
-		wantErr                                    string
+		name, body, ntfyAuthEnv string
+		wantNtfy                bool
+		wantErr                 string
 	}{
 		{name: "omitted", body: `{}`},
 		{name: "empty object", body: `{"notifications":{}}`},
 		{name: "empty ntfy", body: `{"notifications":{"ntfy":{}}}`},
 		{name: "whitespace ntfy", body: `{"notifications":{"ntfy":{"url":"  "}}}`},
 		{name: "ntfy auth only", body: `{}`, ntfyAuthEnv: "secret"},
-		{name: "partial telegram", body: `{"notifications":{"telegram":{"token":"token"}}}`},
-		{name: "telegram only", body: `{"notifications":{"telegram":{"token":"token","chat_id":"chat"}}}`, wantTelegram: true},
-		{name: "telegram from environment", body: `{}`, tokenEnv: "token", chatEnv: "chat", wantTelegram: true},
-		{name: "telegram config and environment", body: `{"notifications":{"telegram":{"token":"token"}}}`, chatEnv: "chat", wantTelegram: true},
 		{name: "ntfy only", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"}}}`, wantNtfy: true},
-		{name: "both", body: `{"notifications":{"ntfy":{"url":"https://ntfy.invalid/topic"},"telegram":{"token":"token","chat_id":"chat"}}}`, wantNtfy: true, wantTelegram: true},
 		{name: "invalid ntfy URL", body: `{"notifications":{"ntfy":{"url":"not-a-url"}}}`, wantErr: "invalid ntfy"},
 		{name: "authenticated HTTP ntfy", body: `{"notifications":{"ntfy":{"url":"http://ntfy.invalid/topic","auth":"secret"}}}`, wantErr: "authenticated ntfy requires HTTPS"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(EnvNtfyAuth, tc.ntfyAuthEnv)
-			t.Setenv(EnvTelegramToken, tc.tokenEnv)
-			t.Setenv(EnvTelegramChatID, tc.chatEnv)
 			cfg, err := loadConfig(context.Background(), "unused", func(string) ([]byte, error) {
 				return []byte(tc.body), nil
 			})
@@ -1195,16 +1137,14 @@ func TestOptionalNotificationProvidersLoadAndInitialize(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantNtfy, cfg.Notifications.Ntfy != nil)
-			assert.Equal(t, tc.wantTelegram, cfg.Notifications.Telegram != nil)
 
 			app, err := InitializeApp(context.Background(), cfg)
 			require.NoError(t, err)
-			assert.Equal(t, tc.wantNtfy || tc.wantTelegram, app.Notifier != nil)
+			assert.Equal(t, tc.wantNtfy, app.Notifier != nil)
 			if app.Notifier != nil {
 				notifier, ok := app.Notifier.(*NotificationManager)
 				require.True(t, ok)
 				assert.Equal(t, tc.wantNtfy, notifier.NtfyURL != "")
-				assert.Equal(t, tc.wantTelegram, notifier.TelegramToken != "" && notifier.TelegramChatID != "")
 			}
 		})
 	}
@@ -1299,7 +1239,7 @@ func TestEmailProviderFilesystemFailures(t *testing.T) {
 }
 
 func TestLoadConfigAdditionalValidationFailures(t *testing.T) {
-	for _, env := range []string{EnvPort, EnvNtfyAuth, EnvTelegramToken, EnvTelegramChatID, EnvDoHURL} {
+	for _, env := range []string{EnvPort, EnvNtfyAuth, EnvDoHURL} {
 		t.Setenv(env, "")
 	}
 	for _, tc := range []struct{ name, checks, want string }{
@@ -1326,7 +1266,7 @@ func TestLoadConfigAdditionalValidationFailures(t *testing.T) {
 }
 
 func TestConfigRejectsReservedDNSTaskNames(t *testing.T) {
-	for _, env := range []string{EnvPort, EnvNtfyAuth, EnvTelegramToken, EnvTelegramChatID, EnvDoHURL} {
+	for _, env := range []string{EnvPort, EnvNtfyAuth, EnvDoHURL} {
 		t.Setenv(env, "")
 	}
 	_, err := loadConfig(context.Background(), "memory", func(string) ([]byte, error) {

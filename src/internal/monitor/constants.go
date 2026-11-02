@@ -116,7 +116,6 @@ const (
 	MaxBodyDrainSize                  = 4096
 	MaxAlertMessageRunes              = 1000
 	MaxProviderMessageBytes           = 3500
-	MaxTelegramAlertRunes             = 400
 	MaxAlertNameRunes                 = 80
 	MaxCycleReportItems               = 64
 	MaxFindingsPerCheck               = 16
@@ -141,12 +140,10 @@ const (
 
 // Environment Variable Keys
 const (
-	EnvConfigPath     = "CONFIG_PATH"
-	EnvPort           = "PORT"
-	EnvDoHURL         = "DOH_URL"
-	EnvNtfyAuth       = "NTFY_AUTH"
-	EnvTelegramToken  = "TELEGRAM_TOKEN"
-	EnvTelegramChatID = "TELEGRAM_CHAT_ID"
+	EnvConfigPath = "CONFIG_PATH"
+	EnvPort       = "PORT"
+	EnvDoHURL     = "DOH_URL"
+	EnvNtfyAuth   = "NTFY_AUTH"
 )
 
 // HTTP Constants
@@ -186,11 +183,8 @@ const (
 	XXSSProtectionZero         = "0"
 	DefaultCSP                 = "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
 
-	TelegramParseModeHTML = "HTML"
-
 	RedactedDomainPlaceholder = "[Hidden Domain]"
 	RedactedAuthPlaceholder   = "[REDACTED_AUTH]"
-	RedactedTokenPlaceholder  = "[REDACTED_TELEGRAM_TOKEN]" // #nosec G101 -- redaction marker, not a credential.
 	NotificationAlertTitle    = "Domain Monitor Alert"
 
 	PrefixHTTP      = "http://"
@@ -208,9 +202,6 @@ const (
 	DNSRetryBaseDelay   = 100 * time.Millisecond
 	WHOISRetryBaseDelay = 2 * time.Second
 	MaxRetryDelay       = 30 * time.Second
-
-	TelegramAPIBase              = "https://api.telegram.org/bot"
-	TelegramAPISendMessageSuffix = "/sendMessage"
 )
 
 // Notification Alert Tags (Icons / Emojis)
@@ -900,12 +891,10 @@ const (
 	// System Info
 	MsgLogStartup          = "Daemon initialized successfully. Domains: %d, DNS Records: %d"
 	MsgLogHTTPAPI          = "HTTP API running on :%s (Endpoints: /health, /api/state)"
-	MsgLogTelegramDisabled = "Telegram disabled: token and chat ID must both be configured."
 	MsgLogShutdownSignal   = "Received signal: %v. Initiating graceful shutdown..."
 	MsgLogShutdownComplete = "Daemon shutdown complete."
 
 	// Internal Operational Logs
-	MsgLogNtfyRequestFailed         = "Ntfy request creation failed"
 	MsgLogNtfyDeliveryFailed        = "Ntfy delivery failed"
 	MsgLogNtfyRequestError          = "Ntfy request error"
 	MsgLogNotificationClientMissing = "Notification HTTP client is not configured"
@@ -917,12 +906,6 @@ const (
 	MsgErrDomainNegativeRenewalPrice = "domain %s: renewal_price cannot be negative"
 	MsgErrNoTierData                 = "no registry or registrar tier data available"
 
-	MsgLogTelegramMarshalFailed    = "Telegram payload marshal failed"
-	MsgLogTelegramRequestFailed    = "Telegram request creation failed"
-	MsgLogTelegramDeliveryFailed   = "Telegram delivery failed"
-	MsgLogTelegramRequestError     = "Telegram request error"
-	MsgLogTelegramPayloadTooLarge  = "Telegram alert exceeds provider message budget"
-	MsgLogTelegramRejected         = "Telegram rejected notification"
 	MsgLogRDAPRefreshFailed        = "Failed to refresh RDAP bootstrap from IANA; falling back to cached registry"
 	MsgLogRDAPRateLimited          = "RDAP rate limited, falling back to WHOIS"
 	MsgLogWHOISRateLimitedRetry    = "WHOIS query rate limited, retrying"
@@ -975,9 +958,6 @@ const (
 	ParamDO                = "do"
 	ParamDOValue           = "1"
 	RecordTypeDNSKEY       = "DNSKEY"
-	FieldChatID            = "chat_id"
-	FieldText              = "text"
-	FieldParseMode         = "parse_mode"
 	FieldError             = "error"
 	FieldDomain            = "domain"
 	FieldPriority          = "priority"
@@ -1027,8 +1007,7 @@ const (
 
 // Provider & Component Names
 const (
-	NameNtfyProvider     = "Ntfy provider"
-	NameTelegramProvider = "Telegram provider"
+	NameNtfyProvider = "Ntfy provider"
 
 	NameOpMonitoringEngine = "Monitoring engine"
 	NameOpDNSLookup        = "DNS lookup"
@@ -1062,10 +1041,7 @@ const (
 	AlertSincePrefix             = " (Since: "
 	AlertConditionFixedText      = " :  (Since: )"
 
-	TelegramAlertHeader  = "⚠️ <b>Domain Monitor Alerts</b>\n\n"
-	TelegramPrefixFormat = "<b>[%s]</b> "
-	TelegramLineFormat   = "• %s%s\n"
-	NtfyPrefixFormat     = "[%s] "
+	NtfyPrefixFormat = "[%s] "
 )
 
 // Logging Formats

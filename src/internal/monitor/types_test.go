@@ -184,7 +184,7 @@ type recordingNotifier struct {
 }
 
 func newRecordingNotifier() *recordingNotifier {
-	notifier := NewNotificationManager("https://ntfy.invalid/test", StrEmpty, StrEmpty, StrEmpty)
+	notifier := NewNotificationManager("https://ntfy.invalid/test", StrEmpty)
 	notifier.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(StrEmpty))}, nil
 	}}

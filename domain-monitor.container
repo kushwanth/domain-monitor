@@ -9,8 +9,6 @@ Image=ghcr.io/your-github-username/your-repo-name@sha256:REPLACE_WITH_RELEASE_DI
 # Add your auth tokens using Secrets here to avoid hardcoding them in config.json
 # Create them using: podman secret create <secret-name> <file-with-secret>
 # Secret=ntfy-auth,type=env,target=NTFY_AUTH
-# Secret=telegram-token,type=env,target=TELEGRAM_TOKEN
-# Environment=TELEGRAM_CHAT_ID=your_telegram_chat_id
 
 # Use the immutable digest published for the reviewed release. Upgrade only by
 # replacing this digest after reviewing release notes and configuration changes.

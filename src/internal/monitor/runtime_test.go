@@ -554,7 +554,7 @@ func TestProcessConditionsDropsHistoryForSuppressedChecks(t *testing.T) {
 
 func TestNotificationWorkerDrainsQueueWhenWakeChannelCloses(t *testing.T) {
 	requests := 0
-	notifier := NewNotificationManager("https://ntfy.invalid/topic", "", "", "")
+	notifier := NewNotificationManager("https://ntfy.invalid/topic", "")
 	notifier.HTTPClient = &MockHTTPClient{MockDo: func(*http.Request) (*http.Response, error) {
 		requests++
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
@@ -597,7 +597,7 @@ func TestReleaseCycleDeliversAlerts(t *testing.T) {
 		return new(dns.Msg).SetReply(q), 0, nil
 	}}
 	requests := 0
-	notifier := NewNotificationManager("https://ntfy.invalid/topic", "", "", "")
+	notifier := NewNotificationManager("https://ntfy.invalid/topic", "")
 	notifier.HTTPClient = &MockHTTPClient{MockDo: func(req *http.Request) (*http.Response, error) {
 		requests++
 		assert.Equal(t, http.MethodPost, req.Method)
@@ -1053,7 +1053,7 @@ func TestServiceFlowConfigCycleAPIAndAlertDelivery(t *testing.T) {
 }
 
 func TestDaemonLifecycleServesChecksAndDeliversAlert(t *testing.T) {
-	for _, variable := range []string{EnvPort, EnvNtfyAuth, EnvTelegramToken, EnvTelegramChatID, EnvDoHURL} {
+	for _, variable := range []string{EnvPort, EnvNtfyAuth, EnvDoHURL} {
 		t.Setenv(variable, "")
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

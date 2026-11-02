@@ -292,16 +292,9 @@ type NtfyConfig struct {
 	Auth string `json:"auth"`
 }
 
-// TelegramConfig contains the optional bot token and destination chat ID.
-type TelegramConfig struct {
-	Token  string `json:"token"`
-	ChatID string `json:"chat_id"`
-}
-
 // NotificationConfig contains the configured delivery providers.
 type NotificationConfig struct {
-	Ntfy     *NtfyConfig     `json:"ntfy"`
-	Telegram *TelegramConfig `json:"telegram"`
+	Ntfy *NtfyConfig `json:"ntfy"`
 }
 
 // Notifications is the JSON-facing name retained for configuration compatibility.
@@ -584,10 +577,6 @@ func cloneConfig(cfg AppConfig) AppConfig {
 	if cfg.Notifications.Ntfy != nil {
 		ntfy := *cfg.Notifications.Ntfy
 		cfg.Notifications.Ntfy = &ntfy
-	}
-	if cfg.Notifications.Telegram != nil {
-		telegram := *cfg.Notifications.Telegram
-		cfg.Notifications.Telegram = &telegram
 	}
 	for i := range cfg.Domains {
 		domain := &cfg.Domains[i]
@@ -982,11 +971,6 @@ type Alert struct {
 	ReportID string
 }
 
-// telegramResponse is the minimal Telegram sendMessage response payload.
-type telegramResponse struct {
-	OK bool `json:"ok"`
-}
-
 // Notifier is the interface for dispatching alerts.
 type Notifier interface {
 	Dispatch(message, redacted string, priority AlertPriority, tag AlertTag, domain, name string)
@@ -1060,10 +1044,8 @@ func (c *pricingCatalog) price(tld string) (float64, bool) {
 
 // NotificationManager sends alerts directly.
 type NotificationManager struct {
-	NtfyURL        string
-	NtfyAuth       string
-	TelegramToken  string
-	TelegramChatID string
+	NtfyURL  string
+	NtfyAuth string
 
 	// Dependencies for network/IO
 	HTTPClient HTTPDoer
